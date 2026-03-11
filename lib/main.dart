@@ -6,6 +6,13 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'firebase_options.dart';
 
+// Colors
+const Color primaryBlue = Color(0xFF0091E5);
+const Color lightBg = Color(0xFFF8FAFB);
+const Color white = Colors.white;
+const Color darkText = Color(0xFF1F2937);
+const Color lightText = Color(0xFF6B7280);
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(
@@ -20,10 +27,20 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'WhatsApp CRM',
+      title: 'WhatHero',
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.green),
         useMaterial3: true,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: primaryBlue,
+          brightness: Brightness.light,
+        ),
+        appBarTheme: const AppBarTheme(
+          backgroundColor: white,
+          foregroundColor: darkText,
+          elevation: 0,
+          surfaceTintColor: Colors.transparent,
+        ),
+        scaffoldBackgroundColor: lightBg,
       ),
       home: const WhatsAppHandshakeScreen(),
     );
@@ -60,14 +77,12 @@ class _WhatsAppHandshakeScreenState extends State<WhatsAppHandshakeScreen> {
     socket.connect();
 
     socket.onConnect((_) {
-      print('Conectado al servidor de sockets');
       setState(() {
         status = 'Esperando QR';
       });
     });
 
     socket.on('qr', (data) {
-      print('Nuevo QR recibido');
       setState(() {
         qrCode = data;
         status = 'Esperando QR';
@@ -76,7 +91,6 @@ class _WhatsAppHandshakeScreenState extends State<WhatsAppHandshakeScreen> {
     });
 
     socket.on('ready', (_) {
-      print('WhatsApp conectado exitosamente');
       setState(() {
         isConnected = true;
         qrCode = null;
@@ -93,12 +107,6 @@ class _WhatsAppHandshakeScreenState extends State<WhatsAppHandshakeScreen> {
     });
   }
 
-  Color getAppBarColor() {
-    if (isConnected) return Colors.green;
-    if (qrCode != null || status == 'Esperando QR') return Colors.orange;
-    return Colors.grey;
-  }
-
   @override
   void dispose() {
     socket.dispose();
@@ -107,58 +115,99 @@ class _WhatsAppHandshakeScreenState extends State<WhatsAppHandshakeScreen> {
 
   @override
   Widget build(BuildContext context) {
-    // Una vez conectado, navegar a la pantalla de chats
     if (isConnected) {
       return ChatsScreen(socket: socket);
     }
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('WhatsApp CRM - Handshake'),
-        backgroundColor: getAppBarColor(),
-        foregroundColor: Colors.white,
-      ),
       body: Center(
         child: Padding(
-          padding: const EdgeInsets.all(20.0),
+          padding: const EdgeInsets.all(24.0),
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
+              // Logo/Title
+              Container(
+                width: 80,
+                height: 80,
+                decoration: BoxDecoration(
+                  color: primaryBlue.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(24),
+                ),
+                child: const Center(
+                  child: Text('🦸', style: TextStyle(fontSize: 48)),
+                ),
+              ),
+              const SizedBox(height: 32),
+              const Text(
+                'WhatHero',
+                style: TextStyle(
+                  fontSize: 36,
+                  fontWeight: FontWeight.bold,
+                  color: darkText,
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Tu gestor de WhatsApp profesional',
+                style: TextStyle(
+                  fontSize: 16,
+                  color: lightText,
+                  fontWeight: FontWeight.w400,
+                ),
+              ),
+              const SizedBox(height: 56),
+              // QR Code or Loading
               if (qrCode != null)
                 Column(
                   children: [
                     const Text(
-                      'Escanea el código QR en WhatsApp',
-                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.w500),
+                      'Escanea el código QR',
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w600,
+                        color: darkText,
+                      ),
                     ),
-                    const SizedBox(height: 20),
+                    const SizedBox(height: 24),
                     Container(
                       decoration: BoxDecoration(
-                        color: Colors.white,
-                        borderRadius: BorderRadius.circular(20),
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black.withOpacity(0.1),
-                            blurRadius: 10,
-                            spreadRadius: 5,
-                          ),
-                        ],
+                        color: white,
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(
+                          color: primaryBlue.withValues(alpha: 0.1),
+                          width: 1,
+                        ),
                       ),
-                      padding: const EdgeInsets.all(10),
+                      padding: const EdgeInsets.all(20),
                       child: QrImageView(
                         data: qrCode!,
                         version: QrVersions.auto,
-                        size: 250.0,
+                        size: 260.0,
                       ),
                     ),
                   ],
                 )
               else
-                const Column(
+                Column(
                   children: [
-                    CircularProgressIndicator(),
-                    SizedBox(height: 20),
-                    Text('Conectando con el servidor...'),
+                    const SizedBox(
+                      width: 60,
+                      height: 60,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2.5,
+                        valueColor: AlwaysStoppedAnimation<Color>(primaryBlue),
+                      ),
+                    ),
+                    const SizedBox(height: 24),
+                    const Text(
+                      'Conectando...',
+                      style: TextStyle(
+                        fontSize: 16,
+                        color: darkText,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
                   ],
                 ),
             ],
@@ -180,65 +229,287 @@ class ChatsScreen extends StatefulWidget {
 
 class _ChatsScreenState extends State<ChatsScreen> {
   String? selectedChatPhone;
+  String searchQuery = '';
+  final TextEditingController searchController = TextEditingController();
+
+  @override
+  void dispose() {
+    searchController.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
+    final isMobile = MediaQuery.of(context).size.width < 600;
+
+    if (isMobile) {
+      return selectedChatPhone == null
+          ? _buildChatsList()
+          : _buildMessageDetail();
+    }
+
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('WhatsApp CRM - Chats'),
-        backgroundColor: Colors.green,
-        foregroundColor: Colors.white,
-      ),
       body: Row(
         children: [
-          // Lista de chats
-          SizedBox(
-            width: 300,
-            child: StreamBuilder<QuerySnapshot>(
-              stream: FirebaseFirestore.instance
-                  .collection('chats')
-                  .orderBy('lastMessageTimestamp', descending: true)
-                  .snapshots(),
-              builder: (context, snapshot) {
-                if (!snapshot.hasData) {
-                  return const Center(child: CircularProgressIndicator());
-                }
-
-                final chats = snapshot.data!.docs;
-
-                if (chats.isEmpty) {
-                  return const Center(child: Text('Sin chats'));
-                }
-
-                return ListView.builder(
-                  itemCount: chats.length,
-                  itemBuilder: (context, index) {
-                    final chat = chats[index];
-                    final phoneNumber = chat['phoneNumber'];
-                    final lastMessage = chat['lastMessage'] ?? 'Sin mensajes';
-
-                    return ListTile(
-                      title: Text(phoneNumber),
-                      subtitle: Text(lastMessage, maxLines: 1, overflow: TextOverflow.ellipsis),
-                      selected: selectedChatPhone == phoneNumber,
-                      onTap: () {
-                        setState(() {
-                          selectedChatPhone = phoneNumber;
-                        });
-                      },
-                    );
-                  },
-                );
-              },
-            ),
-          ),
-          // Detalle del chat
+          SizedBox(width: 400, child: _buildChatsList()),
           Expanded(
             child: selectedChatPhone != null
-                ? MessagesView(phoneNumber: selectedChatPhone!)
-                : const Center(child: Text('Selecciona un chat')),
+                ? _buildMessageDetail()
+                : Container(
+                    color: const Color(0xFFF5F5F5),
+                    child: const Center(
+                      child: Text(
+                        'Selecciona un chat para empezar',
+                        style: TextStyle(
+                          fontSize: 18,
+                          color: Colors.grey,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ),
+                  ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildChatsList() {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('WhatHero', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 24)),
+        elevation: 0,
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(68),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            child: TextField(
+              controller: searchController,
+              onChanged: (value) {
+                setState(() {
+                  searchQuery = value.toLowerCase();
+                });
+              },
+              decoration: InputDecoration(
+                hintText: 'Buscar contacto...',
+                hintStyle: const TextStyle(color: lightText),
+                prefixIcon: const Icon(Icons.search, color: lightText, size: 20),
+                suffixIcon: searchQuery.isNotEmpty
+                    ? IconButton(
+                        icon: const Icon(Icons.close, color: lightText, size: 20),
+                        onPressed: () {
+                          searchController.clear();
+                          setState(() {
+                            searchQuery = '';
+                          });
+                        },
+                      )
+                    : null,
+                filled: true,
+                fillColor: lightBg,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: BorderSide.none,
+                ),
+                contentPadding: const EdgeInsets.symmetric(vertical: 12, horizontal: 4),
+              ),
+            ),
+          ),
+        ),
+      ),
+      body: StreamBuilder<QuerySnapshot>(
+        stream: FirebaseFirestore.instance
+            .collection('chats')
+            .orderBy('lastMessageTimestamp', descending: true)
+            .snapshots(),
+        builder: (context, snapshot) {
+          if (!snapshot.hasData) {
+            return const Center(child: CircularProgressIndicator());
+          }
+
+          final allChats = snapshot.data!.docs;
+          final filteredChats = searchQuery.isEmpty
+              ? allChats
+              : allChats
+                  .where((chat) => (chat['phoneNumber'] as String)
+                      .toLowerCase()
+                      .contains(searchQuery))
+                  .toList();
+
+          if (filteredChats.isEmpty) {
+            return Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text(
+                    searchQuery.isEmpty ? 'Sin chats' : 'No se encontraron resultados',
+                    style: const TextStyle(
+                      fontSize: 16,
+                      color: Colors.grey,
+                    ),
+                  ),
+                ],
+              ),
+            );
+          }
+
+          return ListView.builder(
+            itemCount: filteredChats.length,
+            itemBuilder: (context, index) {
+              final chat = filteredChats[index];
+              final phoneNumber = chat['phoneNumber'] as String;
+              final lastMessage = chat['lastMessage'] ?? 'Sin mensajes';
+              final timestamp = (chat['lastMessageTimestamp'] as Timestamp?)?.toDate();
+
+              return _ChatTile(
+                phoneNumber: phoneNumber,
+                lastMessage: lastMessage,
+                timestamp: timestamp,
+                isSelected: selectedChatPhone == phoneNumber,
+                onTap: () {
+                  setState(() {
+                    selectedChatPhone = phoneNumber;
+                  });
+                },
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildMessageDetail() {
+    return Scaffold(
+      appBar: AppBar(
+        leading: MediaQuery.of(context).size.width < 600
+            ? IconButton(
+                icon: const Icon(Icons.arrow_back),
+                onPressed: () {
+                  setState(() {
+                    selectedChatPhone = null;
+                  });
+                },
+              )
+            : null,
+        title: Text(
+          selectedChatPhone ?? 'Chat',
+          style: const TextStyle(fontWeight: FontWeight.bold),
+        ),
+        elevation: 0,
+      ),
+      body: MessagesView(phoneNumber: selectedChatPhone!),
+    );
+  }
+}
+
+class _ChatTile extends StatelessWidget {
+  final String phoneNumber;
+  final String lastMessage;
+  final DateTime? timestamp;
+  final bool isSelected;
+  final VoidCallback onTap;
+
+  const _ChatTile({
+    required this.phoneNumber,
+    required this.lastMessage,
+    required this.timestamp,
+    required this.isSelected,
+    required this.onTap,
+  });
+
+  String _formatTimeShort(DateTime? dateTime) {
+    if (dateTime == null) return '';
+    final now = DateTime.now();
+    final difference = now.difference(dateTime);
+
+    if (difference.inMinutes < 1) {
+      return 'Ahora';
+    } else if (difference.inHours < 1) {
+      return '${difference.inMinutes}m';
+    } else if (difference.inHours < 24) {
+      return '${difference.inHours}h';
+    } else if (difference.inDays < 7) {
+      return '${difference.inDays}d';
+    } else {
+      return '${dateTime.day}/${dateTime.month}';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        child: Container(
+          color: isSelected ? lightBg : Colors.transparent,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            child: Row(
+              children: [
+                // Avatar
+                Container(
+                  width: 56,
+                  height: 56,
+                  decoration: BoxDecoration(
+                    color: primaryBlue.withValues(alpha: 0.15),
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  child: Center(
+                    child: Text(
+                      phoneNumber.substring(0, 1).toUpperCase(),
+                      style: const TextStyle(
+                        color: primaryBlue,
+                        fontWeight: FontWeight.w700,
+                        fontSize: 22,
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                // Content
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        phoneNumber,
+                        style: const TextStyle(
+                          fontWeight: FontWeight.w600,
+                          fontSize: 15,
+                          color: darkText,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        lastMessage,
+                        style: const TextStyle(
+                          color: lightText,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w400,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                // Time
+                Text(
+                  _formatTimeShort(timestamp),
+                  style: const TextStyle(
+                    color: lightText,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w400,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -255,24 +526,32 @@ class MessagesView extends StatefulWidget {
 
 class _MessagesViewState extends State<MessagesView> {
   final TextEditingController _messageController = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
+
+  @override
+  void dispose() {
+    _messageController.dispose();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scrollController.hasClients) {
+        _scrollController.animateTo(
+          _scrollController.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOut,
+        );
+      }
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
     return Column(
       children: [
-        // Encabezado con el número
-        Container(
-          padding: const EdgeInsets.all(16),
-          decoration: BoxDecoration(
-            color: Colors.green.shade100,
-            border: Border(bottom: BorderSide(color: Colors.green.shade300)),
-          ),
-          child: Text(
-            widget.phoneNumber,
-            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-          ),
-        ),
-        // Stream de mensajes en tiempo real
+        // Messages
         Expanded(
           child: StreamBuilder<QuerySnapshot>(
             stream: FirebaseFirestore.instance
@@ -283,87 +562,114 @@ class _MessagesViewState extends State<MessagesView> {
                 .snapshots(),
             builder: (context, snapshot) {
               if (!snapshot.hasData) {
-                return const Center(child: CircularProgressIndicator());
+                return const Center(
+                  child: CircularProgressIndicator(
+                    valueColor: AlwaysStoppedAnimation<Color>(primaryBlue),
+                  ),
+                );
               }
 
               final messages = snapshot.data!.docs;
 
+              Future.delayed(const Duration(milliseconds: 100), _scrollToBottom);
+
               if (messages.isEmpty) {
-                return const Center(child: Text('Sin mensajes'));
+                return const Center(
+                  child: Text(
+                    'Sin mensajes',
+                    style: TextStyle(color: lightText, fontSize: 16),
+                  ),
+                );
               }
 
               return ListView.builder(
-                reverse: true,
+                controller: _scrollController,
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
                 itemCount: messages.length,
                 itemBuilder: (context, index) {
-                  final msg = messages[messages.length - 1 - index];
+                  final msg = messages[index];
                   final text = msg['text'] ?? '';
                   final fromMe = msg['fromMe'] ?? false;
                   final timestamp = msg['timestamp'] as Timestamp;
 
-                  return Align(
-                    alignment: fromMe ? Alignment.centerRight : Alignment.centerLeft,
-                    child: Container(
-                      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: fromMe ? Colors.green.shade200 : Colors.grey.shade300,
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(text),
-                          const SizedBox(height: 4),
-                          Text(
-                            _formatTime(timestamp.toDate()),
-                            style: const TextStyle(fontSize: 12, color: Colors.grey),
-                          ),
-                        ],
-                      ),
-                    ),
+                  return _MessageBubble(
+                    text: text,
+                    fromMe: fromMe,
+                    timestamp: timestamp.toDate(),
                   );
                 },
               );
             },
           ),
         ),
-        // Input para enviar mensajes
+        // Input Area
         Container(
-          padding: const EdgeInsets.all(16),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
           decoration: BoxDecoration(
-            border: Border(top: BorderSide(color: Colors.grey.shade300)),
+            color: white,
+            border: Border(
+              top: BorderSide(color: primaryBlue.withValues(alpha: 0.05), width: 1),
+            ),
           ),
-          child: Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _messageController,
-                  decoration: InputDecoration(
-                    hintText: 'Escribe un mensaje...',
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(24),
+          child: SafeArea(
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _messageController,
+                    maxLines: null,
+                    textCapitalization: TextCapitalization.sentences,
+                    style: const TextStyle(color: darkText, fontSize: 15),
+                    decoration: InputDecoration(
+                      hintText: 'Escribe un mensaje...',
+                      hintStyle: const TextStyle(color: lightText),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide.none,
+                      ),
+                      filled: true,
+                      fillColor: lightBg,
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 12,
+                      ),
                     ),
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                   ),
                 ),
-              ),
-              const SizedBox(width: 8),
-              FloatingActionButton(
-                mini: true,
-                backgroundColor: Colors.green,
-                onPressed: () {
-                  // TODO: Implementar envío de mensajes
-                  _messageController.clear();
-                },
-                child: const Icon(Icons.send),
-              ),
-            ],
+                const SizedBox(width: 8),
+                Container(
+                  decoration: BoxDecoration(
+                    color: primaryBlue,
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: IconButton(
+                    icon: const Icon(Icons.send_rounded, size: 20),
+                    color: white,
+                    onPressed: () {
+                      // TODO: Implementar envío de mensajes
+                      _messageController.clear();
+                    },
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ],
     );
   }
+}
+
+class _MessageBubble extends StatelessWidget {
+  final String text;
+  final bool fromMe;
+  final DateTime timestamp;
+
+  const _MessageBubble({
+    required this.text,
+    required this.fromMe,
+    required this.timestamp,
+  });
 
   String _formatTime(DateTime dateTime) {
     final hour = dateTime.hour.toString().padLeft(2, '0');
@@ -372,8 +678,54 @@ class _MessagesViewState extends State<MessagesView> {
   }
 
   @override
-  void dispose() {
-    _messageController.dispose();
-    super.dispose();
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Align(
+        alignment: fromMe ? Alignment.centerRight : Alignment.centerLeft,
+        child: Column(
+          crossAxisAlignment: fromMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+          children: [
+            Container(
+              constraints: BoxConstraints(
+                maxWidth: MediaQuery.of(context).size.width * 0.7,
+              ),
+              decoration: BoxDecoration(
+                color: fromMe ? primaryBlue : Colors.white,
+                borderRadius: BorderRadius.circular(14),
+                border: fromMe
+                    ? null
+                    : Border.all(
+                        color: primaryBlue.withValues(alpha: 0.08),
+                        width: 1,
+                      ),
+              ),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              child: Text(
+                text,
+                style: TextStyle(
+                  color: fromMe ? white : darkText,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w400,
+                  height: 1.4,
+                ),
+              ),
+            ),
+            const SizedBox(height: 6),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: Text(
+                _formatTime(timestamp),
+                style: const TextStyle(
+                  color: lightText,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w400,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
