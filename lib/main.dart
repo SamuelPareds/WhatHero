@@ -7,12 +7,13 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:http/http.dart' as http;
 import 'firebase_options.dart';
 
-// Colors
-const Color primaryBlue = Color(0xFF0091E5);
-const Color lightBg = Color(0xFFF8FAFB);
-const Color white = Colors.white;
-const Color darkText = Color(0xFF1F2937);
-const Color lightText = Color(0xFF6B7280);
+// Colors - Dark Mode with Aqua Accent (Apple-style)
+const Color primaryAqua = Color(0xFF06B6D4); // Cyan/Verde Agua moderno
+const Color darkBg = Color(0xFF0F172A); // Fondo muy oscuro (navy)
+const Color surfaceDark = Color(0xFF1F2937); // Elementos oscuros (gris oscuro)
+const Color white = Color(0xFFF3F4F6); // Texto blanco (no puro)
+const Color lightText = Color(0xFFD1D5DB); // Gris claro secundario
+const Color accentAqua = Color(0xFF10B981); // Verde más saturado para detalles
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -31,17 +32,18 @@ class MyApp extends StatelessWidget {
       title: 'WhatHero',
       theme: ThemeData(
         useMaterial3: true,
+        brightness: Brightness.dark,
         colorScheme: ColorScheme.fromSeed(
-          seedColor: primaryBlue,
-          brightness: Brightness.light,
+          seedColor: primaryAqua,
+          brightness: Brightness.dark,
         ),
         appBarTheme: const AppBarTheme(
-          backgroundColor: white,
-          foregroundColor: darkText,
+          backgroundColor: surfaceDark,
+          foregroundColor: white,
           elevation: 0,
           surfaceTintColor: Colors.transparent,
         ),
-        scaffoldBackgroundColor: lightBg,
+        scaffoldBackgroundColor: darkBg,
       ),
       home: const WhatsAppHandshakeScreen(),
     );
@@ -132,7 +134,7 @@ class _WhatsAppHandshakeScreenState extends State<WhatsAppHandshakeScreen> {
                 width: 80,
                 height: 80,
                 decoration: BoxDecoration(
-                  color: primaryBlue.withValues(alpha: 0.1),
+                  color: primaryAqua.withValues(alpha: 0.15),
                   borderRadius: BorderRadius.circular(24),
                 ),
                 child: const Center(
@@ -145,7 +147,7 @@ class _WhatsAppHandshakeScreenState extends State<WhatsAppHandshakeScreen> {
                 style: TextStyle(
                   fontSize: 36,
                   fontWeight: FontWeight.bold,
-                  color: darkText,
+                  color: white,
                 ),
               ),
               const SizedBox(height: 8),
@@ -167,17 +169,17 @@ class _WhatsAppHandshakeScreenState extends State<WhatsAppHandshakeScreen> {
                       style: TextStyle(
                         fontSize: 18,
                         fontWeight: FontWeight.w600,
-                        color: darkText,
+                        color: white,
                       ),
                     ),
                     const SizedBox(height: 24),
                     Container(
                       decoration: BoxDecoration(
-                        color: white,
+                        color: Colors.white,
                         borderRadius: BorderRadius.circular(16),
                         border: Border.all(
-                          color: primaryBlue.withValues(alpha: 0.1),
-                          width: 1,
+                          color: primaryAqua.withValues(alpha: 0.3),
+                          width: 2,
                         ),
                       ),
                       padding: const EdgeInsets.all(20),
@@ -197,7 +199,7 @@ class _WhatsAppHandshakeScreenState extends State<WhatsAppHandshakeScreen> {
                       height: 60,
                       child: CircularProgressIndicator(
                         strokeWidth: 2.5,
-                        valueColor: AlwaysStoppedAnimation<Color>(primaryBlue),
+                        valueColor: AlwaysStoppedAnimation<Color>(primaryAqua),
                       ),
                     ),
                     const SizedBox(height: 24),
@@ -205,7 +207,7 @@ class _WhatsAppHandshakeScreenState extends State<WhatsAppHandshakeScreen> {
                       'Conectando...',
                       style: TextStyle(
                         fontSize: 16,
-                        color: darkText,
+                        color: white,
                         fontWeight: FontWeight.w500,
                       ),
                     ),
@@ -257,13 +259,13 @@ class _ChatsScreenState extends State<ChatsScreen> {
             child: selectedChatPhone != null
                 ? _buildMessageDetail()
                 : Container(
-                    color: const Color(0xFFF5F5F5),
+                    color: darkBg,
                     child: const Center(
                       child: Text(
                         'Selecciona un chat para empezar',
                         style: TextStyle(
                           fontSize: 18,
-                          color: Colors.grey,
+                          color: lightText,
                           fontWeight: FontWeight.w500,
                         ),
                       ),
@@ -278,7 +280,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
   Widget _buildChatsList() {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('WhatHero', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 24)),
+        title: const Text('WhatHero', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 24, color: white)),
         elevation: 0,
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(68),
@@ -291,6 +293,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                   searchQuery = value.toLowerCase();
                 });
               },
+              style: const TextStyle(color: white),
               decoration: InputDecoration(
                 hintText: 'Buscar contacto...',
                 hintStyle: const TextStyle(color: lightText),
@@ -307,7 +310,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                       )
                     : null,
                 filled: true,
-                fillColor: lightBg,
+                fillColor: surfaceDark.withValues(alpha: 0.6),
                 border: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(12),
                   borderSide: BorderSide.none,
@@ -346,7 +349,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                     searchQuery.isEmpty ? 'Sin chats' : 'No se encontraron resultados',
                     style: const TextStyle(
                       fontSize: 16,
-                      color: Colors.grey,
+                      color: lightText,
                     ),
                   ),
                 ],
@@ -397,9 +400,28 @@ class _ChatsScreenState extends State<ChatsScreen> {
           selectedChatPhone ?? 'Chat',
           style: const TextStyle(fontWeight: FontWeight.bold),
         ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.info_outline, size: 20),
+            onPressed: () {
+              _showContactInfo(selectedChatPhone!);
+            },
+          ),
+        ],
         elevation: 0,
       ),
       body: MessagesView(phoneNumber: selectedChatPhone!),
+    );
+  }
+
+  void _showContactInfo(String phoneNumber) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: surfaceDark,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (context) => ContactInfoPanel(phoneNumber: phoneNumber),
     );
   }
 }
@@ -444,7 +466,7 @@ class _ChatTile extends StatelessWidget {
       child: InkWell(
         onTap: onTap,
         child: Container(
-          color: isSelected ? lightBg : Colors.transparent,
+          color: isSelected ? surfaceDark.withValues(alpha: 0.8) : Colors.transparent,
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
             child: Row(
@@ -454,14 +476,14 @@ class _ChatTile extends StatelessWidget {
                   width: 56,
                   height: 56,
                   decoration: BoxDecoration(
-                    color: primaryBlue.withValues(alpha: 0.15),
+                    color: primaryAqua.withValues(alpha: 0.2),
                     borderRadius: BorderRadius.circular(14),
                   ),
                   child: Center(
                     child: Text(
                       phoneNumber.substring(0, 1).toUpperCase(),
                       style: const TextStyle(
-                        color: primaryBlue,
+                        color: primaryAqua,
                         fontWeight: FontWeight.w700,
                         fontSize: 22,
                       ),
@@ -479,7 +501,7 @@ class _ChatTile extends StatelessWidget {
                         style: const TextStyle(
                           fontWeight: FontWeight.w600,
                           fontSize: 15,
-                          color: darkText,
+                          color: white,
                         ),
                         overflow: TextOverflow.ellipsis,
                       ),
@@ -512,6 +534,248 @@ class _ChatTile extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+class ContactInfoPanel extends StatelessWidget {
+  final String phoneNumber;
+
+  const ContactInfoPanel({required this.phoneNumber, super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<DocumentSnapshot>(
+      stream: FirebaseFirestore.instance
+          .collection('chats')
+          .doc(phoneNumber)
+          .snapshots(),
+      builder: (context, snapshot) {
+        if (!snapshot.hasData) {
+          return const SizedBox(
+            height: 300,
+            child: Center(child: CircularProgressIndicator()),
+          );
+        }
+
+        final chatData = snapshot.data!.data() as Map<String, dynamic>?;
+        final lastMessage = chatData?['lastMessage'] ?? 'Sin mensajes';
+        final lastMessageTime = (chatData?['lastMessageTimestamp'] as Timestamp?)?.toDate();
+
+        return StreamBuilder<QuerySnapshot>(
+          stream: FirebaseFirestore.instance
+              .collection('chats')
+              .doc(phoneNumber)
+              .collection('messages')
+              .snapshots(),
+          builder: (context, messagesSnapshot) {
+            final messageCount = messagesSnapshot.data?.docs.length ?? 0;
+
+            return SingleChildScrollView(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Handle
+                    Center(
+                      child: Container(
+                        width: 40,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: lightText.withValues(alpha: 0.3),
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 32),
+                    // Avatar
+                    Center(
+                      child: Container(
+                        width: 80,
+                        height: 80,
+                        decoration: BoxDecoration(
+                          color: primaryAqua.withValues(alpha: 0.2),
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Center(
+                          child: Text(
+                            phoneNumber.substring(0, 1).toUpperCase(),
+                            style: const TextStyle(
+                              color: primaryAqua,
+                              fontWeight: FontWeight.w700,
+                              fontSize: 36,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 24),
+                    // Phone Number
+                    Center(
+                      child: Column(
+                        children: [
+                          Text(
+                            phoneNumber,
+                            style: const TextStyle(
+                              fontSize: 20,
+                              fontWeight: FontWeight.bold,
+                              color: white,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          const Text(
+                            'Contacto de WhatsApp',
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: lightText,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 40),
+                    // Info Section
+                    Container(
+                      decoration: BoxDecoration(
+                        color: darkBg.withValues(alpha: 0.5),
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(
+                          color: primaryAqua.withValues(alpha: 0.1),
+                        ),
+                      ),
+                      padding: const EdgeInsets.all(20),
+                      child: Column(
+                        children: [
+                          _InfoRow(
+                            icon: Icons.message,
+                            label: 'Mensajes',
+                            value: messageCount.toString(),
+                          ),
+                          const Divider(color: Colors.transparent, height: 16),
+                          _InfoRow(
+                            icon: Icons.access_time,
+                            label: 'Último mensaje',
+                            value: lastMessageTime != null
+                                ? _formatLastMessageTime(lastMessageTime)
+                                : 'Sin mensajes',
+                          ),
+                          const Divider(color: Colors.transparent, height: 16),
+                          _InfoRow(
+                            icon: Icons.check_circle,
+                            label: 'Estado',
+                            value: 'Conectado',
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 24),
+                    // Last message preview
+                    Container(
+                      decoration: BoxDecoration(
+                        color: darkBg.withValues(alpha: 0.5),
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(
+                          color: primaryAqua.withValues(alpha: 0.1),
+                        ),
+                      ),
+                      padding: const EdgeInsets.all(16),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'Último mensaje',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: lightText,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          Text(
+                            lastMessage,
+                            style: const TextStyle(
+                              fontSize: 14,
+                              color: white,
+                              height: 1.5,
+                            ),
+                            maxLines: 3,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 32),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  String _formatLastMessageTime(DateTime dateTime) {
+    final now = DateTime.now();
+    final difference = now.difference(dateTime);
+
+    if (difference.inMinutes < 1) {
+      return 'Hace unos segundos';
+    } else if (difference.inHours < 1) {
+      return 'Hace ${difference.inMinutes}m';
+    } else if (difference.inHours < 24) {
+      return 'Hace ${difference.inHours}h';
+    } else if (difference.inDays < 7) {
+      return 'Hace ${difference.inDays}d';
+    } else {
+      return '${dateTime.day}/${dateTime.month}/${dateTime.year}';
+    }
+  }
+}
+
+class _InfoRow extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final String value;
+
+  const _InfoRow({
+    required this.icon,
+    required this.label,
+    required this.value,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Icon(icon, color: primaryAqua, size: 20),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                label,
+                style: const TextStyle(
+                  fontSize: 12,
+                  color: lightText,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                value,
+                style: const TextStyle(
+                  fontSize: 14,
+                  color: white,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
     );
   }
 }
@@ -572,31 +836,30 @@ class _MessagesViewState extends State<MessagesView> {
       );
 
       if (response.statusCode == 200) {
-        // Message sent successfully
+        // Message sent successfully - just clear the input
+        // The message will appear in the chat via Firestore stream
         _messageController.clear();
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Mensaje enviado ✓'),
-            duration: Duration(seconds: 2),
-            backgroundColor: primaryBlue,
-          ),
-        );
       } else {
         final error = response.body;
         throw Exception('Failed to send: $error');
       }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Error: ${e.toString()}'),
-          duration: const Duration(seconds: 3),
-          backgroundColor: Colors.red,
-        ),
-      );
+      // Only show error if still mounted
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('No se pudo enviar: ${e.toString()}'),
+            duration: const Duration(seconds: 3),
+            backgroundColor: Colors.red.shade600,
+          ),
+        );
+      }
     } finally {
-      setState(() {
-        _isSending = false;
-      });
+      if (mounted) {
+        setState(() {
+          _isSending = false;
+        });
+      }
     }
   }
 
@@ -617,7 +880,7 @@ class _MessagesViewState extends State<MessagesView> {
               if (!snapshot.hasData) {
                 return const Center(
                   child: CircularProgressIndicator(
-                    valueColor: AlwaysStoppedAnimation<Color>(primaryBlue),
+                    valueColor: AlwaysStoppedAnimation<Color>(primaryAqua),
                   ),
                 );
               }
@@ -659,9 +922,9 @@ class _MessagesViewState extends State<MessagesView> {
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
           decoration: BoxDecoration(
-            color: white,
+            color: surfaceDark,
             border: Border(
-              top: BorderSide(color: primaryBlue.withValues(alpha: 0.05), width: 1),
+              top: BorderSide(color: primaryAqua.withValues(alpha: 0.1), width: 1),
             ),
           ),
           child: SafeArea(
@@ -672,7 +935,7 @@ class _MessagesViewState extends State<MessagesView> {
                     controller: _messageController,
                     maxLines: null,
                     textCapitalization: TextCapitalization.sentences,
-                    style: const TextStyle(color: darkText, fontSize: 15),
+                    style: const TextStyle(color: white, fontSize: 15),
                     decoration: InputDecoration(
                       hintText: 'Escribe un mensaje...',
                       hintStyle: const TextStyle(color: lightText),
@@ -681,7 +944,7 @@ class _MessagesViewState extends State<MessagesView> {
                         borderSide: BorderSide.none,
                       ),
                       filled: true,
-                      fillColor: lightBg,
+                      fillColor: darkBg.withValues(alpha: 0.8),
                       contentPadding: const EdgeInsets.symmetric(
                         horizontal: 14,
                         vertical: 12,
@@ -692,7 +955,7 @@ class _MessagesViewState extends State<MessagesView> {
                 const SizedBox(width: 8),
                 Container(
                   decoration: BoxDecoration(
-                    color: primaryBlue,
+                    color: primaryAqua,
                     borderRadius: BorderRadius.circular(12),
                   ),
                   child: IconButton(
@@ -702,11 +965,11 @@ class _MessagesViewState extends State<MessagesView> {
                             height: 20,
                             child: CircularProgressIndicator(
                               strokeWidth: 2,
-                              valueColor: AlwaysStoppedAnimation<Color>(white),
+                              valueColor: AlwaysStoppedAnimation<Color>(darkBg),
                             ),
                           )
                         : const Icon(Icons.send_rounded, size: 20),
-                    color: white,
+                    color: darkBg,
                     onPressed: _isSending ? null : _sendMessage,
                   ),
                 ),
@@ -750,12 +1013,12 @@ class _MessageBubble extends StatelessWidget {
                 maxWidth: MediaQuery.of(context).size.width * 0.7,
               ),
               decoration: BoxDecoration(
-                color: fromMe ? primaryBlue : Colors.white,
+                color: fromMe ? primaryAqua : surfaceDark.withValues(alpha: 0.9),
                 borderRadius: BorderRadius.circular(14),
                 border: fromMe
                     ? null
                     : Border.all(
-                        color: primaryBlue.withValues(alpha: 0.08),
+                        color: primaryAqua.withValues(alpha: 0.15),
                         width: 1,
                       ),
               ),
@@ -763,7 +1026,7 @@ class _MessageBubble extends StatelessWidget {
               child: Text(
                 text,
                 style: TextStyle(
-                  color: fromMe ? white : darkText,
+                  color: fromMe ? darkBg : white,
                   fontSize: 15,
                   fontWeight: FontWeight.w400,
                   height: 1.4,
