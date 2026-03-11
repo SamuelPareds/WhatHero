@@ -30,6 +30,7 @@ const logger = pino({ level: 'info' }, pino.destination({ sync: false }));
 
 let currentQR: string | undefined;
 let isReady = false;
+let waSocket: any = null; // Store socket reference for sending messages
 
 async function saveMessageToFirestore(message: any, botJid?: string) {
   try {
@@ -118,13 +119,51 @@ async function connectToWhatsApp() {
     }
   });
 
+  // Store socket reference globally for sending messages
+  waSocket = sock;
+
   return sock;
 }
+
+// REST API endpoint to send messages
+app.post('/send-message', express.json(), async (req, res) => {
+  try {
+    if (!isReady || !waSocket) {
+      return res.status(503).json({ error: 'WhatsApp not connected' });
+    }
+
+    const { to, text } = req.body;
+
+    if (!to || !text) {
+      return res.status(400).json({ error: 'Missing "to" or "text" field' });
+    }
+
+    // Format the phone number for WhatsApp
+    const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
+
+    // Send the message via Baileys
+    const message = await waSocket.sendMessage(jid, { text });
+
+    console.log(`Message sent to ${to}:`, text);
+
+    res.json({
+      success: true,
+      messageId: message.key.id,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('Error sending message:', error);
+    res.status(500).json({
+      error: 'Failed to send message',
+      details: (error as any).message,
+    });
+  }
+});
 
 io.on('connection', (socket) => {
   console.log('Socket.io client connected:', socket.id);
   console.log('Current status - isReady:', isReady, 'hasQR:', !!currentQR);
-  
+
   if (isReady) {
     socket.emit('ready', true);
   } else if (currentQR) {

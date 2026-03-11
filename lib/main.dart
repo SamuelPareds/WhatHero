@@ -4,6 +4,7 @@ import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:http/http.dart' as http;
 import 'firebase_options.dart';
 
 // Colors
@@ -527,6 +528,7 @@ class MessagesView extends StatefulWidget {
 class _MessagesViewState extends State<MessagesView> {
   final TextEditingController _messageController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
+  bool _isSending = false;
 
   @override
   void dispose() {
@@ -545,6 +547,57 @@ class _MessagesViewState extends State<MessagesView> {
         );
       }
     });
+  }
+
+  Future<void> _sendMessage() async {
+    final text = _messageController.text.trim();
+    if (text.isEmpty || _isSending) return;
+
+    setState(() {
+      _isSending = true;
+    });
+
+    try {
+      // Get the backend URL
+      String host = Platform.isAndroid ? 'http://10.0.2.2:3000' : 'http://localhost:3000';
+
+      // Send message to backend
+      final response = await http.post(
+        Uri.parse('$host/send-message'),
+        headers: {'Content-Type': 'application/json'},
+        body: '{"to": "${widget.phoneNumber}", "text": "$text"}',
+      ).timeout(
+        const Duration(seconds: 10),
+        onTimeout: () => throw Exception('Request timeout'),
+      );
+
+      if (response.statusCode == 200) {
+        // Message sent successfully
+        _messageController.clear();
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Mensaje enviado ✓'),
+            duration: Duration(seconds: 2),
+            backgroundColor: primaryBlue,
+          ),
+        );
+      } else {
+        final error = response.body;
+        throw Exception('Failed to send: $error');
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Error: ${e.toString()}'),
+          duration: const Duration(seconds: 3),
+          backgroundColor: Colors.red,
+        ),
+      );
+    } finally {
+      setState(() {
+        _isSending = false;
+      });
+    }
   }
 
   @override
@@ -643,12 +696,18 @@ class _MessagesViewState extends State<MessagesView> {
                     borderRadius: BorderRadius.circular(12),
                   ),
                   child: IconButton(
-                    icon: const Icon(Icons.send_rounded, size: 20),
+                    icon: _isSending
+                        ? const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              valueColor: AlwaysStoppedAnimation<Color>(white),
+                            ),
+                          )
+                        : const Icon(Icons.send_rounded, size: 20),
                     color: white,
-                    onPressed: () {
-                      // TODO: Implementar envío de mensajes
-                      _messageController.clear();
-                    },
+                    onPressed: _isSending ? null : _sendMessage,
                   ),
                 ),
               ],
