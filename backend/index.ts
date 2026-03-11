@@ -5,9 +5,9 @@ import makeWASocket, {
   DisconnectReason, 
   useMultiFileAuthState, 
   fetchLatestBaileysVersion,
-  ConnectionState
+  type ConnectionState
 } from '@whiskeysockets/baileys';
-import pino from 'pino';
+import { pino } from 'pino';
 import path from 'path';
 
 const app = express();
