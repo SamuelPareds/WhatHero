@@ -49,3 +49,4 @@ backend/node_modules/
 backend/dist/
 backend/auth_info/
 backend/.env
+backend/serviceAccountKey.json

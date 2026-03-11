@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "316753391709",
+    "project_id": "whathero-73605",
+    "storage_bucket": "whathero-73605.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:316753391709:android:5b7b3b6257fa6727641db4",
+        "android_client_info": {
+          "package_name": "com.sintaxis.whathero"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDCYKH1NS-cOHEHhDGOMyR-jRnT-tVGHDQ"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
