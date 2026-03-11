@@ -1,14 +1,15 @@
 import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
-import makeWASocket, { 
-  DisconnectReason, 
-  useMultiFileAuthState, 
+import makeWASocket, {
+  DisconnectReason,
+  useMultiFileAuthState,
   fetchLatestBaileysVersion,
   type ConnectionState
 } from '@whiskeysockets/baileys';
 import { pino } from 'pino';
-import path from 'path';
+import admin from 'firebase-admin';
+import serviceAccount from './serviceAccountKey.json' with { type: 'json' };
 
 const app = express();
 const httpServer = createServer(app);
@@ -19,10 +20,57 @@ const io = new Server(httpServer, {
   }
 });
 
+// Initialize Firebase Admin
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount as admin.ServiceAccount),
+});
+
+const db = admin.firestore();
 const logger = pino({ level: 'info' }, pino.destination({ sync: false }));
 
 let currentQR: string | undefined;
 let isReady = false;
+
+async function saveMessageToFirestore(message: any, botJid?: string) {
+  try {
+    const phoneNumber = message.key.remoteJid?.replace('@s.whatsapp.net', '').replace('@g.us', '');
+    if (!phoneNumber) return;
+
+    const messageText = message.message?.conversation ||
+                        message.message?.extendedTextMessage?.text ||
+                        message.message?.imageMessage?.caption ||
+                        '';
+
+    const messageTimestamp = message.messageTimestamp ? message.messageTimestamp * 1000 : Date.now();
+    const messageId = message.key.id;
+
+    const chatDocRef = db.collection('chats').doc(phoneNumber);
+    const messagesSubCollectionRef = chatDocRef.collection('messages');
+
+    // Upsert: guardar el mensaje en la subcolección
+    await messagesSubCollectionRef.doc(messageId).set({
+      id: messageId,
+      text: messageText,
+      timestamp: admin.firestore.Timestamp.fromDate(new Date(messageTimestamp)),
+      from: message.key.fromMe ? (botJid || 'bot') : phoneNumber,
+      fromMe: message.key.fromMe,
+      isMedia: !!message.message?.imageMessage || !!message.message?.documentMessage || !!message.message?.audioMessage,
+    }, { merge: true });
+
+    // Actualizar el documento principal del chat con lastMessage y timestamp
+    await chatDocRef.set({
+      phoneNumber,
+      lastMessage: messageText.substring(0, 100), // Limitar a 100 caracteres
+      lastMessageTimestamp: admin.firestore.Timestamp.fromDate(new Date(messageTimestamp)),
+      lastMessageId: messageId,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    console.log(`Message saved for ${phoneNumber}`);
+  } catch (error) {
+    console.error('Error saving message to Firestore:', error);
+  }
+}
 
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info');
@@ -59,6 +107,14 @@ async function connectToWhatsApp() {
       isReady = true;
       currentQR = undefined;
       io.emit('ready', true);
+    }
+  });
+
+  // Listen for incoming messages
+  sock.ev.on('messages.upsert', async (m) => {
+    const message = m.messages?.[0];
+    if (message && !message.key.fromMe) {
+      await saveMessageToFirestore(message, sock.user?.id);
     }
   });
 
