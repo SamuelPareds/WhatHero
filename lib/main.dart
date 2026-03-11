@@ -801,17 +801,6 @@ class _MessagesViewState extends State<MessagesView> {
     super.dispose();
   }
 
-  void _scrollToBottom() {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scrollController.hasClients) {
-        _scrollController.animateTo(
-          _scrollController.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 300),
-          curve: Curves.easeOut,
-        );
-      }
-    });
-  }
 
   Future<void> _sendMessage() async {
     final text = _messageController.text.trim();
@@ -874,7 +863,7 @@ class _MessagesViewState extends State<MessagesView> {
                 .collection('chats')
                 .doc(widget.phoneNumber)
                 .collection('messages')
-                .orderBy('timestamp', descending: false)
+                .orderBy('timestamp', descending: true)
                 .snapshots(),
             builder: (context, snapshot) {
               if (!snapshot.hasData) {
@@ -886,8 +875,6 @@ class _MessagesViewState extends State<MessagesView> {
               }
 
               final messages = snapshot.data!.docs;
-
-              Future.delayed(const Duration(milliseconds: 100), _scrollToBottom);
 
               if (messages.isEmpty) {
                 return const Center(
@@ -902,6 +889,7 @@ class _MessagesViewState extends State<MessagesView> {
                 controller: _scrollController,
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
                 itemCount: messages.length,
+                reverse: true,
                 itemBuilder: (context, index) {
                   final msg = messages[index];
                   final text = msg['text'] ?? '';
