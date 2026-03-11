@@ -21,6 +21,9 @@ const io = new Server(httpServer, {
 
 const logger = pino({ level: 'info' }, pino.destination({ sync: false }));
 
+let currentQR: string | undefined;
+let isReady = false;
+
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info');
   const { version } = await fetchLatestBaileysVersion();
@@ -39,17 +42,22 @@ async function connectToWhatsApp() {
 
     if (qr) {
       console.log('QR Code received');
+      currentQR = qr;
+      isReady = false;
       io.emit('qr', qr);
     }
 
     if (connection === 'close') {
       const shouldReconnect = (lastDisconnect?.error as any)?.output?.statusCode !== DisconnectReason.loggedOut;
       console.log('connection closed due to ', lastDisconnect?.error, ', reconnecting ', shouldReconnect);
+      isReady = false;
       if (shouldReconnect) {
         connectToWhatsApp();
       }
     } else if (connection === 'open') {
       console.log('opened connection');
+      isReady = true;
+      currentQR = undefined;
       io.emit('ready', true);
     }
   });
@@ -59,6 +67,13 @@ async function connectToWhatsApp() {
 
 io.on('connection', (socket) => {
   console.log('Socket.io client connected:', socket.id);
+  console.log('Current status - isReady:', isReady, 'hasQR:', !!currentQR);
+  
+  if (isReady) {
+    socket.emit('ready', true);
+  } else if (currentQR) {
+    socket.emit('qr', currentQR);
+  }
 });
 
 httpServer.listen(3000, () => {
