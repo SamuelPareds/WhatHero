@@ -9,6 +9,7 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import { pino } from 'pino';
 import admin from 'firebase-admin';
+import { rmSync } from 'fs';
 import serviceAccount from './serviceAccountKey.json' with { type: 'json' };
 
 const app = express();
@@ -31,6 +32,7 @@ const logger = pino({ level: 'info' }, pino.destination({ sync: false }));
 let currentQR: string | undefined;
 let isReady = false;
 let waSocket: any = null; // Store socket reference for sending messages
+let isReconnecting = false; // Prevent multiple reconnection attempts
 
 async function saveMessageToFirestore(message: any, botJid?: string) {
   try {
@@ -97,11 +99,41 @@ async function connectToWhatsApp() {
     }
 
     if (connection === 'close') {
-      const shouldReconnect = (lastDisconnect?.error as any)?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log('connection closed due to ', lastDisconnect?.error, ', reconnecting ', shouldReconnect);
       isReady = false;
-      if (shouldReconnect) {
-        connectToWhatsApp();
+      const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
+
+      if (statusCode === DisconnectReason.loggedOut) {
+        console.log('WhatsApp logged out from device. Clearing auth and requesting new QR.');
+
+        // Clear auth_info folder
+        try {
+          rmSync('auth_info', { recursive: true, force: true });
+          console.log('auth_info cleared');
+        } catch (error) {
+          console.error('Error clearing auth_info:', error);
+        }
+
+        currentQR = undefined;
+        isReconnecting = true;
+
+        // Notify frontend
+        io.emit('status_update', { status: 'logged_out' });
+
+        // Regenerate QR
+        setTimeout(() => {
+          connectToWhatsApp();
+          isReconnecting = false;
+        }, 500);
+      } else {
+        // Regular disconnection - attempt normal reconnect
+        console.log('connection closed due to ', lastDisconnect?.error, ', attempting reconnect');
+        if (!isReconnecting) {
+          isReconnecting = true;
+          setTimeout(() => {
+            connectToWhatsApp();
+            isReconnecting = false;
+          }, 3000);
+        }
       }
     } else if (connection === 'open') {
       console.log('opened connection');

@@ -101,6 +101,16 @@ class _WhatsAppHandshakeScreenState extends State<WhatsAppHandshakeScreen> {
       });
     });
 
+    socket.on('status_update', (data) {
+      if (data is Map && data['status'] == 'logged_out') {
+        setState(() {
+          isConnected = false;
+          qrCode = null;
+          status = 'Sesión cerrada. Escanea el nuevo QR.';
+        });
+      }
+    });
+
     socket.onDisconnect((_) {
       setState(() {
         status = 'Desconectado';
