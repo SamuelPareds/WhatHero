@@ -110,10 +110,10 @@ async function connectToWhatsApp() {
     }
   });
 
-  // Listen for incoming messages
+  // Listen for incoming and outgoing messages
   sock.ev.on('messages.upsert', async (m) => {
     const message = m.messages?.[0];
-    if (message && !message.key.fromMe) {
+    if (message) {
       await saveMessageToFirestore(message, sock.user?.id);
     }
   });
