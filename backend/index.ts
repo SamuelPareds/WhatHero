@@ -36,6 +36,10 @@ let isReconnecting = false; // Prevent multiple reconnection attempts
 
 async function saveMessageToFirestore(message: any, botJid?: string) {
   try {
+    // Multi-tenant constants (for now, using fixed values)
+    const userId = 'admin_1';
+    const sessionId = 'session_001';
+
     const phoneNumber = message.key.remoteJid?.replace('@s.whatsapp.net', '').replace('@g.us', '');
     if (!phoneNumber) return;
 
@@ -47,10 +51,18 @@ async function saveMessageToFirestore(message: any, botJid?: string) {
     const messageTimestamp = message.messageTimestamp ? message.messageTimestamp * 1000 : Date.now();
     const messageId = message.key.id;
 
-    const chatDocRef = db.collection('chats').doc(phoneNumber);
+    // New path: accounts/{userId}/whatsapp_sessions/{sessionId}/chats/{chatId}/messages
+    const chatDocRef = db
+      .collection('accounts')
+      .doc(userId)
+      .collection('whatsapp_sessions')
+      .doc(sessionId)
+      .collection('chats')
+      .doc(phoneNumber);
+
     const messagesSubCollectionRef = chatDocRef.collection('messages');
 
-    // Upsert: guardar el mensaje en la subcolección
+    // Save message to messages subcollection
     await messagesSubCollectionRef.doc(messageId).set({
       id: messageId,
       text: messageText,
@@ -60,16 +72,29 @@ async function saveMessageToFirestore(message: any, botJid?: string) {
       isMedia: !!message.message?.imageMessage || !!message.message?.documentMessage || !!message.message?.audioMessage,
     }, { merge: true });
 
-    // Actualizar el documento principal del chat con lastMessage y timestamp
+    // Update the chat document with lastMessage (for efficient list display)
     await chatDocRef.set({
       phoneNumber,
-      lastMessage: messageText.substring(0, 100), // Limitar a 100 caracteres
+      lastMessage: messageText.substring(0, 100),
       lastMessageTimestamp: admin.firestore.Timestamp.fromDate(new Date(messageTimestamp)),
       lastMessageId: messageId,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true });
 
-    console.log(`Message saved for ${phoneNumber}`);
+    // Also update the session document with the latest lastMessage info
+    const sessionDocRef = db
+      .collection('accounts')
+      .doc(userId)
+      .collection('whatsapp_sessions')
+      .doc(sessionId);
+
+    await sessionDocRef.set({
+      lastMessage: messageText.substring(0, 100),
+      lastMessageTimestamp: admin.firestore.Timestamp.fromDate(new Date(messageTimestamp)),
+      lastChatId: phoneNumber,
+    }, { merge: true });
+
+    console.log(`Message saved for ${phoneNumber} (Account: ${userId}, Session: ${sessionId})`);
   } catch (error) {
     console.error('Error saving message to Firestore:', error);
   }

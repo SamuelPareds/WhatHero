@@ -333,6 +333,10 @@ class _ChatsScreenState extends State<ChatsScreen> {
       ),
       body: StreamBuilder<QuerySnapshot>(
         stream: FirebaseFirestore.instance
+            .collection('accounts')
+            .doc('admin_1')
+            .collection('whatsapp_sessions')
+            .doc('session_001')
             .collection('chats')
             .orderBy('lastMessageTimestamp', descending: true)
             .snapshots(),
@@ -557,6 +561,10 @@ class ContactInfoPanel extends StatelessWidget {
   Widget build(BuildContext context) {
     return StreamBuilder<DocumentSnapshot>(
       stream: FirebaseFirestore.instance
+          .collection('accounts')
+          .doc('admin_1')
+          .collection('whatsapp_sessions')
+          .doc('session_001')
           .collection('chats')
           .doc(phoneNumber)
           .snapshots(),
@@ -574,6 +582,10 @@ class ContactInfoPanel extends StatelessWidget {
 
         return StreamBuilder<QuerySnapshot>(
           stream: FirebaseFirestore.instance
+              .collection('accounts')
+              .doc('admin_1')
+              .collection('whatsapp_sessions')
+              .doc('session_001')
               .collection('chats')
               .doc(phoneNumber)
               .collection('messages')
@@ -870,6 +882,10 @@ class _MessagesViewState extends State<MessagesView> {
         Expanded(
           child: StreamBuilder<QuerySnapshot>(
             stream: FirebaseFirestore.instance
+                .collection('accounts')
+                .doc('admin_1')
+                .collection('whatsapp_sessions')
+                .doc('session_001')
                 .collection('chats')
                 .doc(widget.phoneNumber)
                 .collection('messages')
