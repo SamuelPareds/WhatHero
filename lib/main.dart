@@ -244,6 +244,37 @@ class _ChatsScreenState extends State<ChatsScreen> {
   String? selectedChatPhone;
   String searchQuery = '';
   final TextEditingController searchController = TextEditingController();
+  String? _currentSessionId;
+  String? _currentSessionAlias;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadAvailableSession();
+  }
+
+  Future<void> _loadAvailableSession() async {
+    try {
+      // Load the first available WhatsApp session
+      final sessionsSnapshot = await FirebaseFirestore.instance
+          .collection('accounts')
+          .doc('admin_1')
+          .collection('whatsapp_sessions')
+          .where('status', isEqualTo: 'connected')
+          .limit(1)
+          .get();
+
+      if (sessionsSnapshot.docs.isNotEmpty) {
+        final sessionDoc = sessionsSnapshot.docs.first;
+        setState(() {
+          _currentSessionId = sessionDoc.id;
+          _currentSessionAlias = sessionDoc['alias'] ?? sessionDoc.id;
+        });
+      }
+    } catch (e) {
+      print('Error loading session: $e');
+    }
+  }
 
   @override
   void dispose() {
@@ -290,7 +321,18 @@ class _ChatsScreenState extends State<ChatsScreen> {
   Widget _buildChatsList() {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('WhatHero', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 24, color: white)),
+        title: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('WhatHero', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 24, color: white)),
+            if (_currentSessionAlias != null)
+              Text(
+                _currentSessionAlias!,
+                style: const TextStyle(fontSize: 12, color: lightText, fontWeight: FontWeight.w400),
+              ),
+          ],
+        ),
         elevation: 0,
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(68),
@@ -331,15 +373,26 @@ class _ChatsScreenState extends State<ChatsScreen> {
           ),
         ),
       ),
-      body: StreamBuilder<QuerySnapshot>(
-        stream: FirebaseFirestore.instance
-            .collection('accounts')
-            .doc('admin_1')
-            .collection('whatsapp_sessions')
-            .doc('session_001')
-            .collection('chats')
-            .orderBy('lastMessageTimestamp', descending: true)
-            .snapshots(),
+      body: _currentSessionId == null
+          ? const Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  CircularProgressIndicator(),
+                  SizedBox(height: 16),
+                  Text('Esperando sesión de WhatsApp...', style: TextStyle(color: lightText)),
+                ],
+              ),
+            )
+          : StreamBuilder<QuerySnapshot>(
+            stream: FirebaseFirestore.instance
+                .collection('accounts')
+                .doc('admin_1')
+                .collection('whatsapp_sessions')
+                .doc(_currentSessionId!)
+                .collection('chats')
+                .orderBy('lastMessageTimestamp', descending: true)
+                .snapshots(),
         builder: (context, snapshot) {
           if (!snapshot.hasData) {
             return const Center(child: CircularProgressIndicator());
@@ -424,7 +477,10 @@ class _ChatsScreenState extends State<ChatsScreen> {
         ],
         elevation: 0,
       ),
-      body: MessagesView(phoneNumber: selectedChatPhone!),
+      body: MessagesView(
+        phoneNumber: selectedChatPhone!,
+        sessionId: _currentSessionId!,
+      ),
     );
   }
 
@@ -435,7 +491,10 @@ class _ChatsScreenState extends State<ChatsScreen> {
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
       ),
-      builder: (context) => ContactInfoPanel(phoneNumber: phoneNumber),
+      builder: (context) => ContactInfoPanel(
+        phoneNumber: phoneNumber,
+        sessionId: _currentSessionId!,
+      ),
     );
   }
 }
@@ -554,8 +613,13 @@ class _ChatTile extends StatelessWidget {
 
 class ContactInfoPanel extends StatelessWidget {
   final String phoneNumber;
+  final String sessionId;
 
-  const ContactInfoPanel({required this.phoneNumber, super.key});
+  const ContactInfoPanel({
+    required this.phoneNumber,
+    required this.sessionId,
+    super.key,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -564,7 +628,7 @@ class ContactInfoPanel extends StatelessWidget {
           .collection('accounts')
           .doc('admin_1')
           .collection('whatsapp_sessions')
-          .doc('session_001')
+          .doc(sessionId)
           .collection('chats')
           .doc(phoneNumber)
           .snapshots(),
@@ -585,7 +649,7 @@ class ContactInfoPanel extends StatelessWidget {
               .collection('accounts')
               .doc('admin_1')
               .collection('whatsapp_sessions')
-              .doc('session_001')
+              .doc(sessionId)
               .collection('chats')
               .doc(phoneNumber)
               .collection('messages')
@@ -804,8 +868,9 @@ class _InfoRow extends StatelessWidget {
 
 class MessagesView extends StatefulWidget {
   final String phoneNumber;
+  final String sessionId;
 
-  const MessagesView({required this.phoneNumber, super.key});
+  const MessagesView({required this.phoneNumber, required this.sessionId, super.key});
 
   @override
   State<MessagesView> createState() => _MessagesViewState();
@@ -885,7 +950,7 @@ class _MessagesViewState extends State<MessagesView> {
                 .collection('accounts')
                 .doc('admin_1')
                 .collection('whatsapp_sessions')
-                .doc('session_001')
+                .doc(widget.sessionId)
                 .collection('chats')
                 .doc(widget.phoneNumber)
                 .collection('messages')

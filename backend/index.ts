@@ -33,12 +33,46 @@ let currentQR: string | undefined;
 let isReady = false;
 let waSocket: any = null; // Store socket reference for sending messages
 let isReconnecting = false; // Prevent multiple reconnection attempts
+let currentUserPhone: string | undefined; // Store the connected WhatsApp phone number
+const userId = 'admin_1'; // Multi-tenant user ID (hardcoded for now)
+
+// Helper function to extract and clean phone number from Baileys JID
+function extractPhoneNumber(jid: string): string {
+  return jid.replace('@s.whatsapp.net', '').replace('@g.us', '');
+}
+
+// Initialize/update session document in Firestore
+async function initializeSession(phoneNumber: string) {
+  try {
+    const sessionDocRef = db
+      .collection('accounts')
+      .doc(userId)
+      .collection('whatsapp_sessions')
+      .doc(phoneNumber);
+
+    const sessionData = {
+      phone_number: phoneNumber,
+      alias: `Sucursal - ${phoneNumber}`,
+      status: 'connected',
+      last_sync: admin.firestore.Timestamp.now(),
+      connected_at: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    await sessionDocRef.set(sessionData, { merge: true });
+    console.log(`Session initialized for phone: ${phoneNumber}`);
+  } catch (error) {
+    console.error('Error initializing session:', error);
+  }
+}
 
 async function saveMessageToFirestore(message: any, botJid?: string) {
   try {
-    // Multi-tenant constants (for now, using fixed values)
-    const userId = 'admin_1';
-    const sessionId = 'session_001';
+    if (!currentUserPhone) {
+      console.warn('Current user phone not set, cannot save message');
+      return;
+    }
+
+    const sessionId = currentUserPhone;
 
     const phoneNumber = message.key.remoteJid?.replace('@s.whatsapp.net', '').replace('@g.us', '');
     if (!phoneNumber) return;
@@ -88,11 +122,12 @@ async function saveMessageToFirestore(message: any, botJid?: string) {
       .collection('whatsapp_sessions')
       .doc(sessionId);
 
-    await sessionDocRef.set({
-      lastMessage: messageText.substring(0, 100),
-      lastMessageTimestamp: admin.firestore.Timestamp.fromDate(new Date(messageTimestamp)),
-      lastChatId: phoneNumber,
-    }, { merge: true });
+    await sessionDocRef.update({
+      last_message: messageText.substring(0, 100),
+      last_message_timestamp: admin.firestore.Timestamp.fromDate(new Date(messageTimestamp)),
+      last_chat_id: phoneNumber,
+      last_sync: admin.firestore.Timestamp.now(),
+    });
 
     console.log(`Message saved for ${phoneNumber} (Account: ${userId}, Session: ${sessionId})`);
   } catch (error) {
@@ -113,7 +148,7 @@ async function connectToWhatsApp() {
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', (update: Partial<ConnectionState>) => {
+  sock.ev.on('connection.update', async (update: Partial<ConnectionState>) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
@@ -127,6 +162,24 @@ async function connectToWhatsApp() {
       isReady = false;
       const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
 
+      // Mark session as disconnected
+      if (currentUserPhone) {
+        try {
+          const sessionDocRef = db
+            .collection('accounts')
+            .doc(userId)
+            .collection('whatsapp_sessions')
+            .doc(currentUserPhone);
+
+          await sessionDocRef.update({
+            status: 'disconnected',
+            last_sync: admin.firestore.Timestamp.now(),
+          });
+        } catch (error) {
+          console.error('Error updating session status:', error);
+        }
+      }
+
       if (statusCode === DisconnectReason.loggedOut) {
         console.log('WhatsApp logged out from device. Clearing auth and requesting new QR.');
 
@@ -139,6 +192,7 @@ async function connectToWhatsApp() {
         }
 
         currentQR = undefined;
+        currentUserPhone = undefined;
         isReconnecting = true;
 
         // Notify frontend
@@ -164,6 +218,16 @@ async function connectToWhatsApp() {
       console.log('opened connection');
       isReady = true;
       currentQR = undefined;
+
+      // Extract and store the connected phone number
+      if (sock.user?.id) {
+        currentUserPhone = extractPhoneNumber(sock.user.id);
+        console.log(`WhatsApp connected as: ${currentUserPhone}`);
+
+        // Initialize session document in Firestore
+        await initializeSession(currentUserPhone);
+      }
+
       io.emit('ready', true);
     }
   });
