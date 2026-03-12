@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'package:qr_flutter/qr_flutter.dart';
@@ -45,8 +46,353 @@ class MyApp extends StatelessWidget {
         ),
         scaffoldBackgroundColor: darkBg,
       ),
-      home: const WhatsAppHandshakeScreen(),
+      home: const AccountsScreen(),
     );
+  }
+}
+
+class AccountsScreen extends StatefulWidget {
+  const AccountsScreen({super.key});
+
+  @override
+  State<AccountsScreen> createState() => _AccountsScreenState();
+}
+
+class _AccountsScreenState extends State<AccountsScreen> {
+  late IO.Socket socket;
+
+  @override
+  void initState() {
+    super.initState();
+    initSocket();
+  }
+
+  void initSocket() {
+    String host = Platform.isAndroid ? 'http://10.0.2.2:3000' : 'http://localhost:3000';
+
+    socket = IO.io(host, IO.OptionBuilder()
+      .setTransports(['websocket'])
+      .disableAutoConnect()
+      .build());
+
+    socket.connect();
+  }
+
+  @override
+  void dispose() {
+    socket.dispose();
+    super.dispose();
+  }
+
+  Future<void> _startNewSession() async {
+    try {
+      String host = Platform.isAndroid ? 'http://10.0.2.2:3000' : 'http://localhost:3000';
+      final response = await http.post(
+        Uri.parse('$host/start-session'),
+        headers: {'Content-Type': 'application/json'},
+      ).timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final sessionKey = data['sessionKey'] as String;
+
+        if (!mounted) return;
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => LinkAccountScreen(sessionKey: sessionKey, socket: socket),
+          ),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error: ${e.toString()}')),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Mis Cuentas', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 24, color: white)),
+        elevation: 0,
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: _startNewSession,
+        backgroundColor: primaryAqua,
+        child: const Icon(Icons.add),
+      ),
+      body: StreamBuilder<QuerySnapshot>(
+        stream: FirebaseFirestore.instance
+            .collection('accounts')
+            .doc('admin_1')
+            .collection('whatsapp_sessions')
+            .orderBy('connected_at', descending: true)
+            .snapshots(),
+        builder: (context, snapshot) {
+          if (!snapshot.hasData) {
+            return const Center(child: CircularProgressIndicator());
+          }
+
+          final sessions = snapshot.data!.docs;
+
+          if (sessions.isEmpty) {
+            return Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(Icons.smartphone, size: 48, color: primaryAqua),
+                  const SizedBox(height: 16),
+                  const Text(
+                    'Sin cuentas vinculadas',
+                    style: TextStyle(fontSize: 18, color: white, fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Toca el + para vincular una cuenta',
+                    style: TextStyle(fontSize: 14, color: lightText),
+                  ),
+                ],
+              ),
+            );
+          }
+
+          return ListView.builder(
+            itemCount: sessions.length,
+            itemBuilder: (context, index) {
+              final sessionDoc = sessions[index];
+              final phoneNumber = sessionDoc.id;
+              final alias = sessionDoc['alias'] ?? phoneNumber;
+              final status = sessionDoc['status'] ?? 'disconnected';
+              final isConnected = status == 'connected';
+
+              return GestureDetector(
+                onTap: isConnected
+                    ? () {
+                        final sessionKey = sessionDoc['session_key'] as String?;
+                        if (sessionKey != null) {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) => ChatsScreen(
+                                socket: socket,
+                                sessionId: phoneNumber,
+                                sessionKey: sessionKey,
+                              ),
+                            ),
+                          );
+                        }
+                      }
+                    : null,
+                child: Container(
+                  margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: surfaceDark.withValues(alpha: 0.6),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: primaryAqua.withValues(alpha: 0.2),
+                    ),
+                  ),
+                  padding: const EdgeInsets.all(16),
+                  child: Row(
+                    children: [
+                      Container(
+                        width: 56,
+                        height: 56,
+                        decoration: BoxDecoration(
+                          color: primaryAqua.withValues(alpha: 0.2),
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        child: Center(
+                          child: Text(
+                            alias.substring(0, 1).toUpperCase(),
+                            style: const TextStyle(
+                              color: primaryAqua,
+                              fontWeight: FontWeight.w700,
+                              fontSize: 22,
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 16),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              alias,
+                              style: const TextStyle(
+                                fontWeight: FontWeight.w600,
+                                fontSize: 16,
+                                color: white,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              phoneNumber,
+                              style: const TextStyle(
+                                fontSize: 13,
+                                color: lightText,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: isConnected ? accentAqua.withValues(alpha: 0.2) : Colors.red.withValues(alpha: 0.2),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Text(
+                          isConnected ? 'Conectado' : 'Desconectado',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: isConnected ? accentAqua : Colors.red.shade400,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
+class LinkAccountScreen extends StatefulWidget {
+  final String sessionKey;
+  final IO.Socket socket;
+
+  const LinkAccountScreen({required this.sessionKey, required this.socket, super.key});
+
+  @override
+  State<LinkAccountScreen> createState() => _LinkAccountScreenState();
+}
+
+class _LinkAccountScreenState extends State<LinkAccountScreen> {
+  String? qrCode;
+  String status = 'Iniciando sesión...';
+
+  @override
+  void initState() {
+    super.initState();
+    _setupSocketListeners();
+  }
+
+  void _setupSocketListeners() {
+    widget.socket.on('qr', (data) {
+      if (data is Map && data['sessionKey'] == widget.sessionKey) {
+        if (mounted) {
+          setState(() {
+            qrCode = data['qr'];
+            status = 'Escanea el código QR';
+          });
+        }
+      }
+    });
+
+    widget.socket.on('ready', (data) {
+      if (data is Map && data['sessionKey'] == widget.sessionKey) {
+        if (mounted) {
+          Navigator.pop(context);
+        }
+      }
+    });
+
+    widget.socket.on('status_update', (data) {
+      if (data is Map && data['sessionKey'] == widget.sessionKey && data['status'] == 'logged_out') {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Sesión cerrada'), backgroundColor: Colors.red),
+          );
+          Navigator.pop(context);
+        }
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Vincular Cuenta'),
+        elevation: 0,
+      ),
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24.0),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Container(
+                width: 80,
+                height: 80,
+                decoration: BoxDecoration(
+                  color: primaryAqua.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(24),
+                ),
+                child: const Center(
+                  child: Text('🦸', style: TextStyle(fontSize: 48)),
+                ),
+              ),
+              const SizedBox(height: 32),
+              Text(
+                status,
+                style: const TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w600,
+                  color: white,
+                ),
+              ),
+              const SizedBox(height: 48),
+              if (qrCode != null)
+                Container(
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(
+                      color: primaryAqua.withValues(alpha: 0.3),
+                      width: 2,
+                    ),
+                  ),
+                  padding: const EdgeInsets.all(20),
+                  child: QrImageView(
+                    data: qrCode!,
+                    version: QrVersions.auto,
+                    size: 260.0,
+                  ),
+                )
+              else
+                const SizedBox(
+                  width: 60,
+                  height: 60,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2.5,
+                    valueColor: AlwaysStoppedAnimation<Color>(primaryAqua),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    // Limpiar los listeners específicos para esta sesión
+    widget.socket.off('qr');
+    widget.socket.off('ready');
+    widget.socket.off('status_update');
+    super.dispose();
   }
 }
 
@@ -128,10 +474,6 @@ class _WhatsAppHandshakeScreenState extends State<WhatsAppHandshakeScreen> {
 
   @override
   Widget build(BuildContext context) {
-    if (isConnected) {
-      return ChatsScreen(socket: socket);
-    }
-
     return Scaffold(
       body: Center(
         child: Padding(
@@ -233,8 +575,15 @@ class _WhatsAppHandshakeScreenState extends State<WhatsAppHandshakeScreen> {
 
 class ChatsScreen extends StatefulWidget {
   final IO.Socket socket;
+  final String sessionId;
+  final String sessionKey;
 
-  const ChatsScreen({required this.socket, super.key});
+  const ChatsScreen({
+    required this.socket,
+    required this.sessionId,
+    required this.sessionKey,
+    super.key,
+  });
 
   @override
   State<ChatsScreen> createState() => _ChatsScreenState();
@@ -244,37 +593,6 @@ class _ChatsScreenState extends State<ChatsScreen> {
   String? selectedChatPhone;
   String searchQuery = '';
   final TextEditingController searchController = TextEditingController();
-  String? _currentSessionId;
-  String? _currentSessionAlias;
-
-  @override
-  void initState() {
-    super.initState();
-    _loadAvailableSession();
-  }
-
-  Future<void> _loadAvailableSession() async {
-    try {
-      // Load the first available WhatsApp session
-      final sessionsSnapshot = await FirebaseFirestore.instance
-          .collection('accounts')
-          .doc('admin_1')
-          .collection('whatsapp_sessions')
-          .where('status', isEqualTo: 'connected')
-          .limit(1)
-          .get();
-
-      if (sessionsSnapshot.docs.isNotEmpty) {
-        final sessionDoc = sessionsSnapshot.docs.first;
-        setState(() {
-          _currentSessionId = sessionDoc.id;
-          _currentSessionAlias = sessionDoc['alias'] ?? sessionDoc.id;
-        });
-      }
-    } catch (e) {
-      print('Error loading session: $e');
-    }
-  }
 
   @override
   void dispose() {
@@ -326,11 +644,10 @@ class _ChatsScreenState extends State<ChatsScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text('WhatHero', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 24, color: white)),
-            if (_currentSessionAlias != null)
-              Text(
-                _currentSessionAlias!,
-                style: const TextStyle(fontSize: 12, color: lightText, fontWeight: FontWeight.w400),
-              ),
+            Text(
+              widget.sessionId,
+              style: const TextStyle(fontSize: 12, color: lightText, fontWeight: FontWeight.w400),
+            ),
           ],
         ),
         elevation: 0,
@@ -373,26 +690,15 @@ class _ChatsScreenState extends State<ChatsScreen> {
           ),
         ),
       ),
-      body: _currentSessionId == null
-          ? const Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  CircularProgressIndicator(),
-                  SizedBox(height: 16),
-                  Text('Esperando sesión de WhatsApp...', style: TextStyle(color: lightText)),
-                ],
-              ),
-            )
-          : StreamBuilder<QuerySnapshot>(
-            stream: FirebaseFirestore.instance
-                .collection('accounts')
-                .doc('admin_1')
-                .collection('whatsapp_sessions')
-                .doc(_currentSessionId!)
-                .collection('chats')
-                .orderBy('lastMessageTimestamp', descending: true)
-                .snapshots(),
+      body: StreamBuilder<QuerySnapshot>(
+        stream: FirebaseFirestore.instance
+            .collection('accounts')
+            .doc('admin_1')
+            .collection('whatsapp_sessions')
+            .doc(widget.sessionId)
+            .collection('chats')
+            .orderBy('lastMessageTimestamp', descending: true)
+            .snapshots(),
         builder: (context, snapshot) {
           if (!snapshot.hasData) {
             return const Center(child: CircularProgressIndicator());
@@ -479,7 +785,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
       ),
       body: MessagesView(
         phoneNumber: selectedChatPhone!,
-        sessionId: _currentSessionId!,
+        sessionId: widget.sessionId,
+        sessionKey: widget.sessionKey,
       ),
     );
   }
@@ -493,7 +800,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
       ),
       builder: (context) => ContactInfoPanel(
         phoneNumber: phoneNumber,
-        sessionId: _currentSessionId!,
+        sessionId: widget.sessionId,
       ),
     );
   }
@@ -869,8 +1176,14 @@ class _InfoRow extends StatelessWidget {
 class MessagesView extends StatefulWidget {
   final String phoneNumber;
   final String sessionId;
+  final String sessionKey;
 
-  const MessagesView({required this.phoneNumber, required this.sessionId, super.key});
+  const MessagesView({
+    required this.phoneNumber,
+    required this.sessionId,
+    required this.sessionKey,
+    super.key,
+  });
 
   @override
   State<MessagesView> createState() => _MessagesViewState();
@@ -905,7 +1218,11 @@ class _MessagesViewState extends State<MessagesView> {
       final response = await http.post(
         Uri.parse('$host/send-message'),
         headers: {'Content-Type': 'application/json'},
-        body: '{"to": "${widget.phoneNumber}", "text": "$text"}',
+        body: jsonEncode({
+          'to': widget.phoneNumber,
+          'text': text,
+          'sessionKey': widget.sessionKey,
+        }),
       ).timeout(
         const Duration(seconds: 10),
         onTimeout: () => throw Exception('Request timeout'),
