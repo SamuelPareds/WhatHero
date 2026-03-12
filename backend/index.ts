@@ -37,8 +37,17 @@ let currentUserPhone: string | undefined; // Store the connected WhatsApp phone 
 const userId = 'admin_1'; // Multi-tenant user ID (hardcoded for now)
 
 // Helper function to extract and clean phone number from Baileys JID
-function extractPhoneNumber(jid: string): string {
-  return jid.replace('@s.whatsapp.net', '').replace('@g.us', '');
+// Handles format: "5215561642726:50@s.whatsapp.net" -> "5215561642726"
+function extractPhoneNumber(jid: string | undefined): string {
+  if (!jid) return '';
+
+  // Remove WhatsApp domain suffixes
+  let cleaned = jid.replace('@s.whatsapp.net', '').replace('@g.us', '');
+
+  // Remove device suffix (e.g., ":50")
+  const phoneOnly = cleaned.split(':')[0];
+
+  return phoneOnly || '';
 }
 
 // Initialize/update session document in Firestore
@@ -74,7 +83,11 @@ async function saveMessageToFirestore(message: any, botJid?: string) {
 
     const sessionId = currentUserPhone;
 
-    const phoneNumber = message.key.remoteJid?.replace('@s.whatsapp.net', '').replace('@g.us', '');
+    // Extract clean phone number from the message's remote JID
+    const remoteJid = message.key.remoteJid;
+    if (!remoteJid) return;
+
+    const phoneNumber = extractPhoneNumber(remoteJid);
     if (!phoneNumber) return;
 
     const messageText = message.message?.conversation ||
