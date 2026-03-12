@@ -629,6 +629,7 @@ class AccountsScreen extends StatefulWidget {
 
 class _AccountsScreenState extends State<AccountsScreen> {
   late IO.Socket socket;
+  bool _socketConnected = false;
 
   @override
   void initState() {
@@ -637,13 +638,26 @@ class _AccountsScreenState extends State<AccountsScreen> {
   }
 
   void initSocket() {
+    print('[AccountsScreen] Iniciando Socket.io con accountId: ${widget.accountId}');
     socket = IO.io(backendUrl, IO.OptionBuilder()
       .setTransports(['websocket'])
       .disableAutoConnect()
       .setAuth({'accountId': widget.accountId})
       .build());
 
+    // Listener para conexión exitosa
+    socket.on('connect', (_) {
+      print('[AccountsScreen] Socket conectado: ${socket.id}');
+      setState(() => _socketConnected = true);
+    });
+
+    socket.on('disconnect', (_) {
+      print('[AccountsScreen] Socket desconectado');
+      setState(() => _socketConnected = false);
+    });
+
     socket.connect();
+    print('[AccountsScreen] socket.connect() llamado');
   }
 
   @override
@@ -653,16 +667,30 @@ class _AccountsScreenState extends State<AccountsScreen> {
   }
 
   Future<void> _startNewSession() async {
+    // Esperar a que el socket esté conectado
+    if (!_socketConnected) {
+      print('[AccountsScreen] Socket no está conectado, esperando...');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Conectando... intenta de nuevo')),
+      );
+      return;
+    }
+
     try {
+      print('[AccountsScreen] POST /start-session con accountId: ${widget.accountId}');
       final response = await http.post(
         Uri.parse('$backendUrl/start-session'),
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({'accountId': widget.accountId}),
       ).timeout(const Duration(seconds: 10));
 
+      print('[AccountsScreen] Respuesta POST: ${response.statusCode}');
+
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body) as Map<String, dynamic>;
         final sessionKey = data['sessionKey'] as String;
+        print('[AccountsScreen] sessionKey recibido: $sessionKey');
 
         if (!mounted) return;
         Navigator.push(
@@ -677,6 +705,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
         );
       }
     } catch (e) {
+      print('[AccountsScreen] Error: $e');
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Error: ${e.toString()}')),
@@ -870,37 +899,59 @@ class _LinkAccountScreenState extends State<LinkAccountScreen> {
   @override
   void initState() {
     super.initState();
+    print('[LinkAccountScreen] initState - sessionKey: ${widget.sessionKey}, accountId: ${widget.accountId}');
+    print('[LinkAccountScreen] Socket.id: ${widget.socket.id}, conectado: ${widget.socket.connected}');
     _setupSocketListeners();
   }
 
   void _setupSocketListeners() {
+    print('[LinkAccountScreen] Configurando listeners de socket para sessionKey: ${widget.sessionKey}');
+
     widget.socket.on('qr', (data) {
+      print('[LinkAccountScreen] Evento QR recibido: data=$data, sessionKey esperado=${widget.sessionKey}');
       if (data is Map && data['sessionKey'] == widget.sessionKey) {
+        print('[LinkAccountScreen] QR coincide con sessionKey, mostrando QR');
         if (mounted) {
           setState(() {
             qrCode = data['qr'];
             status = 'Escanea el código QR';
           });
         }
+      } else {
+        print('[LinkAccountScreen] QR NO coincide: data[sessionKey]=${data is Map ? data['sessionKey'] : 'N/A'}');
       }
     });
 
     widget.socket.on('ready', (data) {
+      print('[LinkAccountScreen] Evento READY recibido: data=$data');
       if (data is Map && data['sessionKey'] == widget.sessionKey) {
+        print('[LinkAccountScreen] Cuenta conectada exitosamente, cerrando pantalla');
         if (mounted) {
           Navigator.pop(context);
         }
+      } else {
+        print('[LinkAccountScreen] READY NO coincide: data[sessionKey]=${data is Map ? data['sessionKey'] : 'N/A'}');
       }
     });
 
     widget.socket.on('status_update', (data) {
+      print('[LinkAccountScreen] Evento STATUS_UPDATE recibido: data=$data');
       if (data is Map && data['sessionKey'] == widget.sessionKey && data['status'] == 'logged_out') {
+        print('[LinkAccountScreen] Sesión cerrada, mostrando error y cerrando');
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('Sesión cerrada'), backgroundColor: Colors.red),
           );
           Navigator.pop(context);
         }
+      }
+    });
+
+    // Listener para detectar desconexiones
+    widget.socket.on('disconnect', (_) {
+      print('[LinkAccountScreen] Socket desconectado inesperadamente');
+      if (mounted) {
+        setState(() => status = 'Desconectado - Reconectando...');
       }
     });
   }

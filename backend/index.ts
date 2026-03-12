@@ -187,10 +187,13 @@ async function startSession(sessionKey: string, accountId: string) {
     if (!session) return;
 
     if (qr) {
-      console.log('QR Code received for session:', sessionKey);
+      console.log('[startSession] QR Code recibido para sessionKey:', sessionKey);
+      console.log('[startSession] accountId:', session.accountId);
       session.currentQR = qr;
       session.isReady = false;
+      console.log('[startSession] Emitiendo QR a io.to("' + session.accountId + '").emit("qr", ...)');
       io.to(session.accountId).emit('qr', { qr, sessionKey });
+      console.log('[startSession] QR emitido exitosamente');
     }
 
     if (connection === 'close') {
@@ -244,7 +247,7 @@ async function startSession(sessionKey: string, accountId: string) {
         }
       }
     } else if (connection === 'open') {
-      console.log('opened connection for session:', sessionKey);
+      console.log('[startSession] Conexión abierta para sessionKey:', sessionKey);
       session.isReady = true;
       session.currentQR = undefined;
 
@@ -252,13 +255,15 @@ async function startSession(sessionKey: string, accountId: string) {
       if (sock.user?.id) {
         const phoneNumber = extractPhoneNumber(sock.user.id);
         session.phoneNumber = phoneNumber;
-        console.log(`WhatsApp connected as: ${phoneNumber} (session: ${sessionKey})`);
+        console.log(`[startSession] WhatsApp conectado como: ${phoneNumber} (session: ${sessionKey})`);
 
         // Initialize session document in Firestore
         await initializeSession(phoneNumber, sessionKey, session.accountId);
       }
 
+      console.log('[startSession] Emitiendo READY a io.to("' + session.accountId + '")');
       io.to(session.accountId).emit('ready', { phoneNumber: session.phoneNumber, sessionKey });
+      console.log('[startSession] READY emitido exitosamente');
     }
   });
 
@@ -281,15 +286,23 @@ async function startSession(sessionKey: string, accountId: string) {
 app.post('/start-session', express.json(), async (req, res) => {
   try {
     const { accountId } = req.body;
+    console.log('[/start-session] POST recibido con accountId:', accountId);
+
     if (!accountId) {
+      console.error('[/start-session] Error: Missing accountId');
       return res.status(400).json({ error: 'Missing accountId in request body' });
     }
 
     const sessionKey = randomUUID();
+    console.log('[/start-session] Nuevo sessionKey generado:', sessionKey);
+    console.log('[/start-session] Llamando a startSession...');
+
     await startSession(sessionKey, accountId);
+
+    console.log('[/start-session] startSession completado, enviando sessionKey al cliente');
     res.json({ sessionKey });
   } catch (error) {
-    console.error('Error starting session:', error);
+    console.error('[/start-session] Error:', error);
     res.status(500).json({ error: 'Failed to start session' });
   }
 });
@@ -332,27 +345,35 @@ app.post('/send-message', express.json(), async (req, res) => {
 
 io.on('connection', (socket) => {
   const accountId = socket.handshake.auth.accountId as string | undefined;
-  console.log(`Socket.io client connected: ${socket.id}, accountId: ${accountId}`);
+  console.log('[Socket.io] Cliente conectado: socket.id=' + socket.id + ', accountId=' + accountId);
 
   if (!accountId) {
-    console.warn(`Socket ${socket.id} connected without accountId, disconnecting`);
+    console.warn('[Socket.io] Socket ' + socket.id + ' conectado sin accountId, desconectando');
     socket.disconnect();
     return;
   }
 
   // Join this socket to a room named by accountId (for broadcasting to all their sessions)
+  console.log('[Socket.io] Uniéndose a la sala: ' + accountId);
   socket.join(accountId);
+  console.log('[Socket.io] Socket ' + socket.id + ' unido a la sala: ' + accountId);
 
   // Replay only this user's session states
+  console.log('[Socket.io] Buscando sesiones existentes para accountId: ' + accountId);
+  let sessionCount = 0;
   for (const [key, session] of sessions) {
     if (session.accountId !== accountId) continue;
+    sessionCount++;
 
     if (session.isReady && session.phoneNumber) {
+      console.log('[Socket.io] Reenviando READY para sessionKey: ' + key);
       socket.emit('ready', { phoneNumber: session.phoneNumber, sessionKey: key });
     } else if (session.currentQR) {
+      console.log('[Socket.io] Reenviando QR para sessionKey: ' + key);
       socket.emit('qr', { qr: session.currentQR, sessionKey: key });
     }
   }
+  console.log('[Socket.io] Total de sesiones encontradas para ' + accountId + ': ' + sessionCount);
 });
 
 async function startExistingSessions() {
