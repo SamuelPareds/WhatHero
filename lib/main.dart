@@ -5,6 +5,7 @@ import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:http/http.dart' as http;
 import 'firebase_options.dart';
 
@@ -15,6 +16,10 @@ const Color surfaceDark = Color(0xFF1F2937); // Elementos oscuros (gris oscuro)
 const Color white = Color(0xFFF3F4F6); // Texto blanco (no puro)
 const Color lightText = Color(0xFFD1D5DB); // Gris claro secundario
 const Color accentAqua = Color(0xFF10B981); // Verde más saturado para detalles
+
+// Backend URL helper (Android emulator vs iOS/macOS)
+String get backendUrl =>
+    Platform.isAndroid ? 'http://10.0.2.2:3000' : 'http://localhost:3000';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -46,13 +51,539 @@ class MyApp extends StatelessWidget {
         ),
         scaffoldBackgroundColor: darkBg,
       ),
-      home: const AccountsScreen(),
+      home: const AuthWrapper(),
     );
   }
 }
 
+// ============================================================================
+// AUTH FLOW
+// ============================================================================
+
+class AuthWrapper extends StatelessWidget {
+  const AuthWrapper({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<User?>(
+      stream: FirebaseAuth.instance.authStateChanges(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Scaffold(
+            body: Center(
+              child: CircularProgressIndicator(color: primaryAqua),
+            ),
+          );
+        }
+
+        if (snapshot.hasData) {
+          return AccountsScreen(userId: snapshot.data!.uid);
+        }
+
+        return const WelcomeScreen();
+      },
+    );
+  }
+}
+
+class WelcomeScreen extends StatelessWidget {
+  const WelcomeScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: darkBg,
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 32),
+          child: Column(
+            children: [
+              Expanded(
+                child: Center(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      // Hero icon container
+                      Container(
+                        width: 100,
+                        height: 100,
+                        decoration: BoxDecoration(
+                          color: primaryAqua.withValues(alpha: 0.15),
+                          borderRadius: BorderRadius.circular(24),
+                        ),
+                        child: const Center(
+                          child: Text(
+                            '🦸',
+                            style: TextStyle(fontSize: 56),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 32),
+                      const Text(
+                        'WhatHero',
+                        style: TextStyle(
+                          fontSize: 36,
+                          fontWeight: FontWeight.bold,
+                          color: white,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      const Text(
+                        'Tu gestor de WhatsApp profesional',
+                        style: TextStyle(
+                          fontSize: 16,
+                          color: lightText,
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              Column(
+                children: [
+                  SizedBox(
+                    width: double.infinity,
+                    height: 56,
+                    child: ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: primaryAqua,
+                        foregroundColor: darkBg,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                      onPressed: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => const LoginScreen(),
+                          ),
+                        );
+                      },
+                      child: const Text(
+                        'Iniciar Sesión',
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    width: double.infinity,
+                    child: TextButton(
+                      onPressed: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => const RegisterScreen(),
+                          ),
+                        );
+                      },
+                      child: const Text(
+                        'Crear cuenta',
+                        style: TextStyle(
+                          fontSize: 16,
+                          color: primaryAqua,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class LoginScreen extends StatefulWidget {
+  const LoginScreen({super.key});
+
+  @override
+  State<LoginScreen> createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends State<LoginScreen> {
+  final emailController = TextEditingController();
+  final passwordController = TextEditingController();
+  bool isLoading = false;
+
+  @override
+  void dispose() {
+    emailController.dispose();
+    passwordController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _signIn() async {
+    if (emailController.text.trim().isEmpty ||
+        passwordController.text.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Completa todos los campos')),
+      );
+      return;
+    }
+
+    setState(() => isLoading = true);
+    try {
+      await FirebaseAuth.instance.signInWithEmailAndPassword(
+        email: emailController.text.trim(),
+        password: passwordController.text.trim(),
+      );
+      // AuthWrapper will react automatically — no manual navigation needed
+    } on FirebaseAuthException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(_authErrorMessage(e.code))),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => isLoading = false);
+    }
+  }
+
+  String _authErrorMessage(String code) {
+    switch (code) {
+      case 'user-not-found':
+      case 'wrong-password':
+      case 'invalid-credential':
+        return 'Email o contraseña incorrectos';
+      case 'invalid-email':
+        return 'Email inválido';
+      case 'too-many-requests':
+        return 'Demasiados intentos. Intenta más tarde';
+      default:
+        return 'Error al iniciar sesión';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: darkBg,
+      appBar: AppBar(
+        title: const Text('Iniciar Sesión'),
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          children: [
+            TextField(
+              controller: emailController,
+              enabled: !isLoading,
+              keyboardType: TextInputType.emailAddress,
+              decoration: InputDecoration(
+                hintText: 'Email',
+                hintStyle: const TextStyle(color: lightText),
+                filled: true,
+                fillColor: surfaceDark,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: BorderSide.none,
+                ),
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 16,
+                ),
+              ),
+              style: const TextStyle(color: white),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: passwordController,
+              enabled: !isLoading,
+              obscureText: true,
+              decoration: InputDecoration(
+                hintText: 'Contraseña',
+                hintStyle: const TextStyle(color: lightText),
+                filled: true,
+                fillColor: surfaceDark,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: BorderSide.none,
+                ),
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 16,
+                ),
+              ),
+              style: const TextStyle(color: white),
+            ),
+            const SizedBox(height: 32),
+            SizedBox(
+              width: double.infinity,
+              height: 56,
+              child: ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: primaryAqua,
+                  foregroundColor: darkBg,
+                  disabledBackgroundColor: Colors.grey,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+                onPressed: isLoading ? null : _signIn,
+                child: isLoading
+                    ? const SizedBox(
+                        width: 24,
+                        height: 24,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          valueColor: AlwaysStoppedAnimation(darkBg),
+                        ),
+                      )
+                    : const Text(
+                        'Entrar',
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            TextButton(
+              onPressed: isLoading
+                  ? null
+                  : () {
+                      Navigator.pushReplacement(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => const RegisterScreen(),
+                        ),
+                      );
+                    },
+              child: const Text(
+                '¿No tienes cuenta? Regístrate',
+                style: TextStyle(color: primaryAqua),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class RegisterScreen extends StatefulWidget {
+  const RegisterScreen({super.key});
+
+  @override
+  State<RegisterScreen> createState() => _RegisterScreenState();
+}
+
+class _RegisterScreenState extends State<RegisterScreen> {
+  final emailController = TextEditingController();
+  final passwordController = TextEditingController();
+  final confirmController = TextEditingController();
+  bool isLoading = false;
+
+  @override
+  void dispose() {
+    emailController.dispose();
+    passwordController.dispose();
+    confirmController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _register() async {
+    if (emailController.text.trim().isEmpty ||
+        passwordController.text.trim().isEmpty ||
+        confirmController.text.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Completa todos los campos')),
+      );
+      return;
+    }
+
+    if (passwordController.text != confirmController.text) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Las contraseñas no coinciden')),
+      );
+      return;
+    }
+
+    if (passwordController.text.length < 6) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('La contraseña debe tener al menos 6 caracteres')),
+      );
+      return;
+    }
+
+    setState(() => isLoading = true);
+    try {
+      await FirebaseAuth.instance.createUserWithEmailAndPassword(
+        email: emailController.text.trim(),
+        password: passwordController.text.trim(),
+      );
+      // AuthWrapper will react automatically
+    } on FirebaseAuthException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(_authErrorMessage(e.code))),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => isLoading = false);
+    }
+  }
+
+  String _authErrorMessage(String code) {
+    switch (code) {
+      case 'weak-password':
+        return 'Contraseña muy débil';
+      case 'email-already-in-use':
+        return 'Este email ya está registrado';
+      case 'invalid-email':
+        return 'Email inválido';
+      default:
+        return 'Error al registrarse';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: darkBg,
+      appBar: AppBar(
+        title: const Text('Crear Cuenta'),
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          children: [
+            TextField(
+              controller: emailController,
+              enabled: !isLoading,
+              keyboardType: TextInputType.emailAddress,
+              decoration: InputDecoration(
+                hintText: 'Email',
+                hintStyle: const TextStyle(color: lightText),
+                filled: true,
+                fillColor: surfaceDark,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: BorderSide.none,
+                ),
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 16,
+                ),
+              ),
+              style: const TextStyle(color: white),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: passwordController,
+              enabled: !isLoading,
+              obscureText: true,
+              decoration: InputDecoration(
+                hintText: 'Contraseña',
+                hintStyle: const TextStyle(color: lightText),
+                filled: true,
+                fillColor: surfaceDark,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: BorderSide.none,
+                ),
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 16,
+                ),
+              ),
+              style: const TextStyle(color: white),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: confirmController,
+              enabled: !isLoading,
+              obscureText: true,
+              decoration: InputDecoration(
+                hintText: 'Confirmar contraseña',
+                hintStyle: const TextStyle(color: lightText),
+                filled: true,
+                fillColor: surfaceDark,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: BorderSide.none,
+                ),
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 16,
+                ),
+              ),
+              style: const TextStyle(color: white),
+            ),
+            const SizedBox(height: 32),
+            SizedBox(
+              width: double.infinity,
+              height: 56,
+              child: ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: primaryAqua,
+                  foregroundColor: darkBg,
+                  disabledBackgroundColor: Colors.grey,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+                onPressed: isLoading ? null : _register,
+                child: isLoading
+                    ? const SizedBox(
+                        width: 24,
+                        height: 24,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          valueColor: AlwaysStoppedAnimation(darkBg),
+                        ),
+                      )
+                    : const Text(
+                        'Registrarse',
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            TextButton(
+              onPressed: isLoading
+                  ? null
+                  : () {
+                      Navigator.pushReplacement(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => const LoginScreen(),
+                        ),
+                      );
+                    },
+              child: const Text(
+                '¿Ya tienes cuenta? Inicia sesión',
+                style: TextStyle(color: primaryAqua),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ============================================================================
+// MAIN SCREENS
+// ============================================================================
+
+
 class AccountsScreen extends StatefulWidget {
-  const AccountsScreen({super.key});
+  final String userId;
+
+  const AccountsScreen({required this.userId, super.key});
 
   @override
   State<AccountsScreen> createState() => _AccountsScreenState();
@@ -68,11 +599,10 @@ class _AccountsScreenState extends State<AccountsScreen> {
   }
 
   void initSocket() {
-    String host = Platform.isAndroid ? 'http://10.0.2.2:3000' : 'http://localhost:3000';
-
-    socket = IO.io(host, IO.OptionBuilder()
+    socket = IO.io(backendUrl, IO.OptionBuilder()
       .setTransports(['websocket'])
       .disableAutoConnect()
+      .setAuth({'userId': widget.userId})
       .build());
 
     socket.connect();
@@ -86,10 +616,10 @@ class _AccountsScreenState extends State<AccountsScreen> {
 
   Future<void> _startNewSession() async {
     try {
-      String host = Platform.isAndroid ? 'http://10.0.2.2:3000' : 'http://localhost:3000';
       final response = await http.post(
-        Uri.parse('$host/start-session'),
+        Uri.parse('$backendUrl/start-session'),
         headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'userId': widget.userId}),
       ).timeout(const Duration(seconds: 10));
 
       if (response.statusCode == 200) {
@@ -100,7 +630,11 @@ class _AccountsScreenState extends State<AccountsScreen> {
         Navigator.push(
           context,
           MaterialPageRoute(
-            builder: (_) => LinkAccountScreen(sessionKey: sessionKey, socket: socket),
+            builder: (_) => LinkAccountScreen(
+              sessionKey: sessionKey,
+              socket: socket,
+              userId: widget.userId,
+            ),
           ),
         );
       }
@@ -118,6 +652,13 @@ class _AccountsScreenState extends State<AccountsScreen> {
       appBar: AppBar(
         title: const Text('Mis Cuentas', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 24, color: white)),
         elevation: 0,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.logout, color: lightText),
+            onPressed: () => FirebaseAuth.instance.signOut(),
+            tooltip: 'Cerrar sesión',
+          ),
+        ],
       ),
       floatingActionButton: FloatingActionButton(
         onPressed: _startNewSession,
@@ -127,7 +668,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
       body: StreamBuilder<QuerySnapshot>(
         stream: FirebaseFirestore.instance
             .collection('accounts')
-            .doc('admin_1')
+            .doc(widget.userId)
             .collection('whatsapp_sessions')
             .orderBy('connected_at', descending: true)
             .snapshots(),
@@ -180,6 +721,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
                                 socket: socket,
                                 sessionId: phoneNumber,
                                 sessionKey: sessionKey,
+                                userId: widget.userId,
                               ),
                             ),
                           );
@@ -270,8 +812,14 @@ class _AccountsScreenState extends State<AccountsScreen> {
 class LinkAccountScreen extends StatefulWidget {
   final String sessionKey;
   final IO.Socket socket;
+  final String userId;
 
-  const LinkAccountScreen({required this.sessionKey, required this.socket, super.key});
+  const LinkAccountScreen({
+    required this.sessionKey,
+    required this.socket,
+    required this.userId,
+    super.key,
+  });
 
   @override
   State<LinkAccountScreen> createState() => _LinkAccountScreenState();
@@ -416,9 +964,7 @@ class _WhatsAppHandshakeScreenState extends State<WhatsAppHandshakeScreen> {
   }
 
   void initSocket() {
-    String host = Platform.isAndroid ? 'http://10.0.2.2:3000' : 'http://localhost:3000';
-
-    socket = IO.io(host, IO.OptionBuilder()
+    socket = IO.io(backendUrl, IO.OptionBuilder()
       .setTransports(['websocket'])
       .disableAutoConnect()
       .build());
@@ -577,11 +1123,13 @@ class ChatsScreen extends StatefulWidget {
   final IO.Socket socket;
   final String sessionId;
   final String sessionKey;
+  final String userId;
 
   const ChatsScreen({
     required this.socket,
     required this.sessionId,
     required this.sessionKey,
+    required this.userId,
     super.key,
   });
 
@@ -693,7 +1241,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
       body: StreamBuilder<QuerySnapshot>(
         stream: FirebaseFirestore.instance
             .collection('accounts')
-            .doc('admin_1')
+            .doc(widget.userId)
             .collection('whatsapp_sessions')
             .doc(widget.sessionId)
             .collection('chats')
@@ -787,6 +1335,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
         phoneNumber: selectedChatPhone!,
         sessionId: widget.sessionId,
         sessionKey: widget.sessionKey,
+        userId: widget.userId,
       ),
     );
   }
@@ -801,6 +1350,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
       builder: (context) => ContactInfoPanel(
         phoneNumber: phoneNumber,
         sessionId: widget.sessionId,
+        userId: widget.userId,
       ),
     );
   }
@@ -921,10 +1471,12 @@ class _ChatTile extends StatelessWidget {
 class ContactInfoPanel extends StatelessWidget {
   final String phoneNumber;
   final String sessionId;
+  final String userId;
 
   const ContactInfoPanel({
     required this.phoneNumber,
     required this.sessionId,
+    required this.userId,
     super.key,
   });
 
@@ -933,7 +1485,7 @@ class ContactInfoPanel extends StatelessWidget {
     return StreamBuilder<DocumentSnapshot>(
       stream: FirebaseFirestore.instance
           .collection('accounts')
-          .doc('admin_1')
+          .doc(userId)
           .collection('whatsapp_sessions')
           .doc(sessionId)
           .collection('chats')
@@ -954,7 +1506,7 @@ class ContactInfoPanel extends StatelessWidget {
         return StreamBuilder<QuerySnapshot>(
           stream: FirebaseFirestore.instance
               .collection('accounts')
-              .doc('admin_1')
+              .doc(userId)
               .collection('whatsapp_sessions')
               .doc(sessionId)
               .collection('chats')
@@ -1177,11 +1729,13 @@ class MessagesView extends StatefulWidget {
   final String phoneNumber;
   final String sessionId;
   final String sessionKey;
+  final String userId;
 
   const MessagesView({
     required this.phoneNumber,
     required this.sessionId,
     required this.sessionKey,
+    required this.userId,
     super.key,
   });
 
@@ -1211,12 +1765,9 @@ class _MessagesViewState extends State<MessagesView> {
     });
 
     try {
-      // Get the backend URL
-      String host = Platform.isAndroid ? 'http://10.0.2.2:3000' : 'http://localhost:3000';
-
       // Send message to backend
       final response = await http.post(
-        Uri.parse('$host/send-message'),
+        Uri.parse('$backendUrl/send-message'),
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({
           'to': widget.phoneNumber,
@@ -1265,7 +1816,7 @@ class _MessagesViewState extends State<MessagesView> {
           child: StreamBuilder<QuerySnapshot>(
             stream: FirebaseFirestore.instance
                 .collection('accounts')
-                .doc('admin_1')
+                .doc(widget.userId)
                 .collection('whatsapp_sessions')
                 .doc(widget.sessionId)
                 .collection('chats')

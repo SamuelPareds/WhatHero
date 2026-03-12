@@ -9,7 +9,7 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import { pino } from 'pino';
 import admin from 'firebase-admin';
-import { rmSync, existsSync, readdirSync } from 'fs';
+import { rmSync, existsSync, readdirSync, writeFileSync, readFileSync } from 'fs';
 import { randomUUID } from 'crypto';
 import serviceAccount from './serviceAccountKey.json' with { type: 'json' };
 
@@ -36,10 +36,10 @@ interface SessionData {
   currentQR: string | undefined;
   phoneNumber: string | undefined;
   isReconnecting: boolean;
+  userId: string;
 }
 
 const sessions = new Map<string, SessionData>();
-const userId = 'admin_1'; // Multi-tenant user ID (hardcoded for now)
 
 // Helper function to extract and clean phone number from Baileys JID
 // Handles format: "5215561642726:50@s.whatsapp.net" -> "5215561642726"
@@ -56,7 +56,7 @@ function extractPhoneNumber(jid: string | undefined): string {
 }
 
 // Initialize/update session document in Firestore
-async function initializeSession(phoneNumber: string, sessionKey: string) {
+async function initializeSession(phoneNumber: string, sessionKey: string, userId: string) {
   try {
     const sessionDocRef = db
       .collection('accounts')
@@ -80,7 +80,7 @@ async function initializeSession(phoneNumber: string, sessionKey: string) {
   }
 }
 
-async function saveMessageToFirestore(message: any, sessionKey: string, botJid?: string) {
+async function saveMessageToFirestore(message: any, sessionKey: string, userId: string, botJid?: string) {
   try {
     const session = sessions.get(sessionKey);
     if (!session?.phoneNumber) {
@@ -155,9 +155,12 @@ async function saveMessageToFirestore(message: any, sessionKey: string, botJid?:
   }
 }
 
-async function startSession(sessionKey: string) {
+async function startSession(sessionKey: string, userId: string) {
   const { state, saveCreds } = await useMultiFileAuthState(`auth_info/${sessionKey}`);
   const { version } = await fetchLatestBaileysVersion();
+
+  // Write metadata file so startExistingSessions() can recover this session on reboot
+  writeFileSync(`auth_info/${sessionKey}/meta.json`, JSON.stringify({ userId }));
 
   // Initialize session data
   sessions.set(sessionKey, {
@@ -166,6 +169,7 @@ async function startSession(sessionKey: string) {
     currentQR: undefined,
     phoneNumber: undefined,
     isReconnecting: false,
+    userId,
   });
 
   const sock = makeWASocket({
@@ -186,7 +190,7 @@ async function startSession(sessionKey: string) {
       console.log('QR Code received for session:', sessionKey);
       session.currentQR = qr;
       session.isReady = false;
-      io.emit('qr', { qr, sessionKey });
+      io.to(session.userId).emit('qr', { qr, sessionKey });
     }
 
     if (connection === 'close') {
@@ -198,7 +202,7 @@ async function startSession(sessionKey: string) {
         try {
           const sessionDocRef = db
             .collection('accounts')
-            .doc(userId)
+            .doc(session.userId)
             .collection('whatsapp_sessions')
             .doc(session.phoneNumber);
 
@@ -227,14 +231,14 @@ async function startSession(sessionKey: string) {
         sessions.delete(sessionKey);
 
         // Notify frontend
-        io.emit('status_update', { status: 'logged_out', sessionKey });
+        io.to(session.userId).emit('status_update', { status: 'logged_out', sessionKey });
       } else {
         // Regular disconnection - attempt normal reconnect
         console.log('connection closed due to ', lastDisconnect?.error, ', attempting reconnect');
         if (!session.isReconnecting) {
           session.isReconnecting = true;
           setTimeout(() => {
-            startSession(sessionKey);
+            startSession(sessionKey, session.userId);
             session.isReconnecting = false;
           }, 3000);
         }
@@ -251,10 +255,10 @@ async function startSession(sessionKey: string) {
         console.log(`WhatsApp connected as: ${phoneNumber} (session: ${sessionKey})`);
 
         // Initialize session document in Firestore
-        await initializeSession(phoneNumber, sessionKey);
+        await initializeSession(phoneNumber, sessionKey, session.userId);
       }
 
-      io.emit('ready', { phoneNumber: session.phoneNumber, sessionKey });
+      io.to(session.userId).emit('ready', { phoneNumber: session.phoneNumber, sessionKey });
     }
   });
 
@@ -262,7 +266,7 @@ async function startSession(sessionKey: string) {
   sock.ev.on('messages.upsert', async (m) => {
     const message = m.messages?.[0];
     if (message) {
-      await saveMessageToFirestore(message, sessionKey, sock.user?.id);
+      await saveMessageToFirestore(message, sessionKey, userId, sock.user?.id);
     }
   });
 
@@ -274,10 +278,15 @@ async function startSession(sessionKey: string) {
 }
 
 // REST API endpoint to start a new session
-app.post('/start-session', express.json(), (_, res) => {
+app.post('/start-session', express.json(), async (req, res) => {
   try {
+    const { userId } = req.body;
+    if (!userId) {
+      return res.status(400).json({ error: 'Missing userId in request body' });
+    }
+
     const sessionKey = randomUUID();
-    startSession(sessionKey);
+    await startSession(sessionKey, userId);
     res.json({ sessionKey });
   } catch (error) {
     console.error('Error starting session:', error);
@@ -322,10 +331,22 @@ app.post('/send-message', express.json(), async (req, res) => {
 });
 
 io.on('connection', (socket) => {
-  console.log('Socket.io client connected:', socket.id);
+  const userId = socket.handshake.auth.userId as string | undefined;
+  console.log(`Socket.io client connected: ${socket.id}, userId: ${userId}`);
 
-  // Replay all current session states
+  if (!userId) {
+    console.warn(`Socket ${socket.id} connected without userId, disconnecting`);
+    socket.disconnect();
+    return;
+  }
+
+  // Join this socket to a room named by userId (for broadcasting to all their sessions)
+  socket.join(userId);
+
+  // Replay only this user's session states
   for (const [key, session] of sessions) {
+    if (session.userId !== userId) continue;
+
     if (session.isReady && session.phoneNumber) {
       socket.emit('ready', { phoneNumber: session.phoneNumber, sessionKey: key });
     } else if (session.currentQR) {
@@ -352,7 +373,24 @@ async function startExistingSessions() {
 
   console.log(`Auto-reconnecting ${subdirs.length} existing session(s)...`);
   for (const sessionKey of subdirs) {
-    await startSession(sessionKey);
+    const metaPath = `auth_info/${sessionKey}/meta.json`;
+    if (!existsSync(metaPath)) {
+      console.warn(`Skipping session ${sessionKey}: no meta.json (pre-migration session?)`);
+      continue;
+    }
+
+    try {
+      const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
+      const userId = meta.userId as string;
+      if (!userId) {
+        console.warn(`Skipping session ${sessionKey}: meta.json has no userId`);
+        continue;
+      }
+
+      await startSession(sessionKey, userId);
+    } catch (error) {
+      console.error(`Error reading meta.json for ${sessionKey}:`, error);
+    }
   }
 }
 
