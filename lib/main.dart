@@ -425,6 +425,20 @@ class _RegisterScreenState extends State<RegisterScreen> {
         email: emailController.text.trim(),
         password: passwordController.text.trim(),
       );
+
+      // Crear documento de cuenta en Firestore inmediatamente
+      final user = FirebaseAuth.instance.currentUser;
+      if (user != null) {
+        await FirebaseFirestore.instance
+          .collection('accounts')
+          .doc(user.uid)
+          .set({
+            'email': user.email,
+            'createdAt': Timestamp.now(),
+            'accountId': user.uid,
+          }, SetOptions(merge: true));
+      }
+
       // Pequeño delay para asegurar que Firebase haya actualizado el estado
       if (!mounted) return;
       await Future.delayed(const Duration(milliseconds: 500));
