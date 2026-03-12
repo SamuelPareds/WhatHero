@@ -36,7 +36,7 @@ interface SessionData {
   currentQR: string | undefined;
   phoneNumber: string | undefined;
   isReconnecting: boolean;
-  accountId: string;
+  userId: string;
 }
 
 const sessions = new Map<string, SessionData>();
@@ -56,11 +56,11 @@ function extractPhoneNumber(jid: string | undefined): string {
 }
 
 // Initialize/update session document in Firestore
-async function initializeSession(phoneNumber: string, sessionKey: string, accountId: string) {
+async function initializeSession(phoneNumber: string, sessionKey: string, userId: string) {
   try {
     const sessionDocRef = db
       .collection('accounts')
-      .doc(accountId)
+      .doc(userId)
       .collection('whatsapp_sessions')
       .doc(phoneNumber);
 
@@ -80,49 +80,35 @@ async function initializeSession(phoneNumber: string, sessionKey: string, accoun
   }
 }
 
-async function saveMessageToFirestore(message: any, sessionKey: string, accountId: string, botJid?: string) {
+async function saveMessageToFirestore(message: any, sessionKey: string, userId: string, botJid?: string) {
   try {
     const session = sessions.get(sessionKey);
     if (!session?.phoneNumber) {
-      console.warn(`[${sessionKey}] Session phone number not set, cannot save message`);
+      console.warn('Session phone number not set, cannot save message');
       return;
     }
 
     const sessionId = session.phoneNumber;
-    console.log(`[${sessionKey}] Saving message for account: ${accountId}, session: ${sessionId}`);
 
     // Extract clean phone number from the message's remote JID
     const remoteJid = message.key.remoteJid;
-    if (!remoteJid) {
-      console.warn(`[${sessionKey}] No remoteJid in message, skipping`);
-      return;
-    }
+    if (!remoteJid) return;
 
     const phoneNumber = extractPhoneNumber(remoteJid);
-    if (!phoneNumber) {
-      console.warn(`[${sessionKey}] Could not extract phone number from: ${remoteJid}`);
-      return;
-    }
+    if (!phoneNumber) return;
 
     const messageText = message.message?.conversation ||
                         message.message?.extendedTextMessage?.text ||
                         message.message?.imageMessage?.caption ||
                         '';
 
-    if (!messageText) {
-      console.warn(`[${sessionKey}] Message has no text content`);
-    }
-
     const messageTimestamp = message.messageTimestamp ? message.messageTimestamp * 1000 : Date.now();
     const messageId = message.key.id;
 
-    console.log(`[${sessionKey}] Extracted message: ID=${messageId}, phone=${phoneNumber}, text="${messageText.substring(0, 50)}..."`);
-
-
-    // New path: accounts/{accountId}/whatsapp_sessions/{sessionId}/chats/{chatId}/messages
+    // New path: accounts/{userId}/whatsapp_sessions/{sessionId}/chats/{chatId}/messages
     const chatDocRef = db
       .collection('accounts')
-      .doc(accountId)
+      .doc(userId)
       .collection('whatsapp_sessions')
       .doc(sessionId)
       .collection('chats')
@@ -152,7 +138,7 @@ async function saveMessageToFirestore(message: any, sessionKey: string, accountI
     // Also update the session document with the latest lastMessage info
     const sessionDocRef = db
       .collection('accounts')
-      .doc(accountId)
+      .doc(userId)
       .collection('whatsapp_sessions')
       .doc(sessionId);
 
@@ -163,18 +149,18 @@ async function saveMessageToFirestore(message: any, sessionKey: string, accountI
       last_sync: admin.firestore.Timestamp.now(),
     });
 
-    console.log(`[${sessionKey}] ✅ Message saved successfully for ${phoneNumber} (Account: ${accountId}, Session: ${sessionId}, MessageID: ${messageId})`);
+    console.log(`Message saved for ${phoneNumber} (Account: ${userId}, Session: ${sessionId})`);
   } catch (error) {
     console.error('Error saving message to Firestore:', error);
   }
 }
 
-async function startSession(sessionKey: string, accountId: string) {
+async function startSession(sessionKey: string, userId: string) {
   const { state, saveCreds } = await useMultiFileAuthState(`auth_info/${sessionKey}`);
   const { version } = await fetchLatestBaileysVersion();
 
   // Write metadata file so startExistingSessions() can recover this session on reboot
-  writeFileSync(`auth_info/${sessionKey}/meta.json`, JSON.stringify({ accountId }));
+  writeFileSync(`auth_info/${sessionKey}/meta.json`, JSON.stringify({ userId }));
 
   // Initialize session data
   sessions.set(sessionKey, {
@@ -183,7 +169,7 @@ async function startSession(sessionKey: string, accountId: string) {
     currentQR: undefined,
     phoneNumber: undefined,
     isReconnecting: false,
-    accountId,
+    userId,
   });
 
   const sock = makeWASocket({
@@ -204,7 +190,7 @@ async function startSession(sessionKey: string, accountId: string) {
       console.log('QR Code received for session:', sessionKey);
       session.currentQR = qr;
       session.isReady = false;
-      io.to(session.accountId).emit('qr', { qr, sessionKey });
+      io.to(session.userId).emit('qr', { qr, sessionKey });
     }
 
     if (connection === 'close') {
@@ -216,7 +202,7 @@ async function startSession(sessionKey: string, accountId: string) {
         try {
           const sessionDocRef = db
             .collection('accounts')
-            .doc(session.accountId)
+            .doc(session.userId)
             .collection('whatsapp_sessions')
             .doc(session.phoneNumber);
 
@@ -245,14 +231,14 @@ async function startSession(sessionKey: string, accountId: string) {
         sessions.delete(sessionKey);
 
         // Notify frontend
-        io.to(session.accountId).emit('status_update', { status: 'logged_out', sessionKey });
+        io.to(session.userId).emit('status_update', { status: 'logged_out', sessionKey });
       } else {
         // Regular disconnection - attempt normal reconnect
         console.log('connection closed due to ', lastDisconnect?.error, ', attempting reconnect');
         if (!session.isReconnecting) {
           session.isReconnecting = true;
           setTimeout(() => {
-            startSession(sessionKey, session.accountId);
+            startSession(sessionKey, session.userId);
             session.isReconnecting = false;
           }, 3000);
         }
@@ -269,28 +255,18 @@ async function startSession(sessionKey: string, accountId: string) {
         console.log(`WhatsApp connected as: ${phoneNumber} (session: ${sessionKey})`);
 
         // Initialize session document in Firestore
-        await initializeSession(phoneNumber, sessionKey, session.accountId);
+        await initializeSession(phoneNumber, sessionKey, session.userId);
       }
 
-      io.to(session.accountId).emit('ready', { phoneNumber: session.phoneNumber, sessionKey });
+      io.to(session.userId).emit('ready', { phoneNumber: session.phoneNumber, sessionKey });
     }
   });
 
   // Listen for incoming and outgoing messages
   sock.ev.on('messages.upsert', async (m) => {
-    console.log(`[${sessionKey}] messages.upsert event received, message count: ${m.messages?.length}`);
     const message = m.messages?.[0];
     if (message) {
-      console.log(`[${sessionKey}] Processing message:`, {
-        id: message.key.id,
-        from: message.key.remoteJid,
-        fromMe: message.key.fromMe,
-        hasText: !!message.message?.conversation,
-        hasExtendedText: !!message.message?.extendedTextMessage,
-      });
-      await saveMessageToFirestore(message, sessionKey, accountId, sock.user?.id);
-    } else {
-      console.warn(`[${sessionKey}] No message found in upsert event`);
+      await saveMessageToFirestore(message, sessionKey, userId, sock.user?.id);
     }
   });
 
@@ -304,13 +280,13 @@ async function startSession(sessionKey: string, accountId: string) {
 // REST API endpoint to start a new session
 app.post('/start-session', express.json(), async (req, res) => {
   try {
-    const { accountId } = req.body;
-    if (!accountId) {
-      return res.status(400).json({ error: 'Missing accountId in request body' });
+    const { userId } = req.body;
+    if (!userId) {
+      return res.status(400).json({ error: 'Missing userId in request body' });
     }
 
     const sessionKey = randomUUID();
-    await startSession(sessionKey, accountId);
+    await startSession(sessionKey, userId);
     res.json({ sessionKey });
   } catch (error) {
     console.error('Error starting session:', error);
@@ -323,40 +299,22 @@ app.post('/send-message', express.json(), async (req, res) => {
   try {
     const { to, text, sessionKey } = req.body;
 
-    console.log(`[/send-message] Request: to=${to}, text="${text}", sessionKey=${sessionKey}`);
-
     if (!to || !text || !sessionKey) {
-      console.warn(`[/send-message] Missing fields: to=${to}, text=${text}, sessionKey=${sessionKey}`);
       return res.status(400).json({ error: 'Missing "to", "text", or "sessionKey" field' });
     }
 
     const session = sessions.get(sessionKey);
-    if (!session) {
-      console.error(`[/send-message] Session not found: ${sessionKey}`);
-      return res.status(503).json({ error: 'Session not found' });
-    }
-
-    if (!session.isReady) {
-      console.error(`[/send-message] Session not ready: ${sessionKey}`);
+    if (!session?.isReady) {
       return res.status(503).json({ error: 'Session not ready' });
     }
 
-    // Validate phone number format
-    let cleanPhone = to.replace(/\D/g, ''); // Remove non-digits
-    if (cleanPhone.length < 10) {
-      console.error(`[/send-message] Invalid phone number: ${to}`);
-      return res.status(400).json({ error: 'Invalid phone number format' });
-    }
-
     // Format the phone number for WhatsApp
-    const jid = to.includes('@') ? to : `${cleanPhone}@s.whatsapp.net`;
-
-    console.log(`[/send-message] Sending message from ${session.phoneNumber} to ${jid}`);
+    const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
 
     // Send the message via Baileys
     const message = await session.sock.sendMessage(jid, { text });
 
-    console.log(`[/send-message] Message sent successfully. ID=${message.key.id}, to=${jid}, text="${text.substring(0, 50)}..."`);
+    console.log(`Message sent to ${to}:`, text);
 
     res.json({
       success: true,
@@ -364,7 +322,7 @@ app.post('/send-message', express.json(), async (req, res) => {
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
-    console.error('[/send-message] Error:', error);
+    console.error('Error sending message:', error);
     res.status(500).json({
       error: 'Failed to send message',
       details: (error as any).message,
@@ -372,59 +330,22 @@ app.post('/send-message', express.json(), async (req, res) => {
   }
 });
 
-// Diagnostic endpoint to check messages saved in Firestore
-app.get('/debug/messages/:accountId/:sessionId/:phoneNumber', async (req, res) => {
-  try {
-    const { accountId, sessionId, phoneNumber } = req.params;
-    console.log(`[/debug/messages] Query: account=${accountId}, session=${sessionId}, phone=${phoneNumber}`);
-
-    const messagesRef = db
-      .collection('accounts')
-      .doc(accountId)
-      .collection('whatsapp_sessions')
-      .doc(sessionId)
-      .collection('chats')
-      .doc(phoneNumber)
-      .collection('messages');
-
-    const snapshot = await messagesRef.orderBy('timestamp', 'desc').limit(20).get();
-    const messages = snapshot.docs.map(doc => ({
-      id: doc.id,
-      ...doc.data(),
-    }));
-
-    res.json({
-      accountId,
-      sessionId,
-      phoneNumber,
-      messageCount: messages.length,
-      messages: messages,
-    });
-  } catch (error) {
-    console.error('[/debug/messages] Error:', error);
-    res.status(500).json({
-      error: 'Failed to fetch messages',
-      details: (error as any).message,
-    });
-  }
-});
-
 io.on('connection', (socket) => {
-  const accountId = socket.handshake.auth.accountId as string | undefined;
-  console.log(`Socket.io client connected: ${socket.id}, accountId: ${accountId}`);
+  const userId = socket.handshake.auth.userId as string | undefined;
+  console.log(`Socket.io client connected: ${socket.id}, userId: ${userId}`);
 
-  if (!accountId) {
-    console.warn(`Socket ${socket.id} connected without accountId, disconnecting`);
+  if (!userId) {
+    console.warn(`Socket ${socket.id} connected without userId, disconnecting`);
     socket.disconnect();
     return;
   }
 
-  // Join this socket to a room named by accountId (for broadcasting to all their sessions)
-  socket.join(accountId);
+  // Join this socket to a room named by userId (for broadcasting to all their sessions)
+  socket.join(userId);
 
   // Replay only this user's session states
   for (const [key, session] of sessions) {
-    if (session.accountId !== accountId) continue;
+    if (session.userId !== userId) continue;
 
     if (session.isReady && session.phoneNumber) {
       socket.emit('ready', { phoneNumber: session.phoneNumber, sessionKey: key });
@@ -460,13 +381,13 @@ async function startExistingSessions() {
 
     try {
       const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
-      const accountId = meta.accountId as string;
-      if (!accountId) {
-        console.warn(`Skipping session ${sessionKey}: meta.json has no accountId`);
+      const userId = meta.userId as string;
+      if (!userId) {
+        console.warn(`Skipping session ${sessionKey}: meta.json has no userId`);
         continue;
       }
 
-      await startSession(sessionKey, accountId);
+      await startSession(sessionKey, userId);
     } catch (error) {
       console.error(`Error reading meta.json for ${sessionKey}:`, error);
     }

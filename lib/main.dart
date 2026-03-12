@@ -77,7 +77,7 @@ class AuthWrapper extends StatelessWidget {
         }
 
         if (snapshot.hasData) {
-          return AccountsScreen(accountId: snapshot.data!.uid);
+          return AccountsScreen(userId: snapshot.data!.uid);
         }
 
         return const WelcomeScreen();
@@ -212,7 +212,6 @@ class _LoginScreenState extends State<LoginScreen> {
   final emailController = TextEditingController();
   final passwordController = TextEditingController();
   bool isLoading = false;
-  bool showPassword = false;
 
   @override
   void dispose() {
@@ -236,15 +235,17 @@ class _LoginScreenState extends State<LoginScreen> {
         email: emailController.text.trim(),
         password: passwordController.text.trim(),
       );
-      // AuthWrapper will react automatically — no manual navigation needed
+      // Pequeño delay para asegurar que Firebase haya actualizado el estado
+      if (!mounted) return;
+      await Future.delayed(const Duration(milliseconds: 500));
+      // Pop esta pantalla - AuthWrapper mostrará AccountsScreen automáticamente
+      if (mounted) Navigator.of(context).pop();
     } on FirebaseAuthException catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(_authErrorMessage(e.code))),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => isLoading = false);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(_authErrorMessage(e.code))),
+      );
+      setState(() => isLoading = false);
     }
   }
 
@@ -298,7 +299,7 @@ class _LoginScreenState extends State<LoginScreen> {
             TextField(
               controller: passwordController,
               enabled: !isLoading,
-              obscureText: !showPassword,
+              obscureText: true,
               decoration: InputDecoration(
                 hintText: 'Contraseña',
                 hintStyle: const TextStyle(color: lightText),
@@ -311,13 +312,6 @@ class _LoginScreenState extends State<LoginScreen> {
                 contentPadding: const EdgeInsets.symmetric(
                   horizontal: 16,
                   vertical: 16,
-                ),
-                suffixIcon: IconButton(
-                  icon: Icon(
-                    showPassword ? Icons.visibility : Icons.visibility_off,
-                    color: lightText,
-                  ),
-                  onPressed: () => setState(() => showPassword = !showPassword),
                 ),
               ),
               style: const TextStyle(color: white),
@@ -391,7 +385,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
   final confirmController = TextEditingController();
   bool isLoading = false;
   bool showPassword = false;
-  bool showConfirmPassword = false;
+  bool showConfirm = false;
 
   @override
   void dispose() {
@@ -427,38 +421,21 @@ class _RegisterScreenState extends State<RegisterScreen> {
 
     setState(() => isLoading = true);
     try {
-      final userCredential = await FirebaseAuth.instance.createUserWithEmailAndPassword(
+      await FirebaseAuth.instance.createUserWithEmailAndPassword(
         email: emailController.text.trim(),
         password: passwordController.text.trim(),
       );
-
-      // Create account document
-      final accountId = userCredential.user!.uid;
-      await FirebaseFirestore.instance.collection('accounts').doc(accountId).set({
-        'accountId': accountId,
-        'email': emailController.text.trim(),
-        'createdAt': FieldValue.serverTimestamp(),
-        'accountStatus': true,
-      });
-
-      // Pop RegisterScreen, AuthWrapper will react and show AccountsScreen
-      if (mounted) {
-        Navigator.pop(context);
-      }
+      // Pequeño delay para asegurar que Firebase haya actualizado el estado
+      if (!mounted) return;
+      await Future.delayed(const Duration(milliseconds: 500));
+      // Pop esta pantalla - AuthWrapper mostrará AccountsScreen automáticamente
+      if (mounted) Navigator.of(context).pop();
     } on FirebaseAuthException catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(_authErrorMessage(e.code))),
-        );
-        setState(() => isLoading = false);
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error al crear la cuenta: $e')),
-        );
-        setState(() => isLoading = false);
-      }
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(_authErrorMessage(e.code))),
+      );
+      setState(() => isLoading = false);
     }
   }
 
@@ -529,7 +506,9 @@ class _RegisterScreenState extends State<RegisterScreen> {
                     showPassword ? Icons.visibility : Icons.visibility_off,
                     color: lightText,
                   ),
-                  onPressed: () => setState(() => showPassword = !showPassword),
+                  onPressed: !isLoading
+                      ? () => setState(() => showPassword = !showPassword)
+                      : null,
                 ),
               ),
               style: const TextStyle(color: white),
@@ -538,7 +517,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
             TextField(
               controller: confirmController,
               enabled: !isLoading,
-              obscureText: !showConfirmPassword,
+              obscureText: !showConfirm,
               decoration: InputDecoration(
                 hintText: 'Confirmar contraseña',
                 hintStyle: const TextStyle(color: lightText),
@@ -554,10 +533,12 @@ class _RegisterScreenState extends State<RegisterScreen> {
                 ),
                 suffixIcon: IconButton(
                   icon: Icon(
-                    showConfirmPassword ? Icons.visibility : Icons.visibility_off,
+                    showConfirm ? Icons.visibility : Icons.visibility_off,
                     color: lightText,
                   ),
-                  onPressed: () => setState(() => showConfirmPassword = !showConfirmPassword),
+                  onPressed: !isLoading
+                      ? () => setState(() => showConfirm = !showConfirm)
+                      : null,
                 ),
               ),
               style: const TextStyle(color: white),
@@ -624,9 +605,9 @@ class _RegisterScreenState extends State<RegisterScreen> {
 
 
 class AccountsScreen extends StatefulWidget {
-  final String accountId;
+  final String userId;
 
-  const AccountsScreen({required this.accountId, super.key});
+  const AccountsScreen({required this.userId, super.key});
 
   @override
   State<AccountsScreen> createState() => _AccountsScreenState();
@@ -645,7 +626,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
     socket = IO.io(backendUrl, IO.OptionBuilder()
       .setTransports(['websocket'])
       .disableAutoConnect()
-      .setAuth({'accountId': widget.accountId})
+      .setAuth({'userId': widget.userId})
       .build());
 
     socket.connect();
@@ -653,9 +634,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
 
   @override
   void dispose() {
-    // NO disponer el socket aquí - debe persistir durante toda la sesión del usuario
-    // para que LinkAccountScreen pueda usarlo. El socket se dispone en AuthWrapper
-    // cuando el usuario hace logout.
+    socket.dispose();
     super.dispose();
   }
 
@@ -664,7 +643,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
       final response = await http.post(
         Uri.parse('$backendUrl/start-session'),
         headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'accountId': widget.accountId}),
+        body: jsonEncode({'userId': widget.userId}),
       ).timeout(const Duration(seconds: 10));
 
       if (response.statusCode == 200) {
@@ -678,7 +657,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
             builder: (_) => LinkAccountScreen(
               sessionKey: sessionKey,
               socket: socket,
-              accountId: widget.accountId,
+              userId: widget.userId,
             ),
           ),
         );
@@ -713,7 +692,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
       body: StreamBuilder<QuerySnapshot>(
         stream: FirebaseFirestore.instance
             .collection('accounts')
-            .doc(widget.accountId)
+            .doc(widget.userId)
             .collection('whatsapp_sessions')
             .orderBy('connected_at', descending: true)
             .snapshots(),
@@ -766,7 +745,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
                                 socket: socket,
                                 sessionId: phoneNumber,
                                 sessionKey: sessionKey,
-                                accountId: widget.accountId,
+                                userId: widget.userId,
                               ),
                             ),
                           );
@@ -857,12 +836,12 @@ class _AccountsScreenState extends State<AccountsScreen> {
 class LinkAccountScreen extends StatefulWidget {
   final String sessionKey;
   final IO.Socket socket;
-  final String accountId;
+  final String userId;
 
   const LinkAccountScreen({
     required this.sessionKey,
     required this.socket,
-    required this.accountId,
+    required this.userId,
     super.key,
   });
 
@@ -1168,13 +1147,13 @@ class ChatsScreen extends StatefulWidget {
   final IO.Socket socket;
   final String sessionId;
   final String sessionKey;
-  final String accountId;
+  final String userId;
 
   const ChatsScreen({
     required this.socket,
     required this.sessionId,
     required this.sessionKey,
-    required this.accountId,
+    required this.userId,
     super.key,
   });
 
@@ -1286,7 +1265,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
       body: StreamBuilder<QuerySnapshot>(
         stream: FirebaseFirestore.instance
             .collection('accounts')
-            .doc(widget.accountId)
+            .doc(widget.userId)
             .collection('whatsapp_sessions')
             .doc(widget.sessionId)
             .collection('chats')
@@ -1380,7 +1359,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
         phoneNumber: selectedChatPhone!,
         sessionId: widget.sessionId,
         sessionKey: widget.sessionKey,
-        accountId: widget.accountId,
+        userId: widget.userId,
       ),
     );
   }
@@ -1395,7 +1374,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
       builder: (context) => ContactInfoPanel(
         phoneNumber: phoneNumber,
         sessionId: widget.sessionId,
-        accountId: widget.accountId,
+        userId: widget.userId,
       ),
     );
   }
@@ -1516,12 +1495,12 @@ class _ChatTile extends StatelessWidget {
 class ContactInfoPanel extends StatelessWidget {
   final String phoneNumber;
   final String sessionId;
-  final String accountId;
+  final String userId;
 
   const ContactInfoPanel({
     required this.phoneNumber,
     required this.sessionId,
-    required this.accountId,
+    required this.userId,
     super.key,
   });
 
@@ -1530,7 +1509,7 @@ class ContactInfoPanel extends StatelessWidget {
     return StreamBuilder<DocumentSnapshot>(
       stream: FirebaseFirestore.instance
           .collection('accounts')
-          .doc(accountId)
+          .doc(userId)
           .collection('whatsapp_sessions')
           .doc(sessionId)
           .collection('chats')
@@ -1551,7 +1530,7 @@ class ContactInfoPanel extends StatelessWidget {
         return StreamBuilder<QuerySnapshot>(
           stream: FirebaseFirestore.instance
               .collection('accounts')
-              .doc(accountId)
+              .doc(userId)
               .collection('whatsapp_sessions')
               .doc(sessionId)
               .collection('chats')
@@ -1774,13 +1753,13 @@ class MessagesView extends StatefulWidget {
   final String phoneNumber;
   final String sessionId;
   final String sessionKey;
-  final String accountId;
+  final String userId;
 
   const MessagesView({
     required this.phoneNumber,
     required this.sessionId,
     required this.sessionKey,
-    required this.accountId,
+    required this.userId,
     super.key,
   });
 
@@ -1805,25 +1784,11 @@ class _MessagesViewState extends State<MessagesView> {
     final text = _messageController.text.trim();
     if (text.isEmpty || _isSending) return;
 
-    // Validar que el número sea válido
-    final cleanPhone = widget.phoneNumber.replaceAll(RegExp(r'\D'), '');
-    if (cleanPhone.length < 10) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Número de teléfono inválido'),
-          backgroundColor: Colors.red,
-        ),
-      );
-      return;
-    }
-
     setState(() {
       _isSending = true;
     });
 
     try {
-      print('[_sendMessage] Enviando mensaje a ${widget.phoneNumber}: "$text"');
-
       // Send message to backend
       final response = await http.post(
         Uri.parse('$backendUrl/send-message'),
@@ -1838,31 +1803,17 @@ class _MessagesViewState extends State<MessagesView> {
         onTimeout: () => throw Exception('Request timeout'),
       );
 
-      print('[_sendMessage] Response code: ${response.statusCode}');
-      print('[_sendMessage] Response body: ${response.body}');
-
       if (response.statusCode == 200) {
-        // Message sent successfully - clear the input
+        // Message sent successfully - just clear the input
+        // The message will appear in the chat via Firestore stream
         _messageController.clear();
-
-        // Show success feedback
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('Mensaje enviado'),
-              duration: Duration(seconds: 2),
-              backgroundColor: Colors.green,
-            ),
-          );
-        }
       } else {
         final error = response.body;
-        throw Exception('Error ${response.statusCode}: $error');
+        throw Exception('Failed to send: $error');
       }
     } catch (e) {
       // Only show error if still mounted
       if (mounted) {
-        print('[_sendMessage] Error: $e');
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text('No se pudo enviar: ${e.toString()}'),
@@ -1889,7 +1840,7 @@ class _MessagesViewState extends State<MessagesView> {
           child: StreamBuilder<QuerySnapshot>(
             stream: FirebaseFirestore.instance
                 .collection('accounts')
-                .doc(widget.accountId)
+                .doc(widget.userId)
                 .collection('whatsapp_sessions')
                 .doc(widget.sessionId)
                 .collection('chats')
