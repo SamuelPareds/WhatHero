@@ -20,7 +20,7 @@ const Color accentAqua = Color(0xFF10B981); // Verde más saturado para detalles
 // Backend URL helper (Android emulator vs iOS/macOS vs Web)
 String get backendUrl {
   if (kIsWeb) {
-    return 'http://localhost:3000';
+    return 'http://localhost:3000'; // 'https://whathero-production.up.railway.app' para produc
   }
   if (defaultTargetPlatform == TargetPlatform.android) {
     return 'http://10.0.2.2:3000';
@@ -655,12 +655,16 @@ class _AccountsScreenState extends State<AccountsScreen> {
     // Listener para conexión exitosa
     socket.on('connect', (_) {
       print('[AccountsScreen] Socket conectado: ${socket.id}');
-      setState(() => _socketConnected = true);
+      if (mounted) {
+        setState(() => _socketConnected = true);
+      }
     });
 
     socket.on('disconnect', (_) {
       print('[AccountsScreen] Socket desconectado');
-      setState(() => _socketConnected = false);
+      if (mounted) {
+        setState(() => _socketConnected = false);
+      }
     });
 
     socket.connect();
@@ -669,8 +673,27 @@ class _AccountsScreenState extends State<AccountsScreen> {
 
   @override
   void dispose() {
+    socket.disconnect();
     socket.dispose();
     super.dispose();
+  }
+
+  Future<void> _handleLogout() async {
+    try {
+      socket.disconnect();
+      await FirebaseAuth.instance.signOut();
+      if (!mounted) return;
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (_) => const LoginScreen()),
+      );
+    } catch (e) {
+      print('[AccountsScreen] Error en logout: $e');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error al cerrar sesión: ${e.toString()}')),
+      );
+    }
   }
 
   Future<void> _startNewSession() async {
@@ -729,7 +752,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
         actions: [
           IconButton(
             icon: const Icon(Icons.logout, color: lightText),
-            onPressed: () => FirebaseAuth.instance.signOut(),
+            onPressed: _handleLogout,
             tooltip: 'Cerrar sesión',
           ),
         ],
