@@ -19,8 +19,12 @@ const Color accentAqua = Color(0xFF10B981); // Verde más saturado para detalles
 
 // Backend URL helper (Android emulator vs iOS/macOS vs Web)
 String get backendUrl {
+  if (kReleaseMode) {
+    return 'https://whathero-production.up.railway.app';
+  }
+
   if (kIsWeb) {
-    return 'http://localhost:3000'; // 'https://whathero-production.up.railway.app' para produc
+    return 'http://localhost:3000';
   }
   if (defaultTargetPlatform == TargetPlatform.android) {
     return 'http://10.0.2.2:3000';
@@ -645,6 +649,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
   }
 
   void initSocket() {
+    print('[AccountsScreen] 🚀 Conectando a: $backendUrl (modo: ${kReleaseMode ? 'Release' : 'Debug'})');
     print('[AccountsScreen] Iniciando Socket.io con accountId: ${widget.accountId}');
     socket = IO.io(backendUrl, IO.OptionBuilder()
       .setTransports(['websocket'])
@@ -1113,6 +1118,7 @@ class _WhatsAppHandshakeScreenState extends State<WhatsAppHandshakeScreen> {
   }
 
   void initSocket() {
+    print('[QRScreen] 🚀 Conectando a: $backendUrl (modo: ${kReleaseMode ? 'Release' : 'Debug'})');
     socket = IO.io(backendUrl, IO.OptionBuilder()
       .setTransports(['websocket'])
       .disableAutoConnect()
