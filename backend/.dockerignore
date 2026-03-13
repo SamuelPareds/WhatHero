@@ -1,0 +1,10 @@
+node_modules
+npm-debug.log
+dist
+.git
+.gitignore
+.DS_Store
+auth_info
+.env
+.env.local
+serviceAccountKey.json

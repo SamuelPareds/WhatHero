@@ -9,9 +9,43 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import { pino } from 'pino';
 import admin from 'firebase-admin';
-import { rmSync, existsSync, readdirSync, writeFileSync, readFileSync } from 'fs';
+import { rmSync, existsSync, readdirSync, writeFileSync, readFileSync, mkdirSync } from 'fs';
 import { randomUUID } from 'crypto';
-import serviceAccount from './serviceAccountKey.json' with { type: 'json' };
+
+// Ensure auth_info directory exists
+const authInfoDir = 'auth_info';
+if (!existsSync(authInfoDir)) {
+  mkdirSync(authInfoDir, { recursive: true });
+  console.log(`Created ${authInfoDir} directory`);
+}
+
+// Initialize Firebase Admin from environment variable or file
+let firebaseCredential: admin.ServiceAccount;
+
+if (process.env.FIREBASE_CONFIG) {
+  try {
+    firebaseCredential = JSON.parse(process.env.FIREBASE_CONFIG);
+    console.log('Firebase initialized from FIREBASE_CONFIG environment variable');
+  } catch (error) {
+    console.error('Failed to parse FIREBASE_CONFIG environment variable:', error);
+    process.exit(1);
+  }
+} else if (existsSync('./serviceAccountKey.json')) {
+  try {
+    firebaseCredential = JSON.parse(readFileSync('./serviceAccountKey.json', 'utf-8'));
+    console.log('Firebase initialized from serviceAccountKey.json file');
+  } catch (error) {
+    console.error('Failed to read serviceAccountKey.json:', error);
+    process.exit(1);
+  }
+} else {
+  console.error('Firebase configuration not found. Set FIREBASE_CONFIG environment variable or provide serviceAccountKey.json');
+  process.exit(1);
+}
+
+admin.initializeApp({
+  credential: admin.credential.cert(firebaseCredential),
+});
 
 const app = express();
 const httpServer = createServer(app);
@@ -20,11 +54,6 @@ const io = new Server(httpServer, {
     origin: "*",
     methods: ["GET", "POST"]
   }
-});
-
-// Initialize Firebase Admin
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount as admin.ServiceAccount),
 });
 
 const db = admin.firestore();
@@ -415,7 +444,8 @@ async function startExistingSessions() {
   }
 }
 
-httpServer.listen(3000, async () => {
-  console.log('Server running on port 3000');
+const PORT = parseInt(process.env.PORT || '3000', 10);
+httpServer.listen(PORT, async () => {
+  console.log(`Server running on port ${PORT}`);
   await startExistingSessions();
 });

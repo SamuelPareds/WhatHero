@@ -5,8 +5,9 @@
   "type": "module",
   "main": "index.ts",
   "scripts": {
-    "start": "npm run dev",
-    "dev": "tsx watch index.ts"
+    "start": "node dist/index.js",
+    "dev": "tsx watch index.ts",
+    "build": "tsc"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.6.0",
