@@ -924,6 +924,7 @@ class LinkAccountScreen extends StatefulWidget {
 
 class _LinkAccountScreenState extends State<LinkAccountScreen> {
   String? qrCode;
+  bool sessionConnected = false;
   String status = 'Iniciando sesión...';
 
   @override
@@ -957,7 +958,13 @@ class _LinkAccountScreenState extends State<LinkAccountScreen> {
       if (data is Map && data['sessionKey'] == widget.sessionKey) {
         print('[LinkAccountScreen] Cuenta conectada exitosamente, cerrando pantalla');
         if (mounted) {
-          Navigator.pop(context);
+          setState(() {
+            sessionConnected = true;
+            status = 'Conectado exitosamente ✅';
+          });
+          Future.delayed(const Duration(milliseconds: 800), () {
+            if (mounted) Navigator.pop(context);
+          });
         }
       } else {
         print('[LinkAccountScreen] READY NO coincide: data[sessionKey]=${data is Map ? data['sessionKey'] : 'N/A'}');
@@ -1053,12 +1060,35 @@ class _LinkAccountScreenState extends State<LinkAccountScreen> {
     );
   }
 
+  Future<void> _cancelSession() async {
+    try {
+      // Solo cancelar si la sesión NO se conectó exitosamente
+      if (sessionConnected) {
+        print('[LinkAccountScreen] Sesión ya conectada, no cancelar');
+        return;
+      }
+
+      print('[LinkAccountScreen] Cancelando sesión: ${widget.sessionKey}');
+
+      // Usar Socket.io para cancelar
+      widget.socket.emit('cancel_session', {
+        'sessionKey': widget.sessionKey,
+      });
+    } catch (error) {
+      print('[LinkAccountScreen] Error cancelando sesión: $error');
+    }
+  }
+
   @override
   void dispose() {
+    // Cancelar la sesión en el backend antes de desmontar
+    _cancelSession();
+
     // Limpiar los listeners específicos para esta sesión
     widget.socket.off('qr');
     widget.socket.off('ready');
     widget.socket.off('status_update');
+    widget.socket.off('disconnect');
     super.dispose();
   }
 }

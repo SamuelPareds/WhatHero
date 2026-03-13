@@ -321,6 +321,43 @@ async function startSession(sessionKey: string, accountId: string) {
   return sock;
 }
 
+async function cancelSession(sessionKey: string) {
+  const session = sessions.get(sessionKey);
+  if (!session) {
+    console.log(`[cancelSession] Session not found: ${sessionKey}`);
+    return false;
+  }
+
+  console.log(`[cancelSession] Cancelando sesión: ${sessionKey}`);
+
+  // Close the Baileys socket
+  if (session.sock) {
+    try {
+      await session.sock.ws?.close();
+      console.log(`[cancelSession] Socket cerrado para ${sessionKey}`);
+    } catch (error) {
+      console.error(`[cancelSession] Error cerrando socket:`, error);
+    }
+  }
+
+  // Clean up auth directory
+  try {
+    rmSync(`auth_info/${sessionKey}`, { recursive: true, force: true });
+    console.log(`[cancelSession] Auth directory eliminado: auth_info/${sessionKey}`);
+  } catch (error) {
+    console.error(`[cancelSession] Error limpiando auth:`, error);
+  }
+
+  // Remove from sessions map
+  sessions.delete(sessionKey);
+  console.log(`[cancelSession] Sesión eliminada del mapa`);
+
+  // Notify frontend
+  io.to(session.accountId).emit('session_cancelled', { sessionKey });
+
+  return true;
+}
+
 // REST API endpoint to start a new session
 app.post('/start-session', express.json(), async (req, res) => {
   try {
@@ -343,6 +380,33 @@ app.post('/start-session', express.json(), async (req, res) => {
   } catch (error) {
     console.error('[/start-session] Error:', error);
     res.status(500).json({ error: 'Failed to start session' });
+  }
+});
+
+// REST API endpoint to cancel a session
+app.post('/cancel-session', express.json(), async (req, res) => {
+  try {
+    const { accountId, sessionKey } = req.body;
+    console.log('[/cancel-session] POST recibido con sessionKey:', sessionKey);
+
+    if (!sessionKey || !accountId) {
+      return res.status(400).json({ error: 'Missing sessionKey or accountId' });
+    }
+
+    const session = sessions.get(sessionKey);
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    if (session.accountId !== accountId) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    const success = await cancelSession(sessionKey);
+    res.json({ success });
+  } catch (error) {
+    console.error('[/cancel-session] Error:', error);
+    res.status(500).json({ error: 'Failed to cancel session' });
   }
 });
 
@@ -413,6 +477,25 @@ io.on('connection', (socket) => {
     }
   }
   console.log('[Socket.io] Total de sesiones encontradas para ' + accountId + ': ' + sessionCount);
+
+  socket.on('cancel_session', async (data) => {
+    const { sessionKey } = data;
+    console.log('[Socket.io] cancel_session recibido para:', sessionKey);
+
+    const session = sessions.get(sessionKey);
+    if (!session) {
+      socket.emit('error', { message: 'Session not found' });
+      return;
+    }
+
+    if (session.accountId !== accountId) {
+      socket.emit('error', { message: 'Unauthorized' });
+      return;
+    }
+
+    const success = await cancelSession(sessionKey);
+    socket.emit('session_cancelled', { sessionKey, success });
+  });
 });
 
 async function startExistingSessions() {
