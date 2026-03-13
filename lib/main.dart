@@ -1,6 +1,6 @@
-import 'dart:io';
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:firebase_core/firebase_core.dart';
@@ -17,9 +17,16 @@ const Color white = Color(0xFFF3F4F6); // Texto blanco (no puro)
 const Color lightText = Color(0xFFD1D5DB); // Gris claro secundario
 const Color accentAqua = Color(0xFF10B981); // Verde más saturado para detalles
 
-// Backend URL helper (Android emulator vs iOS/macOS)
-String get backendUrl =>
-    Platform.isAndroid ? 'http://10.0.2.2:3000' : 'http://localhost:3000';
+// Backend URL helper (Android emulator vs iOS/macOS vs Web)
+String get backendUrl {
+  if (kIsWeb) {
+    return 'http://localhost:3000';
+  }
+  if (defaultTargetPlatform == TargetPlatform.android) {
+    return 'http://10.0.2.2:3000';
+  }
+  return 'http://localhost:3000';
+}
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();

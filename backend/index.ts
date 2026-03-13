@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import cors from 'cors';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import makeWASocket, {
@@ -49,6 +50,14 @@ admin.initializeApp({
 });
 
 const app = express();
+
+// Enable CORS for Express (web requests)
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "OPTIONS"],
+  credentials: true
+}));
+
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: {
