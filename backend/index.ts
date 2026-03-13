@@ -13,6 +13,7 @@ import { pino } from 'pino';
 import admin from 'firebase-admin';
 import { rmSync, existsSync, readdirSync, writeFileSync, readFileSync, mkdirSync } from 'fs';
 import { randomUUID } from 'crypto';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 // Ensure auth_info directory exists
 const authInfoDir = 'auth_info';
@@ -76,6 +77,22 @@ interface SessionData {
   phoneNumber: string | undefined;
   isReconnecting: boolean;
   accountId: string;
+  aiConfig?: {
+    enabled: boolean;
+    apiKey: string;
+    systemPrompt: string;
+    responseDelayMs: number;
+    model: string;
+    activeHours?: {
+      enabled: boolean;
+      timezone: string;
+      start: string;
+      end: string;
+    };
+    optedOutContacts: string[];
+    keywordRules: { keyword: string; response: string }[];
+    loadedAt: number;
+  };
 }
 
 const sessions = new Map<string, SessionData>();
@@ -194,6 +211,128 @@ async function saveMessageToFirestore(message: any, sessionKey: string, accountI
   }
 }
 
+// AI config cache TTL: 60 seconds
+const AI_CONFIG_TTL_MS = 60_000;
+
+// Get AI config with in-memory caching
+async function getAIConfig(session: SessionData, accountId: string) {
+  const now = Date.now();
+  if (session.aiConfig && (now - session.aiConfig.loadedAt) < AI_CONFIG_TTL_MS) {
+    return session.aiConfig;
+  }
+
+  try {
+    const sessionDocRef = db
+      .collection('accounts').doc(accountId)
+      .collection('whatsapp_sessions').doc(session.phoneNumber!);
+
+    const doc = await sessionDocRef.get();
+    const data = doc.data();
+
+    session.aiConfig = {
+      enabled: data?.ai_enabled ?? false,
+      apiKey: data?.ai_api_key ?? '',
+      systemPrompt: data?.ai_system_prompt ?? '',
+      responseDelayMs: data?.ai_response_delay_ms ?? 1500,
+      model: data?.ai_model ?? 'gemini-2.5-flash',
+      activeHours: data?.ai_active_hours,
+      optedOutContacts: data?.ai_opted_out_contacts ?? [],
+      keywordRules: data?.ai_keyword_rules ?? [],
+      loadedAt: now,
+    };
+
+    return session.aiConfig;
+  } catch (error) {
+    console.error('[AI] Error fetching AI config:', error);
+    return {
+      enabled: false,
+      apiKey: '',
+      systemPrompt: '',
+      responseDelayMs: 0,
+      model: 'gemini-2.5-flash',
+      optedOutContacts: [],
+      keywordRules: [],
+      loadedAt: now,
+    };
+  }
+}
+
+// Check if current time is within active hours
+function isWithinActiveHours(aiConfig: any): boolean {
+  if (!aiConfig.activeHours?.enabled) {
+    return true; // Active hours disabled = always within hours
+  }
+
+  try {
+    const { timezone, start, end } = aiConfig.activeHours;
+    if (!timezone || !start || !end) {
+      return true; // Invalid config = allow
+    }
+
+    // Get current time in the specified timezone
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    });
+
+    const currentTimeStr = formatter.format(new Date());
+    const [currentHour, currentMinute] = currentTimeStr.split(':').map(Number);
+    const currentTime = currentHour * 60 + currentMinute; // Minutes since midnight
+
+    // Parse start and end times
+    const [startHour, startMinute] = start.split(':').map(Number);
+    const [endHour, endMinute] = end.split(':').map(Number);
+
+    const startTime = startHour * 60 + startMinute;
+    const endTime = endHour * 60 + endMinute;
+
+    // Check if current time is within range
+    if (startTime <= endTime) {
+      // Normal case: 09:00 - 18:00
+      return currentTime >= startTime && currentTime < endTime;
+    } else {
+      // Overnight case: 22:00 - 06:00
+      return currentTime >= startTime || currentTime < endTime;
+    }
+  } catch (error) {
+    console.error('[AI] Error checking active hours:', error);
+    return true; // On error, allow response
+  }
+}
+
+// Generate AI response using Gemini with conversation history
+async function generateAIResponse(
+  apiKey: string,
+  systemPrompt: string,
+  userMessage: string,
+  history?: { role: 'user' | 'model'; parts: { text: string }[] }[],
+  modelName: string = 'gemini-2.5-flash'
+): Promise<string | null> {
+  try {
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({
+      model: modelName,
+    });
+
+    // If we have history, use multi-turn chat; otherwise single-turn
+    if (history && history.length > 0) {
+      const chat = model.startChat({ history });
+      const result = await chat.sendMessage(userMessage);
+      return result.response.text();
+    } else {
+      // Fallback: single turn with system prompt embedded
+      const fullPrompt = `${systemPrompt}\n\n${userMessage}`;
+      const result = await model.generateContent(fullPrompt);
+      return result.response.text();
+    }
+  } catch (error) {
+    console.error('[AI] Error calling Gemini:', error);
+    return null;
+  }
+}
+
 async function startSession(sessionKey: string, accountId: string) {
   const { state, saveCreds } = await useMultiFileAuthState(`auth_info/${sessionKey}`);
   const { version } = await fetchLatestBaileysVersion();
@@ -309,8 +448,117 @@ async function startSession(sessionKey: string, accountId: string) {
   // Listen for incoming and outgoing messages
   sock.ev.on('messages.upsert', async (m) => {
     const message = m.messages?.[0];
-    if (message) {
-      await saveMessageToFirestore(message, sessionKey, accountId, sock.user?.id);
+    if (!message) return;
+
+    await saveMessageToFirestore(message, sessionKey, accountId, sock.user?.id);
+
+    // AI auto-response: only for incoming messages (not from self)
+    if (message.key.fromMe) return;
+    const remoteJid = message.key.remoteJid;
+    if (!remoteJid || remoteJid.endsWith('@g.us')) return; // skip group messages
+
+    const messageText = message.message?.conversation ||
+                        message.message?.extendedTextMessage?.text || '';
+    if (!messageText.trim()) return; // skip media-only messages
+
+    // Get AI config with caching
+    const session = sessions.get(sessionKey);
+    if (!session?.phoneNumber) return;
+
+    const aiConfig = await getAIConfig(session, accountId);
+    if (!aiConfig.enabled || !aiConfig.apiKey) return;
+
+    // Extract contact phone number
+    const contactPhone = extractPhoneNumber(remoteJid);
+
+    // Check if contact is opted out
+    if (aiConfig.optedOutContacts?.includes(contactPhone)) {
+      console.log(`[AI] Contact ${contactPhone} is opted out, skipping AI response`);
+      return;
+    }
+
+    // Check if within active hours
+    if (!isWithinActiveHours(aiConfig)) {
+      console.log(`[AI] Outside active hours, skipping AI response`);
+      return;
+    }
+
+    // Check keyword rules (fast-path, before Gemini)
+    for (const rule of aiConfig.keywordRules) {
+      if (messageText.toLowerCase().includes(rule.keyword.toLowerCase())) {
+        console.log(`[AI] Keyword rule matched: "${rule.keyword}", sending canned response`);
+        await new Promise(r => setTimeout(r, aiConfig.responseDelayMs));
+        await session.sock.sendMessage(remoteJid, { text: rule.response });
+        return;
+      }
+    }
+
+    // Fetch last 10 messages for conversation history
+    let history: { role: 'user' | 'model'; parts: { text: string }[] }[] = [];
+
+    try {
+      const historyDocs = await db
+        .collection('accounts').doc(accountId)
+        .collection('whatsapp_sessions').doc(session.phoneNumber)
+        .collection('chats').doc(contactPhone)
+        .collection('messages')
+        .orderBy('timestamp', 'desc')
+        .limit(10)
+        .get();
+
+      const rawHistory = historyDocs.docs
+        .reverse()
+        .filter(d => d.data().text)
+        .map(d => ({
+          role: d.data().fromMe ? ('model' as const) : ('user' as const),
+          parts: [{ text: d.data().text as string }],
+        }));
+
+      // Ensure history alternates correctly (validate Gemini chat format)
+      // Must be: user -> model -> user -> model...
+      // Last message in history must be 'user' (so AI responds with 'model')
+      history = [];
+      for (const msg of rawHistory) {
+        // If this is the first message, only allow if it's 'user'
+        if (history.length === 0) {
+          if (msg.role === 'user') {
+            history.push(msg);
+          }
+        } else {
+          // For subsequent messages, alternate the role
+          const lastRole = history[history.length - 1].role;
+          if (lastRole === 'user' && msg.role === 'model') {
+            history.push(msg);
+          } else if (lastRole === 'model' && msg.role === 'user') {
+            history.push(msg);
+          }
+          // Skip messages that would break the alternation
+        }
+      }
+
+      // Ensure the last message is 'user' (so we can respond with 'model')
+      if (history.length > 0 && history[history.length - 1].role !== 'user') {
+        history.pop();
+      }
+    } catch (error) {
+      console.log('[AI] Could not fetch message history, continuing without context:', error);
+    }
+
+    // Humanization delay
+    await new Promise(r => setTimeout(r, aiConfig.responseDelayMs));
+
+    // Generate and send AI response with selected model
+    const aiResponse = await generateAIResponse(
+      aiConfig.apiKey,
+      aiConfig.systemPrompt || 'Eres un asistente útil.',
+      messageText,
+      history,
+      aiConfig.model
+    );
+
+    if (aiResponse) {
+      await session.sock.sendMessage(remoteJid, { text: aiResponse });
+      console.log(`[AI] Auto-responded to ${remoteJid} on session ${session.phoneNumber} using model ${aiConfig.model}`);
     }
   });
 
