@@ -324,19 +324,25 @@ async function generateAIResponse(
 ): Promise<string | null> {
   try {
     const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({
-      model: modelName,
-      systemInstruction: systemPrompt, // ✅ Include system prompt for all calls
-    });
+    const model = genAI.getGenerativeModel({ model: modelName });
 
-    // If we have history, use multi-turn chat; otherwise single-turn
+    // If we have history, use multi-turn chat with system prompt prepended to the first user message
     if (history && history.length > 0) {
-      const chat = model.startChat({ history });
+      // Inject system prompt at the beginning of the history by prepending to first user message
+      const enhancedHistory = [...history];
+      if (enhancedHistory.length > 0 && enhancedHistory[0].role === 'user') {
+        enhancedHistory[0] = {
+          role: 'user',
+          parts: [{ text: `${systemPrompt}\n\n${enhancedHistory[0].parts[0]?.text || ''}` }],
+        };
+      }
+      const chat = model.startChat({ history: enhancedHistory });
       const result = await chat.sendMessage(userMessage);
       return result.response.text();
     } else {
-      // Fallback: single turn (system prompt already in model config)
-      const result = await model.generateContent(userMessage);
+      // Single turn: include system prompt in the message
+      const fullPrompt = `${systemPrompt}\n\n${userMessage}`;
+      const result = await model.generateContent(fullPrompt);
       return result.response.text();
     }
   } catch (error) {
