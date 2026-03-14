@@ -1897,7 +1897,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
   late TextEditingController _discriminatorPromptController;
   bool _aiEnabled = false;
   String _selectedModel = 'gemini-2.5-flash';
-  int _responseDelayMs = 1500;
+  int _responseDelayMs = 15000; // Default: 15 seconds
   bool _activeHoursEnabled = false;
   String _activeHoursTimezone = 'America/Mexico_City';
   TimeOfDay _activeHoursStart = const TimeOfDay(hour: 9, minute: 0);
@@ -1936,7 +1936,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
           _systemPromptController.text =
               data['ai_system_prompt'] ?? 'Eres un asistente útil.';
           _selectedModel = data['ai_model'] ?? 'gemini-2.5-flash';
-          _responseDelayMs = data['ai_response_delay_ms'] ?? 1500;
+          _responseDelayMs = data['ai_response_delay_ms'] ?? 15000;
 
           // Active hours
           if (data['ai_active_hours'] is Map) {
@@ -2259,16 +2259,24 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
               style: const TextStyle(color: white),
             ),
             const SizedBox(height: 24),
-            // Response delay slider
+            // Message buffer wait time slider
             Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const Text(
-                  'Demora de respuesta (ms)',
+                  'Espera entre mensajes',
                   style: TextStyle(
                     fontSize: 14,
                     fontWeight: FontWeight.w600,
                     color: lightText,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'El asistente espera este tiempo para recibir más mensajes antes de responder',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: lightText.withValues(alpha: 0.7),
                   ),
                 ),
                 const SizedBox(height: 12),
@@ -2285,9 +2293,9 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
                     children: [
                       Slider(
                         value: _responseDelayMs.toDouble(),
-                        min: 0,
-                        max: 5000,
-                        divisions: 10,
+                        min: 8000,
+                        max: 30000,
+                        divisions: 22,
                         activeColor: primaryAqua,
                         onChanged: (value) {
                           setState(() => _responseDelayMs = value.toInt());
@@ -2296,10 +2304,10 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
                       Padding(
                         padding: const EdgeInsets.only(bottom: 8),
                         child: Text(
-                          '${_responseDelayMs}ms',
+                          '${(_responseDelayMs / 1000).toStringAsFixed(1)}s',
                           style: const TextStyle(
                             fontSize: 12,
-                            color: lightText,
+                            color: primaryAqua,
                             fontWeight: FontWeight.w600,
                           ),
                         ),

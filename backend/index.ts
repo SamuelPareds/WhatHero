@@ -101,6 +101,17 @@ interface SessionData {
 
 const sessions = new Map<string, SessionData>();
 
+// Message buffer interface for aggregating multiple messages before processing
+interface MessageBuffer {
+  contactPhone: string;
+  messages: string[];
+  timeout: NodeJS.Timeout | null;
+  responded: boolean;
+}
+
+// Message buffers per chat: key = `${sessionKey}:${contactPhone}`
+const messageBuffers = new Map<string, MessageBuffer>();
+
 // Helper function to extract and clean phone number from Baileys JID
 // Handles format: "5215561642726:50@s.whatsapp.net" -> "5215561642726"
 function extractPhoneNumber(jid: string | undefined): string {
@@ -407,6 +418,138 @@ async function classifyMessageIntent(
   }
 }
 
+// Process buffered messages: fetch history, run discriminator, and send AI response
+async function processMessageBuffer(
+  sessionKey: string,
+  accountId: string,
+  session: SessionData,
+  remoteJid: string,
+  contactPhone: string,
+  aiConfig: any,
+  bufferedMessages: string[]
+) {
+  try {
+    // Combine all buffered messages into one context
+    const combinedMessage = bufferedMessages.join('\n');
+    console.log(`[Buffer] Processing ${bufferedMessages.length} message(s) for ${contactPhone}: "${combinedMessage.substring(0, 50)}..."`);
+
+    // Fetch last 10 messages for conversation history
+    let history: { role: 'user' | 'model'; parts: { text: string }[] }[] = [];
+
+    try {
+      const historyDocs = await db
+        .collection('accounts').doc(accountId)
+        .collection('whatsapp_sessions').doc(session.phoneNumber!)
+        .collection('chats').doc(contactPhone)
+        .collection('messages')
+        .orderBy('timestamp', 'desc')
+        .limit(10)
+        .get();
+
+      const rawHistory = historyDocs.docs
+        .reverse()
+        .filter(d => d.data().text)
+        .map(d => ({
+          role: d.data().fromMe ? ('model' as const) : ('user' as const),
+          parts: [{ text: d.data().text as string }],
+        }));
+
+      // Ensure history alternates correctly
+      history = [];
+      for (const msg of rawHistory) {
+        if (history.length === 0) {
+          if (msg.role === 'user') {
+            history.push(msg);
+          }
+        } else {
+          const lastRole = history[history.length - 1].role;
+          if (lastRole === 'user' && msg.role === 'model') {
+            history.push(msg);
+          } else if (lastRole === 'model' && msg.role === 'user') {
+            history.push(msg);
+          }
+        }
+      }
+
+      if (history.length > 0 && history[history.length - 1].role !== 'user') {
+        history.pop();
+      }
+    } catch (error) {
+      console.log('[Buffer] Could not fetch message history, continuing without context:', error);
+    }
+
+    // DISCRIMINATOR: Check if message should be handled by AI or human
+    if (aiConfig.discriminator?.enabled && aiConfig.discriminator?.prompt) {
+      const historyText = history
+        .map((msg) => {
+          const role = msg.role === 'user' ? 'Customer' : 'Assistant';
+          return `${role}: ${msg.parts[0]?.text || ''}`;
+        })
+        .join('\n');
+
+      const conversationContext = `${historyText}\nCustomer: ${combinedMessage}`;
+
+      const classification = await classifyMessageIntent(
+        aiConfig.apiKey,
+        aiConfig.discriminator.prompt,
+        conversationContext,
+        aiConfig.model
+      );
+
+      if (classification === 'TalkToHuman') {
+        try {
+          const chatDocRef = db
+            .collection('accounts')
+            .doc(accountId)
+            .collection('whatsapp_sessions')
+            .doc(session.phoneNumber!)
+            .collection('chats')
+            .doc(contactPhone);
+
+          await chatDocRef.update({
+            needs_human: true,
+            human_attention_at: admin.firestore.FieldValue.serverTimestamp(),
+          });
+
+          console.log(`[Buffer] Chat ${contactPhone} marked as needs_human=true`);
+        } catch (error) {
+          console.error('[Buffer] Error marking chat as needing human attention:', error);
+        }
+
+        io.to(accountId).emit('human_attention_required', {
+          sessionKey,
+          chatId: contactPhone,
+          phoneNumber: session.phoneNumber,
+          timestamp: new Date().toISOString(),
+        });
+
+        console.log(
+          `[Buffer] Emitted human_attention_required for ${contactPhone} (Session: ${session.phoneNumber})`
+        );
+        return; // Skip AI response
+      }
+
+      console.log(`[Buffer] Discriminator classification: ${classification}, proceeding with AI response`);
+    }
+
+    // Generate and send AI response
+    const aiResponse = await generateAIResponse(
+      aiConfig.apiKey,
+      aiConfig.systemPrompt || 'Eres un asistente útil.',
+      combinedMessage,
+      history,
+      aiConfig.model
+    );
+
+    if (aiResponse) {
+      await session.sock.sendMessage(remoteJid, { text: aiResponse });
+      console.log(`[Buffer] Auto-responded to ${remoteJid} on session ${session.phoneNumber} with ${aiResponse.length} chars`);
+    }
+  } catch (error) {
+    console.error('[Buffer] Error processing message buffer:', error);
+  }
+}
+
 async function startSession(sessionKey: string, accountId: string) {
   const { state, saveCreds } = await useMultiFileAuthState(`auth_info/${sessionKey}`);
   const { version } = await fetchLatestBaileysVersion();
@@ -557,7 +700,7 @@ async function startSession(sessionKey: string, accountId: string) {
       return;
     }
 
-    // Check keyword rules (fast-path, before Gemini)
+    // Check keyword rules (fast-path, immediate response - not buffered)
     for (const rule of aiConfig.keywordRules) {
       if (messageText.toLowerCase().includes(rule.keyword.toLowerCase())) {
         console.log(`[AI] Keyword rule matched: "${rule.keyword}", sending canned response`);
@@ -567,130 +710,68 @@ async function startSession(sessionKey: string, accountId: string) {
       }
     }
 
-    // Fetch last 10 messages for conversation history
-    let history: { role: 'user' | 'model'; parts: { text: string }[] }[] = [];
+    // ============================================
+    // MESSAGE BUFFERING: Wait for more messages before processing
+    // ============================================
+    const bufferKey = `${sessionKey}:${contactPhone}`;
+    let buffer = messageBuffers.get(bufferKey);
 
-    try {
-      const historyDocs = await db
-        .collection('accounts').doc(accountId)
-        .collection('whatsapp_sessions').doc(session.phoneNumber)
-        .collection('chats').doc(contactPhone)
-        .collection('messages')
-        .orderBy('timestamp', 'desc')
-        .limit(20) // Numero de mensajes que se pasan en el historial
-        .get();
+    // If no existing buffer, create one
+    if (!buffer) {
+      buffer = {
+        contactPhone,
+        messages: [messageText],
+        timeout: null,
+        responded: false,
+      };
+      messageBuffers.set(bufferKey, buffer);
+      console.log(`[Buffer] Created new buffer for ${contactPhone}: message 1`);
+    } else {
+      // Add to existing buffer
+      buffer.messages.push(messageText);
+      console.log(`[Buffer] Added message to buffer for ${contactPhone}: now ${buffer.messages.length} messages`);
 
-      const rawHistory = historyDocs.docs
-        .reverse()
-        .filter(d => d.data().text)
-        .map(d => ({
-          role: d.data().fromMe ? ('model' as const) : ('user' as const),
-          parts: [{ text: d.data().text as string }],
-        }));
-
-      // Ensure history alternates correctly (validate Gemini chat format)
-      // Must be: user -> model -> user -> model...
-      // Last message in history must be 'user' (so AI responds with 'model')
-      history = [];
-      for (const msg of rawHistory) {
-        // If this is the first message, only allow if it's 'user'
-        if (history.length === 0) {
-          if (msg.role === 'user') {
-            history.push(msg);
-          }
-        } else {
-          // For subsequent messages, alternate the role
-          const lastRole = history[history.length - 1].role;
-          if (lastRole === 'user' && msg.role === 'model') {
-            history.push(msg);
-          } else if (lastRole === 'model' && msg.role === 'user') {
-            history.push(msg);
-          }
-          // Skip messages that would break the alternation
-        }
+      // If already responded, don't reset timeout - create new buffer for this message
+      if (buffer.responded) {
+        buffer = {
+          contactPhone,
+          messages: [messageText],
+          timeout: null,
+          responded: false,
+        };
+        messageBuffers.set(bufferKey, buffer);
+        console.log(`[Buffer] Buffer was responded, created new buffer for ${contactPhone}`);
       }
-
-      // Ensure the last message is 'user' (so we can respond with 'model')
-      if (history.length > 0 && history[history.length - 1].role !== 'user') {
-        history.pop();
-      }
-    } catch (error) {
-      console.log('[AI] Could not fetch message history, continuing without context:', error);
     }
 
-    // DISCRIMINATOR: Check if message should be handled by AI or human
-    if (aiConfig.discriminator?.enabled && aiConfig.discriminator?.prompt) {
-      // Format conversation history for discriminator prompt
-      const historyText = history
-        .map((msg) => {
-          const role = msg.role === 'user' ? 'Customer' : 'Assistant';
-          return `${role}: ${msg.parts[0]?.text || ''}`;
-        })
-        .join('\n');
+    // Clear existing timeout if any
+    if (buffer.timeout) {
+      clearTimeout(buffer.timeout);
+      console.log(`[Buffer] Cleared existing timeout for ${contactPhone}`);
+    }
 
-      const conversationContext = `${historyText}\nCustomer: ${messageText}`;
+    // Set new timeout to process buffer after delay
+    buffer.timeout = setTimeout(async () => {
+      console.log(`[Buffer] Timeout expired for ${contactPhone}, processing ${buffer.messages.length} message(s)`);
 
-      const classification = await classifyMessageIntent(
-        aiConfig.apiKey,
-        aiConfig.discriminator.prompt,
-        conversationContext,
-        aiConfig.model
+      // Mark buffer as responded BEFORE processing to prevent race conditions
+      buffer.responded = true;
+
+      // Process the buffered messages
+      await processMessageBuffer(
+        sessionKey,
+        accountId,
+        session,
+        remoteJid,
+        contactPhone,
+        aiConfig,
+        buffer.messages
       );
 
-      if (classification === 'TalkToHuman') {
-        // Mark chat as needing human attention
-        try {
-          const chatDocRef = db
-            .collection('accounts')
-            .doc(accountId)
-            .collection('whatsapp_sessions')
-            .doc(session.phoneNumber)
-            .collection('chats')
-            .doc(contactPhone);
-
-          await chatDocRef.update({
-            needs_human: true,
-            human_attention_at: admin.firestore.FieldValue.serverTimestamp(),
-          });
-
-          console.log(`[Discriminator] Chat ${contactPhone} marked as needs_human=true`);
-        } catch (error) {
-          console.error('[Discriminator] Error marking chat as needing human attention:', error);
-        }
-
-        // Emit Socket.io event to notify frontend
-        io.to(accountId).emit('human_attention_required', {
-          sessionKey,
-          chatId: contactPhone,
-          phoneNumber: session.phoneNumber,
-          timestamp: new Date().toISOString(),
-        });
-
-        console.log(
-          `[Discriminator] Emitted human_attention_required for ${contactPhone} (Session: ${session.phoneNumber})`
-        );
-        return; // Skip AI response
-      }
-
-      console.log(`[Discriminator] Classification: ${classification}, proceeding with AI response`);
-    }
-
-    // Humanization delay
-    await new Promise(r => setTimeout(r, aiConfig.responseDelayMs));
-
-    // Generate and send AI response with selected model
-    const aiResponse = await generateAIResponse(
-      aiConfig.apiKey,
-      aiConfig.systemPrompt || 'Eres un asistente útil.',
-      messageText,
-      history,
-      aiConfig.model
-    );
-
-    if (aiResponse) {
-      await session.sock.sendMessage(remoteJid, { text: aiResponse });
-      console.log(`[AI] Auto-responded to ${remoteJid} on session ${session.phoneNumber} using model ${aiConfig.model}`);
-    }
+      // Clear the buffer from map
+      messageBuffers.delete(bufferKey);
+      console.log(`[Buffer] Cleared buffer for ${contactPhone}`);
+    }, aiConfig.responseDelayMs);
   });
 
   // Store socket reference in session
