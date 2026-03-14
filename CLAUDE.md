@@ -32,7 +32,22 @@ La "Fuente de Verdad" sigue un patrón de documentos anidados para optimizar cos
 Para garantizar que la data llegue al usuario correcto, implementamos **Rooms**:
 - El socket del cliente se une a una sala con su `userId` (Firebase UID).
 - El backend emite eventos (`qr`, `ready`) únicamente a esa sala: `io.to(userId).emit(...)`.
-- **Eventos:** Incluyen un `sessionKey` (UUID) para que el frontend distinga entre múltiples procesos de vinculación simultáneos.
+- **Eventos:** Incluyen un `sessionKey` (UUID) para que el frontend distinja entre múltiples procesos de vinculación simultáneos.
+
+---
+
+## 🔍 Discriminador de Intenciones (Intent Filter)
+Un sistema inteligente de filtrado que intercepta mensajes ANTES del asistente IA:
+- **Configuración:** Por sesión de WhatsApp (en `SessionSettingsPanel`)
+- **Reglas:** Usuario escribe en lenguaje natural ("Pasa al humano si pregunta sobre disponibilidad...")
+- **Funcionamiento:**
+  1. Mensaje llega → Discriminador analiza (Gemini + historial)
+  2. Gemini responde "Respuesta: SI" (IA responde) o "Respuesta: NO" (requiere humano)
+  3. Si "NO": Marca chat como `needs_human: true`, emite evento Socket.io, NO responde IA
+  4. Si "SI": Continúa flujo normal del asistente
+- **UI Feedback:** Badge rojo 🟥⚠️ en chats que requieren humano
+- **Firestore:** Campos `ai_discriminator_enabled`, `ai_discriminator_prompt`, y `needs_human` por chat
+- **Ver guía:** `DISCRIMINATOR_GUIDE.md` (documentación completa con ejemplos)
 
 ---
 

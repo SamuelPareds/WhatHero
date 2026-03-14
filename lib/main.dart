@@ -672,6 +672,12 @@ class _AccountsScreenState extends State<AccountsScreen> {
       }
     });
 
+    socket.on('human_attention_required', (data) {
+      print('[AccountsScreen] human_attention_required: $data');
+      // Badge in chat list is enough visual feedback
+      // No need for additional notification banner
+    });
+
     socket.connect();
     print('[AccountsScreen] socket.connect() llamado');
   }
@@ -1429,9 +1435,11 @@ class _ChatsScreenState extends State<ChatsScreen> {
           final filteredChats = searchQuery.isEmpty
               ? allChats
               : allChats
-                  .where((chat) => (chat['phoneNumber'] as String)
-                      .toLowerCase()
-                      .contains(searchQuery))
+                  .where((chatDoc) {
+                    final chatData = chatDoc.data() as Map<String, dynamic>?;
+                    final phoneNumber = chatData?['phoneNumber'] as String? ?? '';
+                    return phoneNumber.toLowerCase().contains(searchQuery);
+                  })
                   .toList();
 
           if (filteredChats.isEmpty) {
@@ -1454,16 +1462,20 @@ class _ChatsScreenState extends State<ChatsScreen> {
           return ListView.builder(
             itemCount: filteredChats.length,
             itemBuilder: (context, index) {
-              final chat = filteredChats[index];
-              final phoneNumber = chat['phoneNumber'] as String;
-              final lastMessage = chat['lastMessage'] ?? 'Sin mensajes';
-              final timestamp = (chat['lastMessageTimestamp'] as Timestamp?)?.toDate();
+              final chatDoc = filteredChats[index];
+              final chatData = chatDoc.data() as Map<String, dynamic>?;
+
+              final phoneNumber = chatData?['phoneNumber'] as String? ?? '';
+              final lastMessage = chatData?['lastMessage'] ?? 'Sin mensajes';
+              final timestamp = (chatData?['lastMessageTimestamp'] as Timestamp?)?.toDate();
+              final needsHuman = chatData?['needs_human'] as bool? ?? false;
 
               return _ChatTile(
                 phoneNumber: phoneNumber,
                 lastMessage: lastMessage,
                 timestamp: timestamp,
                 isSelected: selectedChatPhone == phoneNumber,
+                needsHuman: needsHuman,
                 onTap: () {
                   setState(() {
                     selectedChatPhone = phoneNumber;
@@ -1534,6 +1546,7 @@ class _ChatTile extends StatelessWidget {
   final String lastMessage;
   final DateTime? timestamp;
   final bool isSelected;
+  final bool needsHuman;
   final VoidCallback onTap;
 
   const _ChatTile({
@@ -1541,6 +1554,7 @@ class _ChatTile extends StatelessWidget {
     required this.lastMessage,
     required this.timestamp,
     required this.isSelected,
+    required this.needsHuman,
     required this.onTap,
   });
 
@@ -1632,6 +1646,17 @@ class _ChatTile extends StatelessWidget {
                     fontWeight: FontWeight.w400,
                   ),
                 ),
+                if (needsHuman) ...[
+                  const SizedBox(width: 8),
+                  Tooltip(
+                    message: 'Requiere atención humana',
+                    child: Icon(
+                      Icons.support_agent,
+                      size: 18,
+                      color: primaryAqua.withValues(alpha: 0.7),
+                    ),
+                  ),
+                ],
               ],
             ),
           ),
@@ -1869,6 +1894,7 @@ class SessionSettingsPanel extends StatefulWidget {
 class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
   late TextEditingController _apiKeyController;
   late TextEditingController _systemPromptController;
+  late TextEditingController _discriminatorPromptController;
   bool _aiEnabled = false;
   String _selectedModel = 'gemini-2.5-flash';
   int _responseDelayMs = 1500;
@@ -1880,6 +1906,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
   List<Map<String, String>> _keywordRules = [];
   String _newKeyword = '';
   String _newKeywordResponse = '';
+  bool _discriminatorEnabled = false;
   bool _isSaving = false;
   bool _isLoading = true;
 
@@ -1888,6 +1915,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
     super.initState();
     _apiKeyController = TextEditingController();
     _systemPromptController = TextEditingController();
+    _discriminatorPromptController = TextEditingController();
     _loadSettings();
   }
 
@@ -1947,6 +1975,11 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
             );
           }
 
+          // Discriminator
+          _discriminatorEnabled = data['ai_discriminator_enabled'] ?? false;
+          _discriminatorPromptController.text =
+              data['ai_discriminator_prompt'] ?? '';
+
           _isLoading = false;
         });
       } else {
@@ -1980,6 +2013,8 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
         },
         'ai_opted_out_contacts': _optedOutContacts,
         'ai_keyword_rules': _keywordRules,
+        'ai_discriminator_enabled': _discriminatorEnabled,
+        'ai_discriminator_prompt': _discriminatorPromptController.text.trim(),
       });
 
       if (mounted) {
@@ -2005,6 +2040,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
   void dispose() {
     _apiKeyController.dispose();
     _systemPromptController.dispose();
+    _discriminatorPromptController.dispose();
     super.dispose();
   }
 
@@ -2272,6 +2308,78 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
                   ),
                 ),
               ],
+            ),
+            const SizedBox(height: 24),
+            // Discriminator section
+            Container(
+              decoration: BoxDecoration(
+                color: darkBg.withValues(alpha: 0.5),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: primaryAqua.withValues(alpha: 0.1)),
+              ),
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text(
+                        'Discriminador de Intenciones',
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                          color: white,
+                        ),
+                      ),
+                      Switch(
+                        value: _discriminatorEnabled,
+                        onChanged: (value) {
+                          setState(() => _discriminatorEnabled = value);
+                        },
+                        activeThumbColor: primaryAqua,
+                      ),
+                    ],
+                  ),
+                  if (_discriminatorEnabled) ...[
+                    const SizedBox(height: 12),
+                    Text(
+                      'Define cuándo se requiere atención humana (lenguaje natural)',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: lightText.withValues(alpha: 0.7),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _discriminatorPromptController,
+                      minLines: 4,
+                      maxLines: 6,
+                      style: const TextStyle(color: white, fontSize: 14),
+                      decoration: InputDecoration(
+                        hintText: 'Ejemplo:\n\nPasa al humano si:\n- El cliente pregunta disponibilidad de fechas específicas\n- Quiere agendar una cita\n- Pregunta por saldo o historial personal\n\nDe lo contrario, responde tú mismo.',
+                        hintStyle: TextStyle(
+                          color: lightText.withValues(alpha: 0.3),
+                          fontSize: 13,
+                        ),
+                        filled: true,
+                        fillColor: darkBg,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(8),
+                          borderSide: BorderSide(
+                            color: primaryAqua.withValues(alpha: 0.1),
+                          ),
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(8),
+                          borderSide: const BorderSide(color: primaryAqua, width: 2),
+                        ),
+                        contentPadding: const EdgeInsets.all(12),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
             ),
             const SizedBox(height: 24),
             // Active hours section

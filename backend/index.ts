@@ -91,6 +91,10 @@ interface SessionData {
     };
     optedOutContacts: string[];
     keywordRules: { keyword: string; response: string }[];
+    discriminator?: {
+      enabled: boolean;
+      prompt: string;
+    };
     loadedAt: number;
   };
 }
@@ -238,6 +242,10 @@ async function getAIConfig(session: SessionData, accountId: string) {
       activeHours: data?.ai_active_hours,
       optedOutContacts: data?.ai_opted_out_contacts ?? [],
       keywordRules: data?.ai_keyword_rules ?? [],
+      discriminator: {
+        enabled: data?.ai_discriminator_enabled ?? false,
+        prompt: data?.ai_discriminator_prompt ?? '',
+      },
       loadedAt: now,
     };
 
@@ -252,6 +260,10 @@ async function getAIConfig(session: SessionData, accountId: string) {
       model: 'gemini-2.5-flash',
       optedOutContacts: [],
       keywordRules: [],
+      discriminator: {
+        enabled: false,
+        prompt: '',
+      },
       loadedAt: now,
     };
   }
@@ -330,6 +342,62 @@ async function generateAIResponse(
   } catch (error) {
     console.error('[AI] Error calling Gemini:', error);
     return null;
+  }
+}
+
+// Classify message intent using discriminator (TalkToAiAssistant or TalkToHuman)
+//
+// HOW IT WORKS:
+// 1. User writes natural language rules (e.g., "Pass to human if client asks about availability")
+// 2. The discriminator prompt is: {USER_RULES} + {CONVERSATION_HISTORY}
+// 3. Gemini analyzes if the latest message matches the rules
+// 4. Gemini responds with "Respuesta: SI" (AI can respond) or "Respuesta: NO" (needs human)
+// 5. Backend parses the response and routes accordingly
+//
+// EXAMPLE PROMPT (what user writes):
+// "Pass messages to a human if:
+//  - Client asks about specific availability (dates, times)
+//  - Client wants to book/reschedule an appointment
+//  - Client asks about personal data or account balance
+//
+//  For anything else, you can respond directly."
+async function classifyMessageIntent(
+  apiKey: string,
+  discriminatorPrompt: string,
+  conversationHistory: string,
+  modelName: string = 'gemini-2.5-flash'
+): Promise<'TalkToAiAssistant' | 'TalkToHuman'> {
+  try {
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({ model: modelName });
+
+    // Replace {HISTORY} placeholder with actual conversation
+    let userPrompt = discriminatorPrompt.replace('{HISTORY}', conversationHistory);
+
+    // Add instructions for clear response format
+    userPrompt += '\n\n---\nResponde SOLO con una de estas dos opciones:\n- Respuesta: SI (si el asistente puede responder)\n- Respuesta: NO (si requiere intervención humana)';
+
+    const result = await model.generateContent(userPrompt);
+    const responseText = result.response.text().toUpperCase();
+
+    console.log(`[Discriminator] Gemini response: ${responseText.substring(0, 100)}`);
+
+    // Check response for simple YES/NO keywords
+    // Look for "Respuesta: SI" or "Respuesta: NO"
+    if (responseText.includes('RESPUESTA: NO') || responseText.includes('NO')) {
+      // Check that it's actually saying NO, not just containing "NO" elsewhere
+      if (responseText.includes('RESPUESTA: NO')) {
+        return 'TalkToHuman';
+      }
+      // If only "NO" without context, treat as ambiguous and allow AI
+    }
+
+    // Default to AI response (SI or ambiguous)
+    return 'TalkToAiAssistant';
+  } catch (error) {
+    console.error('[Discriminator] Error classifying intent:', error);
+    // Default: allow AI response on error
+    return 'TalkToAiAssistant';
   }
 }
 
@@ -542,6 +610,63 @@ async function startSession(sessionKey: string, accountId: string) {
       }
     } catch (error) {
       console.log('[AI] Could not fetch message history, continuing without context:', error);
+    }
+
+    // DISCRIMINATOR: Check if message should be handled by AI or human
+    if (aiConfig.discriminator?.enabled && aiConfig.discriminator?.prompt) {
+      // Format conversation history for discriminator prompt
+      const historyText = history
+        .map((msg) => {
+          const role = msg.role === 'user' ? 'Customer' : 'Assistant';
+          return `${role}: ${msg.parts[0]?.text || ''}`;
+        })
+        .join('\n');
+
+      const conversationContext = `${historyText}\nCustomer: ${messageText}`;
+
+      const classification = await classifyMessageIntent(
+        aiConfig.apiKey,
+        aiConfig.discriminator.prompt,
+        conversationContext,
+        aiConfig.model
+      );
+
+      if (classification === 'TalkToHuman') {
+        // Mark chat as needing human attention
+        try {
+          const chatDocRef = db
+            .collection('accounts')
+            .doc(accountId)
+            .collection('whatsapp_sessions')
+            .doc(session.phoneNumber)
+            .collection('chats')
+            .doc(contactPhone);
+
+          await chatDocRef.update({
+            needs_human: true,
+            human_attention_at: admin.firestore.FieldValue.serverTimestamp(),
+          });
+
+          console.log(`[Discriminator] Chat ${contactPhone} marked as needs_human=true`);
+        } catch (error) {
+          console.error('[Discriminator] Error marking chat as needing human attention:', error);
+        }
+
+        // Emit Socket.io event to notify frontend
+        io.to(accountId).emit('human_attention_required', {
+          sessionKey,
+          chatId: contactPhone,
+          phoneNumber: session.phoneNumber,
+          timestamp: new Date().toISOString(),
+        });
+
+        console.log(
+          `[Discriminator] Emitted human_attention_required for ${contactPhone} (Session: ${session.phoneNumber})`
+        );
+        return; // Skip AI response
+      }
+
+      console.log(`[Discriminator] Classification: ${classification}, proceeding with AI response`);
     }
 
     // Humanization delay
