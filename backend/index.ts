@@ -326,6 +326,7 @@ async function generateAIResponse(
     const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({
       model: modelName,
+      systemInstruction: systemPrompt, // ✅ Include system prompt for all calls
     });
 
     // If we have history, use multi-turn chat; otherwise single-turn
@@ -334,9 +335,8 @@ async function generateAIResponse(
       const result = await chat.sendMessage(userMessage);
       return result.response.text();
     } else {
-      // Fallback: single turn with system prompt embedded
-      const fullPrompt = `${systemPrompt}\n\n${userMessage}`;
-      const result = await model.generateContent(fullPrompt);
+      // Fallback: single turn (system prompt already in model config)
+      const result = await model.generateContent(userMessage);
       return result.response.text();
     }
   } catch (error) {
