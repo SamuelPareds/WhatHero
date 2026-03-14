@@ -577,7 +577,7 @@ async function startSession(sessionKey: string, accountId: string) {
         .collection('chats').doc(contactPhone)
         .collection('messages')
         .orderBy('timestamp', 'desc')
-        .limit(10)
+        .limit(20) // Numero de mensajes que se pasan en el historial
         .get();
 
       const rawHistory = historyDocs.docs
