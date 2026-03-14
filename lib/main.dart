@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:firebase_core/firebase_core.dart';
@@ -2971,23 +2972,35 @@ class _MessagesViewState extends State<MessagesView> {
             child: Row(
               children: [
                 Expanded(
-                  child: TextField(
-                    controller: _messageController,
-                    maxLines: null,
-                    textCapitalization: TextCapitalization.sentences,
-                    style: const TextStyle(color: white, fontSize: 15),
-                    decoration: InputDecoration(
-                      hintText: 'Escribe un mensaje...',
-                      hintStyle: const TextStyle(color: lightText),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide.none,
-                      ),
-                      filled: true,
-                      fillColor: darkBg.withValues(alpha: 0.8),
-                      contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 14,
-                        vertical: 12,
+                  child: Focus(
+                    onKeyEvent: (node, event) {
+                      if (event.logicalKey == LogicalKeyboardKey.enter &&
+                          !HardwareKeyboard.instance.isShiftPressed) {
+                        // Enter sin Shift: enviar mensaje
+                        _sendMessage();
+                        return KeyEventResult.handled;
+                      }
+                      // Shift+Enter o cualquier otra tecla: permitir procesamiento normal
+                      return KeyEventResult.ignored;
+                    },
+                    child: TextField(
+                      controller: _messageController,
+                      maxLines: null,
+                      textCapitalization: TextCapitalization.sentences,
+                      style: const TextStyle(color: white, fontSize: 15),
+                      decoration: InputDecoration(
+                        hintText: 'Escribe un mensaje...',
+                        hintStyle: const TextStyle(color: lightText),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide.none,
+                        ),
+                        filled: true,
+                        fillColor: darkBg.withValues(alpha: 0.8),
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 12,
+                        ),
                       ),
                     ),
                   ),
