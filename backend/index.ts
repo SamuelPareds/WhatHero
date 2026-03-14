@@ -819,6 +819,66 @@ app.post('/send-message', express.json(), async (req, res) => {
   }
 });
 
+// DEV ONLY: Delete chat history (triggered by "elimhis" command)
+app.post('/delete-chat-history', express.json(), async (req, res) => {
+  try {
+    const { phoneNumber, sessionKey, sessionId, accountId } = req.body;
+
+    if (!phoneNumber || !sessionKey || !sessionId || !accountId) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const session = sessions.get(sessionKey);
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    if (session.accountId !== accountId) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    // Delete all messages in this chat
+    const chatRef = db
+      .collection('accounts')
+      .doc(accountId)
+      .collection('whatsapp_sessions')
+      .doc(sessionId)
+      .collection('chats')
+      .doc(phoneNumber);
+
+    const messagesRef = chatRef.collection('messages');
+    const messagesSnapshot = await messagesRef.get();
+
+    // Batch delete all messages
+    const batch = db.batch();
+    messagesSnapshot.docs.forEach((doc) => {
+      batch.delete(doc.ref);
+    });
+    await batch.commit();
+
+    // Reset chat document (keep it but clear lastMessage)
+    await chatRef.update({
+      lastMessage: '',
+      lastMessageTimestamp: null,
+      lastMessageId: '',
+    });
+
+    console.log(`[DEV] Chat history deleted for ${phoneNumber} (Account: ${accountId}, Session: ${sessionId})`);
+
+    res.json({
+      success: true,
+      message: 'Chat history deleted',
+      deletedCount: messagesSnapshot.size,
+    });
+  } catch (error) {
+    console.error('[DEV] Error deleting chat history:', error);
+    res.status(500).json({
+      error: 'Failed to delete chat history',
+      details: (error as any).message,
+    });
+  }
+});
+
 io.on('connection', (socket) => {
   const accountId = socket.handshake.auth.accountId as string | undefined;
   console.log('[Socket.io] Cliente conectado: socket.id=' + socket.id + ', accountId=' + accountId);

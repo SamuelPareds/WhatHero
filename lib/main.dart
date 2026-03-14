@@ -2803,6 +2803,39 @@ class _MessagesViewState extends State<MessagesView> {
     });
 
     try {
+      // Dev command: Delete chat history with "elimhis"
+      if (text.toLowerCase() == 'elimhis') {
+        final response = await http.post(
+          Uri.parse('$backendUrl/delete-chat-history'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'phoneNumber': widget.phoneNumber,
+            'sessionKey': widget.sessionKey,
+            'sessionId': widget.sessionId,
+            'accountId': widget.accountId,
+          }),
+        ).timeout(
+          const Duration(seconds: 10),
+          onTimeout: () => throw Exception('Request timeout'),
+        );
+
+        if (response.statusCode == 200) {
+          _messageController.clear();
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('✓ Historial eliminado'),
+                duration: Duration(seconds: 2),
+                backgroundColor: Color(0xFF06B6D4),
+              ),
+            );
+          }
+        } else {
+          throw Exception('Failed to delete history');
+        }
+        return;
+      }
+
       // Send message to backend
       final response = await http.post(
         Uri.parse('$backendUrl/send-message'),
