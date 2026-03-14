@@ -1653,7 +1653,7 @@ class _ChatTile extends StatelessWidget {
                     child: Icon(
                       Icons.support_agent,
                       size: 18,
-                      color: primaryAqua.withValues(alpha: 0.7),
+                      color: Colors.orange,
                     ),
                   ),
                 ],
@@ -2821,6 +2821,20 @@ class _MessagesViewState extends State<MessagesView> {
         // Message sent successfully - just clear the input
         // The message will appear in the chat via Firestore stream
         _messageController.clear();
+
+        // Reset needs_human flag when operator responds
+        try {
+          await FirebaseFirestore.instance
+              .collection('accounts')
+              .doc(widget.accountId)
+              .collection('whatsapp_sessions')
+              .doc(widget.sessionId)
+              .collection('chats')
+              .doc(widget.phoneNumber)
+              .update({'needs_human': false});
+        } catch (e) {
+          debugPrint('Error resetting needs_human: $e');
+        }
       } else {
         final error = response.body;
         throw Exception('Failed to send: $error');
