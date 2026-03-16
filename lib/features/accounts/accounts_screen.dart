@@ -8,7 +8,7 @@ import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/features/auth.dart';
 import 'package:crm_whatsapp/features/accounts/link_account_screen.dart';
 import 'package:crm_whatsapp/features/settings.dart';
-import 'package:crm_whatsapp/main.dart' show ChatsScreen;
+import 'package:crm_whatsapp/features/chat.dart';
 
 class AccountsScreen extends StatefulWidget {
   final String accountId;
