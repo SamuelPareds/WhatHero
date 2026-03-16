@@ -13,11 +13,10 @@ import { pino } from 'pino';
 import admin from 'firebase-admin';
 import { rmSync, existsSync, readdirSync, writeFileSync, readFileSync, mkdirSync } from 'fs';
 import { randomUUID } from 'crypto';
-import { GoogleGenerativeAI } from '@google/generative-ai';
 import { SessionData, MessageBuffer } from './src/types';
 import { extractPhoneNumber, storeLIDMapping, resolveLIDFromContacts } from './src/utils/phone';
-import { initializeSession, saveMessageToFirestore, getAIConfig, AI_CONFIG_TTL_MS } from './src/services/firestoreService';
-import { isWithinActiveHours, generateAIResponse, normalizeHistory, classifyMessageIntent, processMessageBuffer } from './src/services/aiService';
+import { initializeSession, saveMessageToFirestore, getAIConfig } from './src/services/firestoreService';
+import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer } from './src/services/aiService';
 
 // Ensure auth_info directory exists
 const authInfoDir = 'auth_info';
