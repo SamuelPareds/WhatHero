@@ -82,8 +82,11 @@ export async function saveMessageToFirestore(message: any, sessionKey: string, a
     }, { merge: true });
 
     // Update the chat document with lastMessage (for efficient list display)
+    // IMPORTANT: Store the remoteJid so we can use the correct format when replying
+    // (e.g., if it's @lid format, we need to use that exact format to send messages)
     await chatDocRef.set({
       phoneNumber,
+      remoteJid, // Store the full JID to preserve @lid or other formats
       lastMessage: messageText.substring(0, 100),
       lastMessageTimestamp: admin.firestore.Timestamp.fromDate(new Date(messageTimestamp)),
       lastMessageId: messageId,

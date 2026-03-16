@@ -87,6 +87,7 @@ class _MessagesViewState extends State<MessagesView> {
           'to': widget.phoneNumber,
           'text': text,
           'sessionKey': widget.sessionKey,
+          'accountId': widget.accountId,
         }),
       ).timeout(
         const Duration(seconds: 10),

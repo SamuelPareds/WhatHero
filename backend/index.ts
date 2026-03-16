@@ -15,7 +15,7 @@ import { rmSync, existsSync, readdirSync, writeFileSync, readFileSync, mkdirSync
 import { randomUUID } from 'crypto';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { SessionData, MessageBuffer } from './src/types';
-import { extractPhoneNumber } from './src/utils/phone';
+import { extractPhoneNumber, storeLIDMapping, resolveLIDFromContacts } from './src/utils/phone';
 import { initializeSession, saveMessageToFirestore, getAIConfig, AI_CONFIG_TTL_MS } from './src/services/firestoreService';
 import { isWithinActiveHours, generateAIResponse, normalizeHistory, classifyMessageIntent, processMessageBuffer } from './src/services/aiService';
 
@@ -107,6 +107,15 @@ async function startSession(sessionKey: string, accountId: string) {
   });
 
   sock.ev.on('creds.update', saveCreds);
+
+  // Listen for LID-to-Phone mappings (Baileys v6.6+)
+  // This is crucial for resolving @lid format JIDs to real phone numbers
+  (sock.ev.on as any)('lid-mapping.update', (mappings: Record<string, string>) => {
+    console.log(`[startSession] LID-Mapping update received with ${Object.keys(mappings).length} mappings`);
+    for (const [lid, phoneNumber] of Object.entries(mappings)) {
+      storeLIDMapping(lid, phoneNumber);
+    }
+  });
 
   sock.ev.on('connection.update', async (update: Partial<ConnectionState>) => {
     const { connection, lastDisconnect, qr } = update;
@@ -218,7 +227,19 @@ async function startSession(sessionKey: string, accountId: string) {
     if (!aiConfig.enabled || !aiConfig.apiKey) return;
 
     // Extract contact phone number
-    const contactPhone = extractPhoneNumber(remoteJid);
+    let contactPhone = extractPhoneNumber(remoteJid);
+
+    // If we got a LID format, try to resolve it to a real phone number
+    if (contactPhone && remoteJid.includes('@lid')) {
+      console.log(`[AI] Message from LID format: ${remoteJid}, attempting to resolve...`);
+      const resolved = await resolveLIDFromContacts(contactPhone, sock);
+      if (resolved) {
+        contactPhone = resolved;
+        console.log(`[AI] Successfully resolved LID to ${contactPhone}`);
+      } else {
+        console.warn(`[AI] Could not resolve LID ${contactPhone}, will use LID as contact identifier`);
+      }
+    }
 
     // Check if contact is opted out
     if (aiConfig.optedOutContacts?.includes(contactPhone)) {
@@ -405,19 +426,43 @@ app.post('/cancel-session', express.json(), async (req, res) => {
 // REST API endpoint to send messages
 app.post('/send-message', express.json(), async (req, res) => {
   try {
-    const { to, text, sessionKey } = req.body;
+    const { to, text, sessionKey, accountId } = req.body;
 
-    if (!to || !text || !sessionKey) {
-      return res.status(400).json({ error: 'Missing "to", "text", or "sessionKey" field' });
+    if (!to || !text || !sessionKey || !accountId) {
+      return res.status(400).json({ error: 'Missing required fields: to, text, sessionKey, accountId' });
     }
 
     const session = sessions.get(sessionKey);
-    if (!session?.isReady) {
+    if (!session?.isReady || !session?.phoneNumber) {
       return res.status(503).json({ error: 'Session not ready' });
     }
 
-    // Format the phone number for WhatsApp
-    const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
+    // Try to get the stored remoteJid from the chat document
+    // This is important for @lid format contacts - we need to use the exact JID format
+    let jid = to.includes('@') ? to : `${to}@s.whatsapp.net`; // Default fallback
+
+    try {
+      const chatDocRef = db
+        .collection('accounts')
+        .doc(accountId)
+        .collection('whatsapp_sessions')
+        .doc(session.phoneNumber)
+        .collection('chats')
+        .doc(to);
+
+      const chatDoc = await chatDocRef.get();
+      if (chatDoc.exists && chatDoc.data()?.remoteJid) {
+        jid = chatDoc.data()!.remoteJid;
+        console.log(`[/send-message] Using stored remoteJid: ${jid}`);
+      } else {
+        console.log(`[/send-message] No stored remoteJid found for ${to}, using default: ${jid}`);
+      }
+    } catch (error) {
+      console.warn(`[/send-message] Error retrieving chat document:`, error);
+      // Continue with default jid
+    }
+
+    console.log(`[/send-message] Sending message to JID: ${jid}`);
 
     // Send the message via Baileys
     const message = await session.sock.sendMessage(jid, { text });
