@@ -362,6 +362,40 @@ async function generateAIResponse(
   }
 }
 
+// Normalize message history to alternating user/model format for Gemini
+function normalizeHistory(
+  rawDocs: any[]
+): { role: 'user' | 'model'; parts: { text: string }[] }[] {
+  const rawHistory = rawDocs
+    .filter(d => d.text)
+    .map(d => ({
+      role: d.fromMe ? ('model' as const) : ('user' as const),
+      parts: [{ text: d.text as string }],
+    }));
+
+  const normalized: { role: 'user' | 'model'; parts: { text: string }[] }[] = [];
+  for (const msg of rawHistory) {
+    if (normalized.length === 0) {
+      if (msg.role === 'user') {
+        normalized.push(msg);
+      }
+    } else {
+      const lastRole = normalized[normalized.length - 1].role;
+      if (lastRole === 'user' && msg.role === 'model') {
+        normalized.push(msg);
+      } else if (lastRole === 'model' && msg.role === 'user') {
+        normalized.push(msg);
+      }
+    }
+  }
+
+  if (normalized.length > 0 && normalized[normalized.length - 1].role !== 'user') {
+    normalized.pop();
+  }
+
+  return normalized;
+}
+
 // Classify message intent using discriminator (TalkToAiAssistant or TalkToHuman)
 //
 // HOW IT WORKS:
@@ -399,17 +433,19 @@ async function classifyMessageIntent(
 
     console.log(`[Discriminator] Gemini response: ${responseText.substring(0, 100)}`);
 
-    // Check response for simple YES/NO keywords
-    // Look for "Respuesta: SI" or "Respuesta: NO"
-    if (responseText.includes('RESPUESTA: NO') || responseText.includes('NO')) {
-      // Check that it's actually saying NO, not just containing "NO" elsewhere
-      if (responseText.includes('RESPUESTA: NO')) {
-        return 'TalkToHuman';
-      }
-      // If only "NO" without context, treat as ambiguous and allow AI
+    // Check response for explicit YES/NO keywords
+    if (responseText.includes('RESPUESTA: NO')) {
+      console.log('[Discriminator] Decision: TalkToHuman (NO detected)');
+      return 'TalkToHuman';
     }
 
-    // Default to AI response (SI or ambiguous)
+    if (responseText.includes('RESPUESTA: SI')) {
+      console.log('[Discriminator] Decision: TalkToAiAssistant (SI detected)');
+      return 'TalkToAiAssistant';
+    }
+
+    // If response is ambiguous, default to AI response (safety: prefer responding to blocking)
+    console.log('[Discriminator] Decision: TalkToAiAssistant (ambiguous, defaulting to AI)');
     return 'TalkToAiAssistant';
   } catch (error) {
     console.error('[Discriminator] Error classifying intent:', error);
@@ -443,43 +479,20 @@ async function processMessageBuffer(
         .collection('chats').doc(contactPhone)
         .collection('messages')
         .orderBy('timestamp', 'desc')
-        .limit(10)
+        .limit(20)
         .get();
 
-      const rawHistory = historyDocs.docs
-        .reverse()
-        .filter(d => d.data().text)
-        .map(d => ({
-          role: d.data().fromMe ? ('model' as const) : ('user' as const),
-          parts: [{ text: d.data().text as string }],
-        }));
-
-      // Ensure history alternates correctly
-      history = [];
-      for (const msg of rawHistory) {
-        if (history.length === 0) {
-          if (msg.role === 'user') {
-            history.push(msg);
-          }
-        } else {
-          const lastRole = history[history.length - 1].role;
-          if (lastRole === 'user' && msg.role === 'model') {
-            history.push(msg);
-          } else if (lastRole === 'model' && msg.role === 'user') {
-            history.push(msg);
-          }
-        }
-      }
-
-      if (history.length > 0 && history[history.length - 1].role !== 'user') {
-        history.pop();
-      }
+      const rawDocs = historyDocs.docs.reverse().map(d => d.data());
+      history = normalizeHistory(rawDocs);
     } catch (error) {
       console.log('[Buffer] Could not fetch message history, continuing without context:', error);
     }
 
     // DISCRIMINATOR: Check if message should be handled by AI or human
     if (aiConfig.discriminator?.enabled && aiConfig.discriminator?.prompt) {
+      console.log(`[Discriminator] Enabled for ${contactPhone}, prompt length: ${aiConfig.discriminator.prompt.length}`);
+      console.log(`[Discriminator] Message: "${combinedMessage.substring(0, 80)}..."`);
+
       const historyText = history
         .map((msg) => {
           const role = msg.role === 'user' ? 'Customer' : 'Assistant';
@@ -495,6 +508,8 @@ async function processMessageBuffer(
         conversationContext,
         aiConfig.model
       );
+
+      console.log(`[Discriminator] Classification result: ${classification}`);
 
       if (classification === 'TalkToHuman') {
         try {
@@ -901,6 +916,69 @@ app.post('/send-message', express.json(), async (req, res) => {
     console.error('Error sending message:', error);
     res.status(500).json({
       error: 'Failed to send message',
+      details: (error as any).message,
+    });
+  }
+});
+
+// REST API endpoint to generate AI response (bypass discriminator)
+// Used when operator wants AI to generate a response for approval before sending
+app.post('/generate-ai-response', express.json(), async (req, res) => {
+  try {
+    const { chatPhone, sessionKey, accountId } = req.body;
+
+    if (!chatPhone || !sessionKey || !accountId) {
+      return res.status(400).json({ error: 'Missing chatPhone, sessionKey, or accountId' });
+    }
+
+    // Find active session
+    const sessionData = sessions.get(sessionKey);
+    if (!sessionData) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    const phoneNumber = sessionData.phoneNumber!;
+
+    // Load AI config
+    const aiConfig = await getAIConfig(sessionData, accountId);
+    if (!aiConfig.enabled || !aiConfig.apiKey) {
+      return res.status(400).json({ error: 'AI not configured for this session' });
+    }
+
+    // Fetch last 20 messages from chat
+    const messagesRef = db
+      .collection('accounts').doc(accountId)
+      .collection('whatsapp_sessions').doc(phoneNumber)
+      .collection('chats').doc(chatPhone)
+      .collection('messages')
+      .orderBy('timestamp', 'desc')
+      .limit(20);
+
+    const snapshot = await messagesRef.get();
+    const rawDocs = snapshot.docs.reverse().map(d => d.data());
+    const history = normalizeHistory(rawDocs);
+
+    // Get last user message for context
+    const lastUserMsg = rawDocs.filter(m => !m.fromMe).at(-1)?.text ?? '';
+
+    // Generate response directly (bypass discriminator)
+    const suggestedText = await generateAIResponse(
+      aiConfig.apiKey,
+      aiConfig.systemPrompt,
+      lastUserMsg,
+      history,
+      aiConfig.model
+    );
+
+    if (!suggestedText) {
+      return res.status(500).json({ error: 'AI failed to generate response' });
+    }
+
+    res.json({ suggestedText });
+  } catch (error) {
+    console.error('Error generating AI response:', error);
+    res.status(500).json({
+      error: 'Failed to generate response',
       details: (error as any).message,
     });
   }

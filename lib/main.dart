@@ -47,6 +47,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      debugShowCheckedModeBanner: false,
       title: 'WhatHero',
       theme: ThemeData(
         useMaterial3: true,
@@ -2794,6 +2795,7 @@ class _MessagesViewState extends State<MessagesView> {
   final TextEditingController _messageController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
   bool _isSending = false;
+  bool _isGenerating = false;
 
   @override
   void dispose() {
@@ -2897,6 +2899,37 @@ class _MessagesViewState extends State<MessagesView> {
         setState(() {
           _isSending = false;
         });
+      }
+    }
+  }
+
+  Future<void> _generateAIResponse() async {
+    setState(() => _isGenerating = true);
+    try {
+      final response = await http.post(
+        Uri.parse('$backendUrl/generate-ai-response'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'chatPhone': widget.phoneNumber,
+          'sessionKey': widget.sessionKey,
+          'accountId': widget.accountId,
+        }),
+      ).timeout(const Duration(seconds: 30));
+
+      if (response.statusCode == 200 && mounted) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final text = data['suggestedText'] as String? ?? '';
+        setState(() => _messageController.text = text);
+        _messageController.selection = TextSelection.fromPosition(
+          TextPosition(offset: text.length),
+        );
+      }
+    } catch (e) {
+      // Silent error - user can retry
+      debugPrint('Error generating AI response: $e');
+    } finally {
+      if (mounted) {
+        setState(() => _isGenerating = false);
       }
     }
   }
@@ -3006,6 +3039,26 @@ class _MessagesViewState extends State<MessagesView> {
                   ),
                 ),
                 const SizedBox(width: 8),
+                // Generate AI response button
+                _isGenerating
+                    ? const SizedBox(
+                        width: 44,
+                        height: 44,
+                        child: Padding(
+                          padding: EdgeInsets.all(8),
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF06B6D4)),
+                          ),
+                        ),
+                      )
+                    : IconButton(
+                        icon: const Icon(Icons.auto_awesome, size: 20),
+                        tooltip: 'Generar respuesta con IA',
+                        color: const Color(0xFF06B6D4),
+                        onPressed: _generateAIResponse,
+                      ),
+                const SizedBox(width: 4),
                 Container(
                   decoration: BoxDecoration(
                     color: primaryAqua,
