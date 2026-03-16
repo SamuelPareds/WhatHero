@@ -201,14 +201,24 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
               ),
             ),
             const SizedBox(height: 24),
-            // Title
-            const Text(
-              'Configuración IA',
-              style: TextStyle(
-                fontSize: 24,
-                fontWeight: FontWeight.bold,
-                color: white,
-              ),
+            // Title Row with Close Button
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text(
+                  'Configuración IA',
+                  style: TextStyle(
+                    fontSize: 24,
+                    fontWeight: FontWeight.bold,
+                    color: white,
+                  ),
+                ),
+                IconButton(
+                  onPressed: () => Navigator.pop(context),
+                  icon: const Icon(Icons.close, color: lightText),
+                  tooltip: 'Cerrar sin guardar',
+                ),
+              ],
             ),
             const SizedBox(height: 24),
             // Enable toggle
@@ -840,6 +850,24 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
                           fontSize: 16,
                         ),
                       ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            // Cancel button
+            SizedBox(
+              width: double.infinity,
+              child: TextButton(
+                onPressed: () => Navigator.pop(context),
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                ),
+                child: Text(
+                  'Cancelar',
+                  style: TextStyle(
+                    color: lightText.withValues(alpha: 0.7),
+                    fontSize: 14,
+                  ),
+                ),
               ),
             ),
             const SizedBox(height: 16),
