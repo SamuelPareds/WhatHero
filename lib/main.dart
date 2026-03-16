@@ -9,29 +9,8 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:http/http.dart' as http;
 import 'firebase_options.dart';
-
-// Colors - Dark Mode with Aqua Accent (Apple-style)
-const Color primaryAqua = Color(0xFF06B6D4); // Cyan/Verde Agua moderno
-const Color darkBg = Color(0xFF0F172A); // Fondo muy oscuro (navy)
-const Color surfaceDark = Color(0xFF1F2937); // Elementos oscuros (gris oscuro)
-const Color white = Color(0xFFF3F4F6); // Texto blanco (no puro)
-const Color lightText = Color(0xFFD1D5DB); // Gris claro secundario
-const Color accentAqua = Color(0xFF10B981); // Verde más saturado para detalles
-
-// Backend URL helper (Android emulator vs iOS/macOS vs Web)
-String get backendUrl {
-  if (kReleaseMode) {
-    return 'https://whathero-production.up.railway.app';
-  }
-
-  if (kIsWeb) {
-    return 'http://localhost:3000';
-  }
-  if (defaultTargetPlatform == TargetPlatform.android) {
-    return 'http://10.0.2.2:3000';
-  }
-  return 'http://localhost:3000';
-}
+import 'core.dart';
+import 'features/auth.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -49,578 +28,9 @@ class MyApp extends StatelessWidget {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'WhatHero',
-      theme: ThemeData(
-        useMaterial3: true,
-        brightness: Brightness.dark,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: primaryAqua,
-          brightness: Brightness.dark,
-        ),
-        appBarTheme: const AppBarTheme(
-          backgroundColor: surfaceDark,
-          foregroundColor: white,
-          elevation: 0,
-          surfaceTintColor: Colors.transparent,
-        ),
-        scaffoldBackgroundColor: darkBg,
-      ),
-      home: const AuthWrapper(),
-    );
-  }
-}
-
-// ============================================================================
-// AUTH FLOW
-// ============================================================================
-
-class AuthWrapper extends StatelessWidget {
-  const AuthWrapper({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return StreamBuilder<User?>(
-      stream: FirebaseAuth.instance.authStateChanges(),
-      builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting) {
-          return const Scaffold(
-            body: Center(
-              child: CircularProgressIndicator(color: primaryAqua),
-            ),
-          );
-        }
-
-        if (snapshot.hasData) {
-          return AccountsScreen(accountId: snapshot.data!.uid);
-        }
-
-        return const WelcomeScreen();
-      },
-    );
-  }
-}
-
-class WelcomeScreen extends StatelessWidget {
-  const WelcomeScreen({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: darkBg,
-      body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 32),
-          child: Column(
-            children: [
-              Expanded(
-                child: Center(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      // Hero icon container
-                      Container(
-                        width: 100,
-                        height: 100,
-                        decoration: BoxDecoration(
-                          color: primaryAqua.withValues(alpha: 0.15),
-                          borderRadius: BorderRadius.circular(24),
-                        ),
-                        child: const Center(
-                          child: Text(
-                            '🦸',
-                            style: TextStyle(fontSize: 56),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 32),
-                      const Text(
-                        'WhatHero',
-                        style: TextStyle(
-                          fontSize: 36,
-                          fontWeight: FontWeight.bold,
-                          color: white,
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      const Text(
-                        'Tu gestor de WhatsApp profesional',
-                        style: TextStyle(
-                          fontSize: 16,
-                          color: lightText,
-                        ),
-                        textAlign: TextAlign.center,
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-              Column(
-                children: [
-                  SizedBox(
-                    width: double.infinity,
-                    height: 56,
-                    child: ElevatedButton(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: primaryAqua,
-                        foregroundColor: darkBg,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                      ),
-                      onPressed: () {
-                        Navigator.push(
-                          context,
-                          MaterialPageRoute(
-                            builder: (_) => const LoginScreen(),
-                          ),
-                        );
-                      },
-                      child: const Text(
-                        'Iniciar Sesión',
-                        style: TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  SizedBox(
-                    width: double.infinity,
-                    child: TextButton(
-                      onPressed: () {
-                        Navigator.push(
-                          context,
-                          MaterialPageRoute(
-                            builder: (_) => const RegisterScreen(),
-                          ),
-                        );
-                      },
-                      child: const Text(
-                        'Crear cuenta',
-                        style: TextStyle(
-                          fontSize: 16,
-                          color: primaryAqua,
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class LoginScreen extends StatefulWidget {
-  const LoginScreen({super.key});
-
-  @override
-  State<LoginScreen> createState() => _LoginScreenState();
-}
-
-class _LoginScreenState extends State<LoginScreen> {
-  final emailController = TextEditingController();
-  final passwordController = TextEditingController();
-  bool isLoading = false;
-
-  @override
-  void dispose() {
-    emailController.dispose();
-    passwordController.dispose();
-    super.dispose();
-  }
-
-  Future<void> _signIn() async {
-    if (emailController.text.trim().isEmpty ||
-        passwordController.text.trim().isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Completa todos los campos')),
-      );
-      return;
-    }
-
-    setState(() => isLoading = true);
-    try {
-      await FirebaseAuth.instance.signInWithEmailAndPassword(
-        email: emailController.text.trim(),
-        password: passwordController.text.trim(),
-      );
-      // Pequeño delay para asegurar que Firebase haya actualizado el estado
-      if (!mounted) return;
-      await Future.delayed(const Duration(milliseconds: 500));
-      // Pop esta pantalla - AuthWrapper mostrará AccountsScreen automáticamente
-      if (mounted) Navigator.of(context).pop();
-    } on FirebaseAuthException catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(_authErrorMessage(e.code))),
-      );
-      setState(() => isLoading = false);
-    }
-  }
-
-  String _authErrorMessage(String code) {
-    switch (code) {
-      case 'user-not-found':
-      case 'wrong-password':
-      case 'invalid-credential':
-        return 'Email o contraseña incorrectos';
-      case 'invalid-email':
-        return 'Email inválido';
-      case 'too-many-requests':
-        return 'Demasiados intentos. Intenta más tarde';
-      default:
-        return 'Error al iniciar sesión';
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: darkBg,
-      appBar: AppBar(
-        title: const Text('Iniciar Sesión'),
-      ),
-      body: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          children: [
-            TextField(
-              controller: emailController,
-              enabled: !isLoading,
-              keyboardType: TextInputType.emailAddress,
-              decoration: InputDecoration(
-                hintText: 'Email',
-                hintStyle: const TextStyle(color: lightText),
-                filled: true,
-                fillColor: surfaceDark,
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: BorderSide.none,
-                ),
-                contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 16,
-                ),
-              ),
-              style: const TextStyle(color: white),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: passwordController,
-              enabled: !isLoading,
-              obscureText: true,
-              decoration: InputDecoration(
-                hintText: 'Contraseña',
-                hintStyle: const TextStyle(color: lightText),
-                filled: true,
-                fillColor: surfaceDark,
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: BorderSide.none,
-                ),
-                contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 16,
-                ),
-              ),
-              style: const TextStyle(color: white),
-            ),
-            const SizedBox(height: 32),
-            SizedBox(
-              width: double.infinity,
-              height: 56,
-              child: ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: primaryAqua,
-                  foregroundColor: darkBg,
-                  disabledBackgroundColor: Colors.grey,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
-                onPressed: isLoading ? null : _signIn,
-                child: isLoading
-                    ? const SizedBox(
-                        width: 24,
-                        height: 24,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          valueColor: AlwaysStoppedAnimation(darkBg),
-                        ),
-                      )
-                    : const Text(
-                        'Entrar',
-                        style: TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-              ),
-            ),
-            const SizedBox(height: 16),
-            TextButton(
-              onPressed: isLoading
-                  ? null
-                  : () {
-                      Navigator.pushReplacement(
-                        context,
-                        MaterialPageRoute(
-                          builder: (_) => const RegisterScreen(),
-                        ),
-                      );
-                    },
-              child: const Text(
-                '¿No tienes cuenta? Regístrate',
-                style: TextStyle(color: primaryAqua),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class RegisterScreen extends StatefulWidget {
-  const RegisterScreen({super.key});
-
-  @override
-  State<RegisterScreen> createState() => _RegisterScreenState();
-}
-
-class _RegisterScreenState extends State<RegisterScreen> {
-  final emailController = TextEditingController();
-  final passwordController = TextEditingController();
-  final confirmController = TextEditingController();
-  bool isLoading = false;
-  bool showPassword = false;
-  bool showConfirm = false;
-
-  @override
-  void dispose() {
-    emailController.dispose();
-    passwordController.dispose();
-    confirmController.dispose();
-    super.dispose();
-  }
-
-  Future<void> _register() async {
-    if (emailController.text.trim().isEmpty ||
-        passwordController.text.trim().isEmpty ||
-        confirmController.text.trim().isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Completa todos los campos')),
-      );
-      return;
-    }
-
-    if (passwordController.text != confirmController.text) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Las contraseñas no coinciden')),
-      );
-      return;
-    }
-
-    if (passwordController.text.length < 6) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('La contraseña debe tener al menos 6 caracteres')),
-      );
-      return;
-    }
-
-    setState(() => isLoading = true);
-    try {
-      await FirebaseAuth.instance.createUserWithEmailAndPassword(
-        email: emailController.text.trim(),
-        password: passwordController.text.trim(),
-      );
-
-      // Crear documento de cuenta en Firestore inmediatamente
-      final user = FirebaseAuth.instance.currentUser;
-      if (user != null) {
-        await FirebaseFirestore.instance
-          .collection('accounts')
-          .doc(user.uid)
-          .set({
-            'email': user.email,
-            'createdAt': Timestamp.now(),
-            'accountId': user.uid,
-          }, SetOptions(merge: true));
-      }
-
-      // Pequeño delay para asegurar que Firebase haya actualizado el estado
-      if (!mounted) return;
-      await Future.delayed(const Duration(milliseconds: 500));
-      // Pop esta pantalla - AuthWrapper mostrará AccountsScreen automáticamente
-      if (mounted) Navigator.of(context).pop();
-    } on FirebaseAuthException catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(_authErrorMessage(e.code))),
-      );
-      setState(() => isLoading = false);
-    }
-  }
-
-  String _authErrorMessage(String code) {
-    switch (code) {
-      case 'weak-password':
-        return 'Contraseña muy débil';
-      case 'email-already-in-use':
-        return 'Este email ya está registrado';
-      case 'invalid-email':
-        return 'Email inválido';
-      default:
-        return 'Error al registrarse';
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: darkBg,
-      appBar: AppBar(
-        title: const Text('Crear Cuenta'),
-      ),
-      body: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          children: [
-            TextField(
-              controller: emailController,
-              enabled: !isLoading,
-              keyboardType: TextInputType.emailAddress,
-              decoration: InputDecoration(
-                hintText: 'Email',
-                hintStyle: const TextStyle(color: lightText),
-                filled: true,
-                fillColor: surfaceDark,
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: BorderSide.none,
-                ),
-                contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 16,
-                ),
-              ),
-              style: const TextStyle(color: white),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: passwordController,
-              enabled: !isLoading,
-              obscureText: !showPassword,
-              decoration: InputDecoration(
-                hintText: 'Contraseña',
-                hintStyle: const TextStyle(color: lightText),
-                filled: true,
-                fillColor: surfaceDark,
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: BorderSide.none,
-                ),
-                contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 16,
-                ),
-                suffixIcon: IconButton(
-                  icon: Icon(
-                    showPassword ? Icons.visibility : Icons.visibility_off,
-                    color: lightText,
-                  ),
-                  onPressed: !isLoading
-                      ? () => setState(() => showPassword = !showPassword)
-                      : null,
-                ),
-              ),
-              style: const TextStyle(color: white),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: confirmController,
-              enabled: !isLoading,
-              obscureText: !showConfirm,
-              decoration: InputDecoration(
-                hintText: 'Confirmar contraseña',
-                hintStyle: const TextStyle(color: lightText),
-                filled: true,
-                fillColor: surfaceDark,
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: BorderSide.none,
-                ),
-                contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 16,
-                ),
-                suffixIcon: IconButton(
-                  icon: Icon(
-                    showConfirm ? Icons.visibility : Icons.visibility_off,
-                    color: lightText,
-                  ),
-                  onPressed: !isLoading
-                      ? () => setState(() => showConfirm = !showConfirm)
-                      : null,
-                ),
-              ),
-              style: const TextStyle(color: white),
-            ),
-            const SizedBox(height: 32),
-            SizedBox(
-              width: double.infinity,
-              height: 56,
-              child: ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: primaryAqua,
-                  foregroundColor: darkBg,
-                  disabledBackgroundColor: Colors.grey,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
-                onPressed: isLoading ? null : _register,
-                child: isLoading
-                    ? const SizedBox(
-                        width: 24,
-                        height: 24,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          valueColor: AlwaysStoppedAnimation(darkBg),
-                        ),
-                      )
-                    : const Text(
-                        'Registrarse',
-                        style: TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-              ),
-            ),
-            const SizedBox(height: 16),
-            TextButton(
-              onPressed: isLoading
-                  ? null
-                  : () {
-                      Navigator.pushReplacement(
-                        context,
-                        MaterialPageRoute(
-                          builder: (_) => const LoginScreen(),
-                        ),
-                      );
-                    },
-              child: const Text(
-                '¿Ya tienes cuenta? Inicia sesión',
-                style: TextStyle(color: primaryAqua),
-              ),
-            ),
-          ],
-        ),
+      theme: buildWhatHeroTheme(),
+      home: AuthWrapper(
+        onUserAuthenticated: (accountId) => AccountsScreen(accountId: accountId),
       ),
     );
   }
@@ -686,8 +96,11 @@ class _AccountsScreenState extends State<AccountsScreen> {
 
   @override
   void dispose() {
+    // Remove all socket listeners before disconnecting
+    socket.off('connect');
+    socket.off('disconnect');
+    socket.off('human_attention_required');
     socket.disconnect();
-    socket.dispose();
     super.dispose();
   }
 
@@ -1153,29 +566,35 @@ class _WhatsAppHandshakeScreenState extends State<WhatsAppHandshakeScreen> {
     socket.connect();
 
     socket.onConnect((_) {
-      setState(() {
-        status = 'Esperando QR';
-      });
+      if (mounted) {
+        setState(() {
+          status = 'Esperando QR';
+        });
+      }
     });
 
     socket.on('qr', (data) {
-      setState(() {
-        qrCode = data;
-        status = 'Esperando QR';
-        isConnected = false;
-      });
+      if (mounted) {
+        setState(() {
+          qrCode = data;
+          status = 'Esperando QR';
+          isConnected = false;
+        });
+      }
     });
 
     socket.on('ready', (_) {
-      setState(() {
-        isConnected = true;
-        qrCode = null;
-        status = 'Conectado';
-      });
+      if (mounted) {
+        setState(() {
+          isConnected = true;
+          qrCode = null;
+          status = 'Conectado';
+        });
+      }
     });
 
     socket.on('status_update', (data) {
-      if (data is Map && data['status'] == 'logged_out') {
+      if (data is Map && data['status'] == 'logged_out' && mounted) {
         setState(() {
           isConnected = false;
           qrCode = null;
@@ -1185,17 +604,25 @@ class _WhatsAppHandshakeScreenState extends State<WhatsAppHandshakeScreen> {
     });
 
     socket.onDisconnect((_) {
-      setState(() {
-        status = 'Desconectado';
-        isConnected = false;
-        qrCode = null;
-      });
+      if (mounted) {
+        setState(() {
+          status = 'Desconectado';
+          isConnected = false;
+          qrCode = null;
+        });
+      }
     });
   }
 
   @override
   void dispose() {
-    socket.dispose();
+    // Remove all socket listeners before disconnecting
+    socket.off('connect');
+    socket.off('qr');
+    socket.off('ready');
+    socket.off('status_update');
+    socket.off('disconnect');
+    socket.disconnect();
     super.dispose();
   }
 

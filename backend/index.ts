@@ -14,6 +14,8 @@ import admin from 'firebase-admin';
 import { rmSync, existsSync, readdirSync, writeFileSync, readFileSync, mkdirSync } from 'fs';
 import { randomUUID } from 'crypto';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { SessionData, MessageBuffer } from './src/types';
+import { extractPhoneNumber } from './src/utils/phone';
 
 // Ensure auth_info directory exists
 const authInfoDir = 'auth_info';
@@ -70,61 +72,10 @@ const io = new Server(httpServer, {
 const db = admin.firestore();
 const logger = pino({ level: 'info' }, pino.destination({ sync: false }));
 
-interface SessionData {
-  sock: any;
-  isReady: boolean;
-  currentQR: string | undefined;
-  phoneNumber: string | undefined;
-  isReconnecting: boolean;
-  accountId: string;
-  aiConfig?: {
-    enabled: boolean;
-    apiKey: string;
-    systemPrompt: string;
-    responseDelayMs: number;
-    model: string;
-    activeHours?: {
-      enabled: boolean;
-      timezone: string;
-      start: string;
-      end: string;
-    };
-    optedOutContacts: string[];
-    keywordRules: { keyword: string; response: string }[];
-    discriminator?: {
-      enabled: boolean;
-      prompt: string;
-    };
-    loadedAt: number;
-  };
-}
-
 const sessions = new Map<string, SessionData>();
-
-// Message buffer interface for aggregating multiple messages before processing
-interface MessageBuffer {
-  contactPhone: string;
-  messages: string[];
-  timeout: NodeJS.Timeout | null;
-  responded: boolean;
-}
 
 // Message buffers per chat: key = `${sessionKey}:${contactPhone}`
 const messageBuffers = new Map<string, MessageBuffer>();
-
-// Helper function to extract and clean phone number from Baileys JID
-// Handles format: "5215561642726:50@s.whatsapp.net" -> "5215561642726"
-function extractPhoneNumber(jid: string | undefined): string {
-  if (!jid) return '';
-
-  // Remove WhatsApp domain suffixes
-  let cleaned = jid.replace('@s.whatsapp.net', '').replace('@g.us', '');
-
-  // Remove device suffix (e.g., ":50")
-  const phoneOnly = cleaned.split(':')[0];
-
-  return phoneOnly || '';
-}
 
 // Initialize/update session document in Firestore
 async function initializeSession(phoneNumber: string, sessionKey: string, accountId: string) {
