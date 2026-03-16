@@ -8,6 +8,8 @@ export interface SessionData {
   aiConfig?: {
     enabled: boolean;
     apiKey: string;
+    provider?: 'gemini' | 'openai';
+    openaiApiKey?: string;
     systemPrompt: string;
     responseDelayMs: number;
     model: string;

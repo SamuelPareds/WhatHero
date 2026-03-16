@@ -18,9 +18,11 @@ class SessionSettingsPanel extends StatefulWidget {
 
 class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
   late TextEditingController _apiKeyController;
+  late TextEditingController _openaiApiKeyController;
   late TextEditingController _systemPromptController;
   late TextEditingController _discriminatorPromptController;
   bool _aiEnabled = false;
+  String _selectedProvider = 'gemini';
   String _selectedModel = 'gemini-2.5-flash';
   int _responseDelayMs = 15000; // Default: 15 seconds
   bool _activeHoursEnabled = false;
@@ -39,6 +41,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
   void initState() {
     super.initState();
     _apiKeyController = TextEditingController();
+    _openaiApiKeyController = TextEditingController();
     _systemPromptController = TextEditingController();
     _discriminatorPromptController = TextEditingController();
     _loadSettings();
@@ -57,10 +60,13 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
         final data = doc.data() ?? {};
         setState(() {
           _aiEnabled = data['ai_enabled'] ?? false;
+          _selectedProvider = data['ai_provider'] ?? 'gemini';
           _apiKeyController.text = data['ai_api_key'] ?? '';
+          _openaiApiKeyController.text = data['ai_openai_api_key'] ?? '';
           _systemPromptController.text =
               data['ai_system_prompt'] ?? 'Eres un asistente útil.';
-          _selectedModel = data['ai_model'] ?? 'gemini-2.5-flash';
+          _selectedModel = data['ai_model'] ??
+              (_selectedProvider == 'openai' ? 'gpt-4o-mini' : 'gemini-2.5-flash');
           _responseDelayMs = data['ai_response_delay_ms'] ?? 15000;
 
           // Active hours
@@ -126,7 +132,9 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
           .doc(widget.sessionId)
           .update({
         'ai_enabled': _aiEnabled,
+        'ai_provider': _selectedProvider,
         'ai_api_key': _apiKeyController.text,
+        'ai_openai_api_key': _openaiApiKeyController.text,
         'ai_system_prompt': _systemPromptController.text,
         'ai_model': _selectedModel,
         'ai_response_delay_ms': _responseDelayMs,
@@ -164,6 +172,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
   @override
   void dispose() {
     _apiKeyController.dispose();
+    _openaiApiKeyController.dispose();
     _systemPromptController.dispose();
     _discriminatorPromptController.dispose();
     super.dispose();
@@ -255,6 +264,63 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
               ),
             ),
             const SizedBox(height: 20),
+            // Provider selector
+            const Text(
+              'Proveedor de IA',
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+                color: lightText,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Container(
+              decoration: BoxDecoration(
+                color: darkBg.withValues(alpha: 0.3),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: primaryAqua.withValues(alpha: 0.2),
+                ),
+              ),
+              child: DropdownButton<String>(
+                value: _selectedProvider,
+                onChanged: (String? value) {
+                  if (value != null) {
+                    setState(() {
+                      _selectedProvider = value;
+                      // Reset model to provider default when switching
+                      _selectedModel = value == 'openai' ? 'gpt-4o-mini' : 'gemini-2.5-flash';
+                    });
+                  }
+                },
+                isExpanded: true,
+                underline: const SizedBox(),
+                dropdownColor: surfaceDark,
+                items: [
+                  DropdownMenuItem(
+                    value: 'gemini',
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      child: Text(
+                        'Google Gemini',
+                        style: TextStyle(color: primaryAqua),
+                      ),
+                    ),
+                  ),
+                  DropdownMenuItem(
+                    value: 'openai',
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      child: Text(
+                        'OpenAI',
+                        style: TextStyle(color: white),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 20),
             // Model selector
             const Text(
               'Modelo de IA',
@@ -283,83 +349,150 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
                 isExpanded: true,
                 underline: const SizedBox(),
                 dropdownColor: surfaceDark,
-                items: [
-                  DropdownMenuItem(
-                    value: 'gemini-2.5-flash',
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 16),
-                      child: Text(
-                        'Flash 2.5 (Recomendado)',
-                        style: TextStyle(color: primaryAqua),
-                      ),
-                    ),
-                  ),
-                  DropdownMenuItem(
-                    value: 'gemini-3-flash',
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 16),
-                      child: Text(
-                        'Flash 3 (Más rápido)',
-                        style: TextStyle(color: white),
-                      ),
-                    ),
-                  ),
-                  DropdownMenuItem(
-                    value: 'gemini-2.5-pro',
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 16),
-                      child: Text(
-                        'Pro 2.5 (Más preciso)',
-                        style: TextStyle(color: white),
-                      ),
-                    ),
-                  ),
-                  DropdownMenuItem(
-                    value: 'gemini-2.5-flash-lite',
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 16),
-                      child: Text(
-                        'Flash Lite (Más barato)',
-                        style: TextStyle(color: lightText),
-                      ),
-                    ),
-                  ),
-                ],
+                items: _selectedProvider == 'openai'
+                    ? [
+                        DropdownMenuItem(
+                          value: 'gpt-4o-mini',
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 16),
+                            child: Text(
+                              'GPT-4o Mini (Recomendado)',
+                              style: TextStyle(color: primaryAqua),
+                            ),
+                          ),
+                        ),
+                        DropdownMenuItem(
+                          value: 'gpt-4o',
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 16),
+                            child: Text(
+                              'GPT-4o (Más potente)',
+                              style: TextStyle(color: white),
+                            ),
+                          ),
+                        ),
+                        DropdownMenuItem(
+                          value: 'gpt-4-turbo',
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 16),
+                            child: Text(
+                              'GPT-4 Turbo (Más rápido)',
+                              style: TextStyle(color: lightText),
+                            ),
+                          ),
+                        ),
+                      ]
+                    : [
+                        DropdownMenuItem(
+                          value: 'gemini-2.5-flash',
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 16),
+                            child: Text(
+                              'Flash 2.5 (Recomendado)',
+                              style: TextStyle(color: primaryAqua),
+                            ),
+                          ),
+                        ),
+                        DropdownMenuItem(
+                          value: 'gemini-3-flash',
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 16),
+                            child: Text(
+                              'Flash 3 (Más rápido)',
+                              style: TextStyle(color: white),
+                            ),
+                          ),
+                        ),
+                        DropdownMenuItem(
+                          value: 'gemini-2.5-pro',
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 16),
+                            child: Text(
+                              'Pro 2.5 (Más preciso)',
+                              style: TextStyle(color: white),
+                            ),
+                          ),
+                        ),
+                        DropdownMenuItem(
+                          value: 'gemini-2.5-flash-lite',
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 16),
+                            child: Text(
+                              'Flash Lite (Más barato)',
+                              style: TextStyle(color: lightText),
+                            ),
+                          ),
+                        ),
+                      ],
               ),
             ),
             const SizedBox(height: 20),
-            // API Key field
-            const Text(
-              'Gemini API Key',
-              style: TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.w600,
-                color: lightText,
+            // API Key fields (conditional based on provider)
+            if (_selectedProvider == 'gemini') ...[
+              const Text(
+                'Gemini API Key',
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                  color: lightText,
+                ),
               ),
-            ),
-            const SizedBox(height: 8),
-            TextField(
-              controller: _apiKeyController,
-              obscureText: true,
-              enabled: !_isSaving,
-              decoration: InputDecoration(
-                hintText: 'sk-...',
-                hintStyle: TextStyle(color: lightText.withValues(alpha: 0.5)),
-                filled: true,
-                fillColor: darkBg.withValues(alpha: 0.3),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: BorderSide(
-                    color: primaryAqua.withValues(alpha: 0.2),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _apiKeyController,
+                obscureText: true,
+                enabled: !_isSaving,
+                decoration: InputDecoration(
+                  hintText: 'AIza...',
+                  hintStyle: TextStyle(color: lightText.withValues(alpha: 0.5)),
+                  filled: true,
+                  fillColor: darkBg.withValues(alpha: 0.3),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide: BorderSide(
+                      color: primaryAqua.withValues(alpha: 0.2),
+                    ),
+                  ),
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 12,
                   ),
                 ),
-                contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 12,
+                style: const TextStyle(color: white),
+              ),
+            ] else ...[
+              const Text(
+                'OpenAI API Key',
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                  color: lightText,
                 ),
               ),
-              style: const TextStyle(color: white),
-            ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _openaiApiKeyController,
+                obscureText: true,
+                enabled: !_isSaving,
+                decoration: InputDecoration(
+                  hintText: 'sk-...',
+                  hintStyle: TextStyle(color: lightText.withValues(alpha: 0.5)),
+                  filled: true,
+                  fillColor: darkBg.withValues(alpha: 0.3),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide: BorderSide(
+                      color: primaryAqua.withValues(alpha: 0.2),
+                    ),
+                  ),
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 12,
+                  ),
+                ),
+                style: const TextStyle(color: white),
+              ),
+            ],
             const SizedBox(height: 20),
             // System prompt field
             const Text(

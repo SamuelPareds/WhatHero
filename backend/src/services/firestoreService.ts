@@ -131,6 +131,8 @@ export async function getAIConfig(session: SessionData, accountId: string) {
     session.aiConfig = {
       enabled: data?.ai_enabled ?? false,
       apiKey: data?.ai_api_key ?? '',
+      provider: data?.ai_provider ?? 'gemini',
+      openaiApiKey: data?.ai_openai_api_key ?? '',
       systemPrompt: data?.ai_system_prompt ?? '',
       responseDelayMs: data?.ai_response_delay_ms ?? 1500,
       model: data?.ai_model ?? 'gemini-2.5-flash',
@@ -150,6 +152,8 @@ export async function getAIConfig(session: SessionData, accountId: string) {
     return {
       enabled: false,
       apiKey: '',
+      provider: 'gemini',
+      openaiApiKey: '',
       systemPrompt: '',
       responseDelayMs: 0,
       model: 'gemini-2.5-flash',

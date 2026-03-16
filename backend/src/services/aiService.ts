@@ -1,5 +1,6 @@
 import admin from 'firebase-admin';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import OpenAI from 'openai';
 import { SessionData } from '../types';
 
 // Lazy evaluation: getDb() is called only after Firebase is initialized
@@ -58,8 +59,42 @@ export function isWithinActiveHours(aiConfig: any): boolean {
   }
 }
 
-// Generate AI response using Gemini with conversation history
+// Generate AI response using Gemini or OpenAI with conversation history
 export async function generateAIResponse(
+  apiKey: string,
+  systemPrompt: string,
+  userMessage: string,
+  history?: { role: 'user' | 'model'; parts: { text: string }[] }[],
+  modelName: string = 'gemini-2.5-flash',
+  provider: 'gemini' | 'openai' = 'gemini',
+  openaiApiKey?: string
+): Promise<string | null> {
+  try {
+    if (provider === 'openai') {
+      return await generateAIResponseOpenAI(
+        openaiApiKey || apiKey,
+        systemPrompt,
+        userMessage,
+        history,
+        modelName
+      );
+    } else {
+      return await generateAIResponseGemini(
+        apiKey,
+        systemPrompt,
+        userMessage,
+        history,
+        modelName
+      );
+    }
+  } catch (error) {
+    console.error('[AI] Error calling AI service:', error);
+    return null;
+  }
+}
+
+// Generate AI response using Gemini
+async function generateAIResponseGemini(
   apiKey: string,
   systemPrompt: string,
   userMessage: string,
@@ -91,6 +126,55 @@ export async function generateAIResponse(
     }
   } catch (error) {
     console.error('[AI] Error calling Gemini:', error);
+    return null;
+  }
+}
+
+// Generate AI response using OpenAI
+async function generateAIResponseOpenAI(
+  apiKey: string,
+  systemPrompt: string,
+  userMessage: string,
+  history?: { role: 'user' | 'model'; parts: { text: string }[] }[],
+  modelName: string = 'gpt-4o-mini'
+): Promise<string | null> {
+  try {
+    const client = new OpenAI({ apiKey });
+
+    // Convert Gemini history format to OpenAI format
+    const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+      {
+        role: 'system',
+        content: systemPrompt,
+      },
+    ];
+
+    // Add conversation history
+    if (history && history.length > 0) {
+      for (const msg of history) {
+        messages.push({
+          role: msg.role === 'user' ? 'user' : 'assistant',
+          content: msg.parts[0]?.text || '',
+        });
+      }
+    }
+
+    // Add current user message
+    messages.push({
+      role: 'user',
+      content: userMessage,
+    });
+
+    const response = await client.chat.completions.create({
+      model: modelName,
+      messages,
+      temperature: 0.7,
+      max_tokens: 1000,
+    });
+
+    return response.choices[0]?.message.content || null;
+  } catch (error) {
+    console.error('[AI] Error calling OpenAI:', error);
     return null;
   }
 }
@@ -134,8 +218,8 @@ export function normalizeHistory(
 // HOW IT WORKS:
 // 1. User writes natural language rules (e.g., "Pass to human if client asks about availability")
 // 2. The discriminator prompt is: {USER_RULES} + {CONVERSATION_HISTORY}
-// 3. Gemini analyzes if the latest message matches the rules
-// 4. Gemini responds with "Respuesta: SI" (AI can respond) or "Respuesta: NO" (needs human)
+// 3. AI analyzes if the latest message matches the rules
+// 4. AI responds with "Respuesta: SI" (AI can respond) or "Respuesta: NO" (needs human)
 // 5. Backend parses the response and routes accordingly
 //
 // EXAMPLE PROMPT (what user writes):
@@ -146,6 +230,38 @@ export function normalizeHistory(
 //
 //  For anything else, you can respond directly."
 export async function classifyMessageIntent(
+  apiKey: string,
+  discriminatorPrompt: string,
+  conversationHistory: string,
+  modelName: string = 'gemini-2.5-flash',
+  provider: 'gemini' | 'openai' = 'gemini',
+  openaiApiKey?: string
+): Promise<'TalkToAiAssistant' | 'TalkToHuman'> {
+  try {
+    if (provider === 'openai') {
+      return await classifyMessageIntentOpenAI(
+        openaiApiKey || apiKey,
+        discriminatorPrompt,
+        conversationHistory,
+        modelName
+      );
+    } else {
+      return await classifyMessageIntentGemini(
+        apiKey,
+        discriminatorPrompt,
+        conversationHistory,
+        modelName
+      );
+    }
+  } catch (error) {
+    console.error('[Discriminator] Error classifying intent:', error);
+    // Default: allow AI response on error
+    return 'TalkToAiAssistant';
+  }
+}
+
+// Classify using Gemini
+async function classifyMessageIntentGemini(
   apiKey: string,
   discriminatorPrompt: string,
   conversationHistory: string,
@@ -181,7 +297,60 @@ export async function classifyMessageIntent(
     console.log('[Discriminator] Decision: TalkToAiAssistant (ambiguous, defaulting to AI)');
     return 'TalkToAiAssistant';
   } catch (error) {
-    console.error('[Discriminator] Error classifying intent:', error);
+    console.error('[Discriminator] Error classifying intent with Gemini:', error);
+    // Default: allow AI response on error
+    return 'TalkToAiAssistant';
+  }
+}
+
+// Classify using OpenAI
+async function classifyMessageIntentOpenAI(
+  apiKey: string,
+  discriminatorPrompt: string,
+  conversationHistory: string,
+  modelName: string = 'gpt-4o-mini'
+): Promise<'TalkToAiAssistant' | 'TalkToHuman'> {
+  try {
+    const client = new OpenAI({ apiKey });
+
+    // Replace {HISTORY} placeholder with actual conversation
+    let userPrompt = discriminatorPrompt.replace('{HISTORY}', conversationHistory);
+
+    // Add instructions for clear response format
+    userPrompt += '\n\n---\nResponde SOLO con una de estas dos opciones:\n- Respuesta: SI (si el asistente puede responder)\n- Respuesta: NO (si requiere intervención humana)';
+
+    const response = await client.chat.completions.create({
+      model: modelName,
+      messages: [
+        {
+          role: 'user',
+          content: userPrompt,
+        },
+      ],
+      temperature: 0.7,
+      max_tokens: 100,
+    });
+
+    const responseText = (response.choices[0]?.message.content || '').toUpperCase();
+
+    console.log(`[Discriminator] OpenAI response: ${responseText.substring(0, 100)}`);
+
+    // Check response for explicit YES/NO keywords
+    if (responseText.includes('RESPUESTA: NO')) {
+      console.log('[Discriminator] Decision: TalkToHuman (NO detected)');
+      return 'TalkToHuman';
+    }
+
+    if (responseText.includes('RESPUESTA: SI')) {
+      console.log('[Discriminator] Decision: TalkToAiAssistant (SI detected)');
+      return 'TalkToAiAssistant';
+    }
+
+    // If response is ambiguous, default to AI response (safety: prefer responding to blocking)
+    console.log('[Discriminator] Decision: TalkToAiAssistant (ambiguous, defaulting to AI)');
+    return 'TalkToAiAssistant';
+  } catch (error) {
+    console.error('[Discriminator] Error classifying intent with OpenAI:', error);
     // Default: allow AI response on error
     return 'TalkToAiAssistant';
   }
@@ -239,7 +408,9 @@ export async function processMessageBuffer(
         aiConfig.apiKey,
         aiConfig.discriminator.prompt,
         conversationContext,
-        aiConfig.model
+        aiConfig.model,
+        aiConfig.provider || 'gemini',
+        aiConfig.openaiApiKey
       );
 
       console.log(`[Discriminator] Classification result: ${classification}`);
@@ -286,7 +457,9 @@ export async function processMessageBuffer(
       aiConfig.systemPrompt || 'Eres un asistente útil.',
       combinedMessage,
       history,
-      aiConfig.model
+      aiConfig.model,
+      aiConfig.provider || 'gemini',
+      aiConfig.openaiApiKey
     );
 
     if (aiResponse) {

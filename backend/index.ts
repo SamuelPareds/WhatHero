@@ -223,13 +223,18 @@ async function startSession(sessionKey: string, accountId: string) {
     if (!session?.phoneNumber) return;
 
     const aiConfig = await getAIConfig(session, accountId);
-    if (!aiConfig.enabled || !aiConfig.apiKey) return;
+    const provider: 'gemini' | 'openai' = (aiConfig.provider || 'gemini') as 'gemini' | 'openai';
+    const hasValidApiKey = provider === 'openai'
+      ? aiConfig.openaiApiKey
+      : aiConfig.apiKey;
+    if (!aiConfig.enabled || !hasValidApiKey) return;
 
     // Extract contact phone number
     let contactPhone = extractPhoneNumber(remoteJid);
+    if (!contactPhone) return; // Skip if we can't extract phone number
 
     // If we got a LID format, try to resolve it to a real phone number
-    if (contactPhone && remoteJid.includes('@lid')) {
+    if (remoteJid.includes('@lid')) {
       console.log(`[AI] Message from LID format: ${remoteJid}, attempting to resolve...`);
       const resolved = await resolveLIDFromContacts(contactPhone, sock);
       if (resolved) {
@@ -241,7 +246,8 @@ async function startSession(sessionKey: string, accountId: string) {
     }
 
     // Check if contact is opted out
-    if (aiConfig.optedOutContacts?.includes(contactPhone)) {
+    const optedOut = (aiConfig.optedOutContacts as string[]) || [];
+    if (optedOut.includes(contactPhone)) {
       console.log(`[AI] Contact ${contactPhone} is opted out, skipping AI response`);
       return;
     }
@@ -502,7 +508,11 @@ app.post('/generate-ai-response', express.json(), async (req, res) => {
 
     // Load AI config
     const aiConfig = await getAIConfig(sessionData, accountId);
-    if (!aiConfig.enabled || !aiConfig.apiKey) {
+    const provider: 'gemini' | 'openai' = (aiConfig.provider || 'gemini') as 'gemini' | 'openai';
+    const hasValidApiKey = provider === 'openai'
+      ? aiConfig.openaiApiKey
+      : aiConfig.apiKey;
+    if (!aiConfig.enabled || !hasValidApiKey) {
       return res.status(400).json({ error: 'AI not configured for this session' });
     }
 
@@ -528,7 +538,9 @@ app.post('/generate-ai-response', express.json(), async (req, res) => {
       aiConfig.systemPrompt,
       lastUserMsg,
       history,
-      aiConfig.model
+      aiConfig.model,
+      provider,
+      aiConfig.openaiApiKey
     );
 
     if (!suggestedText) {
