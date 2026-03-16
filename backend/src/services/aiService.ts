@@ -179,38 +179,16 @@ async function generateAIResponseOpenAI(
   }
 }
 
-// Normalize message history to alternating user/model format for Gemini
+// Normalize message history to preserve all messages for better context
 export function normalizeHistory(
   rawDocs: any[]
 ): { role: 'user' | 'model'; parts: { text: string }[] }[] {
-  const rawHistory = rawDocs
-    .filter(d => d.text)
+  return rawDocs
+    .filter(d => d.text && d.text.trim().length > 0)
     .map(d => ({
       role: d.fromMe ? ('model' as const) : ('user' as const),
       parts: [{ text: d.text as string }],
     }));
-
-  const normalized: { role: 'user' | 'model'; parts: { text: string }[] }[] = [];
-  for (const msg of rawHistory) {
-    if (normalized.length === 0) {
-      if (msg.role === 'user') {
-        normalized.push(msg);
-      }
-    } else {
-      const lastRole = normalized[normalized.length - 1].role;
-      if (lastRole === 'user' && msg.role === 'model') {
-        normalized.push(msg);
-      } else if (lastRole === 'model' && msg.role === 'user') {
-        normalized.push(msg);
-      }
-    }
-  }
-
-  if (normalized.length > 0 && normalized[normalized.length - 1].role !== 'user') {
-    normalized.pop();
-  }
-
-  return normalized;
 }
 
 // Classify message intent using discriminator (TalkToAiAssistant or TalkToHuman)
@@ -271,11 +249,17 @@ async function classifyMessageIntentGemini(
     const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({ model: modelName });
 
-    // Replace {HISTORY} placeholder with actual conversation
-    let userPrompt = discriminatorPrompt.replace('{HISTORY}', conversationHistory);
+    // Always include conversation history with user rules
+    const userPrompt = `${discriminatorPrompt}
 
-    // Add instructions for clear response format
-    userPrompt += '\n\n---\nResponde SOLO con una de estas dos opciones:\n- Respuesta: SI (si el asistente puede responder)\n- Respuesta: NO (si requiere intervención humana)';
+---HISTORIAL DE CONVERSACIÓN---
+${conversationHistory}
+
+---INSTRUCCIONES---
+Analiza el último mensaje del cliente basándote en las reglas anteriores.
+Responde SOLO con una de estas dos opciones:
+- Respuesta: SI (si el asistente puede responder)
+- Respuesta: NO (si requiere intervención humana)`;
 
     const result = await model.generateContent(userPrompt);
     const responseText = result.response.text().toUpperCase();
@@ -313,11 +297,17 @@ async function classifyMessageIntentOpenAI(
   try {
     const client = new OpenAI({ apiKey });
 
-    // Replace {HISTORY} placeholder with actual conversation
-    let userPrompt = discriminatorPrompt.replace('{HISTORY}', conversationHistory);
+    // Always include conversation history with user rules
+    const userPrompt = `${discriminatorPrompt}
 
-    // Add instructions for clear response format
-    userPrompt += '\n\n---\nResponde SOLO con una de estas dos opciones:\n- Respuesta: SI (si el asistente puede responder)\n- Respuesta: NO (si requiere intervención humana)';
+---HISTORIAL DE CONVERSACIÓN---
+${conversationHistory}
+
+---INSTRUCCIONES---
+Analiza el último mensaje del cliente basándote en las reglas anteriores.
+Responde SOLO con una de estas dos opciones:
+- Respuesta: SI (si el asistente puede responder)
+- Respuesta: NO (si requiere intervención humana)`;
 
     const response = await client.chat.completions.create({
       model: modelName,
@@ -327,7 +317,7 @@ async function classifyMessageIntentOpenAI(
           content: userPrompt,
         },
       ],
-      temperature: 0.7,
+      temperature: 0.2,
       max_tokens: 100,
     });
 

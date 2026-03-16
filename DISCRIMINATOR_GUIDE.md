@@ -57,6 +57,8 @@ Pasa el mensaje a un humano si:
 Para todo lo demás, responde tú mismo.
 ```
 
+**Nota:** El historial de la conversación se incluye automáticamente. No necesitas escribir placeholders como `{HISTORY}` ni nada similar. Solo escribe tus reglas en lenguaje natural.
+
 ---
 
 ## Ejemplos Prácticos
@@ -111,21 +113,29 @@ Recibirás una notificación en la app:
 ## Flujo Técnico (Para Curiosos)
 
 1. **Mensaje llega**: "¿Tienes disponibilidad el jueves?"
-2. **Discriminador activa**: Lee el historial completo de la conversación
-3. **Envía a Gemini**:
+2. **Discriminador activa**:
+   - Lee el historial completo de la conversación (automático)
+   - Recupera tus reglas configuradas
+3. **Envía a OpenAI/Gemini**:
    ```
    Tu regla: "Pasa al humano si pregunta sobre disponibilidad..."
-   Historial: [historial completo]
-   Último mensaje: "¿Tienes disponibilidad el jueves?"
+   ---HISTORIAL DE CONVERSACIÓN---
+   Customer: Me das info de lipo sin cirugía?
+   Assistant: Claro, aquí está la info...
+   Customer: ¿Tienes disponibilidad el jueves?
 
-   ¿Debe ir al humano o al asistente?
+   ---INSTRUCCIONES---
+   Analiza el último mensaje basándote en las reglas anteriores.
+   Responde SOLO: "Respuesta: SI" o "Respuesta: NO"
    ```
-4. **Gemini responde**: "Respuesta: NO" (requiere humano)
+4. **OpenAI/Gemini responde**: "Respuesta: NO" (requiere humano)
 5. **Backend ejecuta**:
    - ❌ No envía respuesta automática
    - 📌 Marca el chat con "needs_human: true"
    - 🔔 Emite evento a la app
 6. **Operador ve**: Badge rojo en el chat, lo abre y responde
+
+**Cambio importante (v2):** El historial ahora se pasa automáticamente en cada análisis. No necesitas configurar nada especial.
 
 ---
 
