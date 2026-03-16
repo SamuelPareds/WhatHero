@@ -209,9 +209,35 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 },
               )
             : null,
-        title: Text(
-          selectedChatPhone ?? 'Chat',
-          style: const TextStyle(fontWeight: FontWeight.bold),
+        title: StreamBuilder<DocumentSnapshot>(
+          stream: FirebaseFirestore.instance
+              .collection('accounts')
+              .doc(widget.accountId)
+              .collection('whatsapp_sessions')
+              .doc(widget.sessionId)
+              .collection('chats')
+              .doc(selectedChatPhone)
+              .snapshots(),
+          builder: (context, snapshot) {
+            final needsHuman = (snapshot.data?.data() as Map<String, dynamic>?)?['needs_human'] as bool? ?? false;
+            return Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  selectedChatPhone ?? 'Chat',
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+                if (needsHuman) ...[
+                  const SizedBox(width: 8),
+                  const Icon(
+                    Icons.support_agent,
+                    size: 20,
+                    color: Color(0xFFF97316),
+                  ),
+                ],
+              ],
+            );
+          },
         ),
         actions: [
           IconButton(
@@ -333,16 +359,10 @@ class _ChatTile extends StatelessWidget {
                         ),
                       ),
                       if (needsHuman)
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                          decoration: BoxDecoration(
-                            color: Colors.red.withValues(alpha: 0.2),
-                            borderRadius: BorderRadius.circular(4),
-                          ),
-                          child: const Text(
-                            '⚠️',
-                            style: TextStyle(fontSize: 10),
-                          ),
+                        const Icon(
+                          Icons.support_agent,
+                          size: 18,
+                          color: Color(0xFFF97316),
                         ),
                     ],
                   ),
