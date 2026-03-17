@@ -210,7 +210,23 @@ async function startSession(sessionKey: string, accountId: string) {
     await saveMessageToFirestore(message, sessionKey, accountId, sessions, sock.user?.id);
 
     // AI auto-response: only for incoming messages (not from self)
-    if (message.key.fromMe) return;
+    if (message.key.fromMe) {
+      // 📌 Cancel any pending buffer for this contact when human responds
+      const remoteJidForCancel = message.key.remoteJid;
+      if (remoteJidForCancel && !remoteJidForCancel.endsWith('@g.us')) {
+        const contactPhoneForCancel = extractPhoneNumber(remoteJidForCancel);
+        if (contactPhoneForCancel) {
+          const bufferKey = `${sessionKey}:${contactPhoneForCancel}`;
+          const buffer = messageBuffers.get(bufferKey);
+          if (buffer?.timeout) {
+            clearTimeout(buffer.timeout);
+            messageBuffers.delete(bufferKey);
+            console.log(`[Buffer] CANCELLED: Human response detected for ${contactPhoneForCancel}`);
+          }
+        }
+      }
+      return;
+    }
     const remoteJid = message.key.remoteJid;
     if (!remoteJid || remoteJid.endsWith('@g.us')) return; // skip group messages
 
