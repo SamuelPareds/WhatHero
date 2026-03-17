@@ -274,6 +274,28 @@ async function startSession(sessionKey: string, accountId: string) {
       return;
     }
 
+    // Check if AI auto-response is enabled for this specific contact
+    let aiAutoResponseEnabled = true; // Default: IA enabled
+    try {
+      const chatDocRef = db
+        .collection('accounts')
+        .doc(accountId)
+        .collection('whatsapp_sessions')
+        .doc(session.phoneNumber)
+        .collection('chats')
+        .doc(contactPhone);
+
+      const chatDoc = await chatDocRef.get();
+      aiAutoResponseEnabled = (chatDoc.data()?.ai_auto_response as boolean) ?? true;
+    } catch (error) {
+      console.warn(`[AI] Error checking ai_auto_response for ${contactPhone}:`, error);
+    }
+
+    if (!aiAutoResponseEnabled) {
+      console.log(`[AI] Auto-response disabled for ${contactPhone}, skipping AI response`);
+      return;
+    }
+
     // Check keyword rules (fast-path, immediate response - not buffered)
     for (const rule of aiConfig.keywordRules) {
       if (messageText.toLowerCase().includes(rule.keyword.toLowerCase())) {
@@ -682,6 +704,32 @@ io.on('connection', (socket) => {
 
     const success = await cancelSession(sessionKey);
     socket.emit('session_cancelled', { sessionKey, success });
+  });
+
+  // 📌 Cancel pending buffer when user disables AI for a specific contact
+  socket.on('cancel_ai_buffer', (data) => {
+    const { sessionKey, contactPhone } = data;
+    console.log('[Socket.io] cancel_ai_buffer recibido para:', contactPhone, 'en sesión:', sessionKey);
+
+    const session = sessions.get(sessionKey);
+    if (!session || session.accountId !== accountId) {
+      console.warn('[Socket.io] Unauthorized or session not found for cancel_ai_buffer');
+      socket.emit('ai_toggle_result', { success: false, message: 'Unauthorized' });
+      return;
+    }
+
+    const bufferKey = `${sessionKey}:${contactPhone}`;
+    const buffer = messageBuffers.get(bufferKey);
+
+    if (buffer && buffer.timeout) {
+      clearTimeout(buffer.timeout);
+      messageBuffers.delete(bufferKey);
+      console.log(`[Buffer] CANCELLED via Socket.io: User disabled AI for ${contactPhone}`);
+      socket.emit('ai_toggle_result', { success: true, message: 'IA desactivada', contactPhone });
+    } else {
+      console.log(`[Buffer] No pending buffer found for ${contactPhone}`);
+      socket.emit('ai_toggle_result', { success: true, message: 'IA desactivada', contactPhone });
+    }
   });
 });
 
