@@ -19,7 +19,6 @@ export interface SessionData {
       start: string;
       end: string;
     };
-    optedOutContacts: string[];
     keywordRules: { keyword: string; response: string }[];
     discriminator?: {
       enabled: boolean;

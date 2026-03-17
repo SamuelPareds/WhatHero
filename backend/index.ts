@@ -261,13 +261,6 @@ async function startSession(sessionKey: string, accountId: string) {
       }
     }
 
-    // Check if contact is opted out
-    const optedOut = (aiConfig.optedOutContacts as string[]) || [];
-    if (optedOut.includes(contactPhone)) {
-      console.log(`[AI] Contact ${contactPhone} is opted out, skipping AI response`);
-      return;
-    }
-
     // Check if within active hours
     if (!isWithinActiveHours(aiConfig)) {
       console.log(`[AI] Outside active hours, skipping AI response`);

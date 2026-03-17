@@ -137,7 +137,6 @@ export async function getAIConfig(session: SessionData, accountId: string) {
       responseDelayMs: data?.ai_response_delay_ms ?? 1500,
       model: data?.ai_model ?? 'gemini-2.5-flash',
       activeHours: data?.ai_active_hours,
-      optedOutContacts: data?.ai_opted_out_contacts ?? [],
       keywordRules: data?.ai_keyword_rules ?? [],
       discriminator: {
         enabled: data?.ai_discriminator_enabled ?? false,
@@ -157,7 +156,6 @@ export async function getAIConfig(session: SessionData, accountId: string) {
       systemPrompt: '',
       responseDelayMs: 0,
       model: 'gemini-2.5-flash',
-      optedOutContacts: [],
       keywordRules: [],
       discriminator: {
         enabled: false,

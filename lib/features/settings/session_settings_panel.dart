@@ -29,7 +29,6 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
   String _activeHoursTimezone = 'America/Mexico_City';
   TimeOfDay _activeHoursStart = const TimeOfDay(hour: 9, minute: 0);
   TimeOfDay _activeHoursEnd = const TimeOfDay(hour: 18, minute: 0);
-  List<String> _optedOutContacts = [];
   List<Map<String, String>> _keywordRules = [];
   String _newKeyword = '';
   String _newKeywordResponse = '';
@@ -90,10 +89,6 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
             }
           }
 
-          // Opted out contacts
-          _optedOutContacts =
-              List<String>.from(data['ai_opted_out_contacts'] ?? []);
-
           // Keyword rules
           if (data['ai_keyword_rules'] is List) {
             _keywordRules = List<Map<String, String>>.from(
@@ -144,7 +139,6 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
           'start': '${_activeHoursStart.hour.toString().padLeft(2, '0')}:${_activeHoursStart.minute.toString().padLeft(2, '0')}',
           'end': '${_activeHoursEnd.hour.toString().padLeft(2, '0')}:${_activeHoursEnd.minute.toString().padLeft(2, '0')}',
         },
-        'ai_opted_out_contacts': _optedOutContacts,
         'ai_keyword_rules': _keywordRules,
         'ai_discriminator_enabled': _discriminatorEnabled,
         'ai_discriminator_prompt': _discriminatorPromptController.text.trim(),
@@ -774,82 +768,6 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
                       ],
                     ),
                   ],
-                ],
-              ),
-            ),
-            const SizedBox(height: 20),
-            // Opted-out contacts
-            Container(
-              decoration: BoxDecoration(
-                color: darkBg.withValues(alpha: 0.5),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: primaryAqua.withValues(alpha: 0.1)),
-              ),
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'Contactos bloqueados',
-                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: white),
-                  ),
-                  const SizedBox(height: 12),
-                  if (_optedOutContacts.isNotEmpty)
-                    Column(
-                      children: _optedOutContacts.map((phone) {
-                        return Padding(
-                          padding: const EdgeInsets.only(bottom: 8),
-                          child: Row(
-                            children: [
-                              Expanded(child: Text(phone, style: const TextStyle(color: lightText, fontSize: 13))),
-                              IconButton(
-                                icon: const Icon(Icons.delete_outline, color: Colors.red, size: 18),
-                                onPressed: () => setState(() => _optedOutContacts.remove(phone)),
-                                padding: EdgeInsets.zero,
-                              ),
-                            ],
-                          ),
-                        );
-                      }).toList(),
-                    ),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: TextField(
-                          decoration: InputDecoration(
-                            hintText: '+1234567890',
-                            hintStyle: TextStyle(color: lightText.withValues(alpha: 0.5)),
-                            isDense: true,
-                            filled: true,
-                            fillColor: darkBg.withValues(alpha: 0.3),
-                            border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
-                            contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                          ),
-                          style: const TextStyle(color: white, fontSize: 13),
-                          onChanged: (v) => setState(() {}),
-                          onSubmitted: (phone) {
-                            if (phone.trim().isNotEmpty && !_optedOutContacts.contains(phone)) {
-                              setState(() {
-                                _optedOutContacts.add(phone);
-                              });
-                            }
-                          },
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      SizedBox(
-                        height: 40,
-                        child: ElevatedButton(
-                          onPressed: () => {},
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: primaryAqua.withValues(alpha: 0.3),
-                            padding: const EdgeInsets.symmetric(horizontal: 12),
-                          ),
-                          child: const Text('Agregar', style: TextStyle(fontSize: 12, color: primaryAqua)),
-                        ),
-                      ),
-                    ],
-                  ),
                 ],
               ),
             ),
