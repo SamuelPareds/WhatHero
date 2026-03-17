@@ -38,7 +38,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
       if (mounted) {
         final success = data['success'] as bool? ?? false;
         final message = data['message'] as String? ?? '';
-        _showEtherealToast(success, message);
+        final isActivating = message.toLowerCase() == 'ia activada'; // Explicit check for activation
+        _showEtherealToast(success, message, isActivating: isActivating);
       }
     });
   }
@@ -50,64 +51,97 @@ class _ChatsScreenState extends State<ChatsScreen> {
     super.dispose();
   }
 
-  // 📌 Ethereal Toast with Glassmorphism
-  void _showEtherealToast(bool success, String message) {
+  // 📌 Ethereal Bubble Notification with face_retouching_natural icon
+  void _showEtherealToast(bool success, String message, {bool isActivating = true}) {
     final overlayState = Overlay.of(context);
     late OverlayEntry overlayEntry;
+
+    // Determine colors based on explicit isActivating parameter (not message content)
+    final primaryColor = isActivating ? const Color(0xFF10B981) : const Color(0xFF9CA3AF);
 
     overlayEntry = OverlayEntry(
       builder: (context) => Center(
         child: TweenAnimationBuilder<double>(
           tween: Tween(begin: 0, end: 1),
-          duration: const Duration(milliseconds: 300),
+          duration: const Duration(milliseconds: 400),
           builder: (context, value, child) {
             return Opacity(
               opacity: value,
-              child: Transform.translate(
-                offset: Offset(0, -20 * (1 - value)),
+              child: Transform.scale(
+                scale: 0.8 + (value * 0.2),
                 child: child,
               ),
             );
           },
           child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            padding: const EdgeInsets.symmetric(horizontal: 36, vertical: 28),
             decoration: BoxDecoration(
-              color: (success ? const Color(0xFF06B6D4) : const Color(0xFFEF4444))
-                  .withValues(alpha: 0.15),
+              color: primaryColor.withValues(alpha: 0.12),
               border: Border.all(
-                color: (success ? const Color(0xFF06B6D4) : const Color(0xFFEF4444))
-                    .withValues(alpha: 0.3),
-                width: 1,
+                color: primaryColor.withValues(alpha: 0.25),
+                width: 1.5,
               ),
-              borderRadius: BorderRadius.circular(12),
+              borderRadius: BorderRadius.circular(32),
               boxShadow: [
                 BoxShadow(
-                  color: (success ? const Color(0xFF06B6D4) : const Color(0xFFEF4444))
-                      .withValues(alpha: 0.1),
-                  blurRadius: 16,
-                  spreadRadius: 2,
+                  color: primaryColor.withValues(alpha: 0.15),
+                  blurRadius: 24,
+                  spreadRadius: 4,
                 ),
               ],
             ),
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(12),
-              child: BackdropFilter(
-                filter: ImageFilter.blur(sigmaX: 12, sigmaY: 12),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      success ? Icons.check_circle : Icons.error_outline,
-                      color: success ? const Color(0xFF06B6D4) : const Color(0xFFEF4444),
-                      size: 18,
+            clipBehavior: Clip.antiAlias,
+            child: BackdropFilter(
+              filter: ImageFilter.blur(sigmaX: 16, sigmaY: 16),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                    // Icon with dynamic indicator
+                    Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        Icon(
+                          Icons.face_retouching_natural,
+                          size: 48,
+                          color: primaryColor.withValues(alpha: 0.7),
+                        ),
+                        // Dynamic check/indicator
+                        Positioned(
+                          bottom: -4,
+                          right: -4,
+                          child: Container(
+                            padding: const EdgeInsets.all(4),
+                            decoration: BoxDecoration(
+                              color: isActivating ? const Color(0xFF10B981) : const Color(0xFF9CA3AF),
+                              shape: BoxShape.circle,
+                              boxShadow: [
+                                BoxShadow(
+                                  color: (isActivating ? const Color(0xFF10B981) : const Color(0xFF9CA3AF))
+                                      .withValues(alpha: 0.3),
+                                  blurRadius: 8,
+                                  spreadRadius: 1,
+                                ),
+                              ],
+                            ),
+                            child: Icon(
+                              isActivating ? Icons.check : Icons.close,
+                              size: 16,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
-                    const SizedBox(width: 10),
+                    const SizedBox(height: 12),
                     Text(
                       message,
+                      textAlign: TextAlign.center,
+                      softWrap: true,
                       style: TextStyle(
-                        color: success ? const Color(0xFF06B6D4) : const Color(0xFFEF4444),
-                        fontSize: 14,
-                        fontWeight: FontWeight.w500,
+                        color: primaryColor,
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: 0.3,
                       ),
                     ),
                   ],
@@ -116,7 +150,6 @@ class _ChatsScreenState extends State<ChatsScreen> {
             ),
           ),
         ),
-      ),
     );
 
     overlayState.insert(overlayEntry);
@@ -368,7 +401,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                       debugPrint('Emitted cancel_ai_buffer for $selectedChatPhone');
                     } else {
                       // If enabling, show success toast immediately (no buffer to cancel)
-                      _showEtherealToast(true, 'IA activada');
+                      _showEtherealToast(true, 'IA activada', isActivating: true);
                     }
 
                     // Update Firestore
@@ -385,7 +418,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                   } catch (e) {
                     debugPrint('Error toggling AI: $e');
                     // Show error toast
-                    _showEtherealToast(false, 'Error al cambiar IA');
+                    _showEtherealToast(false, 'Error al cambiar IA', isActivating: false);
                   }
                 },
               );
