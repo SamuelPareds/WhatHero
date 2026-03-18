@@ -200,6 +200,11 @@ class _ChatsScreenState extends State<ChatsScreen> {
   Widget _buildChatsList() {
     return Scaffold(
       appBar: AppBar(
+        leading: IconButton(
+          icon: const Icon(Icons.manage_accounts_outlined, color: lightText),
+          onPressed: () => Navigator.pop(context),
+          tooltip: 'Cuentas',
+        ),
         title: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
