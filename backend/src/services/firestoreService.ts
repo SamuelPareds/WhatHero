@@ -113,6 +113,41 @@ export async function saveMessageToFirestore(message: any, sessionKey: string, a
   }
 }
 
+export async function updateContactInFirestore(contact: any, sessionKey: string, accountId: string, sessions: Map<string, SessionData>) {
+  try {
+    const session = sessions.get(sessionKey);
+    if (!session?.phoneNumber) return;
+
+    const sessionId = session.phoneNumber;
+    const remoteJid = contact.id;
+    if (!remoteJid || remoteJid.endsWith('@g.us')) return; // Skip groups
+
+    const phoneNumber = extractPhoneNumber(remoteJid);
+    if (!phoneNumber) return;
+
+    // We only care about 'name' (agenda name). 
+    // We ignore 'notify' (pushName) as per requirements.
+    if (!contact.name) return;
+
+    const chatDocRef = getDb()
+      .collection('accounts')
+      .doc(accountId)
+      .collection('whatsapp_sessions')
+      .doc(sessionId)
+      .collection('chats')
+      .doc(phoneNumber);
+
+    await chatDocRef.set({
+      contactName: contact.name,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    console.log(`Contact name updated for ${phoneNumber}: ${contact.name}`);
+  } catch (error) {
+    console.error('Error updating contact in Firestore:', error);
+  }
+}
+
 // Get AI config with in-memory caching
 export async function getAIConfig(session: SessionData, accountId: string) {
   const now = Date.now();

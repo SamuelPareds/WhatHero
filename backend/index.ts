@@ -15,7 +15,7 @@ import { rmSync, existsSync, readdirSync, writeFileSync, readFileSync, mkdirSync
 import { randomUUID } from 'crypto';
 import { SessionData, MessageBuffer } from './src/types';
 import { extractPhoneNumber, storeLIDMapping, resolveLIDFromContacts } from './src/utils/phone';
-import { initializeSession, saveMessageToFirestore, getAIConfig } from './src/services/firestoreService';
+import { initializeSession, saveMessageToFirestore, getAIConfig, updateContactInFirestore } from './src/services/firestoreService';
 import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer } from './src/services/aiService';
 
 // Ensure auth_info directory exists
@@ -106,6 +106,19 @@ async function startSession(sessionKey: string, accountId: string) {
   });
 
   sock.ev.on('creds.update', saveCreds);
+
+  // Listen for contact updates to capture agenda names
+  sock.ev.on('contacts.upsert', (contacts) => {
+    for (const contact of contacts) {
+      updateContactInFirestore(contact, sessionKey, accountId, sessions);
+    }
+  });
+
+  sock.ev.on('contacts.update', (updates) => {
+    for (const update of updates) {
+      updateContactInFirestore(update, sessionKey, accountId, sessions);
+    }
+  });
 
   // Listen for LID-to-Phone mappings (Baileys v6.6+)
   // This is crucial for resolving @lid format JIDs to real phone numbers

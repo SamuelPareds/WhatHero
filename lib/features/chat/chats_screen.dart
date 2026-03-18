@@ -291,7 +291,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
                   .where((chatDoc) {
                     final chatData = chatDoc.data() as Map<String, dynamic>?;
                     final phoneNumber = chatData?['phoneNumber'] as String? ?? '';
-                    return phoneNumber.toLowerCase().contains(searchQuery);
+                    final contactName = chatData?['contactName'] as String? ?? '';
+                    return phoneNumber.toLowerCase().contains(searchQuery) || 
+                           contactName.toLowerCase().contains(searchQuery);
                   })
                   .toList();
 
@@ -319,12 +321,14 @@ class _ChatsScreenState extends State<ChatsScreen> {
               final chatData = chatDoc.data() as Map<String, dynamic>?;
 
               final phoneNumber = chatData?['phoneNumber'] as String? ?? '';
+              final contactName = chatData?['contactName'] as String? ?? '';
               final lastMessage = chatData?['lastMessage'] ?? 'Sin mensajes';
               final timestamp = (chatData?['lastMessageTimestamp'] as Timestamp?)?.toDate();
               final needsHuman = chatData?['needs_human'] as bool? ?? false;
 
               return _ChatTile(
                 phoneNumber: phoneNumber,
+                contactName: contactName,
                 lastMessage: lastMessage,
                 timestamp: timestamp,
                 isSelected: selectedChatPhone == phoneNumber,
@@ -366,12 +370,16 @@ class _ChatsScreenState extends State<ChatsScreen> {
               .snapshots(),
           builder: (context, snapshot) {
             final chatData = snapshot.data?.data() as Map<String, dynamic>?;
+            final contactName = chatData?['contactName'] as String? ?? '';
             final needsHuman = chatData?['needs_human'] as bool? ?? false;
+            
+            final displayName = contactName.isNotEmpty ? contactName : (selectedChatPhone ?? 'Chat');
+            
             return Row(
               mainAxisSize: MainAxisSize.min,
               children: [
                 Text(
-                  selectedChatPhone ?? 'Chat',
+                  displayName,
                   style: const TextStyle(fontWeight: FontWeight.bold),
                 ),
                 if (needsHuman) ...[
@@ -479,6 +487,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
 class _ChatTile extends StatelessWidget {
   final String phoneNumber;
+  final String contactName;
   final String lastMessage;
   final DateTime? timestamp;
   final bool isSelected;
@@ -487,6 +496,7 @@ class _ChatTile extends StatelessWidget {
 
   const _ChatTile({
     required this.phoneNumber,
+    required this.contactName,
     required this.lastMessage,
     required this.timestamp,
     required this.isSelected,
@@ -517,6 +527,9 @@ class _ChatTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final displayName = contactName.isNotEmpty ? contactName : phoneNumber;
+    final avatarLetter = displayName.substring(0, 1).toUpperCase();
+
     return GestureDetector(
       onTap: onTap,
       child: Container(
@@ -534,7 +547,7 @@ class _ChatTile extends StatelessWidget {
               ),
               child: Center(
                 child: Text(
-                  phoneNumber.substring(0, 1).toUpperCase(),
+                  avatarLetter,
                   style: const TextStyle(
                     color: primaryAqua,
                     fontWeight: FontWeight.w700,
@@ -552,7 +565,7 @@ class _ChatTile extends StatelessWidget {
                     children: [
                       Expanded(
                         child: Text(
-                          phoneNumber,
+                          displayName,
                           style: const TextStyle(
                             fontWeight: FontWeight.w600,
                             fontSize: 14,
