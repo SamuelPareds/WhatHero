@@ -459,13 +459,14 @@ app.post('/cancel-session', express.json(), async (req, res) => {
   }
 });
 
-// REST API endpoint to send messages
+// REST API endpoint to send messages (text or media with optional caption)
 app.post('/send-message', express.json(), async (req, res) => {
   try {
-    const { to, text, sessionKey, accountId } = req.body;
+    const { to, text, imageUrl, sessionKey, accountId } = req.body;
 
-    if (!to || !text || !sessionKey || !accountId) {
-      return res.status(400).json({ error: 'Missing required fields: to, text, sessionKey, accountId' });
+    // text is optional if imageUrl is provided, but at least one must exist
+    if (!to || !sessionKey || !accountId || (!text && !imageUrl)) {
+      return res.status(400).json({ error: 'Missing required fields: to, sessionKey, accountId, and at least one of (text, imageUrl)' });
     }
 
     const session = sessions.get(sessionKey);
@@ -500,10 +501,33 @@ app.post('/send-message', express.json(), async (req, res) => {
 
     console.log(`[/send-message] Sending message to JID: ${jid}`);
 
-    // Send the message via Baileys
-    const message = await session.sock.sendMessage(jid, { text });
+    // Send the message via Baileys (text or image with optional caption)
+    let message;
+    if (imageUrl) {
+      // Send as image with optional caption
+      // Baileys requires image as Buffer, not URL - download it first
+      try {
+        console.log(`[/send-message] Downloading image from URL: ${imageUrl}`);
+        const imageResponse = await fetch(imageUrl).then(res => {
+          if (!res.ok) throw new Error(`Failed to fetch image: ${res.statusText}`);
+          return res.arrayBuffer();
+        });
+        const imageBuffer = Buffer.from(imageResponse);
 
-    console.log(`Message sent to ${to}:`, text);
+        message = await session.sock.sendMessage(jid, {
+          image: imageBuffer,
+          caption: text || undefined,
+        });
+        console.log(`Image sent to ${to} with caption: ${text || '(no caption)'}`);
+      } catch (imageError) {
+        console.error(`[/send-message] Error downloading/sending image:`, imageError);
+        throw new Error(`Failed to process image URL: ${(imageError as any).message}`);
+      }
+    } else {
+      // Send as text
+      message = await session.sock.sendMessage(jid, { text });
+      console.log(`Text message sent to ${to}:`, text);
+    }
 
     res.json({
       success: true,

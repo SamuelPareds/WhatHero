@@ -212,6 +212,20 @@ class _ChatsScreenState extends State<ChatsScreen> {
           ],
         ),
         elevation: 0,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.flash_on, size: 20),
+            tooltip: 'Respuestas rápidas',
+            onPressed: () => showModalBottomSheet(
+              context: context,
+              isScrollControlled: true,
+              builder: (_) => QuickResponsesPanel(
+                sessionId: widget.sessionId,
+                accountId: widget.accountId,
+              ),
+            ),
+          ),
+        ],
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(68),
           child: Padding(

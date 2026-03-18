@@ -29,11 +29,14 @@ class _MessagesViewState extends State<MessagesView> {
   final ScrollController _scrollController = ScrollController();
   bool _isSending = false;
   bool _isGenerating = false;
+  String _quickResponseFilter = '';
+  OverlayEntry? _quickResponseOverlay;
 
   @override
   void dispose() {
     _messageController.dispose();
     _scrollController.dispose();
+    _quickResponseOverlay?.remove();
     super.dispose();
   }
 
@@ -167,6 +170,220 @@ class _MessagesViewState extends State<MessagesView> {
     }
   }
 
+  void _handleQuickResponseInput(String value) {
+    // Check if "/" is at the beginning of the text
+    if (value.startsWith('/')) {
+      // Extract the filter text after "/"
+      final filter = value.substring(1).toLowerCase();
+      setState(() => _quickResponseFilter = filter);
+      _showQuickResponsesOverlay();
+    } else {
+      // If "/" was removed, close the overlay
+      _quickResponseOverlay?.remove();
+      _quickResponseOverlay = null;
+    }
+  }
+
+  void _showQuickResponsesOverlay() async {
+    try {
+      final snapshot = await FirebaseFirestore.instance
+          .collection('accounts')
+          .doc(widget.accountId)
+          .collection('whatsapp_sessions')
+          .doc(widget.sessionId)
+          .collection('quick_responses')
+          .orderBy('order', descending: false)
+          .get();
+
+      if (!mounted) return;
+
+      final allResponses = snapshot.docs
+          .map((doc) => {...doc.data(), 'id': doc.id})
+          .toList();
+
+      // Filter responses based on current filter text
+      final filtered = allResponses
+          .where((qr) {
+            final title = (qr['title'] as String? ?? '').toLowerCase();
+            return title.contains(_quickResponseFilter);
+          })
+          .toList();
+
+      // Remove old overlay if exists
+      _quickResponseOverlay?.remove();
+
+      if (filtered.isEmpty) {
+        _quickResponseOverlay = null;
+        return;
+      }
+
+      _quickResponseOverlay = OverlayEntry(
+        builder: (context) => Positioned(
+          bottom: MediaQuery.of(context).viewInsets.bottom + 140,
+          left: 12,
+          right: 12,
+          child: Material(
+            color: Colors.transparent,
+            child: Container(
+              decoration: BoxDecoration(
+                color: surfaceDark,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: primaryAqua.withValues(alpha: 0.2)),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.3),
+                    blurRadius: 12,
+                    offset: const Offset(0, 2),
+                  ),
+                ],
+              ),
+              constraints: const BoxConstraints(maxHeight: 160),
+              child: ListView.separated(
+                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+                itemCount: filtered.length,
+                separatorBuilder: (_, __) => Divider(
+                  color: primaryAqua.withValues(alpha: 0.1),
+                  height: 1,
+                  indent: 8,
+                  endIndent: 8,
+                ),
+                itemBuilder: (_, idx) {
+                  final qr = filtered[idx];
+                  final title = qr['title'] as String? ?? '';
+                  final text = qr['text'] as String? ?? '';
+                  final imageUrl = qr['imageUrl'] as String? ?? '';
+
+                  return InkWell(
+                    onTap: () => _selectQuickResponse(qr),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  title,
+                                  style: const TextStyle(
+                                    color: primaryAqua,
+                                    fontWeight: FontWeight.w600,
+                                    fontSize: 12,
+                                  ),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                                if (text.isNotEmpty)
+                                  Padding(
+                                    padding: const EdgeInsets.only(top: 2),
+                                    child: Text(
+                                      text.substring(0, (text.length < 40 ? text.length : 40)),
+                                      style: TextStyle(
+                                        color: lightText.withValues(alpha: 0.5),
+                                        fontSize: 10,
+                                      ),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ),
+                          if (imageUrl.isNotEmpty) ...[
+                            const SizedBox(width: 4),
+                            Icon(Icons.image, size: 14, color: primaryAqua.withValues(alpha: 0.6)),
+                          ],
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ),
+        ),
+      );
+
+      Overlay.of(context).insert(_quickResponseOverlay!);
+    } catch (e) {
+      debugPrint('Error loading quick responses: $e');
+    }
+  }
+
+  void _selectQuickResponse(Map<String, dynamic> template) {
+    final text = template['text'] as String? ?? '';
+    final imageUrl = template['imageUrl'] as String? ?? '';
+
+    // Remove overlay
+    _quickResponseOverlay?.remove();
+    _quickResponseOverlay = null;
+
+    if (imageUrl.isNotEmpty) {
+      // Send immediately if has image
+      _sendQuickResponse(template);
+    } else {
+      // Fill text field if text-only (remove the "/" prefix)
+      setState(() => _messageController.text = text);
+      _messageController.selection = TextSelection.fromPosition(
+        TextPosition(offset: text.length),
+      );
+    }
+  }
+
+  Future<void> _sendQuickResponse(Map<String, dynamic> template) async {
+    final text = template['text'] as String? ?? '';
+    final imageUrl = template['imageUrl'] as String? ?? '';
+
+    if (imageUrl.isEmpty) return;
+
+    setState(() => _isSending = true);
+
+    try {
+      final response = await http.post(
+        Uri.parse('$backendUrl/send-message'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'to': widget.phoneNumber,
+          'text': text,
+          'imageUrl': imageUrl,
+          'sessionKey': widget.sessionKey,
+          'accountId': widget.accountId,
+        }),
+      ).timeout(
+        const Duration(seconds: 10),
+        onTimeout: () => throw Exception('Request timeout'),
+      );
+
+      if (response.statusCode == 200) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('✓ Respuesta enviada'),
+              duration: Duration(seconds: 2),
+              backgroundColor: Color(0xFF06B6D4),
+            ),
+          );
+        }
+      } else {
+        throw Exception('Failed to send: ${response.body}');
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error al enviar: ${e.toString()}'),
+            duration: const Duration(seconds: 3),
+            backgroundColor: Colors.red.shade600,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isSending = false);
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Column(
@@ -254,8 +471,9 @@ class _MessagesViewState extends State<MessagesView> {
                       maxLines: null,
                       textCapitalization: TextCapitalization.sentences,
                       style: const TextStyle(color: white, fontSize: 15),
+                      onChanged: _handleQuickResponseInput,
                       decoration: InputDecoration(
-                        hintText: 'Escribe un mensaje...',
+                        hintText: '',
                         hintStyle: const TextStyle(color: lightText),
                         border: OutlineInputBorder(
                           borderRadius: BorderRadius.circular(12),
