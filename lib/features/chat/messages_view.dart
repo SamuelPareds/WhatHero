@@ -313,14 +313,15 @@ class _MessagesViewState extends State<MessagesView> {
   void _selectQuickResponse(Map<String, dynamic> template) {
     final text = template['text'] as String? ?? '';
     final imageUrl = template['imageUrl'] as String? ?? '';
+    final title = template['title'] as String? ?? '';
 
     // Remove overlay
     _quickResponseOverlay?.remove();
     _quickResponseOverlay = null;
 
     if (imageUrl.isNotEmpty) {
-      // Send immediately if has image
-      _sendQuickResponse(template);
+      // Show confirmation dialog for image responses
+      _showImageConfirmationDialog(title, text, imageUrl);
     } else {
       // Fill text field if text-only (remove the "/" prefix)
       setState(() => _messageController.text = text);
@@ -328,6 +329,100 @@ class _MessagesViewState extends State<MessagesView> {
         TextPosition(offset: text.length),
       );
     }
+  }
+
+  void _showImageConfirmationDialog(String title, String caption, String imageUrl) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: surfaceDark,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
+        title: Text(
+          title,
+          style: const TextStyle(color: white, fontWeight: FontWeight.w600),
+        ),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // Image preview
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: SizedBox(
+                    height: 150,
+                    width: double.maxFinite,
+                    child: Image.network(
+                      imageUrl,
+                      fit: BoxFit.cover,
+                      errorBuilder: (context, error, stackTrace) => Container(
+                        decoration: BoxDecoration(
+                          color: darkBg,
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: const Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(Icons.broken_image, color: lightText, size: 32),
+                            SizedBox(height: 8),
+                            Text('Error cargando imagen', style: TextStyle(color: lightText, fontSize: 12)),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                if (caption.isNotEmpty) ...[
+                  const SizedBox(height: 16),
+                  Text(
+                    'Mensaje:',
+                    style: TextStyle(color: lightText.withValues(alpha: 0.7), fontSize: 12, fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 6),
+                  Container(
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: darkBg.withValues(alpha: 0.5),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: primaryAqua.withValues(alpha: 0.2)),
+                    ),
+                    child: Text(
+                      caption,
+                      style: const TextStyle(color: white, fontSize: 13),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: Text(
+              'Cancelar',
+              style: TextStyle(color: lightText.withValues(alpha: 0.6)),
+            ),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: primaryAqua,
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+            ),
+            onPressed: () {
+              Navigator.pop(context);
+              _sendQuickResponse({'text': caption, 'imageUrl': imageUrl});
+            },
+            child: const Text(
+              'Enviar',
+              style: TextStyle(color: darkBg, fontWeight: FontWeight.w600, fontSize: 14),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _sendQuickResponse(Map<String, dynamic> template) async {
