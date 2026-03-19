@@ -1,7 +1,10 @@
-# Stage 1: Build
-FROM node:20-alpine AS builder
+# Baileys v7.0 uses ESM - run directly with tsx in both dev and prod
+FROM node:20-alpine
 
 WORKDIR /app
+
+# Create auth_info directory with proper permissions
+RUN mkdir -p auth_info && chmod 755 auth_info
 
 # Copy package files
 COPY package*.json ./
@@ -13,26 +16,6 @@ RUN npm ci
 # Copy source code
 COPY src ./src
 COPY index.ts ./
-
-# Build TypeScript
-RUN npm run build
-
-# Stage 2: Production
-FROM node:20-alpine
-
-WORKDIR /app
-
-# Create auth_info directory with proper permissions
-RUN mkdir -p auth_info && chmod 755 auth_info
-
-# Copy package files
-COPY package*.json ./
-
-# Install production dependencies only
-RUN npm ci --omit=dev
-
-# Copy compiled code from builder
-COPY --from=builder /app/dist ./dist
 
 # Expose port 3000
 EXPOSE 3000

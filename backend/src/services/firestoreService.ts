@@ -1,4 +1,5 @@
 import admin from 'firebase-admin';
+import { toNumber } from '@whiskeysockets/baileys';
 import { SessionData } from '../types';
 import { extractPhoneNumber } from '../utils/phone';
 
@@ -54,8 +55,8 @@ export async function saveMessageToFirestore(message: any, sessionKey: string, a
 
     // If we got a LID format and no mapping exists yet, try to resolve it
     if (remoteJid.includes('@lid') && sock) {
-      const { resolveLIDFromContacts } = await import('../utils/phone');
-      const resolved = await resolveLIDFromContacts(phoneNumber, sock);
+      const { resolveLIDViaSock } = await import('../utils/phone');
+      const resolved = await resolveLIDViaSock(phoneNumber, sock);
       if (resolved) {
         phoneNumber = resolved;
         console.log(`[Firestore] Resolved LID ${extractPhoneNumber(remoteJid)} → ${phoneNumber}`);
@@ -67,7 +68,8 @@ export async function saveMessageToFirestore(message: any, sessionKey: string, a
                         message.message?.imageMessage?.caption ||
                         '';
 
-    const messageTimestamp = message.messageTimestamp ? message.messageTimestamp * 1000 : Date.now();
+    // Use toNumber() to handle potential Long type from protobuf
+    const messageTimestamp = message.messageTimestamp ? toNumber(message.messageTimestamp) * 1000 : Date.now();
     const messageId = message.key.id;
 
     // New path: accounts/{accountId}/whatsapp_sessions/{sessionId}/chats/{chatId}/messages
@@ -129,13 +131,15 @@ export async function updateContactInFirestore(contact: any, sessionKey: string,
     if (!session?.phoneNumber) return;
 
     const sessionId = session.phoneNumber;
-    const remoteJid = contact.id;
-    if (!remoteJid || remoteJid.endsWith('@g.us')) return; // Skip groups
 
-    const phoneNumber = extractPhoneNumber(remoteJid);
+    // In Baileys v7, if contact.id is a LID, contact.phoneNumber contains the real PN JID
+    const rawJid = (contact.phoneNumber ?? contact.id) as string;
+    if (!rawJid || rawJid.endsWith('@g.us')) return; // Skip groups
+
+    const phoneNumber = extractPhoneNumber(rawJid);
     if (!phoneNumber) return;
 
-    // We only care about 'name' (agenda name). 
+    // We only care about 'name' (agenda name).
     // We ignore 'notify' (pushName) as per requirements.
     if (!contact.name) return;
 

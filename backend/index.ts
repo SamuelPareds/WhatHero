@@ -14,7 +14,7 @@ import admin from 'firebase-admin';
 import { rmSync, existsSync, readdirSync, writeFileSync, readFileSync, mkdirSync } from 'fs';
 import { randomUUID } from 'crypto';
 import { SessionData, MessageBuffer } from './src/types';
-import { extractPhoneNumber, storeLIDMapping, resolveLIDFromContacts } from './src/utils/phone';
+import { extractPhoneNumber, storeLIDMapping, resolveLIDViaSock } from './src/utils/phone';
 import { initializeSession, saveMessageToFirestore, getAIConfig, updateContactInFirestore, consolidateLIDChat } from './src/services/firestoreService';
 import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer } from './src/services/aiService';
 
@@ -120,19 +120,19 @@ async function startSession(sessionKey: string, accountId: string) {
     }
   });
 
-  // Listen for LID-to-Phone mappings (Baileys v6.6+)
-  // This is crucial for resolving @lid format JIDs to real phone numbers
-  (sock.ev.on as any)('lid-mapping.update', async (mappings: Record<string, string>) => {
-    console.log(`[startSession] LID-Mapping update received with ${Object.keys(mappings).length} mappings`);
+  // Listen for LID-to-Phone mappings (Baileys v7.0+)
+  // Payload is now typed as { lid, pn } instead of Record<string, string>
+  // These are emitted both during initial history sync and whenever a new mapping is discovered
+  sock.ev.on('lid-mapping.update', async ({ lid, pn }) => {
+    const lidNum = lid.split('@')[0];
+    const pnNum = pn.split('@')[0];
+    console.log(`[startSession] LID-Mapping update: ${lidNum} → ${pnNum}`);
+    storeLIDMapping(lidNum, pnNum);
+
+    // Consolidate any duplicate chats created under the LID identifier
     const session = sessions.get(sessionKey);
-
-    for (const [lid, phoneNumber] of Object.entries(mappings)) {
-      storeLIDMapping(lid, phoneNumber);
-
-      // Consolidate any duplicate chats created under the LID identifier
-      if (session?.phoneNumber) {
-        await consolidateLIDChat(accountId, session.phoneNumber, lid, phoneNumber);
-      }
+    if (session?.phoneNumber) {
+      await consolidateLIDChat(accountId, session.phoneNumber, lidNum, pnNum);
     }
   });
 
@@ -272,7 +272,7 @@ async function startSession(sessionKey: string, accountId: string) {
     // If we got a LID format, try to resolve it to a real phone number
     if (remoteJid.includes('@lid')) {
       console.log(`[AI] Message from LID format: ${remoteJid}, attempting to resolve...`);
-      const resolved = await resolveLIDFromContacts(contactPhone, sock);
+      const resolved = await resolveLIDViaSock(contactPhone, sock);
       if (resolved) {
         contactPhone = resolved;
         console.log(`[AI] Successfully resolved LID to ${contactPhone}`);

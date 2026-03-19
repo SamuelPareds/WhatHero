@@ -201,9 +201,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
     return Scaffold(
       appBar: AppBar(
         leading: IconButton(
-          icon: const Icon(Icons.manage_accounts_outlined, color: lightText),
+          icon: const Icon(Icons.manage_accounts_outlined, color: primaryAqua),
           onPressed: () => Navigator.pop(context),
-          tooltip: 'Cuentas',
+          tooltip: 'Volver a Mis Cuentas',
         ),
         title: Column(
           mainAxisSize: MainAxisSize.min,
@@ -302,13 +302,43 @@ class _ChatsScreenState extends State<ChatsScreen> {
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
+                  Icon(
+                    searchQuery.isEmpty ? Icons.chat_bubble_outline : Icons.search_off,
+                    size: 48,
+                    color: primaryAqua.withValues(alpha: 0.5),
+                  ),
+                  const SizedBox(height: 16),
                   Text(
                     searchQuery.isEmpty ? 'Sin chats' : 'No se encontraron resultados',
                     style: const TextStyle(
-                      fontSize: 16,
+                      fontSize: 18,
+                      fontWeight: FontWeight.w600,
+                      color: white,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    searchQuery.isEmpty
+                        ? 'Los chats aparecerán aquí cuando recibas mensajes'
+                        : 'Intenta con otro contacto o número',
+                    style: const TextStyle(
+                      fontSize: 14,
                       color: lightText,
                     ),
                   ),
+                  if (searchQuery.isEmpty) ...[
+                    const SizedBox(height: 24),
+                    ElevatedButton.icon(
+                      onPressed: () => Navigator.pop(context),
+                      icon: const Icon(Icons.manage_accounts_outlined),
+                      label: const Text('Ir a Mis Cuentas'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: primaryAqua,
+                        foregroundColor: darkBg,
+                        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                      ),
+                    ),
+                  ],
                 ],
               ),
             );

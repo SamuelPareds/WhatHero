@@ -53,37 +53,28 @@ export function clearLIDMappings(): void {
   console.log('[LID-Mapping] Cleared all LID mappings');
 }
 
-// Attempt to resolve a LID by searching through Baileys contacts
-// This is a fallback when lid-mapping.update hasn't been received yet
-export async function resolveLIDFromContacts(lid: string, sock: any): Promise<string | null> {
+// Attempt to resolve a LID to a phone number using Baileys v7.0+ LIDMappingStore
+// The store reads from persisted auth state files and can fetch from WhatsApp if needed
+export async function resolveLIDViaSock(lid: string, sock: any): Promise<string | null> {
   try {
-    const normalizedLid = lid.includes('@') ? lid.split('@')[0] : lid;
+    const lidNum = lid.includes('@') ? lid.split('@')[0] : lid;
 
-    // Check if we already have a mapping
-    const cached = lidToPhoneMap.get(normalizedLid);
+    // 1. Check in-memory cache first
+    const cached = lidToPhoneMap.get(lidNum);
     if (cached) return cached;
 
-    // Try to get all contacts from Baileys
-    if (!sock?.contacts) {
-      console.warn(`[LID-Resolve] Socket doesn't have contacts property`);
-      return null;
-    }
-
-    // Search through contacts to find matching LID
-    // This attempts to match by contact properties
-    for (const [jid, contact] of Object.entries(sock.contacts)) {
-      const contactJid = typeof jid === 'string' ? jid : '';
-      if (contactJid.includes('@lid') && contactJid.includes(normalizedLid)) {
-        const phoneNumber = extractPhoneNumber(contactJid);
-        if (phoneNumber && phoneNumber !== normalizedLid) {
-          storeLIDMapping(normalizedLid, phoneNumber);
-          console.log(`[LID-Resolve] Resolved ${normalizedLid} to ${phoneNumber} via contacts`);
-          return phoneNumber;
-        }
+    // 2. Use Baileys v7.0 LIDMappingStore (reads from auth_info files + WhatsApp USYNC)
+    if (sock?.signalRepository?.lidMapping) {
+      const pnJid = await sock.signalRepository.lidMapping.getPNForLID(`${lidNum}@lid`);
+      if (pnJid) {
+        const pnNum = pnJid.split('@')[0];
+        storeLIDMapping(lidNum, pnNum);
+        console.log(`[LID-Resolve] Resolved via lidMapping store: ${lidNum} → ${pnNum}`);
+        return pnNum;
       }
     }
 
-    console.warn(`[LID-Resolve] Could not resolve LID ${normalizedLid} from contacts`);
+    console.warn(`[LID-Resolve] Could not resolve LID ${lidNum}`);
     return null;
   } catch (error) {
     console.error(`[LID-Resolve] Error resolving LID:`, error);
