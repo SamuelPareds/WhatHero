@@ -67,7 +67,7 @@ export async function resolveLIDViaSock(lid: string, sock: any): Promise<string 
     if (sock?.signalRepository?.lidMapping) {
       const pnJid = await sock.signalRepository.lidMapping.getPNForLID(`${lidNum}@lid`);
       if (pnJid) {
-        const pnNum = pnJid.split('@')[0];
+        const pnNum = extractPhoneNumber(pnJid);
         storeLIDMapping(lidNum, pnNum);
         console.log(`[LID-Resolve] Resolved via lidMapping store: ${lidNum} → ${pnNum}`);
         return pnNum;

@@ -124,8 +124,8 @@ async function startSession(sessionKey: string, accountId: string) {
   // Payload is now typed as { lid, pn } instead of Record<string, string>
   // These are emitted both during initial history sync and whenever a new mapping is discovered
   sock.ev.on('lid-mapping.update', async ({ lid, pn }) => {
-    const lidNum = lid.split('@')[0];
-    const pnNum = pn.split('@')[0];
+    const lidNum = extractPhoneNumber(lid);
+    const pnNum = extractPhoneNumber(pn);
     console.log(`[startSession] LID-Mapping update: ${lidNum} → ${pnNum}`);
     storeLIDMapping(lidNum, pnNum);
 
