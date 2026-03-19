@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:crm_whatsapp/core.dart';
 
 class MessageBubble extends StatelessWidget {
@@ -27,28 +28,43 @@ class MessageBubble extends StatelessWidget {
         child: Column(
           crossAxisAlignment: fromMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
           children: [
-            Container(
-              constraints: BoxConstraints(
-                maxWidth: MediaQuery.of(context).size.width * 0.7,
-              ),
-              decoration: BoxDecoration(
-                color: fromMe ? primaryAqua : surfaceDark.withValues(alpha: 0.9),
-                borderRadius: BorderRadius.circular(14),
-                border: fromMe
-                    ? null
-                    : Border.all(
-                        color: primaryAqua.withValues(alpha: 0.15),
-                        width: 1,
-                      ),
-              ),
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-              child: Text(
-                text,
-                style: TextStyle(
-                  color: fromMe ? darkBg : white,
-                  fontSize: 15,
-                  fontWeight: FontWeight.w400,
-                  height: 1.4,
+            GestureDetector(
+              onLongPress: () async {
+                await Clipboard.setData(ClipboardData(text: text));
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Copiado'),
+                      duration: Duration(milliseconds: 1500),
+                      behavior: SnackBarBehavior.floating,
+                      margin: EdgeInsets.only(bottom: 20, left: 20, right: 20),
+                    ),
+                  );
+                }
+              },
+              child: Container(
+                constraints: BoxConstraints(
+                  maxWidth: MediaQuery.of(context).size.width * 0.7,
+                ),
+                decoration: BoxDecoration(
+                  color: fromMe ? primaryAqua : surfaceDark.withValues(alpha: 0.9),
+                  borderRadius: BorderRadius.circular(14),
+                  border: fromMe
+                      ? null
+                      : Border.all(
+                          color: primaryAqua.withValues(alpha: 0.15),
+                          width: 1,
+                        ),
+                ),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                child: Text(
+                  text,
+                  style: TextStyle(
+                    color: fromMe ? darkBg : white,
+                    fontSize: 15,
+                    fontWeight: FontWeight.w400,
+                    height: 1.4,
+                  ),
                 ),
               ),
             ),
