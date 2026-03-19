@@ -15,7 +15,7 @@ import { rmSync, existsSync, readdirSync, writeFileSync, readFileSync, mkdirSync
 import { randomUUID } from 'crypto';
 import { SessionData, MessageBuffer } from './src/types';
 import { extractPhoneNumber, storeLIDMapping, resolveLIDFromContacts } from './src/utils/phone';
-import { initializeSession, saveMessageToFirestore, getAIConfig, updateContactInFirestore } from './src/services/firestoreService';
+import { initializeSession, saveMessageToFirestore, getAIConfig, updateContactInFirestore, consolidateLIDChat } from './src/services/firestoreService';
 import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer } from './src/services/aiService';
 
 // Ensure auth_info directory exists
@@ -122,10 +122,17 @@ async function startSession(sessionKey: string, accountId: string) {
 
   // Listen for LID-to-Phone mappings (Baileys v6.6+)
   // This is crucial for resolving @lid format JIDs to real phone numbers
-  (sock.ev.on as any)('lid-mapping.update', (mappings: Record<string, string>) => {
+  (sock.ev.on as any)('lid-mapping.update', async (mappings: Record<string, string>) => {
     console.log(`[startSession] LID-Mapping update received with ${Object.keys(mappings).length} mappings`);
+    const session = sessions.get(sessionKey);
+
     for (const [lid, phoneNumber] of Object.entries(mappings)) {
       storeLIDMapping(lid, phoneNumber);
+
+      // Consolidate any duplicate chats created under the LID identifier
+      if (session?.phoneNumber) {
+        await consolidateLIDChat(accountId, session.phoneNumber, lid, phoneNumber);
+      }
     }
   });
 
@@ -220,7 +227,7 @@ async function startSession(sessionKey: string, accountId: string) {
     const message = m.messages?.[0];
     if (!message) return;
 
-    await saveMessageToFirestore(message, sessionKey, accountId, sessions, sock.user?.id);
+    await saveMessageToFirestore(message, sessionKey, accountId, sessions, sock.user?.id, sock);
 
     // AI auto-response: only for incoming messages (not from self)
     if (message.key.fromMe) {

@@ -35,7 +35,7 @@ export async function initializeSession(phoneNumber: string, sessionKey: string,
   }
 }
 
-export async function saveMessageToFirestore(message: any, sessionKey: string, accountId: string, sessions: Map<string, SessionData>, botJid?: string) {
+export async function saveMessageToFirestore(message: any, sessionKey: string, accountId: string, sessions: Map<string, SessionData>, botJid?: string, sock?: any) {
   try {
     const session = sessions.get(sessionKey);
     if (!session?.phoneNumber) {
@@ -49,8 +49,18 @@ export async function saveMessageToFirestore(message: any, sessionKey: string, a
     const remoteJid = message.key.remoteJid;
     if (!remoteJid) return;
 
-    const phoneNumber = extractPhoneNumber(remoteJid);
+    let phoneNumber = extractPhoneNumber(remoteJid);
     if (!phoneNumber) return;
+
+    // If we got a LID format and no mapping exists yet, try to resolve it
+    if (remoteJid.includes('@lid') && sock) {
+      const { resolveLIDFromContacts } = await import('../utils/phone');
+      const resolved = await resolveLIDFromContacts(phoneNumber, sock);
+      if (resolved) {
+        phoneNumber = resolved;
+        console.log(`[Firestore] Resolved LID ${extractPhoneNumber(remoteJid)} → ${phoneNumber}`);
+      }
+    }
 
     const messageText = message.message?.conversation ||
                         message.message?.extendedTextMessage?.text ||
@@ -145,6 +155,97 @@ export async function updateContactInFirestore(contact: any, sessionKey: string,
     console.log(`Contact name updated for ${phoneNumber}: ${contact.name}`);
   } catch (error) {
     console.error('Error updating contact in Firestore:', error);
+  }
+}
+
+// Consolidate duplicate chats when LID-to-Phone mapping is discovered
+// If a chat exists under a LID identifier, migrate it to the real phone number
+export async function consolidateLIDChat(
+  accountId: string,
+  sessionId: string,
+  lid: string,
+  phoneNumber: string
+) {
+  try {
+    const db = getDb();
+
+    // Check if a chat exists under the LID
+    const lidChatRef = db
+      .collection('accounts')
+      .doc(accountId)
+      .collection('whatsapp_sessions')
+      .doc(sessionId)
+      .collection('chats')
+      .doc(lid);
+
+    const lidChatDoc = await lidChatRef.get();
+    if (!lidChatDoc.exists) {
+      // No LID chat found, nothing to consolidate
+      return;
+    }
+
+    const lidChatData = lidChatDoc.data();
+    if (!lidChatData) {
+      return;
+    }
+    console.log(`[Consolidate] Found LID chat for ${lid}, consolidating to ${phoneNumber}`);
+
+    // Check if phone number chat already exists
+    const phoneChatRef = db
+      .collection('accounts')
+      .doc(accountId)
+      .collection('whatsapp_sessions')
+      .doc(sessionId)
+      .collection('chats')
+      .doc(phoneNumber);
+
+    const phoneChatDoc = await phoneChatRef.get();
+
+    if (phoneChatDoc.exists) {
+      // Merge scenario: both chats exist
+      console.log(`[Consolidate] Both LID and phone chats exist, merging messages...`);
+
+      // Fetch all messages from LID chat
+      const lidMessagesRef = lidChatRef.collection('messages');
+      const lidMessagesSnapshot = await lidMessagesRef.get();
+
+      // Move all messages from LID chat to phone chat
+      const batch = db.batch();
+      lidMessagesSnapshot.docs.forEach((doc) => {
+        const messageRef = phoneChatRef.collection('messages').doc(doc.id);
+        batch.set(messageRef, doc.data(), { merge: true });
+      });
+      await batch.commit();
+
+      console.log(`[Consolidate] Migrated ${lidMessagesSnapshot.size} messages from LID ${lid} to ${phoneNumber}`);
+
+      // Delete LID chat document
+      await lidChatRef.delete();
+      console.log(`[Consolidate] Deleted LID chat document for ${lid}`);
+    } else {
+      // Simple rename: only LID chat exists
+      console.log(`[Consolidate] Phone chat doesn't exist, renaming LID chat to ${phoneNumber}`);
+
+      // Copy all data from LID to phone number
+      await phoneChatRef.set(lidChatData, { merge: true });
+
+      // Fetch and copy all messages
+      const lidMessagesRef = lidChatRef.collection('messages');
+      const lidMessagesSnapshot = await lidMessagesRef.get();
+
+      const batch = db.batch();
+      lidMessagesSnapshot.docs.forEach((doc) => {
+        const messageRef = phoneChatRef.collection('messages').doc(doc.id);
+        batch.set(messageRef, doc.data());
+      });
+      await batch.commit();
+
+      // Delete LID chat
+      await lidChatRef.delete();
+      console.log(`[Consolidate] Renamed LID chat ${lid} → ${phoneNumber}, migrated ${lidMessagesSnapshot.size} messages`);
+    }
+  } catch (error) {
+    console.error(`[Consolidate] Error consolidating LID ${lid}:`, error);
   }
 }
 
