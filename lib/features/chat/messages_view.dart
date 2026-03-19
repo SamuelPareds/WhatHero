@@ -526,11 +526,17 @@ class _MessagesViewState extends State<MessagesView> {
                   final text = msg['text'] ?? '';
                   final fromMe = msg['fromMe'] ?? false;
                   final timestamp = msg['timestamp'] as Timestamp;
+                  final messageId = msg.id;
 
                   return MessageBubble(
+                    key: ValueKey(messageId),
                     text: text,
                     fromMe: fromMe,
                     timestamp: timestamp.toDate(),
+                    messageId: messageId,
+                    chatPhone: widget.phoneNumber,
+                    sessionKey: widget.sessionKey,
+                    accountId: widget.accountId,
                   );
                 },
               );

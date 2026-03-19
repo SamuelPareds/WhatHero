@@ -632,6 +632,135 @@ app.post('/generate-ai-response', express.json(), async (req, res) => {
   }
 });
 
+// REST API endpoint to edit a message
+app.post('/edit-message', express.json(), async (req, res) => {
+  try {
+    const { messageId, chatPhone, newText, sessionKey, accountId } = req.body;
+
+    if (!messageId || !chatPhone || !newText || !sessionKey || !accountId) {
+      return res.status(400).json({ error: 'Missing required fields: messageId, chatPhone, newText, sessionKey, accountId' });
+    }
+
+    const session = sessions.get(sessionKey);
+    if (!session?.isReady || !session?.phoneNumber) {
+      return res.status(503).json({ error: 'Session not ready' });
+    }
+
+    // Get the remoteJid from the chat document
+    let jid = chatPhone.includes('@') ? chatPhone : `${chatPhone}@s.whatsapp.net`;
+    try {
+      const chatDocRef = db
+        .collection('accounts')
+        .doc(accountId)
+        .collection('whatsapp_sessions')
+        .doc(session.phoneNumber)
+        .collection('chats')
+        .doc(chatPhone);
+
+      const chatDoc = await chatDocRef.get();
+      if (chatDoc.exists && chatDoc.data()?.remoteJid) {
+        jid = chatDoc.data()!.remoteJid;
+        console.log(`[/edit-message] Using stored remoteJid: ${jid}`);
+      }
+    } catch (error) {
+      console.warn(`[/edit-message] Error retrieving chat document:`, error);
+    }
+
+    // Construct messageKey for Baileys
+    const messageKey = {
+      remoteJid: jid,
+      id: messageId,
+      fromMe: true
+    };
+
+    console.log(`[/edit-message] Editing message ${messageId} in chat ${chatPhone} with new text: ${newText}`);
+
+    // Edit the message via Baileys
+    await session.sock.sendMessage(jid, {
+      text: newText,
+      edit: messageKey
+    });
+
+    console.log(`[/edit-message] Message ${messageId} edited successfully`);
+
+    res.json({
+      success: true,
+      messageId: messageId,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('[/edit-message] Error:', error);
+    res.status(500).json({
+      error: 'Failed to edit message',
+      details: (error as any).message,
+    });
+  }
+});
+
+// REST API endpoint to delete a message
+app.post('/delete-message', express.json(), async (req, res) => {
+  try {
+    const { messageId, chatPhone, sessionKey, accountId } = req.body;
+
+    if (!messageId || !chatPhone || !sessionKey || !accountId) {
+      return res.status(400).json({ error: 'Missing required fields: messageId, chatPhone, sessionKey, accountId' });
+    }
+
+    const session = sessions.get(sessionKey);
+    if (!session?.isReady || !session?.phoneNumber) {
+      return res.status(503).json({ error: 'Session not ready' });
+    }
+
+    // Get the remoteJid from the chat document
+    let jid = chatPhone.includes('@') ? chatPhone : `${chatPhone}@s.whatsapp.net`;
+    try {
+      const chatDocRef = db
+        .collection('accounts')
+        .doc(accountId)
+        .collection('whatsapp_sessions')
+        .doc(session.phoneNumber)
+        .collection('chats')
+        .doc(chatPhone);
+
+      const chatDoc = await chatDocRef.get();
+      if (chatDoc.exists && chatDoc.data()?.remoteJid) {
+        jid = chatDoc.data()!.remoteJid;
+        console.log(`[/delete-message] Using stored remoteJid: ${jid}`);
+      }
+    } catch (error) {
+      console.warn(`[/delete-message] Error retrieving chat document:`, error);
+    }
+
+    // Construct messageKey for Baileys
+    const messageKey = {
+      remoteJid: jid,
+      id: messageId,
+      fromMe: true
+    };
+
+    console.log(`[/delete-message] Deleting message ${messageId} from chat ${chatPhone}`);
+
+    // Delete the message via Baileys (for everyone)
+    await session.sock.sendMessage(jid, {
+      delete: messageKey
+    });
+
+    console.log(`[/delete-message] Message ${messageId} deleted successfully`);
+
+    res.json({
+      success: true,
+      messageId: messageId,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('[/delete-message] Error:', error);
+    res.status(500).json({
+      error: 'Failed to delete message',
+      details: (error as any).message,
+    });
+  }
+});
+
 // DEV ONLY: Delete chat history (triggered by "elimhis" command)
 app.post('/delete-chat-history', express.json(), async (req, res) => {
   try {
