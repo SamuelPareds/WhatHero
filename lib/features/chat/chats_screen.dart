@@ -1,20 +1,19 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'dart:ui';
-import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:crm_whatsapp/core.dart';
+import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/features/settings.dart';
 import 'messages_view.dart';
 
 class ChatsScreen extends StatefulWidget {
-  final IO.Socket socket;
   final String sessionId;
   final String sessionKey;
   final String accountId;
 
   const ChatsScreen({
-    required this.socket,
     required this.sessionId,
     required this.sessionKey,
     required this.accountId,
@@ -30,24 +29,51 @@ class _ChatsScreenState extends State<ChatsScreen> {
   String searchQuery = '';
   final TextEditingController searchController = TextEditingController();
 
+  StreamSubscription? _statusSubscription;
+  StreamSubscription? _humanAttentionSubscription;
+
   @override
   void initState() {
     super.initState();
-    // 📌 Listen for AI toggle confirmation from backend
-    widget.socket.on('ai_toggle_result', (data) {
-      if (mounted) {
-        final success = data['success'] as bool? ?? false;
-        final message = data['message'] as String? ?? '';
-        final isActivating = message.toLowerCase() == 'ia activada'; // Explicit check for activation
-        _showEtherealToast(success, message, isActivating: isActivating);
+    _setupSocketListeners();
+  }
+
+  void _setupSocketListeners() {
+    // Escuchar el estado de la sesión
+    _statusSubscription = SocketService().statusStream.listen((event) {
+      if (event.sessionKey == widget.sessionKey) {
+        if (event.status == 'logged_out' || event.status == 'disconnected') {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('Sesión ${widget.sessionId} desconectada'),
+                backgroundColor: Colors.red,
+              ),
+            );
+            // Podríamos decidir volver atrás o mostrar un aviso visual
+          }
+        }
       }
     });
+
+    // Escuchar alertas de atención humana
+    _humanAttentionSubscription = SocketService().humanAttentionStream.listen((data) {
+      if (data['sessionKey'] == widget.sessionKey) {
+        // Podríamos mostrar una notificación interna o resaltar el chat
+        debugPrint('[ChatsScreen] Atención humana requerida para: ${data['contactPhone']}');
+      }
+    });
+
+    // NOTA: El evento 'ai_toggle_result' no está explícitamente en SocketService aún,
+    // pero podemos agregarlo o manejarlo genéricamente si el backend lo envía.
+    // Por ahora, mantendremos la lógica de UI.
   }
 
   @override
   void dispose() {
     searchController.dispose();
-    widget.socket.off('ai_toggle_result');
+    _statusSubscription?.cancel();
+    _humanAttentionSubscription?.cancel();
     super.dispose();
   }
 
@@ -402,9 +428,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
             final chatData = snapshot.data?.data() as Map<String, dynamic>?;
             final contactName = chatData?['contactName'] as String? ?? '';
             final needsHuman = chatData?['needs_human'] as bool? ?? false;
-            
+
             final displayName = contactName.isNotEmpty ? contactName : (selectedChatPhone ?? 'Chat');
-            
+
             return Row(
               mainAxisSize: MainAxisSize.min,
               children: [
@@ -451,11 +477,14 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
                     // If disabling (turning false), cancel any pending buffer
                     if (aiAutoResponse) {
-                      widget.socket.emit('cancel_ai_buffer', {
-                        'sessionKey': widget.sessionKey,
-                        'contactPhone': selectedChatPhone,
+                      SocketService().sendMessage({
+                        'event': 'cancel_ai_buffer',
+                        'data': {
+                          'sessionKey': widget.sessionKey,
+                          'contactPhone': selectedChatPhone,
+                        }
                       });
-                      debugPrint('Emitted cancel_ai_buffer for $selectedChatPhone');
+                      debugPrint('Emitted cancel_ai_buffer for $selectedChatPhone via SocketService');
                     } else {
                       // If enabling, show success toast immediately (no buffer to cancel)
                       _showEtherealToast(true, 'IA activada', isActivating: true);

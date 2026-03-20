@@ -1,10 +1,10 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:http/http.dart' as http;
 import 'package:crm_whatsapp/core.dart';
+import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/features/auth.dart';
 import 'package:crm_whatsapp/features/accounts/link_account_screen.dart';
 import 'package:crm_whatsapp/features/settings.dart';
@@ -20,63 +20,18 @@ class AccountsScreen extends StatefulWidget {
 }
 
 class _AccountsScreenState extends State<AccountsScreen> {
-  late IO.Socket socket;
-  bool _socketConnected = false;
   bool _autoNavigated = false;
 
   @override
   void initState() {
     super.initState();
-    initSocket();
-  }
-
-  void initSocket() {
-    print('[AccountsScreen] 🚀 Conectando a: $backendUrl (modo: ${identical(true, const bool.fromEnvironment("dart.vm.product")) ? 'Release' : 'Debug'})');
-    print('[AccountsScreen] Iniciando Socket.io con accountId: ${widget.accountId}');
-    socket = IO.io(backendUrl, IO.OptionBuilder()
-      .setTransports(['websocket'])
-      .disableAutoConnect()
-      .setAuth({'accountId': widget.accountId})
-      .build());
-
-    // Listener para conexión exitosa
-    socket.on('connect', (_) {
-      print('[AccountsScreen] Socket conectado: ${socket.id}');
-      if (mounted) {
-        setState(() => _socketConnected = true);
-      }
-    });
-
-    socket.on('disconnect', (_) {
-      print('[AccountsScreen] Socket desconectado');
-      if (mounted) {
-        setState(() => _socketConnected = false);
-      }
-    });
-
-    socket.on('human_attention_required', (data) {
-      print('[AccountsScreen] human_attention_required: $data');
-      // Badge in chat list is enough visual feedback
-      // No need for additional notification banner
-    });
-
-    socket.connect();
-    print('[AccountsScreen] socket.connect() llamado');
-  }
-
-  @override
-  void dispose() {
-    // Remove all socket listeners before disconnecting
-    socket.off('connect');
-    socket.off('disconnect');
-    socket.off('human_attention_required');
-    socket.disconnect();
-    super.dispose();
+    // Inicializar el socket global una sola vez para este accountId
+    SocketService().init(widget.accountId);
   }
 
   Future<void> _handleLogout() async {
     try {
-      socket.disconnect();
+      // El dispose del socket se encarga de cerrar la conexión
       await FirebaseAuth.instance.signOut();
       if (!mounted) return;
       Navigator.pushReplacement(
@@ -93,12 +48,12 @@ class _AccountsScreenState extends State<AccountsScreen> {
   }
 
   Future<void> _startNewSession() async {
-    // Esperar a que el socket esté conectado
-    if (!_socketConnected) {
+    // Verificar conexión del socket centralizado
+    if (!SocketService().isConnected) {
       print('[AccountsScreen] Socket no está conectado, esperando...');
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Conectando... intenta de nuevo')),
+        const SnackBar(content: Text('Conectando al servidor... intenta de nuevo')),
       );
       return;
     }
@@ -124,7 +79,6 @@ class _AccountsScreenState extends State<AccountsScreen> {
           MaterialPageRoute(
             builder: (_) => LinkAccountScreen(
               sessionKey: sessionKey,
-              socket: socket,
               accountId: widget.accountId,
             ),
           ),
@@ -193,7 +147,6 @@ class _AccountsScreenState extends State<AccountsScreen> {
                     context,
                     MaterialPageRoute(
                       builder: (_) => ChatsScreen(
-                        socket: socket,
                         sessionId: phoneNumber,
                         sessionKey: sessionKey,
                         accountId: widget.accountId,
@@ -244,7 +197,6 @@ class _AccountsScreenState extends State<AccountsScreen> {
                             context,
                             MaterialPageRoute(
                               builder: (_) => ChatsScreen(
-                                socket: socket,
                                 sessionId: phoneNumber,
                                 sessionKey: sessionKey,
                                 accountId: widget.accountId,
