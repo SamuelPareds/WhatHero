@@ -346,6 +346,31 @@ Responde SOLO con una de estas dos opciones:
   }
 }
 
+// Divide la respuesta en grupos de párrafos (alternando 2 y 3) para simular escritura humana
+async function sendChunkedResponse(sock: any, remoteJid: string, response: string): Promise<void> {
+  const chunks = response.split(/\n\n+/);
+
+  // Si es texto corto (1 párrafo), enviar directo sin chunking
+  if (chunks.length <= 1) {
+    await sock.sendMessage(remoteJid, { text: response.trim() });
+    return;
+  }
+
+  let i = 0;
+  let groupSize = 2;
+  while (i < chunks.length) {
+    const group = chunks.slice(i, i + groupSize).join('\n\n').trim();
+    if (group) {
+      await sock.sendMessage(remoteJid, { text: group });
+      // Delay proporcional a la longitud del chunk (mínimo 800ms, máximo 2500ms)
+      const delay = Math.min(2500, Math.max(800, group.length * 10));
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+    i += groupSize;
+    groupSize = groupSize === 2 ? 3 : 2;
+  }
+}
+
 // Process buffered messages: fetch history, run discriminator, and send AI response
 export async function processMessageBuffer(
   sessionKey: string,
@@ -453,8 +478,8 @@ export async function processMessageBuffer(
     );
 
     if (aiResponse) {
-      await session.sock.sendMessage(remoteJid, { text: aiResponse });
-      console.log(`[Buffer] Auto-responded to ${remoteJid} on session ${session.phoneNumber} with ${aiResponse.length} chars`);
+      await sendChunkedResponse(session.sock, remoteJid, aiResponse);
+      console.log(`[Buffer] Auto-responded to ${remoteJid} en chunks`);
     }
   } catch (error) {
     console.error('[Buffer] Error processing message buffer:', error);

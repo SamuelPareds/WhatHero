@@ -55,10 +55,11 @@ Un sistema inteligente de filtrado que intercepta mensajes ANTES del asistente I
 - **Desafío de Eficiencia:** Antes de codificar, evalúa si hay una forma más sencilla o con mejor rendimiento. Di: *"Existe una forma más sencilla de hacer esto"* si es el caso.
 - **Minimalismo:** Menos dependencias y menos líneas de código son siempre mejores.
 - **Seguridad:** Los datos de la sesión (`auth_info`) nunca se suben al repo; se gestionan vía Volúmenes o Variables de Entorno.
+- **Commentarios** Si hay comentarios en el código, siempre ponlos en español, para que los vibecoding podamos entender.
 
 ---
 
 ## 🛠️ Stack Tecnológico
 - **Frontend:** Flutter (Web/Mobile).
-- **Backend:** Node.js + Express + Socket.io + Baileys.
+- **Backend:** Node.js + Express + Socket.io + Baileys 7.0.
 - **Infraestructura:** Railway (Docker + Volumes) & Firebase (Auth + Firestore + Hosting).
