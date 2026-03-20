@@ -150,12 +150,9 @@ class _LinkAccountScreenState extends State<LinkAccountScreen> {
 
     print('[LinkAccountScreen] Cancelando sesión via SocketService: ${widget.sessionKey}');
     
-    // Usar el socket global para enviar la cancelación
-    SocketService().sendMessage({
-      'event': 'cancel_session',
-      'data': {
-        'sessionKey': widget.sessionKey,
-      }
+    // Usar el nuevo método emit para enviar el evento directamente
+    SocketService().emit('cancel_session', {
+      'sessionKey': widget.sessionKey,
     });
   }
 

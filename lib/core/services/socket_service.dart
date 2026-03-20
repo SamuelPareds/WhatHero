@@ -121,12 +121,17 @@ class SocketService {
     _humanAttentionController.close();
   }
 
+  /// Método genérico para emitir eventos al backend
+  void emit(String event, dynamic data) {
+    if (_isConnected) {
+      _socket?.emit(event, data);
+    } else {
+      debugPrint('[SocketService] Error: Socket no conectado, no se puede emitir $event');
+    }
+  }
+
   /// Método para enviar mensajes a través del socket (más rápido que HTTP)
   void sendMessage(Map<String, dynamic> data) {
-    if (_isConnected) {
-      _socket?.emit('send_message_socket', data);
-    } else {
-      debugPrint('[SocketService] Error: Socket no conectado, no se puede enviar mensaje');
-    }
+    emit('send_message_socket', data);
   }
 }

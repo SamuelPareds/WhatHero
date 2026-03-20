@@ -154,8 +154,9 @@ async function startSession(sessionKey: string, accountId: string) {
     if (connection === 'close') {
       session.isReady = false;
       const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
+      const errorMessage = (lastDisconnect?.error as any)?.message;
 
-      // Mark session as disconnected
+      // Mark session as disconnected in Firestore if we have a phone number
       if (session.phoneNumber) {
         try {
           const sessionDocRef = db
@@ -171,6 +172,12 @@ async function startSession(sessionKey: string, accountId: string) {
         } catch (error) {
           console.error('Error updating session status:', error);
         }
+      }
+
+      // CHECK: If session was removed from the map, don't attempt reconnect
+      if (!sessions.has(sessionKey)) {
+        console.log(`[startSession] Session ${sessionKey} was explicitly cancelled. Stopping reconnect loop.`);
+        return;
       }
 
       if (statusCode === DisconnectReason.loggedOut) {
@@ -190,13 +197,28 @@ async function startSession(sessionKey: string, accountId: string) {
 
         // Notify frontend
         io.to(session.accountId).emit('status_update', { status: 'logged_out', sessionKey });
+      } else if (statusCode === 408 && !session.phoneNumber) {
+        // QR Timeout on a session that was never connected
+        console.log(`[startSession] QR Timeout for new session ${sessionKey}. Cleaning up instead of reconnecting.`);
+        
+        // Clean up memory and files to prevent leaks
+        try {
+          rmSync(`auth_info/${sessionKey}`, { recursive: true, force: true });
+        } catch (e) {}
+        sessions.delete(sessionKey);
+        
+        io.to(session.accountId).emit('status_update', { status: 'qr_timeout', sessionKey });
       } else {
         // Regular disconnection - attempt normal reconnect
-        console.log('connection closed due to ', lastDisconnect?.error, ', attempting reconnect');
+        console.log(`[startSession] Connection closed (code: ${statusCode}, msg: ${errorMessage}), attempting reconnect for ${sessionKey}`);
+        
         if (!session.isReconnecting) {
           session.isReconnecting = true;
           setTimeout(() => {
-            startSession(sessionKey, session.accountId);
+            // Check again if session still exists before calling startSession
+            if (sessions.has(sessionKey)) {
+              startSession(sessionKey, session.accountId);
+            }
             session.isReconnecting = false;
           }, 3000);
         }
