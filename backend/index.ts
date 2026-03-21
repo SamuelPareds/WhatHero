@@ -449,6 +449,59 @@ async function cancelSession(sessionKey: string) {
   return true;
 }
 
+/**
+ * Common logic to send a message via Baileys, reused by HTTP and Socket handlers
+ */
+async function performSendMessage({ to, text, imageUrl, sessionKey, accountId }: any) {
+  const session = sessions.get(sessionKey);
+  if (!session?.isReady || !session?.phoneNumber) {
+    throw new Error('Session not ready');
+  }
+
+  // Try to get the stored remoteJid from the chat document
+  let jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
+
+  try {
+    const chatDocRef = db
+      .collection('accounts')
+      .doc(accountId)
+      .collection('whatsapp_sessions')
+      .doc(session.phoneNumber)
+      .collection('chats')
+      .doc(to);
+
+    const chatDoc = await chatDocRef.get();
+    if (chatDoc.exists && chatDoc.data()?.remoteJid) {
+      jid = chatDoc.data()!.remoteJid;
+    }
+  } catch (error) {
+    console.warn(`[performSendMessage] Error retrieving chat document:`, error);
+  }
+
+  let message;
+  if (imageUrl) {
+    console.log(`[performSendMessage] Downloading image from URL: ${imageUrl}`);
+    const imageResponse = await fetch(imageUrl).then(res => {
+      if (!res.ok) throw new Error(`Failed to fetch image: ${res.statusText}`);
+      return res.arrayBuffer();
+    });
+    const imageBuffer = Buffer.from(imageResponse);
+
+    message = await session.sock.sendMessage(jid, {
+      image: imageBuffer,
+      caption: text || undefined,
+    });
+  } else {
+    message = await session.sock.sendMessage(jid, { text });
+  }
+
+  return {
+    success: true,
+    messageId: message.key.id,
+    timestamp: new Date().toISOString(),
+  };
+}
+
 // REST API endpoint to start a new session
 app.post('/start-session', express.json(), async (req, res) => {
   try {
@@ -501,83 +554,13 @@ app.post('/cancel-session', express.json(), async (req, res) => {
   }
 });
 
-// REST API endpoint to send messages (text or media with optional caption)
+// REST API endpoint to send messages (now uses common logic)
 app.post('/send-message', express.json(), async (req, res) => {
   try {
-    const { to, text, imageUrl, sessionKey, accountId } = req.body;
-
-    // text is optional if imageUrl is provided, but at least one must exist
-    if (!to || !sessionKey || !accountId || (!text && !imageUrl)) {
-      return res.status(400).json({ error: 'Missing required fields: to, sessionKey, accountId, and at least one of (text, imageUrl)' });
-    }
-
-    const session = sessions.get(sessionKey);
-    if (!session?.isReady || !session?.phoneNumber) {
-      return res.status(503).json({ error: 'Session not ready' });
-    }
-
-    // Try to get the stored remoteJid from the chat document
-    // This is important for @lid format contacts - we need to use the exact JID format
-    let jid = to.includes('@') ? to : `${to}@s.whatsapp.net`; // Default fallback
-
-    try {
-      const chatDocRef = db
-        .collection('accounts')
-        .doc(accountId)
-        .collection('whatsapp_sessions')
-        .doc(session.phoneNumber)
-        .collection('chats')
-        .doc(to);
-
-      const chatDoc = await chatDocRef.get();
-      if (chatDoc.exists && chatDoc.data()?.remoteJid) {
-        jid = chatDoc.data()!.remoteJid;
-        console.log(`[/send-message] Using stored remoteJid: ${jid}`);
-      } else {
-        console.log(`[/send-message] No stored remoteJid found for ${to}, using default: ${jid}`);
-      }
-    } catch (error) {
-      console.warn(`[/send-message] Error retrieving chat document:`, error);
-      // Continue with default jid
-    }
-
-    console.log(`[/send-message] Sending message to JID: ${jid}`);
-
-    // Send the message via Baileys (text or image with optional caption)
-    let message;
-    if (imageUrl) {
-      // Send as image with optional caption
-      // Baileys requires image as Buffer, not URL - download it first
-      try {
-        console.log(`[/send-message] Downloading image from URL: ${imageUrl}`);
-        const imageResponse = await fetch(imageUrl).then(res => {
-          if (!res.ok) throw new Error(`Failed to fetch image: ${res.statusText}`);
-          return res.arrayBuffer();
-        });
-        const imageBuffer = Buffer.from(imageResponse);
-
-        message = await session.sock.sendMessage(jid, {
-          image: imageBuffer,
-          caption: text || undefined,
-        });
-        console.log(`Image sent to ${to} with caption: ${text || '(no caption)'}`);
-      } catch (imageError) {
-        console.error(`[/send-message] Error downloading/sending image:`, imageError);
-        throw new Error(`Failed to process image URL: ${(imageError as any).message}`);
-      }
-    } else {
-      // Send as text
-      message = await session.sock.sendMessage(jid, { text });
-      console.log(`Text message sent to ${to}:`, text);
-    }
-
-    res.json({
-      success: true,
-      messageId: message.key.id,
-      timestamp: new Date().toISOString(),
-    });
+    const result = await performSendMessage(req.body);
+    res.json(result);
   } catch (error) {
-    console.error('Error sending message:', error);
+    console.error('Error sending message (HTTP):', error);
     res.status(500).json({
       error: 'Failed to send message',
       details: (error as any).message,
@@ -892,6 +875,34 @@ io.on('connection', (socket) => {
 
     const success = await cancelSession(sessionKey);
     socket.emit('session_cancelled', { sessionKey, success });
+  });
+
+  // Handle message sending via WebSocket
+  socket.on('send_message_socket', async (data) => {
+    const { to, text, imageUrl, sessionKey, accountId: msgAccountId } = data;
+    console.log(`[Socket.io] Enviar mensaje solicitado para: ${to}`);
+
+    try {
+      // Security check: ensure accountId matches socket auth
+      if (msgAccountId !== accountId) {
+        throw new Error('Unauthorized accountId');
+      }
+
+      const result = await performSendMessage(data);
+      
+      // Emit success back to the specific client
+      socket.emit('message_sent_success', { 
+        to, 
+        messageId: result.messageId,
+        tempId: data.tempId // We'll add this in Flutter for optimistic UI
+      });
+    } catch (error) {
+      console.error('[Socket.io] Error enviando mensaje:', error);
+      socket.emit('message_sent_error', { 
+        to, 
+        error: (error as any).message 
+      });
+    }
   });
 
   // 📌 Cancel pending buffer when user disables AI for a specific contact
