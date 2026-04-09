@@ -43,6 +43,17 @@ Para garantizar que la data llegue al usuario correcto, implementamos **Rooms**:
 
 ---
 
+## 🛡️ Ciclo de Vida de Sesión WhatsApp (Robustez)
+
+Es CRÍTICO que cualquier cambio futuro respete estos principios de estabilidad:
+
+1.  **Persistencia del Historial:** Al desvincular una cuenta, el documento en Firestore **NUNCA** debe borrarse. Solo cambia el status a `disconnected` para preservar chats y configuración de IA.
+2.  **Sincronización de Estado:** El frontend debe reaccionar a `status_update: logged_out` y `ready` vía WebSockets para evitar estados "fantasma".
+3.  **Protección de Vinculación:** `LinkAccountScreen` debe protegerse contra cierres accidentales que maten sesiones exitosas (usar `PopScope` y validación de `sessionConnected`).
+4.  **Re-vinculación Transparente:** La revinculación de un número existente debe ser un `merge` en Firestore, nunca un `set` que sobrescriba subcolecciones.
+
+---
+
 ## 🛠️ Stack Tecnológico
 - **Frontend:** Flutter (Web/Mobile).
 - **Backend:** Node.js + Express + Socket.io + Baileys.

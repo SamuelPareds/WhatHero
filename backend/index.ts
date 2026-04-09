@@ -17,6 +17,7 @@ import { SessionData, MessageBuffer } from './src/types';
 import { extractPhoneNumber, storeLIDMapping, resolveLIDViaSock } from './src/utils/phone';
 import { initializeSession, saveMessageToFirestore, getAIConfig, updateContactInFirestore, consolidateLIDChat } from './src/services/firestoreService';
 import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer } from './src/services/aiService';
+import { ReminderService } from './src/services/reminderService';
 
 // Ensure auth_info directory exists
 const authInfoDir = 'auth_info';
@@ -102,7 +103,11 @@ async function startSession(sessionKey: string, accountId: string) {
     version,
     auth: state,
     logger: logger.child({ class: 'baileys' }),
-    printQRInTerminal: true
+    browser: ['WhatHero', 'Chrome', '121.0.0'],
+    generateHighQualityLinkPreview: true,
+    syncFullHistory: false,
+    markOnlineOnConnect: true,
+    printQRInTerminal: false // Desactivado para evitar logs deprecados
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -279,6 +284,24 @@ async function startSession(sessionKey: string, accountId: string) {
     const messageText = message.message?.conversation ||
                         message.message?.extendedTextMessage?.text || '';
     if (!messageText.trim()) return; // skip media-only messages
+
+    // --- KEYWORD TRIGGER FOR REMINDERS ---
+    const lowerMsg = messageText.toLowerCase();
+    if (lowerMsg === 'enviar_recordatorios' || lowerMsg === 'enviar recordatorios') {
+      const session = sessions.get(sessionKey);
+      if (session?.phoneNumber) {
+        console.log(`[Reminders] Manual trigger detected from ${message.key.remoteJid}`);
+        // Run in background
+        ReminderService.processReminders(accountId, session.phoneNumber, sessionKey, sessions)
+          .then(result => {
+            console.log(`[Reminders] Manual trigger completed for ${session.phoneNumber}`, result);
+          })
+          .catch(err => {
+            console.error(`[Reminders] Manual trigger failed for ${session.phoneNumber}`, err);
+          });
+        return; // Skip AI response for this message
+      }
+    }
 
     // Get AI config with caching
     const session = sessions.get(sessionKey);
@@ -825,6 +848,26 @@ app.post('/delete-chat-history', express.json(), async (req, res) => {
     console.error('[DEV] Error deleting chat history:', error);
     res.status(500).json({
       error: 'Failed to delete chat history',
+      details: (error as any).message,
+    });
+  }
+});
+
+// REST API endpoint to send reminders manually
+app.post('/send-reminders', express.json(), async (req, res) => {
+  try {
+    const { sessionKey, accountId, sessionId } = req.body;
+
+    if (!sessionKey || !accountId || !sessionId) {
+      return res.status(400).json({ error: 'Missing sessionKey, accountId, or sessionId' });
+    }
+
+    const result = await ReminderService.processReminders(accountId, sessionId, sessionKey, sessions);
+    res.json(result);
+  } catch (error) {
+    console.error('Error sending reminders (HTTP):', error);
+    res.status(500).json({
+      error: 'Failed to send reminders',
       details: (error as any).message,
     });
   }
