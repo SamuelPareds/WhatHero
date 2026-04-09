@@ -13,6 +13,7 @@ import { pino } from 'pino';
 import admin from 'firebase-admin';
 import { rmSync, existsSync, readdirSync, writeFileSync, readFileSync, mkdirSync } from 'fs';
 import { randomUUID } from 'crypto';
+import cron from 'node-cron';
 import { SessionData, MessageBuffer } from './src/types';
 import { extractPhoneNumber, storeLIDMapping, resolveLIDViaSock } from './src/utils/phone';
 import { initializeSession, saveMessageToFirestore, getAIConfig, updateContactInFirestore, consolidateLIDChat } from './src/services/firestoreService';
@@ -285,27 +286,24 @@ async function startSession(sessionKey: string, accountId: string) {
                         message.message?.extendedTextMessage?.text || '';
     if (!messageText.trim()) return; // skip media-only messages
 
+    // Extract contact phone number
+    const session = sessions.get(sessionKey);
+    if (!session?.phoneNumber) return;
+
     // --- KEYWORD TRIGGER FOR REMINDERS ---
     const lowerMsg = messageText.toLowerCase();
     if (lowerMsg === 'enviar_recordatorios' || lowerMsg === 'enviar recordatorios') {
-      const session = sessions.get(sessionKey);
-      if (session?.phoneNumber) {
-        console.log(`[Reminders] Manual trigger detected from ${message.key.remoteJid}`);
-        // Run in background
-        ReminderService.processReminders(accountId, session.phoneNumber, sessionKey, sessions)
-          .then(result => {
-            console.log(`[Reminders] Manual trigger completed for ${session.phoneNumber}`, result);
-          })
-          .catch(err => {
-            console.error(`[Reminders] Manual trigger failed for ${session.phoneNumber}`, err);
-          });
-        return; // Skip AI response for this message
-      }
+      console.log(`[Reminders] Manual trigger detected from ${message.key.remoteJid}`);
+      // Run in background
+      ReminderService.processReminders(accountId, session.phoneNumber, sessionKey, sessions)
+        .then(result => {
+          console.log(`[Reminders] Manual trigger completed for ${session.phoneNumber}`, result);
+        })
+        .catch(err => {
+          console.error(`[Reminders] Manual trigger failed for ${session.phoneNumber}`, err);
+        });
+      return; // Skip AI response for this message
     }
-
-    // Get AI config with caching
-    const session = sessions.get(sessionKey);
-    if (!session?.phoneNumber) return;
 
     const aiConfig = await getAIConfig(session, accountId);
     const provider: 'gemini' | 'openai' = (aiConfig.provider || 'gemini') as 'gemini' | 'openai';
@@ -1022,4 +1020,9 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 httpServer.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);
   await startExistingSessions();
+
+  // Setup cron for reminders (checks every minute)
+  cron.schedule('* * * * *', () => {
+    ReminderService.checkAndRunScheduledReminders(sessions);
+  });
 });
