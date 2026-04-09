@@ -196,7 +196,11 @@ async function startSession(sessionKey: string, accountId: string) {
         sessions.delete(sessionKey);
 
         // Notify frontend
-        io.to(session.accountId).emit('status_update', { status: 'logged_out', sessionKey });
+        io.to(session.accountId).emit('status_update', { 
+          status: 'logged_out', 
+          sessionKey,
+          phoneNumber: session.phoneNumber 
+        });
       } else if (statusCode === 408 && !session.phoneNumber) {
         // QR Timeout on a session that was never connected
         console.log(`[startSession] QR Timeout for new session ${sessionKey}. Cleaning up instead of reconnecting.`);

@@ -188,112 +188,130 @@ class _AccountsScreenState extends State<AccountsScreen> {
               final status = sessionDoc['status'] ?? 'disconnected';
               final isConnected = status == 'connected';
 
-              return GestureDetector(
-                onTap: isConnected
-                    ? () {
-                        final sessionKey = sessionDoc['session_key'] as String?;
-                        if (sessionKey != null) {
-                          Navigator.push(
-                            context,
-                            MaterialPageRoute(
-                              builder: (_) => ChatsScreen(
-                                sessionId: phoneNumber,
-                                sessionKey: sessionKey,
-                                accountId: widget.accountId,
-                              ),
-                            ),
-                          );
-                        }
-                      }
-                    : null,
-                child: Container(
-                  margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: surfaceDark.withValues(alpha: 0.6),
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(
-                      color: primaryAqua.withValues(alpha: 0.2),
-                    ),
+              return Container(
+                margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                decoration: BoxDecoration(
+                  color: surfaceDark.withValues(alpha: 0.6),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: isConnected 
+                        ? primaryAqua.withValues(alpha: 0.2) 
+                        : Colors.red.withValues(alpha: 0.2),
                   ),
-                  padding: const EdgeInsets.all(16),
-                  child: Row(
-                    children: [
-                      Container(
-                        width: 56,
-                        height: 56,
-                        decoration: BoxDecoration(
-                          color: primaryAqua.withValues(alpha: 0.2),
-                          borderRadius: BorderRadius.circular(14),
-                        ),
-                        child: Center(
-                          child: Text(
-                            alias.substring(0, 1).toUpperCase(),
-                            style: const TextStyle(
-                              color: primaryAqua,
-                              fontWeight: FontWeight.w700,
-                              fontSize: 22,
+                ),
+                child: InkWell(
+                  onTap: isConnected
+                      ? () {
+                          final sessionKey = sessionDoc['session_key'] as String?;
+                          if (sessionKey != null) {
+                            Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) => ChatsScreen(
+                                  sessionId: phoneNumber,
+                                  sessionKey: sessionKey,
+                                  accountId: widget.accountId,
+                                ),
+                              ),
+                            );
+                          }
+                        }
+                      : null,
+                  borderRadius: BorderRadius.circular(12),
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Row(
+                      children: [
+                        Container(
+                          width: 56,
+                          height: 56,
+                          decoration: BoxDecoration(
+                            color: isConnected 
+                                ? primaryAqua.withValues(alpha: 0.2)
+                                : Colors.red.withValues(alpha: 0.1),
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                          child: Center(
+                            child: Text(
+                              alias.substring(0, 1).toUpperCase(),
+                              style: TextStyle(
+                                color: isConnected ? primaryAqua : Colors.red.shade400,
+                                fontWeight: FontWeight.w700,
+                                fontSize: 22,
+                              ),
                             ),
                           ),
                         ),
-                      ),
-                      const SizedBox(width: 16),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
+                        const SizedBox(width: 16),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                alias,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w600,
+                                  fontSize: 16,
+                                  color: white,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                phoneNumber,
+                                style: const TextStyle(
+                                  fontSize: 13,
+                                  color: lightText,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.end,
                           children: [
-                            Text(
-                              alias,
-                              style: const TextStyle(
-                                fontWeight: FontWeight.w600,
-                                fontSize: 16,
-                                color: white,
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                              decoration: BoxDecoration(
+                                color: isConnected ? accentAqua.withValues(alpha: 0.2) : Colors.red.withValues(alpha: 0.2),
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                              child: Text(
+                                isConnected ? 'Conectado' : 'Desvinculado',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: isConnected ? accentAqua : Colors.red.shade400,
+                                  fontWeight: FontWeight.w700,
+                                ),
                               ),
                             ),
-                            const SizedBox(height: 4),
-                            Text(
-                              phoneNumber,
-                              style: const TextStyle(
-                                fontSize: 13,
-                                color: lightText,
+                            if (!isConnected)
+                              IconButton(
+                                icon: const Icon(Icons.sync, color: primaryAqua, size: 22),
+                                onPressed: _startNewSession,
+                                tooltip: 'Re-vincular cuenta',
                               ),
-                            ),
                           ],
                         ),
-                      ),
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                        decoration: BoxDecoration(
-                          color: isConnected ? accentAqua.withValues(alpha: 0.2) : Colors.red.withValues(alpha: 0.2),
-                          borderRadius: BorderRadius.circular(12),
+                        const SizedBox(width: 4),
+                        IconButton(
+                          icon: const Icon(Icons.settings_outlined, color: lightText, size: 20),
+                          onPressed: () {
+                            showModalBottomSheet(
+                              context: context,
+                              backgroundColor: surfaceDark,
+                              isScrollControlled: true,
+                              shape: const RoundedRectangleBorder(
+                                borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+                              ),
+                              builder: (_) => SessionSettingsPanel(
+                                sessionId: phoneNumber,
+                                accountId: widget.accountId,
+                              ),
+                            );
+                          },
                         ),
-                        child: Text(
-                          isConnected ? 'Conectado' : 'Desconectado',
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: isConnected ? accentAqua : Colors.red.shade400,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      IconButton(
-                        icon: const Icon(Icons.settings_outlined, color: lightText, size: 20),
-                        onPressed: () {
-                          showModalBottomSheet(
-                            context: context,
-                            backgroundColor: surfaceDark,
-                            isScrollControlled: true,
-                            shape: const RoundedRectangleBorder(
-                              borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-                            ),
-                            builder: (_) => SessionSettingsPanel(
-                              sessionId: phoneNumber,
-                              accountId: widget.accountId,
-                            ),
-                          );
-                        },
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
                 ),
               );

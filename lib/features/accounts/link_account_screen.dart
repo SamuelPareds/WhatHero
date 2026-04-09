@@ -79,65 +79,97 @@ class _LinkAccountScreenState extends State<LinkAccountScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Vincular Cuenta'),
-        elevation: 0,
-      ),
-      body: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24.0),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Container(
-                width: 80,
-                height: 80,
-                decoration: BoxDecoration(
-                  color: primaryAqua.withValues(alpha: 0.15),
-                  borderRadius: BorderRadius.circular(24),
-                ),
-                child: const Center(
-                  child: Text('🦸', style: TextStyle(fontSize: 48)),
-                ),
-              ),
-              const SizedBox(height: 32),
-              Text(
-                status,
-                style: const TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.w600,
-                  color: white,
-                ),
-              ),
-              const SizedBox(height: 48),
-              if (qrCode != null)
+    return PopScope(
+      canPop: true,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) {
+          print('[LinkAccountScreen] onPopInvoked - didPop: $didPop');
+        }
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('Vincular Cuenta'),
+          elevation: 0,
+        ),
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24.0),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
                 Container(
+                  width: 80,
+                  height: 80,
                   decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(
-                      color: primaryAqua.withValues(alpha: 0.3),
-                      width: 2,
+                    color: sessionConnected 
+                        ? Colors.green.withValues(alpha: 0.15) 
+                        : primaryAqua.withValues(alpha: 0.15),
+                    borderRadius: BorderRadius.circular(24),
+                  ),
+                  child: Center(
+                    child: Text(
+                      sessionConnected ? '✅' : '🦸', 
+                      style: const TextStyle(fontSize: 48)
                     ),
                   ),
-                  padding: const EdgeInsets.all(20),
-                  child: QrImageView(
-                    data: qrCode!,
-                    version: QrVersions.auto,
-                    size: 260.0,
-                  ),
-                )
-              else
-                const SizedBox(
-                  width: 60,
-                  height: 60,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2.5,
-                    valueColor: AlwaysStoppedAnimation<Color>(primaryAqua),
+                ),
+                const SizedBox(height: 32),
+                Text(
+                  status,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w600,
+                    color: sessionConnected ? Colors.green.shade400 : white,
                   ),
                 ),
-            ],
+                const SizedBox(height: 48),
+                if (qrCode != null && !sessionConnected)
+                  Container(
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(
+                        color: primaryAqua.withValues(alpha: 0.3),
+                        width: 2,
+                      ),
+                    ),
+                    padding: const EdgeInsets.all(20),
+                    child: QrImageView(
+                      data: qrCode!,
+                      version: QrVersions.auto,
+                      size: 260.0,
+                    ),
+                  )
+                else if (sessionConnected)
+                  const Column(
+                    children: [
+                      Icon(Icons.check_circle_outline, size: 100, color: Colors.green),
+                      SizedBox(height: 16),
+                      Text('¡Vinculación Exitosa!', style: TextStyle(color: white, fontSize: 20)),
+                    ],
+                  )
+                else
+                  const Column(
+                    children: [
+                      SizedBox(
+                        width: 60,
+                        height: 60,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2.5,
+                          valueColor: AlwaysStoppedAnimation<Color>(primaryAqua),
+                        ),
+                      ),
+                      SizedBox(height: 24),
+                      Text(
+                        'Generando código QR...\nEsto puede tardar unos segundos',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: lightText, fontSize: 14),
+                      ),
+                    ],
+                  ),
+              ],
+            ),
           ),
         ),
       ),
