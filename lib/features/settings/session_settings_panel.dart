@@ -16,7 +16,11 @@ class SessionSettingsPanel extends StatefulWidget {
   State<SessionSettingsPanel> createState() => _SessionSettingsPanelState();
 }
 
-class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
+class _SessionSettingsPanelState extends State<SessionSettingsPanel> with SingleTickerProviderStateMixin {
+  late TabController _tabController;
+  
+  // Controllers
+  late TextEditingController _aliasController;
   late TextEditingController _apiKeyController;
   late TextEditingController _openaiApiKeyController;
   late TextEditingController _systemPromptController;
@@ -24,10 +28,11 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
   late TextEditingController _reminderApiUrlController;
   late TextEditingController _reminderTemplateController;
   
+  // States
   bool _aiEnabled = false;
   String _selectedProvider = 'gemini';
   String _selectedModel = 'gemini-2.5-flash';
-  int _responseDelayMs = 15000; // Default: 15 seconds
+  int _responseDelayMs = 15000;
   bool _activeHoursEnabled = false;
   String _activeHoursTimezone = 'America/Mexico_City';
   TimeOfDay _activeHoursStart = const TimeOfDay(hour: 9, minute: 0);
@@ -37,7 +42,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
   String _newKeywordResponse = '';
   bool _discriminatorEnabled = false;
   
-  // AgendaCool Reminders
+  // AgendaCool
   bool _reminderEnabled = false;
   TimeOfDay _reminderScheduledTime = const TimeOfDay(hour: 9, minute: 0);
 
@@ -47,6 +52,8 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
   @override
   void initState() {
     super.initState();
+    _tabController = TabController(length: 4, vsync: this);
+    _aliasController = TextEditingController();
     _apiKeyController = TextEditingController();
     _openaiApiKeyController = TextEditingController();
     _systemPromptController = TextEditingController();
@@ -68,74 +75,53 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
       if (doc.exists) {
         final data = doc.data() ?? {};
         setState(() {
+          _aliasController.text = data['alias'] ?? 'Sucursal - ${widget.sessionId}';
           _aiEnabled = data['ai_enabled'] ?? false;
           _selectedProvider = data['ai_provider'] ?? 'gemini';
           _apiKeyController.text = data['ai_api_key'] ?? '';
           _openaiApiKeyController.text = data['ai_openai_api_key'] ?? '';
-          _systemPromptController.text =
-              data['ai_system_prompt'] ?? 'Eres un asistente útil.';
-          _selectedModel = data['ai_model'] ??
-              (_selectedProvider == 'openai' ? 'gpt-4o-mini' : 'gemini-2.5-flash');
+          _systemPromptController.text = data['ai_system_prompt'] ?? 'Eres un asistente útil.';
+          _selectedModel = data['ai_model'] ?? (_selectedProvider == 'openai' ? 'gpt-4o-mini' : 'gemini-2.5-flash');
           _responseDelayMs = data['ai_response_delay_ms'] ?? 15000;
 
-          // AgendaCool Reminders
           _reminderEnabled = data['reminder_enabled'] ?? false;
           _reminderApiUrlController.text = data['reminder_api_url'] ?? '';
-          _reminderTemplateController.text = data['reminder_template'] ?? '¡Hola {name}! 🌸\n\nTe recordamos tu cita para mañana a las {time}. ¿Confirmamos tu asistencia? 🤗';
+          _reminderTemplateController.text = data['reminder_template'] ?? '¡Hola {name}! 🌸\n\nTe recordamos tu cita para mañana a las {time}.';
           
           if (data['reminder_scheduled_time'] is String) {
             final parts = (data['reminder_scheduled_time'] as String).split(':');
-            _reminderScheduledTime = TimeOfDay(
-              hour: int.tryParse(parts[0]) ?? 9,
-              minute: int.tryParse(parts[1]) ?? 0,
-            );
+            _reminderScheduledTime = TimeOfDay(hour: int.tryParse(parts[0]) ?? 9, minute: int.tryParse(parts[1]) ?? 0);
           }
 
-          // Active hours
           if (data['ai_active_hours'] is Map) {
             final hours = data['ai_active_hours'] as Map;
             _activeHoursEnabled = hours['enabled'] ?? false;
             _activeHoursTimezone = hours['timezone'] ?? 'America/Mexico_City';
             if (hours['start'] is String) {
               final parts = (hours['start'] as String).split(':');
-              _activeHoursStart = TimeOfDay(
-                hour: int.tryParse(parts[0]) ?? 9,
-                minute: int.tryParse(parts[1]) ?? 0,
-              );
+              _activeHoursStart = TimeOfDay(hour: int.tryParse(parts[0]) ?? 9, minute: int.tryParse(parts[1]) ?? 0);
             }
             if (hours['end'] is String) {
               final parts = (hours['end'] as String).split(':');
-              _activeHoursEnd = TimeOfDay(
-                hour: int.tryParse(parts[0]) ?? 18,
-                minute: int.tryParse(parts[1]) ?? 0,
-              );
+              _activeHoursEnd = TimeOfDay(hour: int.tryParse(parts[0]) ?? 18, minute: int.tryParse(parts[1]) ?? 0);
             }
           }
 
-          // Keyword rules
           if (data['ai_keyword_rules'] is List) {
-            _keywordRules = List<Map<String, String>>.from(
-              (data['ai_keyword_rules'] as List).map(
-                (rule) => {
-                  'keyword': rule['keyword'] as String? ?? '',
-                  'response': rule['response'] as String? ?? '',
-                },
-              ),
-            );
+            _keywordRules = List<Map<String, String>>.from((data['ai_keyword_rules'] as List).map((rule) => {
+              'keyword': rule['keyword'] as String? ?? '',
+              'response': rule['response'] as String? ?? '',
+            }));
           }
 
-          // Discriminator
           _discriminatorEnabled = data['ai_discriminator_enabled'] ?? false;
-          _discriminatorPromptController.text =
-              data['ai_discriminator_prompt'] ?? '';
-
+          _discriminatorPromptController.text = data['ai_discriminator_prompt'] ?? '';
           _isLoading = false;
         });
       } else {
         setState(() => _isLoading = false);
       }
     } catch (e) {
-      debugPrint('Error loading settings: $e');
       setState(() => _isLoading = false);
     }
   }
@@ -149,6 +135,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
           .collection('whatsapp_sessions')
           .doc(widget.sessionId)
           .update({
+        'alias': _aliasController.text.trim(),
         'ai_enabled': _aiEnabled,
         'ai_provider': _selectedProvider,
         'ai_api_key': _apiKeyController.text,
@@ -172,26 +159,20 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
       });
 
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Configuración guardada')),
-        );
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Configuración guardada exitosamente')));
         Navigator.pop(context);
       }
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error al guardar: $e')),
-        );
-      }
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
     } finally {
-      if (mounted) {
-        setState(() => _isSaving = false);
-      }
+      if (mounted) setState(() => _isSaving = false);
     }
   }
 
   @override
   void dispose() {
+    _tabController.dispose();
+    _aliasController.dispose();
     _apiKeyController.dispose();
     _openaiApiKeyController.dispose();
     _systemPromptController.dispose();
@@ -204,892 +185,510 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
   @override
   Widget build(BuildContext context) {
     if (_isLoading) {
-      return const SizedBox(
-        height: 400,
-        child: Center(child: CircularProgressIndicator()),
-      );
+      return const SizedBox(height: 500, child: Center(child: CircularProgressIndicator(color: primaryAqua)));
     }
 
-    return SingleChildScrollView(
-      child: Padding(
-        padding: EdgeInsets.fromLTRB(
-          24,
-          24,
-          24,
-          24 + MediaQuery.of(context).viewInsets.bottom,
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // Handle
-            Center(
-              child: Container(
-                width: 40,
-                height: 4,
-                decoration: BoxDecoration(
-                  color: lightText.withValues(alpha: 0.3),
-                  borderRadius: BorderRadius.circular(2),
-                ),
-              ),
-            ),
-            const SizedBox(height: 24),
-            // Title Row with Close Button
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+    return Container(
+      height: MediaQuery.of(context).size.height * 0.85,
+      decoration: const BoxDecoration(
+        color: surfaceDark,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      child: Column(
+        children: [
+          // Header & Handle
+          _buildHeader(),
+          
+          // TabBar
+          _buildTabBar(),
+          
+          // Content
+          Expanded(
+            child: TabBarView(
+              controller: _tabController,
               children: [
-                const Text(
-                  'Configuración IA',
-                  style: TextStyle(
-                    fontSize: 24,
-                    fontWeight: FontWeight.bold,
-                    color: white,
-                  ),
-                ),
-                IconButton(
-                  onPressed: () => Navigator.pop(context),
-                  icon: const Icon(Icons.close, color: lightText),
-                  tooltip: 'Cerrar sin guardar',
+                _buildGeneralTab(),
+                _buildAITab(),
+                _buildRulesTab(),
+                _buildIntegrationsTab(),
+              ],
+            ),
+          ),
+          
+          // Footer with Save Button
+          _buildFooter(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHeader() {
+    return Column(
+      children: [
+        const SizedBox(height: 12),
+        Container(
+          width: 40,
+          height: 4,
+          decoration: BoxDecoration(color: lightText.withValues(alpha: 0.2), borderRadius: BorderRadius.circular(2)),
+        ),
+        const SizedBox(height: 16),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 24),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text('Ajustes de Sesión', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: white)),
+              IconButton(onPressed: () => Navigator.pop(context), icon: const Icon(Icons.close, color: lightText)),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildTabBar() {
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      decoration: BoxDecoration(color: darkBg.withValues(alpha: 0.5), borderRadius: BorderRadius.circular(16)),
+      child: TabBar(
+        controller: _tabController,
+        dividerColor: Colors.transparent,
+        indicatorSize: TabBarIndicatorSize.tab,
+        indicator: BoxDecoration(color: primaryAqua.withValues(alpha: 0.2), borderRadius: BorderRadius.circular(12), border: Border.all(color: primaryAqua.withValues(alpha: 0.5))),
+        labelColor: primaryAqua,
+        unselectedLabelColor: lightText,
+        tabs: const [
+          Tab(icon: Icon(Icons.person_outline, size: 20), text: 'Perfil'),
+          Tab(icon: Icon(Icons.auto_awesome_outlined, size: 20), text: 'Asistente'),
+          Tab(icon: Icon(Icons.reply_all_rounded, size: 20), text: 'Respuestas'),
+          Tab(icon: Icon(Icons.electrical_services, size: 20), text: 'Conexión'),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildGeneralTab() {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _sectionTitle('Identidad de la Cuenta'),
+          const SizedBox(height: 8),
+          const Text('Este nombre te ayudará a identificar esta sucursal o número rápidamente.', style: TextStyle(color: lightText, fontSize: 13)),
+          const SizedBox(height: 20),
+          _textField(
+            controller: _aliasController,
+            label: 'Nombre Personalizado (Alias)',
+            hint: 'Ej: Ventas México, Sucursal Centro...',
+            icon: Icons.edit_note,
+          ),
+          const SizedBox(height: 32),
+          _sectionTitle('Información de Conexión'),
+          const SizedBox(height: 16),
+          _infoTile('ID de Sesión', widget.sessionId, Icons.fingerprint),
+          _infoTile('Número Vinculado', '+${widget.sessionId}', Icons.chat_bubble_outline),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAITab() {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        children: [
+          _switchTile('Activar Asistente IA', _aiEnabled, (v) => setState(() => _aiEnabled = v)),
+          const SizedBox(height: 24),
+          _sectionTitle('Cerebro del Asistente'),
+          const SizedBox(height: 16),
+          _dropdownTile('Proveedor', _selectedProvider, ['gemini', 'openai'], (v) {
+            setState(() {
+              _selectedProvider = v!;
+              _selectedModel = v == 'openai' ? 'gpt-4o-mini' : 'gemini-2.5-flash';
+            });
+          }),
+          const SizedBox(height: 16),
+          _modelDropdownTile(),
+          const SizedBox(height: 16),
+          _textField(
+            controller: _selectedProvider == 'gemini' ? _apiKeyController : _openaiApiKeyController,
+            label: 'API Key (${_selectedProvider.toUpperCase()})',
+            hint: 'Pega tu llave aquí...',
+            isPassword: true,
+          ),
+          const SizedBox(height: 24),
+          _sectionTitle('Personalidad y Tiempo'),
+          const SizedBox(height: 16),
+          _textField(
+            controller: _systemPromptController,
+            label: 'Instrucciones del Sistema',
+            hint: 'Ej: Eres un asistente de ventas amable...',
+            maxLines: 5,
+          ),
+          const SizedBox(height: 24),
+          _sliderTile(
+            'Espera para responder', 
+            '${(_responseDelayMs / 1000).toStringAsFixed(1)}s', 
+            'El asistente espera este tiempo para recibir más mensajes antes de procesar una respuesta única.',
+            _responseDelayMs.toDouble(), 
+            8000, 
+            30000, 
+            (v) => setState(() => _responseDelayMs = v.toInt())
+          ),
+          const SizedBox(height: 24),
+          _sectionTitle('Control de Disponibilidad'),
+          const SizedBox(height: 16),
+          _expandableSection(
+            'Horario de Atención',
+            Icons.access_time,
+            _activeHoursEnabled,
+            (v) => setState(() => _activeHoursEnabled = v),
+            Column(
+              children: [
+                _dropdownTile('Zona Horaria', _activeHoursTimezone, ['America/Mexico_City', 'America/New_York', 'Europe/Madrid'], (v) => setState(() => _activeHoursTimezone = v!)),
+                Row(
+                  children: [
+                    Expanded(child: _timeTile('Apertura', _activeHoursStart, (t) => setState(() => _activeHoursStart = t))),
+                    const SizedBox(width: 12),
+                    Expanded(child: _timeTile('Cierre', _activeHoursEnd, (t) => setState(() => _activeHoursEnd = t))),
+                  ],
                 ),
               ],
             ),
-            const SizedBox(height: 24),
-            // Enable toggle
-            Container(
-              decoration: BoxDecoration(
-                color: darkBg.withValues(alpha: 0.5),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(
-                  color: primaryAqua.withValues(alpha: 0.1),
-                ),
-              ),
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text(
-                      'Activar Asistente IA',
-                      style: TextStyle(
-                        fontSize: 16,
-                        fontWeight: FontWeight.w600,
-                        color: white,
-                      ),
-                    ),
-                    Switch(
-                      value: _aiEnabled,
-                      onChanged: (value) {
-                        setState(() => _aiEnabled = value);
-                      },
-                      activeThumbColor: primaryAqua,
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 20),
-            // Provider selector
-            const Text(
-              'Proveedor de IA',
-              style: TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.w600,
-                color: lightText,
-              ),
-            ),
-            const SizedBox(height: 8),
-            Container(
-              decoration: BoxDecoration(
-                color: darkBg.withValues(alpha: 0.3),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(
-                  color: primaryAqua.withValues(alpha: 0.2),
-                ),
-              ),
-              child: DropdownButton<String>(
-                value: _selectedProvider,
-                onChanged: (String? value) {
-                  if (value != null) {
-                    setState(() {
-                      _selectedProvider = value;
-                      // Reset model to provider default when switching
-                      _selectedModel = value == 'openai' ? 'gpt-4o-mini' : 'gemini-2.5-flash';
-                    });
-                  }
-                },
-                isExpanded: true,
-                underline: const SizedBox(),
-                dropdownColor: surfaceDark,
-                items: [
-                  DropdownMenuItem(
-                    value: 'gemini',
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 16),
-                      child: Text(
-                        'Google Gemini',
-                        style: TextStyle(color: primaryAqua),
-                      ),
-                    ),
-                  ),
-                  DropdownMenuItem(
-                    value: 'openai',
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 16),
-                      child: Text(
-                        'OpenAI',
-                        style: TextStyle(color: white),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 20),
-            // Model selector
-            const Text(
-              'Modelo de IA',
-              style: TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.w600,
-                color: lightText,
-              ),
-            ),
-            const SizedBox(height: 8),
-            Container(
-              decoration: BoxDecoration(
-                color: darkBg.withValues(alpha: 0.3),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(
-                  color: primaryAqua.withValues(alpha: 0.2),
-                ),
-              ),
-              child: DropdownButton<String>(
-                value: _selectedModel,
-                onChanged: (String? value) {
-                  if (value != null) {
-                    setState(() => _selectedModel = value);
-                  }
-                },
-                isExpanded: true,
-                underline: const SizedBox(),
-                dropdownColor: surfaceDark,
-                items: _selectedProvider == 'openai'
-                    ? [
-                        DropdownMenuItem(
-                          value: 'gpt-4o-mini',
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 16),
-                            child: Text(
-                              'GPT-4o Mini (Recomendado)',
-                              style: TextStyle(color: primaryAqua),
-                            ),
-                          ),
-                        ),
-                        DropdownMenuItem(
-                          value: 'gpt-4o',
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 16),
-                            child: Text(
-                              'GPT-4o (Más potente)',
-                              style: TextStyle(color: white),
-                            ),
-                          ),
-                        ),
-                        DropdownMenuItem(
-                          value: 'gpt-4-turbo',
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 16),
-                            child: Text(
-                              'GPT-4 Turbo (Más rápido)',
-                              style: TextStyle(color: lightText),
-                            ),
-                          ),
-                        ),
-                      ]
-                    : [
-                        DropdownMenuItem(
-                          value: 'gemini-2.5-flash',
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 16),
-                            child: Text(
-                              'Flash 2.5 (Recomendado)',
-                              style: TextStyle(color: primaryAqua),
-                            ),
-                          ),
-                        ),
-                        DropdownMenuItem(
-                          value: 'gemini-3-flash',
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 16),
-                            child: Text(
-                              'Flash 3 (Más rápido)',
-                              style: TextStyle(color: white),
-                            ),
-                          ),
-                        ),
-                        DropdownMenuItem(
-                          value: 'gemini-2.5-pro',
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 16),
-                            child: Text(
-                              'Pro 2.5 (Más preciso)',
-                              style: TextStyle(color: white),
-                            ),
-                          ),
-                        ),
-                        DropdownMenuItem(
-                          value: 'gemini-2.5-flash-lite',
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 16),
-                            child: Text(
-                              'Flash Lite (Más barato)',
-                              style: TextStyle(color: lightText),
-                            ),
-                          ),
-                        ),
-                      ],
-              ),
-            ),
-            const SizedBox(height: 20),
-            // API Key fields (conditional based on provider)
-            if (_selectedProvider == 'gemini') ...[
-              const Text(
-                'Gemini API Key',
-                style: TextStyle(
-                  fontSize: 14,
-                  fontWeight: FontWeight.w600,
-                  color: lightText,
-                ),
-              ),
-              const SizedBox(height: 8),
-              TextField(
-                controller: _apiKeyController,
-                obscureText: true,
-                enabled: !_isSaving,
-                decoration: InputDecoration(
-                  hintText: 'AIza...',
-                  hintStyle: TextStyle(color: lightText.withValues(alpha: 0.5)),
-                  filled: true,
-                  fillColor: darkBg.withValues(alpha: 0.3),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(12),
-                    borderSide: BorderSide(
-                      color: primaryAqua.withValues(alpha: 0.2),
-                    ),
-                  ),
-                  contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 12,
-                  ),
-                ),
-                style: const TextStyle(color: white),
-              ),
-            ] else ...[
-              const Text(
-                'OpenAI API Key',
-                style: TextStyle(
-                  fontSize: 14,
-                  fontWeight: FontWeight.w600,
-                  color: lightText,
-                ),
-              ),
-              const SizedBox(height: 8),
-              TextField(
-                controller: _openaiApiKeyController,
-                obscureText: true,
-                enabled: !_isSaving,
-                decoration: InputDecoration(
-                  hintText: 'sk-...',
-                  hintStyle: TextStyle(color: lightText.withValues(alpha: 0.5)),
-                  filled: true,
-                  fillColor: darkBg.withValues(alpha: 0.3),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(12),
-                    borderSide: BorderSide(
-                      color: primaryAqua.withValues(alpha: 0.2),
-                    ),
-                  ),
-                  contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 12,
-                  ),
-                ),
-                style: const TextStyle(color: white),
-              ),
-            ],
-            const SizedBox(height: 20),
-            // System prompt field
-            const Text(
-              'Instrucciones del Asistente',
-              style: TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.w600,
-                color: lightText,
-              ),
-            ),
-            const SizedBox(height: 8),
-            TextField(
-              controller: _systemPromptController,
-              maxLines: 4,
-              enabled: !_isSaving,
-              decoration: InputDecoration(
-                hintText: 'Eres un asistente de ventas para nuestra empresa...',
-                hintStyle: TextStyle(color: lightText.withValues(alpha: 0.5)),
-                filled: true,
-                fillColor: darkBg.withValues(alpha: 0.3),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: BorderSide(
-                    color: primaryAqua.withValues(alpha: 0.2),
-                  ),
-                ),
-                contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 12,
-                ),
-              ),
-              style: const TextStyle(color: white),
-            ),
-            const SizedBox(height: 24),
-            // Message buffer wait time slider
+          ),
+          const SizedBox(height: 16),
+          _expandableSection(
+            'Discriminador IA',
+            Icons.psychology,
+            _discriminatorEnabled,
+            (v) => setState(() => _discriminatorEnabled = v),
             Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text(
-                  'Espera entre mensajes',
-                  style: TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.w600,
-                    color: lightText,
-                  ),
-                ),
-                const SizedBox(height: 4),
                 Text(
-                  'El asistente espera este tiempo para recibir más mensajes antes de responder',
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: lightText.withValues(alpha: 0.7),
-                  ),
+                  'Define cuándo se requiere atención humana (lenguaje natural)',
+                  style: TextStyle(color: lightText.withValues(alpha: 0.7), fontSize: 12),
                 ),
                 const SizedBox(height: 12),
-                Container(
-                  decoration: BoxDecoration(
-                    color: darkBg.withValues(alpha: 0.5),
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(
-                      color: primaryAqua.withValues(alpha: 0.1),
-                    ),
-                  ),
-                  padding: const EdgeInsets.symmetric(horizontal: 16),
-                  child: Column(
-                    children: [
-                      Slider(
-                        value: _responseDelayMs.toDouble(),
-                        min: 8000,
-                        max: 30000,
-                        divisions: 22,
-                        activeColor: primaryAqua,
-                        onChanged: (value) {
-                          setState(() => _responseDelayMs = value.toInt());
-                        },
-                      ),
-                      Padding(
-                        padding: const EdgeInsets.only(bottom: 8),
-                        child: Text(
-                          '${(_responseDelayMs / 1000).toStringAsFixed(1)}s',
-                          style: const TextStyle(
-                            fontSize: 12,
-                            color: primaryAqua,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
+                _textField(
+                  controller: _discriminatorPromptController, 
+                  label: 'Reglas de Intervención Humana', 
+                  hint: 'Ejemplo:\n\nPasa al humano si:\n- El cliente pregunta disponibilidad de fechas específicas\n- Quiere agendar una cita\n- Pregunta por saldo o historial personal\n\nDe lo contrario, responde tú mismo.', 
+                  maxLines: 6
                 ),
               ],
             ),
-            const SizedBox(height: 24),
-            // Discriminator section
-            Container(
-              decoration: BoxDecoration(
-                color: darkBg.withValues(alpha: 0.5),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: primaryAqua.withValues(alpha: 0.1)),
-              ),
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      const Text(
-                        'Discriminador de Intenciones',
-                        style: TextStyle(
-                          fontSize: 14,
-                          fontWeight: FontWeight.w600,
-                          color: white,
-                        ),
-                      ),
-                      Switch(
-                        value: _discriminatorEnabled,
-                        onChanged: (value) {
-                          setState(() => _discriminatorEnabled = value);
-                        },
-                        activeThumbColor: primaryAqua,
-                      ),
-                    ],
-                  ),
-                  if (_discriminatorEnabled) ...[
-                    const SizedBox(height: 12),
-                    Text(
-                      'Define cuándo se requiere atención humana (lenguaje natural)',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: lightText.withValues(alpha: 0.7),
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    TextField(
-                      controller: _discriminatorPromptController,
-                      minLines: 4,
-                      maxLines: 6,
-                      style: const TextStyle(color: white, fontSize: 14),
-                      decoration: InputDecoration(
-                        hintText: 'Ejemplo:\n\nPasa al humano si:\n- El cliente pregunta disponibilidad de fechas específicas\n- Quiere agendar una cita\n- Pregunta por saldo o historial personal\n\nDe lo contrario, responde tú mismo.',
-                        hintStyle: TextStyle(
-                          color: lightText.withValues(alpha: 0.3),
-                          fontSize: 13,
-                        ),
-                        filled: true,
-                        fillColor: darkBg,
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(8),
-                          borderSide: BorderSide(
-                            color: primaryAqua.withValues(alpha: 0.1),
-                          ),
-                        ),
-                        focusedBorder: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(8),
-                          borderSide: const BorderSide(color: primaryAqua, width: 2),
-                        ),
-                        contentPadding: const EdgeInsets.all(12),
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-            const SizedBox(height: 24),
-            // Active hours section
-            Container(
-              decoration: BoxDecoration(
-                color: darkBg.withValues(alpha: 0.5),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: primaryAqua.withValues(alpha: 0.1)),
-              ),
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      const Text(
-                        'Horario de atención',
-                        style: TextStyle(
-                          fontSize: 14,
-                          fontWeight: FontWeight.w600,
-                          color: white,
-                        ),
-                      ),
-                      Switch(
-                        value: _activeHoursEnabled,
-                        onChanged: (v) => setState(() => _activeHoursEnabled = v),
-                        activeThumbColor: primaryAqua,
-                      ),
-                    ],
-                  ),
-                  if (_activeHoursEnabled) ...[
-                    const SizedBox(height: 12),
-                    Text(
-                      'Zona horaria',
-                      style: const TextStyle(
-                        fontSize: 12,
-                        color: lightText,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-                    Container(
-                      decoration: BoxDecoration(
-                        color: darkBg.withValues(alpha: 0.3),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: DropdownButton<String>(
-                        value: _activeHoursTimezone,
-                        isExpanded: true,
-                        underline: const SizedBox(),
-                        dropdownColor: surfaceDark,
-                        items: [
-                          'America/Mexico_City',
-                          'America/New_York',
-                          'Europe/Madrid',
-                          'Europe/London',
-                          'America/Los_Angeles',
-                        ].map((tz) => DropdownMenuItem(value: tz, child: Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 12),
-                          child: Text(tz, style: const TextStyle(color: white)),
-                        ))).toList(),
-                        onChanged: (v) => setState(() => _activeHoursTimezone = v ?? 'America/Mexico_City'),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text('Inicio', style: const TextStyle(fontSize: 12, color: lightText)),
-                              const SizedBox(height: 4),
-                              GestureDetector(
-                                onTap: () async {
-                                  final time = await showTimePicker(context: context, initialTime: _activeHoursStart);
-                                  if (time != null) setState(() => _activeHoursStart = time);
-                                },
-                                child: Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                                  decoration: BoxDecoration(
-                                    color: darkBg.withValues(alpha: 0.3),
-                                    borderRadius: BorderRadius.circular(8),
-                                  ),
-                                  child: Text('${_activeHoursStart.hour.toString().padLeft(2, '0')}:${_activeHoursStart.minute.toString().padLeft(2, '0')}', style: const TextStyle(color: primaryAqua)),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text('Fin', style: const TextStyle(fontSize: 12, color: lightText)),
-                              const SizedBox(height: 4),
-                              GestureDetector(
-                                onTap: () async {
-                                  final time = await showTimePicker(context: context, initialTime: _activeHoursEnd);
-                                  if (time != null) setState(() => _activeHoursEnd = time);
-                                },
-                                child: Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                                  decoration: BoxDecoration(
-                                    color: darkBg.withValues(alpha: 0.3),
-                                    borderRadius: BorderRadius.circular(8),
-                                  ),
-                                  child: Text('${_activeHoursEnd.hour.toString().padLeft(2, '0')}:${_activeHoursEnd.minute.toString().padLeft(2, '0')}', style: const TextStyle(color: primaryAqua)),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
-                ],
-              ),
-            ),
-            const SizedBox(height: 20),
-            // Keyword rules
-            Container(
-              decoration: BoxDecoration(
-                color: darkBg.withValues(alpha: 0.5),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: primaryAqua.withValues(alpha: 0.1)),
-              ),
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'Respuestas por palabra clave',
-                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: white),
-                  ),
-                  const SizedBox(height: 12),
-                  if (_keywordRules.isNotEmpty)
-                    Column(
-                      children: _keywordRules.asMap().entries.map((e) {
-                        final idx = e.key;
-                        final rule = e.value;
-                        return Padding(
-                          padding: const EdgeInsets.only(bottom: 8),
-                          child: Row(
-                            children: [
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text('${rule['keyword']}', style: const TextStyle(color: primaryAqua, fontSize: 12, fontWeight: FontWeight.w600)),
-                                    Text('${rule['response']!.substring(0, (rule['response']!.length < 30 ? rule['response']!.length : 30))}...', style: const TextStyle(color: lightText, fontSize: 11)),
-                                  ],
-                                ),
-                              ),
-                              IconButton(
-                                icon: const Icon(Icons.delete_outline, color: Colors.red, size: 18),
-                                onPressed: () => setState(() => _keywordRules.removeAt(idx)),
-                                padding: EdgeInsets.zero,
-                              ),
-                            ],
-                          ),
-                        );
-                      }).toList(),
-                    ),
-                  Column(
-                    children: [
-                      TextField(
-                        decoration: InputDecoration(
-                          hintText: 'Palabra clave',
-                          isDense: true,
-                          filled: true,
-                          fillColor: darkBg.withValues(alpha: 0.3),
-                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
-                          contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                        ),
-                        style: const TextStyle(color: white, fontSize: 12),
-                        onChanged: (v) => _newKeyword = v,
-                      ),
-                      const SizedBox(height: 8),
-                      TextField(
-                        decoration: InputDecoration(
-                          hintText: 'Respuesta',
-                          isDense: true,
-                          filled: true,
-                          fillColor: darkBg.withValues(alpha: 0.3),
-                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
-                          contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                        ),
-                        maxLines: 2,
-                        style: const TextStyle(color: white, fontSize: 12),
-                        onChanged: (v) => _newKeywordResponse = v,
-                      ),
-                      const SizedBox(height: 8),
-                      SizedBox(
-                        width: double.infinity,
-                        child: ElevatedButton(
-                          onPressed: () {
-                            if (_newKeyword.trim().isNotEmpty && _newKeywordResponse.trim().isNotEmpty) {
-                              setState(() {
-                                _keywordRules.add({'keyword': _newKeyword, 'response': _newKeywordResponse});
-                                _newKeyword = '';
-                                _newKeywordResponse = '';
-                              });
-                            }
-                          },
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: primaryAqua.withValues(alpha: 0.3),
-                            padding: const EdgeInsets.symmetric(vertical: 8),
-                          ),
-                          child: const Text('Agregar regla', style: TextStyle(fontSize: 12, color: primaryAqua)),
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 32),
-            // AgendaCool Integration Section
-            Container(
-              width: double.infinity,
-              decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  colors: [
-                    primaryAqua.withValues(alpha: 0.15),
-                    Colors.purple.withValues(alpha: 0.15),
-                  ],
-                ),
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(
-                  color: primaryAqua.withValues(alpha: 0.3),
-                ),
-              ),
-              padding: const EdgeInsets.all(20),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Container(
-                        padding: const EdgeInsets.all(8),
-                        decoration: BoxDecoration(
-                          color: white,
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        child: const Icon(Icons.calendar_month, color: Color(0xFF6200EE), size: 24),
-                      ),
-                      const SizedBox(width: 12),
-                      const Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              'AgendaCool Integration',
-                              style: TextStyle(
-                                color: white,
-                                fontSize: 18,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                            Text(
-                              'Sincroniza tus citas y envía recordatorios automáticos',
-                              style: TextStyle(
-                                color: lightText,
-                                fontSize: 12,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      Switch(
-                        value: _reminderEnabled,
-                        activeColor: primaryAqua,
-                        onChanged: (v) => setState(() => _reminderEnabled = v),
-                      ),
-                    ],
-                  ),
-                  if (_reminderEnabled) ...[
-                    const SizedBox(height: 20),
-                    const Text(
-                      'API URL de AgendaCool',
-                      style: TextStyle(fontSize: 13, color: lightText, fontWeight: FontWeight.w600),
-                    ),
-                    const SizedBox(height: 8),
-                    TextField(
-                      controller: _reminderApiUrlController,
-                      style: const TextStyle(color: white, fontSize: 14),
-                      decoration: InputDecoration(
-                        hintText: 'https://tu-api-agendacool.com/appointments',
-                        hintStyle: TextStyle(color: white.withValues(alpha: 0.2)),
-                        filled: true,
-                        fillColor: darkBg.withValues(alpha: 0.5),
-                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-                    Row(
-                      children: [
-                        const Icon(Icons.access_time, color: primaryAqua, size: 20),
-                        const SizedBox(width: 8),
-                        const Text(
-                          'Hora de envío diario',
-                          style: TextStyle(color: white, fontSize: 14, fontWeight: FontWeight.w500),
-                        ),
-                        const Spacer(),
-                        GestureDetector(
-                          onTap: () async {
-                            final time = await showTimePicker(
-                              context: context,
-                              initialTime: _reminderScheduledTime,
-                            );
-                            if (time != null) setState(() => _reminderScheduledTime = time);
-                          },
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                            decoration: BoxDecoration(
-                              color: primaryAqua.withValues(alpha: 0.1),
-                              borderRadius: BorderRadius.circular(8),
-                              border: Border.all(color: primaryAqua.withValues(alpha: 0.3)),
-                            ),
-                            child: Text(
-                              '${_reminderScheduledTime.hour.toString().padLeft(2, '0')}:${_reminderScheduledTime.minute.toString().padLeft(2, '0')}',
-                              style: const TextStyle(color: primaryAqua, fontWeight: FontWeight.bold),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 16),
-                    const Text(
-                      'Plantilla del Recordatorio',
-                      style: TextStyle(fontSize: 13, color: lightText, fontWeight: FontWeight.w600),
-                    ),
-                    const SizedBox(height: 8),
-                    TextField(
-                      controller: _reminderTemplateController,
-                      maxLines: 4,
-                      style: const TextStyle(color: white, fontSize: 14),
-                      decoration: InputDecoration(
-                        hintText: '¡Hola {name}!...',
-                        helperText: 'Usa {name}, {time}, {date} para personalizar',
-                        helperStyle: TextStyle(color: primaryAqua.withValues(alpha: 0.7), fontSize: 11),
-                        filled: true,
-                        fillColor: darkBg.withValues(alpha: 0.5),
-                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-            const SizedBox(height: 32),
-            // Save button
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton(
-                onPressed: _isSaving ? null : _save,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: primaryAqua,
-                  disabledBackgroundColor: primaryAqua.withValues(alpha: 0.5),
-                  padding: const EdgeInsets.symmetric(vertical: 16),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
-                child: _isSaving
-                    ? const SizedBox(
-                        height: 20,
-                        width: 20,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          valueColor:
-                              AlwaysStoppedAnimation<Color>(darkBg),
-                        ),
-                      )
-                    : const Text(
-                        'Guardar',
-                        style: TextStyle(
-                          color: darkBg,
-                          fontWeight: FontWeight.w600,
-                          fontSize: 16,
-                        ),
-                      ),
-              ),
-            ),
-            const SizedBox(height: 12),
-            // Cancel button
-            SizedBox(
-              width: double.infinity,
-              child: TextButton(
-                onPressed: () => Navigator.pop(context),
-                style: TextButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(vertical: 12),
-                ),
-                child: Text(
-                  'Cancelar',
-                  style: TextStyle(
-                    color: lightText.withValues(alpha: 0.7),
-                    fontSize: 14,
-                  ),
-                ),
-              ),
-            ),
-            const SizedBox(height: 16),
-          ],
-        ),
+          ),
+        ],
       ),
     );
+  }
+
+  Widget _buildRulesTab() {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _sectionTitle('Respuestas Automáticas'),
+          const SizedBox(height: 8),
+          const Text('Si el mensaje del cliente contiene alguna de estas palabras, el bot responderá de forma inmediata ignorando a la IA.', style: TextStyle(color: lightText, fontSize: 13)),
+          const SizedBox(height: 20),
+          ..._keywordRules.asMap().entries.map((e) => _keywordTile(e.key, e.value['keyword']!, e.value['response']!)),
+          _addKeywordSection(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildIntegrationsTab() {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        children: [
+          Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(colors: [primaryAqua.withValues(alpha: 0.1), Colors.purple.withValues(alpha: 0.1)]),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: primaryAqua.withValues(alpha: 0.3)),
+            ),
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              children: [
+                Row(
+                  children: [
+                    const Icon(Icons.calendar_month, color: Color(0xFF6200EE), size: 32),
+                    const SizedBox(width: 16),
+                    const Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text('AgendaCool', style: TextStyle(color: white, fontSize: 18, fontWeight: FontWeight.bold)),
+                      Text('Recordatorios de Citas', style: TextStyle(color: lightText, fontSize: 12)),
+                    ])),
+                    Switch(value: _reminderEnabled, activeColor: primaryAqua, onChanged: (v) => setState(() => _reminderEnabled = v)),
+                  ],
+                ),
+                if (_reminderEnabled) ...[
+                  const SizedBox(height: 24),
+                  _textField(controller: _reminderApiUrlController, label: 'API URL de Sincronización', hint: 'https://...'),
+                  const SizedBox(height: 16),
+                  _timeTile('Hora de Envío Diario', _reminderScheduledTime, (t) => setState(() => _reminderScheduledTime = t)),
+                  const SizedBox(height: 16),
+                  _textField(controller: _reminderTemplateController, label: 'Mensaje de Recordatorio', hint: 'Hola {name}...', maxLines: 3),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFooter() {
+    return Container(
+      padding: EdgeInsets.fromLTRB(24, 16, 24, 16 + MediaQuery.of(context).padding.bottom),
+      decoration: BoxDecoration(
+        color: surfaceDark,
+        border: Border(top: BorderSide(color: white.withValues(alpha: 0.05))),
+      ),
+      child: ElevatedButton(
+        onPressed: _isSaving ? null : _save,
+        style: ElevatedButton.styleFrom(
+          backgroundColor: primaryAqua,
+          minimumSize: const Size(double.infinity, 56),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          elevation: 0,
+        ),
+        child: _isSaving 
+          ? const CircularProgressIndicator(color: darkBg) 
+          : const Text('Guardar Todos los Cambios', style: TextStyle(color: darkBg, fontSize: 16, fontWeight: FontWeight.bold)),
+      ),
+    );
+  }
+
+  // --- Helper Widgets ---
+
+  Widget _sectionTitle(String title) {
+    return Text(title.toUpperCase(), style: const TextStyle(color: primaryAqua, fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1.2));
+  }
+
+  Widget _textField({required TextEditingController controller, required String label, String? hint, int maxLines = 1, bool isPassword = false, IconData? icon}) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: const TextStyle(color: lightText, fontSize: 13, fontWeight: FontWeight.w600)),
+        const SizedBox(height: 8),
+        TextField(
+          controller: controller,
+          maxLines: maxLines,
+          obscureText: isPassword,
+          style: const TextStyle(color: white),
+          decoration: InputDecoration(
+            hintText: hint,
+            prefixIcon: icon != null ? Icon(icon, color: primaryAqua, size: 20) : null,
+            hintStyle: TextStyle(color: white.withValues(alpha: 0.2)),
+            filled: true,
+            fillColor: darkBg.withValues(alpha: 0.3),
+            border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+            contentPadding: const EdgeInsets.all(16),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _switchTile(String title, bool value, Function(bool) onChanged) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(color: darkBg.withValues(alpha: 0.3), borderRadius: BorderRadius.circular(16)),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(title, style: const TextStyle(color: white, fontWeight: FontWeight.bold)),
+          Switch(value: value, activeColor: primaryAqua, onChanged: onChanged),
+        ],
+      ),
+    );
+  }
+
+  Widget _modelDropdownTile() {
+    final List<Map<String, String>> models = _selectedProvider == 'openai' 
+      ? [
+          {'id': 'gpt-4o-mini', 'name': 'GPT-4o Mini', 'desc': 'Recomendado'},
+          {'id': 'gpt-4o', 'name': 'GPT-4o', 'desc': 'Más potente'},
+          {'id': 'gpt-4-turbo', 'name': 'GPT-4 Turbo', 'desc': 'Más rápido'},
+        ]
+      : [
+          {'id': 'gemini-2.5-flash', 'name': 'Flash 2.5', 'desc': 'Recomendado'},
+          {'id': 'gemini-3-flash', 'name': 'Flash 3', 'desc': 'Más rápido'},
+          {'id': 'gemini-2.5-pro', 'name': 'Pro 2.5', 'desc': 'Más preciso'},
+          {'id': 'gemini-2.5-flash-lite', 'name': 'Flash Lite', 'desc': 'Más barato'},
+        ];
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text('Modelo de IA', style: TextStyle(color: lightText, fontSize: 12)),
+        const SizedBox(height: 8),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          decoration: BoxDecoration(color: darkBg.withValues(alpha: 0.3), borderRadius: BorderRadius.circular(12)),
+          child: DropdownButton<String>(
+            value: _selectedModel,
+            isExpanded: true,
+            underline: const SizedBox(),
+            dropdownColor: surfaceDark,
+            items: models.map((m) => DropdownMenuItem(
+              value: m['id'], 
+              child: Row(
+                children: [
+                  Text(m['name']!, style: const TextStyle(color: white)),
+                  const SizedBox(width: 8),
+                  Text('(${m['desc']})', style: TextStyle(color: primaryAqua.withValues(alpha: 0.7), fontSize: 11)),
+                ],
+              )
+            )).toList(),
+            onChanged: (v) => setState(() => _selectedModel = v!),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _dropdownTile(String label, String value, List<String> items, Function(String?) onChanged) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: const TextStyle(color: lightText, fontSize: 12)),
+        const SizedBox(height: 8),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          decoration: BoxDecoration(color: darkBg.withValues(alpha: 0.3), borderRadius: BorderRadius.circular(12)),
+          child: DropdownButton<String>(
+            value: value,
+            isExpanded: true,
+            underline: const SizedBox(),
+            dropdownColor: surfaceDark,
+            items: items.map((i) => DropdownMenuItem(value: i, child: Text(i, style: const TextStyle(color: white)))).toList(),
+            onChanged: onChanged,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _timeTile(String label, TimeOfDay time, Function(TimeOfDay) onTap) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: const TextStyle(color: lightText, fontSize: 12)),
+        const SizedBox(height: 8),
+        InkWell(
+          onTap: () async {
+            final t = await showTimePicker(context: context, initialTime: time);
+            if (t != null) onTap(t);
+          },
+          child: Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(color: darkBg.withValues(alpha: 0.3), borderRadius: BorderRadius.circular(12)),
+            child: Row(children: [
+              const Icon(Icons.access_time, color: primaryAqua, size: 18),
+              const SizedBox(width: 8),
+              Text('${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}', style: const TextStyle(color: white, fontWeight: FontWeight.bold)),
+            ]),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _infoTile(String label, String value, IconData icon) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(color: darkBg.withValues(alpha: 0.2), borderRadius: BorderRadius.circular(12)),
+      child: Row(children: [
+        Icon(icon, color: lightText, size: 20),
+        const SizedBox(width: 16),
+        Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(label, style: const TextStyle(color: lightText, fontSize: 11)),
+          Text(value, style: const TextStyle(color: white, fontWeight: FontWeight.bold)),
+        ]),
+      ]),
+    );
+  }
+
+  Widget _expandableSection(String title, IconData icon, bool enabled, Function(bool) onToggle, Widget child) {
+    return Container(
+      decoration: BoxDecoration(color: darkBg.withValues(alpha: 0.3), borderRadius: BorderRadius.circular(16)),
+      child: Column(children: [
+        ListTile(
+          leading: Icon(icon, color: enabled ? primaryAqua : lightText),
+          title: Text(title, style: TextStyle(color: white, fontWeight: enabled ? FontWeight.bold : FontWeight.normal)),
+          trailing: Switch(value: enabled, activeColor: primaryAqua, onChanged: onToggle),
+        ),
+        if (enabled) Padding(padding: const EdgeInsets.fromLTRB(16, 0, 16, 16), child: child),
+      ]),
+    );
+  }
+
+  Widget _keywordTile(int index, String key, String resp) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      decoration: BoxDecoration(color: darkBg.withValues(alpha: 0.2), borderRadius: BorderRadius.circular(12)),
+      child: Row(children: [
+        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(key, style: const TextStyle(color: primaryAqua, fontWeight: FontWeight.bold)),
+          Text(resp, style: const TextStyle(color: lightText, fontSize: 12), maxLines: 1, overflow: TextOverflow.ellipsis),
+        ])),
+        IconButton(icon: const Icon(Icons.delete_outline, color: Colors.red, size: 20), onPressed: () => setState(() => _keywordRules.removeAt(index))),
+      ]),
+    );
+  }
+
+  Widget _addKeywordSection() {
+    return Container(
+      margin: const EdgeInsets.only(top: 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(border: Border.all(color: primaryAqua.withValues(alpha: 0.2)), borderRadius: BorderRadius.circular(12)),
+      child: Column(children: [
+        TextField(
+          onChanged: (v) => _newKeyword = v,
+          style: const TextStyle(color: white, fontSize: 13),
+          decoration: const InputDecoration(hintText: 'Palabra clave...', border: InputBorder.none, isDense: true),
+        ),
+        const Divider(color: white, height: 16),
+        TextField(
+          onChanged: (v) => _newKeywordResponse = v,
+          style: const TextStyle(color: white, fontSize: 13),
+          decoration: const InputDecoration(hintText: 'Respuesta...', border: InputBorder.none, isDense: true),
+        ),
+        const SizedBox(height: 8),
+        TextButton(
+          onPressed: () {
+            if (_newKeyword.isNotEmpty && _newKeywordResponse.isNotEmpty) {
+              setState(() {
+                _keywordRules.add({'keyword': _newKeyword, 'response': _newKeywordResponse});
+                _newKeyword = ''; _newKeywordResponse = '';
+              });
+            }
+          },
+          child: const Text('+ Agregar Regla', style: TextStyle(color: primaryAqua, fontWeight: FontWeight.bold)),
+        ),
+      ]),
+    );
+  }
+
+  Widget _sliderTile(String label, String value, String description, double current, double min, double max, Function(double) onChanged) {
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+        Text(label, style: const TextStyle(color: white, fontWeight: FontWeight.bold, fontSize: 13)),
+        Text(value, style: const TextStyle(color: primaryAqua, fontWeight: FontWeight.bold)),
+      ]),
+      const SizedBox(height: 4),
+      Text(description, style: TextStyle(color: lightText.withValues(alpha: 0.7), fontSize: 12)),
+      const SizedBox(height: 8),
+      Slider(value: current, min: min, max: max, activeColor: primaryAqua, inactiveColor: darkBg, onChanged: onChanged),
+    ]);
   }
 }
