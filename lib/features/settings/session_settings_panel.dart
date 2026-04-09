@@ -21,6 +21,9 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
   late TextEditingController _openaiApiKeyController;
   late TextEditingController _systemPromptController;
   late TextEditingController _discriminatorPromptController;
+  late TextEditingController _reminderApiUrlController;
+  late TextEditingController _reminderTemplateController;
+  
   bool _aiEnabled = false;
   String _selectedProvider = 'gemini';
   String _selectedModel = 'gemini-2.5-flash';
@@ -33,6 +36,11 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
   String _newKeyword = '';
   String _newKeywordResponse = '';
   bool _discriminatorEnabled = false;
+  
+  // AgendaCool Reminders
+  bool _reminderEnabled = false;
+  TimeOfDay _reminderScheduledTime = const TimeOfDay(hour: 9, minute: 0);
+
   bool _isSaving = false;
   bool _isLoading = true;
 
@@ -43,6 +51,8 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
     _openaiApiKeyController = TextEditingController();
     _systemPromptController = TextEditingController();
     _discriminatorPromptController = TextEditingController();
+    _reminderApiUrlController = TextEditingController();
+    _reminderTemplateController = TextEditingController();
     _loadSettings();
   }
 
@@ -67,6 +77,19 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
           _selectedModel = data['ai_model'] ??
               (_selectedProvider == 'openai' ? 'gpt-4o-mini' : 'gemini-2.5-flash');
           _responseDelayMs = data['ai_response_delay_ms'] ?? 15000;
+
+          // AgendaCool Reminders
+          _reminderEnabled = data['reminder_enabled'] ?? false;
+          _reminderApiUrlController.text = data['reminder_api_url'] ?? '';
+          _reminderTemplateController.text = data['reminder_template'] ?? '¡Hola {name}! 🌸\n\nTe recordamos tu cita para mañana a las {time}. ¿Confirmamos tu asistencia? 🤗';
+          
+          if (data['reminder_scheduled_time'] is String) {
+            final parts = (data['reminder_scheduled_time'] as String).split(':');
+            _reminderScheduledTime = TimeOfDay(
+              hour: int.tryParse(parts[0]) ?? 9,
+              minute: int.tryParse(parts[1]) ?? 0,
+            );
+          }
 
           // Active hours
           if (data['ai_active_hours'] is Map) {
@@ -142,6 +165,10 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
         'ai_keyword_rules': _keywordRules,
         'ai_discriminator_enabled': _discriminatorEnabled,
         'ai_discriminator_prompt': _discriminatorPromptController.text.trim(),
+        'reminder_enabled': _reminderEnabled,
+        'reminder_api_url': _reminderApiUrlController.text.trim(),
+        'reminder_template': _reminderTemplateController.text.trim(),
+        'reminder_scheduled_time': '${_reminderScheduledTime.hour.toString().padLeft(2, '0')}:${_reminderScheduledTime.minute.toString().padLeft(2, '0')}',
       });
 
       if (mounted) {
@@ -169,6 +196,8 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
     _openaiApiKeyController.dispose();
     _systemPromptController.dispose();
     _discriminatorPromptController.dispose();
+    _reminderApiUrlController.dispose();
+    _reminderTemplateController.dispose();
     super.dispose();
   }
 
@@ -866,6 +895,142 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> {
                       ),
                     ],
                   ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 32),
+            // AgendaCool Integration Section
+            Container(
+              width: double.infinity,
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  colors: [
+                    primaryAqua.withValues(alpha: 0.15),
+                    Colors.purple.withValues(alpha: 0.15),
+                  ],
+                ),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(
+                  color: primaryAqua.withValues(alpha: 0.3),
+                ),
+              ),
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          color: white,
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: const Icon(Icons.calendar_month, color: Color(0xFF6200EE), size: 24),
+                      ),
+                      const SizedBox(width: 12),
+                      const Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'AgendaCool Integration',
+                              style: TextStyle(
+                                color: white,
+                                fontSize: 18,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            Text(
+                              'Sincroniza tus citas y envía recordatorios automáticos',
+                              style: TextStyle(
+                                color: lightText,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      Switch(
+                        value: _reminderEnabled,
+                        activeColor: primaryAqua,
+                        onChanged: (v) => setState(() => _reminderEnabled = v),
+                      ),
+                    ],
+                  ),
+                  if (_reminderEnabled) ...[
+                    const SizedBox(height: 20),
+                    const Text(
+                      'API URL de AgendaCool',
+                      style: TextStyle(fontSize: 13, color: lightText, fontWeight: FontWeight.w600),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _reminderApiUrlController,
+                      style: const TextStyle(color: white, fontSize: 14),
+                      decoration: InputDecoration(
+                        hintText: 'https://tu-api-agendacool.com/appointments',
+                        hintStyle: TextStyle(color: white.withValues(alpha: 0.2)),
+                        filled: true,
+                        fillColor: darkBg.withValues(alpha: 0.5),
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    Row(
+                      children: [
+                        const Icon(Icons.access_time, color: primaryAqua, size: 20),
+                        const SizedBox(width: 8),
+                        const Text(
+                          'Hora de envío diario',
+                          style: TextStyle(color: white, fontSize: 14, fontWeight: FontWeight.w500),
+                        ),
+                        const Spacer(),
+                        GestureDetector(
+                          onTap: () async {
+                            final time = await showTimePicker(
+                              context: context,
+                              initialTime: _reminderScheduledTime,
+                            );
+                            if (time != null) setState(() => _reminderScheduledTime = time);
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                            decoration: BoxDecoration(
+                              color: primaryAqua.withValues(alpha: 0.1),
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(color: primaryAqua.withValues(alpha: 0.3)),
+                            ),
+                            child: Text(
+                              '${_reminderScheduledTime.hour.toString().padLeft(2, '0')}:${_reminderScheduledTime.minute.toString().padLeft(2, '0')}',
+                              style: const TextStyle(color: primaryAqua, fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    const Text(
+                      'Plantilla del Recordatorio',
+                      style: TextStyle(fontSize: 13, color: lightText, fontWeight: FontWeight.w600),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _reminderTemplateController,
+                      maxLines: 4,
+                      style: const TextStyle(color: white, fontSize: 14),
+                      decoration: InputDecoration(
+                        hintText: '¡Hola {name}!...',
+                        helperText: 'Usa {name}, {time}, {date} para personalizar',
+                        helperStyle: TextStyle(color: primaryAqua.withValues(alpha: 0.7), fontSize: 11),
+                        filled: true,
+                        fillColor: darkBg.withValues(alpha: 0.5),
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ),
