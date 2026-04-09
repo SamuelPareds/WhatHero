@@ -306,6 +306,17 @@ async function startSession(sessionKey: string, accountId: string) {
     }
 
     const aiConfig = await getAIConfig(session, accountId);
+
+    // --- KEYWORD RULES (Immediate response) ---
+    for (const rule of aiConfig.keywordRules) {
+      if (messageText.toLowerCase().includes(rule.keyword.toLowerCase())) {
+        console.log(`[AI] Keyword rule matched: "${rule.keyword}", sending canned response`);
+        await new Promise(r => setTimeout(r, aiConfig.responseDelayMs > 2000 ? 2000 : aiConfig.responseDelayMs));
+        await session.sock.sendMessage(remoteJid, { text: rule.response });
+        return; // Important: stop here so AI doesn't also respond
+      }
+    }
+
     const provider: 'gemini' | 'openai' = (aiConfig.provider || 'gemini') as 'gemini' | 'openai';
     const hasValidApiKey = provider === 'openai'
       ? aiConfig.openaiApiKey
@@ -354,16 +365,6 @@ async function startSession(sessionKey: string, accountId: string) {
     if (!aiAutoResponseEnabled) {
       console.log(`[AI] Auto-response disabled for ${contactPhone}, skipping AI response`);
       return;
-    }
-
-    // Check keyword rules (fast-path, immediate response - not buffered)
-    for (const rule of aiConfig.keywordRules) {
-      if (messageText.toLowerCase().includes(rule.keyword.toLowerCase())) {
-        console.log(`[AI] Keyword rule matched: "${rule.keyword}", sending canned response`);
-        await new Promise(r => setTimeout(r, aiConfig.responseDelayMs));
-        await session.sock.sendMessage(remoteJid, { text: rule.response });
-        return;
-      }
     }
 
     // ============================================
