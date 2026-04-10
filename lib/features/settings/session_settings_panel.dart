@@ -28,6 +28,11 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
   late TextEditingController _reminderApiUrlController;
   late TextEditingController _reminderTemplateController;
   
+  // FocusNodes for focus management
+  late FocusNode _systemPromptFocus;
+  late FocusNode _discriminatorFocus;
+  late FocusNode _reminderTemplateFocus;
+  
   // States
   bool _aiEnabled = false;
   String _selectedProvider = 'gemini';
@@ -60,6 +65,9 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
     _discriminatorPromptController = TextEditingController();
     _reminderApiUrlController = TextEditingController();
     _reminderTemplateController = TextEditingController();
+    _systemPromptFocus = FocusNode();
+    _discriminatorFocus = FocusNode();
+    _reminderTemplateFocus = FocusNode();
     _loadSettings();
   }
 
@@ -179,6 +187,9 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
     _discriminatorPromptController.dispose();
     _reminderApiUrlController.dispose();
     _reminderTemplateController.dispose();
+    _systemPromptFocus.dispose();
+    _discriminatorFocus.dispose();
+    _reminderTemplateFocus.dispose();
     super.dispose();
   }
 
@@ -325,6 +336,8 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
             label: 'Instrucciones del Sistema',
             hint: 'Ej: Eres un asistente de ventas amable...',
             maxLines: 5,
+            canExpand: true,
+            focusNode: _systemPromptFocus,
           ),
           const SizedBox(height: 24),
           _sliderTile(
@@ -375,7 +388,9 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
                   controller: _discriminatorPromptController, 
                   label: 'Reglas de Intervención Humana', 
                   hint: 'Ejemplo:\n\nPasa al humano si:\n- El cliente pregunta disponibilidad de fechas específicas\n- Quiere agendar una cita\n- Pregunta por saldo o historial personal\n\nDe lo contrario, responde tú mismo.', 
-                  maxLines: 6
+                  maxLines: 6,
+                  canExpand: true,
+                  focusNode: _discriminatorFocus,
                 ),
               ],
             ),
@@ -433,7 +448,14 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
                   const SizedBox(height: 16),
                   _timeTile('Hora de Envío Diario', _reminderScheduledTime, (t) => setState(() => _reminderScheduledTime = t)),
                   const SizedBox(height: 16),
-                  _textField(controller: _reminderTemplateController, label: 'Mensaje de Recordatorio', hint: 'Hola {name}...', maxLines: 3),
+                  _textField(
+                    controller: _reminderTemplateController, 
+                    label: 'Mensaje de Recordatorio', 
+                    hint: 'Hola {name}...', 
+                    maxLines: 3,
+                    canExpand: true,
+                    focusNode: _reminderTemplateFocus,
+                  ),
                 ],
               ],
             ),
@@ -465,23 +487,99 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
     );
   }
 
+  void _showExpandedEditor(String title, TextEditingController controller, FocusNode? focusNode) {
+    showDialog(
+      context: context,
+      builder: (context) => Dialog.fullscreen(
+        backgroundColor: surfaceDark,
+        child: Scaffold(
+          backgroundColor: surfaceDark,
+          appBar: AppBar(
+            backgroundColor: surfaceDark,
+            elevation: 0,
+            title: Text(title, style: const TextStyle(color: white, fontSize: 18, fontWeight: FontWeight.bold)),
+            leading: IconButton(
+              icon: const Icon(Icons.close, color: white),
+              onPressed: () {
+                Navigator.pop(context);
+                focusNode?.requestFocus();
+              },
+            ),
+            actions: [
+              TextButton(
+                onPressed: () {
+                  Navigator.pop(context);
+                  focusNode?.requestFocus();
+                },
+                child: const Text('LISTO', style: TextStyle(color: primaryAqua, fontWeight: FontWeight.bold)),
+              ),
+              const SizedBox(width: 8),
+            ],
+          ),
+          body: Padding(
+            padding: const EdgeInsets.all(24.0),
+            child: TextField(
+              controller: controller,
+              maxLines: null,
+              expands: true,
+              textAlignVertical: TextAlignVertical.top,
+              autofocus: true,
+              style: const TextStyle(color: white, fontSize: 16, height: 1.6),
+              decoration: InputDecoration(
+                border: InputBorder.none,
+                hintText: 'Escribe tus instrucciones detalladas aquí...',
+                hintStyle: TextStyle(color: white.withValues(alpha: 0.1)),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   // --- Helper Widgets ---
 
   Widget _sectionTitle(String title) {
     return Text(title.toUpperCase(), style: const TextStyle(color: primaryAqua, fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1.2));
   }
 
-  Widget _textField({required TextEditingController controller, required String label, String? hint, int maxLines = 1, bool isPassword = false, IconData? icon}) {
+  Widget _textField({
+    required TextEditingController controller, 
+    required String label, 
+    String? hint, 
+    int maxLines = 1, 
+    bool isPassword = false, 
+    IconData? icon,
+    bool canExpand = false,
+    FocusNode? focusNode,
+  }) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(label, style: const TextStyle(color: lightText, fontSize: 13, fontWeight: FontWeight.w600)),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text(label, style: const TextStyle(color: lightText, fontSize: 13, fontWeight: FontWeight.w600)),
+            if (canExpand)
+              GestureDetector(
+                onTap: () => _showExpandedEditor(label, controller, focusNode),
+                child: const Row(
+                  children: [
+                    Icon(Icons.open_in_full_rounded, color: primaryAqua, size: 14),
+                    SizedBox(width: 4),
+                    Text('Expandir', style: TextStyle(color: primaryAqua, fontSize: 11, fontWeight: FontWeight.bold)),
+                  ],
+                ),
+              ),
+          ],
+        ),
         const SizedBox(height: 8),
         TextField(
           controller: controller,
+          focusNode: focusNode,
           maxLines: maxLines,
           obscureText: isPassword,
-          style: const TextStyle(color: white),
+          style: const TextStyle(color: white, fontSize: 14),
           decoration: InputDecoration(
             hintText: hint,
             prefixIcon: icon != null ? Icon(icon, color: primaryAqua, size: 20) : null,
