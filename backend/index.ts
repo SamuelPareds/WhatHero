@@ -186,13 +186,14 @@ async function startSession(sessionKey: string, accountId: string) {
         return;
       }
 
-      if (statusCode === DisconnectReason.loggedOut) {
-        console.log(`WhatsApp logged out from device (${sessionKey}). Clearing auth.`);
+      if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+        const reasonMsg = statusCode === 401 ? 'SESIÓN INVÁLIDA O NO AUTORIZADA' : 'LOGOUT DESDE EL TELÉFONO';
+        console.log(`[ALERTA] WhatsApp cerró la sesión (${sessionKey}). Motivo: ${reasonMsg}. Limpiando credenciales locales.`);
 
         // Clear auth folder for this session
         try {
           rmSync(`auth_info/${sessionKey}`, { recursive: true, force: true });
-          console.log(`auth_info/${sessionKey} cleared`);
+          console.log(`[startSession] Carpeta auth_info/${sessionKey} eliminada.`);
         } catch (error) {
           console.error('Error clearing auth folder:', error);
         }
@@ -207,6 +208,15 @@ async function startSession(sessionKey: string, accountId: string) {
           sessionKey,
           phoneNumber: session.phoneNumber 
         });
+      } else if (statusCode === 409) {
+        console.log(`[ALERTA] Conflicto multidispositivo para ${sessionKey}. Se ha iniciado sesión en otro lugar. Limpiando para re-vincular.`);
+        
+        try {
+          rmSync(`auth_info/${sessionKey}`, { recursive: true, force: true });
+        } catch (e) {}
+        
+        sessions.delete(sessionKey);
+        io.to(session.accountId).emit('status_update', { status: 'logged_out', sessionKey });
       } else if (statusCode === 408 && !session.phoneNumber) {
         // QR Timeout on a session that was never connected
         console.log(`[startSession] QR Timeout for new session ${sessionKey}. Cleaning up instead of reconnecting.`);
@@ -1002,6 +1012,46 @@ io.on('connection', (socket) => {
 });
 
 async function startExistingSessions() {
+  // --- HEALTH CHECK: Synchronize Firestore status with local auth_info ---
+  try {
+    console.log('[HealthCheck] Sincronizando estados fantasma con Firestore...');
+    
+    // Get all account documents first to avoid collectionGroup index requirement
+    const accountsSnapshot = await db.collection('accounts').get();
+    let cleanedCount = 0;
+
+    for (const accountDoc of accountsSnapshot.docs) {
+      const sessionsSnapshot = await accountDoc.ref
+        .collection('whatsapp_sessions')
+        .where('status', '==', 'connected')
+        .get();
+
+      for (const sessionDoc of sessionsSnapshot.docs) {
+        const data = sessionDoc.data();
+        const sessionKey = data.session_key;
+        
+        // If no sessionKey is stored or the local auth directory/creds don't exist
+        if (!sessionKey || !existsSync(`auth_info/${sessionKey}/creds.json`)) {
+          console.log(`[HealthCheck] Marcando sesión huérfana como desconectada: ${sessionDoc.id} (Account: ${accountDoc.id})`);
+          await sessionDoc.ref.update({
+            status: 'disconnected',
+            disconnect_reason: 'health_check_cleanup',
+            last_sync: admin.firestore.Timestamp.now(),
+          });
+          cleanedCount++;
+        }
+      }
+    }
+
+    if (cleanedCount > 0) {
+      console.log(`[HealthCheck] ✅ Sincronización completada. Limpiadas ${cleanedCount} sesiones fantasma.`);
+    } else {
+      console.log('[HealthCheck] ✅ Todo en orden. No hay sesiones fantasma.');
+    }
+  } catch (error) {
+    console.error('[HealthCheck] Error durante la sincronización:', error);
+  }
+
   if (!existsSync('auth_info')) {
     console.log('No existing auth_info directory');
     return;

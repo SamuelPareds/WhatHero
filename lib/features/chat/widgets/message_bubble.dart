@@ -10,7 +10,7 @@ class MessageBubble extends StatefulWidget {
   final DateTime timestamp;
   final String messageId;
   final String chatPhone;
-  final String sessionKey;
+  final String? sessionKey;
   final String accountId;
 
   const MessageBubble({
@@ -20,7 +20,7 @@ class MessageBubble extends StatefulWidget {
     required this.timestamp,
     required this.messageId,
     required this.chatPhone,
-    required this.sessionKey,
+    this.sessionKey,
     required this.accountId,
   });
 

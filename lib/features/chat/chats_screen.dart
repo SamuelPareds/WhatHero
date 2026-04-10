@@ -618,7 +618,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
       body: MessagesView(
         phoneNumber: selectedChatPhone!,
         sessionId: widget.sessionId!,
-        sessionKey: widget.sessionKey!,
+        sessionKey: widget.sessionKey,
         accountId: widget.accountId,
       ),
     );

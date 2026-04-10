@@ -10,13 +10,13 @@ import 'widgets/message_bubble.dart';
 class MessagesView extends StatefulWidget {
   final String phoneNumber;
   final String sessionId;
-  final String sessionKey;
+  final String? sessionKey;
   final String accountId;
 
   const MessagesView({
     required this.phoneNumber,
     required this.sessionId,
-    required this.sessionKey,
+    this.sessionKey,
     required this.accountId,
     super.key,
   });
@@ -475,53 +475,74 @@ class _MessagesViewState extends State<MessagesView> {
             },
           ),
         ),
-        // Input Area
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-          decoration: BoxDecoration(color: surfaceDark, border: Border(top: BorderSide(color: primaryAqua.withValues(alpha: 0.1), width: 1))),
+          decoration: BoxDecoration(
+            color: surfaceDark, 
+            border: Border(top: BorderSide(color: primaryAqua.withValues(alpha: 0.1), width: 1))
+          ),
           child: SafeArea(
-            child: Row(
-              children: [
-                Expanded(
-                  child: Focus(
-                    onKeyEvent: (node, event) {
-                      if (event.logicalKey == LogicalKeyboardKey.enter && !HardwareKeyboard.instance.isShiftPressed && event is KeyDownEvent) {
-                        _sendMessage();
-                        return KeyEventResult.handled;
-                      }
-                      return KeyEventResult.ignored;
-                    },
-                    child: TextField(
-                      controller: _messageController,
-                      maxLines: null,
-                      textCapitalization: TextCapitalization.sentences,
-                      style: const TextStyle(color: white, fontSize: 15),
-                      onChanged: _handleQuickResponseInput,
-                      decoration: InputDecoration(
-                        hintText: '',
-                        hintStyle: const TextStyle(color: lightText),
-                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
-                        filled: true,
-                        fillColor: darkBg.withValues(alpha: 0.8),
-                        contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            child: Builder(
+              builder: (context) {
+                final sKey = widget.sessionKey;
+                final bool isDisconnected = sKey == null || sKey == 'disconnected';
+                
+                if (isDisconnected) {
+                  return Container(
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    width: double.infinity,
+                    child: const Text(
+                      'Cuenta desvinculada. Re-vincula para enviar mensajes.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: Colors.redAccent, fontSize: 13, fontWeight: FontWeight.w500),
+                    ),
+                  );
+                }
+                
+                return Row(
+                  children: [
+                    Expanded(
+                      child: Focus(
+                        onKeyEvent: (node, event) {
+                          if (event.logicalKey == LogicalKeyboardKey.enter && !HardwareKeyboard.instance.isShiftPressed && event is KeyDownEvent) {
+                            _sendMessage();
+                            return KeyEventResult.handled;
+                          }
+                          return KeyEventResult.ignored;
+                        },
+                        child: TextField(
+                          controller: _messageController,
+                          maxLines: null,
+                          textCapitalization: TextCapitalization.sentences,
+                          style: const TextStyle(color: white, fontSize: 15),
+                          onChanged: _handleQuickResponseInput,
+                          decoration: InputDecoration(
+                            hintText: '',
+                            hintStyle: const TextStyle(color: lightText),
+                            border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+                            filled: true,
+                            fillColor: darkBg.withValues(alpha: 0.8),
+                            contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                          ),
+                        ),
                       ),
                     ),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                _isGenerating
-                    ? const SizedBox(width: 44, height: 44, child: Padding(padding: EdgeInsets.all(8), child: CircularProgressIndicator(strokeWidth: 2, valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF06B6D4)))))
-                    : IconButton(icon: const Icon(Icons.auto_awesome, size: 20), tooltip: 'Generar respuesta con IA', color: const Color(0xFF06B6D4), onPressed: _generateAIResponse),
-                const SizedBox(width: 4),
-                Container(
-                  decoration: BoxDecoration(color: primaryAqua, borderRadius: BorderRadius.circular(12)),
-                  child: IconButton(
-                    icon: _isSending ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, valueColor: AlwaysStoppedAnimation<Color>(darkBg))) : const Icon(Icons.send_rounded, size: 20),
-                    color: darkBg,
-                    onPressed: _isSending ? null : _sendMessage,
-                  ),
-                ),
-              ],
+                    const SizedBox(width: 8),
+                    _isGenerating
+                        ? const SizedBox(width: 44, height: 44, child: Padding(padding: EdgeInsets.all(8), child: CircularProgressIndicator(strokeWidth: 2, valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF06B6D4)))))
+                        : IconButton(icon: const Icon(Icons.auto_awesome, size: 20), tooltip: 'Generar respuesta con IA', color: const Color(0xFF06B6D4), onPressed: _generateAIResponse),
+                    const SizedBox(width: 4),
+                    Container(
+                      decoration: BoxDecoration(color: primaryAqua, borderRadius: BorderRadius.circular(12)),
+                      child: IconButton(
+                        icon: _isSending ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, valueColor: AlwaysStoppedAnimation<Color>(darkBg))) : const Icon(Icons.send_rounded, size: 20),
+                        color: darkBg,
+                        onPressed: _isSending ? null : _sendMessage,
+                      ),
+                    ),
+                  ],
+                );
+              },
             ),
           ),
         ),

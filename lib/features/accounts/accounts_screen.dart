@@ -167,23 +167,20 @@ class _AccountsScreenState extends State<AccountsScreen> {
                   ),
                 ),
                 child: InkWell(
-                  onTap: isConnected
-                      ? () {
-                          final sessionKey = sessionDoc['session_key'] as String?;
-                          if (sessionKey != null) {
-                            Navigator.push(
-                              context,
-                              MaterialPageRoute(
-                                builder: (_) => ChatsScreen(
-                                  sessionId: phoneNumber,
-                                  sessionKey: sessionKey,
-                                  accountId: widget.accountId,
-                                ),
-                              ),
-                            );
-                          }
-                        }
-                      : null,
+                  onTap: () {
+                    final sessionKey = sessionDoc['session_key'] as String?;
+                    // Permitimos entrar aunque no haya sessionKey (será modo lectura)
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => ChatsScreen(
+                          sessionId: phoneNumber,
+                          sessionKey: sessionKey ?? 'disconnected',
+                          accountId: widget.accountId,
+                        ),
+                      ),
+                    );
+                  },
                   borderRadius: BorderRadius.circular(12),
                   child: Padding(
                     padding: const EdgeInsets.all(16),
