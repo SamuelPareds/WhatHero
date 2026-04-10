@@ -19,7 +19,7 @@ export interface SessionData {
       start: string;
       end: string;
     };
-    keywordRules: { keyword: string; response: string }[];
+    keywordRules: { keyword: string; response: string; imageUrl?: string }[];
     discriminator?: {
       enabled: boolean;
       prompt: string;

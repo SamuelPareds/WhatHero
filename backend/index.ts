@@ -312,7 +312,30 @@ async function startSession(sessionKey: string, accountId: string) {
       if (messageText.toLowerCase().includes(rule.keyword.toLowerCase())) {
         console.log(`[AI] Keyword rule matched: "${rule.keyword}", sending canned response`);
         await new Promise(r => setTimeout(r, aiConfig.responseDelayMs > 2000 ? 2000 : aiConfig.responseDelayMs));
-        await session.sock.sendMessage(remoteJid, { text: rule.response });
+        
+        if (rule.imageUrl) {
+          try {
+            console.log(`[AI] Downloading image for keyword rule: ${rule.imageUrl}`);
+            const imageResponse = await fetch(rule.imageUrl).then(res => {
+              if (!res.ok) throw new Error(`Failed to fetch image: ${res.statusText}`);
+              return res.arrayBuffer();
+            });
+            const imageBuffer = Buffer.from(imageResponse);
+            await session.sock.sendMessage(remoteJid, { 
+              image: imageBuffer, 
+              caption: rule.response || undefined 
+            });
+          } catch (error) {
+            console.error(`[AI] Error sending image for keyword rule:`, error);
+            // Fallback to text only if image fails
+            if (rule.response) {
+              await session.sock.sendMessage(remoteJid, { text: rule.response });
+            }
+          }
+        } else {
+          await session.sock.sendMessage(remoteJid, { text: rule.response });
+        }
+        
         return; // Important: stop here so AI doesn't also respond
       }
     }

@@ -42,9 +42,10 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
   String _activeHoursTimezone = 'America/Mexico_City';
   TimeOfDay _activeHoursStart = const TimeOfDay(hour: 9, minute: 0);
   TimeOfDay _activeHoursEnd = const TimeOfDay(hour: 18, minute: 0);
-  List<Map<String, String>> _keywordRules = [];
+  List<Map<String, dynamic>> _keywordRules = [];
   String _newKeyword = '';
   String _newKeywordResponse = '';
+  String _newKeywordImageUrl = '';
   bool _discriminatorEnabled = false;
   
   // AgendaCool
@@ -116,9 +117,10 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
           }
 
           if (data['ai_keyword_rules'] is List) {
-            _keywordRules = List<Map<String, String>>.from((data['ai_keyword_rules'] as List).map((rule) => {
+            _keywordRules = List<Map<String, dynamic>>.from((data['ai_keyword_rules'] as List).map((rule) => {
               'keyword': rule['keyword'] as String? ?? '',
               'response': rule['response'] as String? ?? '',
+              'imageUrl': rule['imageUrl'] as String? ?? '',
             }));
           }
 
@@ -410,7 +412,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
           const SizedBox(height: 8),
           const Text('Si el mensaje del cliente contiene alguna de estas palabras, el bot responderá de forma inmediata ignorando a la IA.', style: TextStyle(color: lightText, fontSize: 13)),
           const SizedBox(height: 20),
-          ..._keywordRules.asMap().entries.map((e) => _keywordTile(e.key, e.value['keyword']!, e.value['response']!)),
+          ..._keywordRules.asMap().entries.map((e) => _keywordTile(e.key, e.value['keyword']!, e.value['response']!, e.value['imageUrl'])),
           _addKeywordSection(),
         ],
       ),
@@ -729,14 +731,22 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
     );
   }
 
-  Widget _keywordTile(int index, String key, String resp) {
+  Widget _keywordTile(int index, String key, String resp, String? imageUrl) {
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       decoration: BoxDecoration(color: darkBg.withValues(alpha: 0.2), borderRadius: BorderRadius.circular(12)),
       child: Row(children: [
         Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text(key, style: const TextStyle(color: primaryAqua, fontWeight: FontWeight.bold)),
+          Row(
+            children: [
+              Text(key, style: const TextStyle(color: primaryAqua, fontWeight: FontWeight.bold)),
+              if (imageUrl != null && imageUrl.isNotEmpty) ...[
+                const SizedBox(width: 8),
+                const Icon(Icons.image, color: primaryAqua, size: 14),
+              ],
+            ],
+          ),
           Text(resp, style: const TextStyle(color: lightText, fontSize: 12), maxLines: 1, overflow: TextOverflow.ellipsis),
         ])),
         IconButton(icon: const Icon(Icons.delete_outline, color: Colors.red, size: 20), onPressed: () => setState(() => _keywordRules.removeAt(index))),
@@ -745,35 +755,121 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
   }
 
   Widget _addKeywordSection() {
+    // Controller temporal para el editor expandido si el usuario lo requiere
+    final TextEditingController tempResponseController = TextEditingController(text: _newKeywordResponse);
+    
     return Container(
       margin: const EdgeInsets.only(top: 8),
       padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(border: Border.all(color: primaryAqua.withValues(alpha: 0.2)), borderRadius: BorderRadius.circular(12)),
-      child: Column(children: [
-        TextField(
-          onChanged: (v) => _newKeyword = v,
-          style: const TextStyle(color: white, fontSize: 13),
-          decoration: const InputDecoration(hintText: 'Palabra clave...', border: InputBorder.none, isDense: true),
-        ),
-        const Divider(color: white, height: 16),
-        TextField(
-          onChanged: (v) => _newKeywordResponse = v,
-          style: const TextStyle(color: white, fontSize: 13),
-          decoration: const InputDecoration(hintText: 'Respuesta...', border: InputBorder.none, isDense: true),
-        ),
-        const SizedBox(height: 8),
-        TextButton(
-          onPressed: () {
-            if (_newKeyword.isNotEmpty && _newKeywordResponse.isNotEmpty) {
-              setState(() {
-                _keywordRules.add({'keyword': _newKeyword, 'response': _newKeywordResponse});
-                _newKeyword = ''; _newKeywordResponse = '';
-              });
-            }
-          },
-          child: const Text('+ Agregar Regla', style: TextStyle(color: primaryAqua, fontWeight: FontWeight.bold)),
-        ),
-      ]),
+      decoration: BoxDecoration(
+        color: darkBg.withValues(alpha: 0.2),
+        border: Border.all(color: primaryAqua.withValues(alpha: 0.2)), 
+        borderRadius: BorderRadius.circular(16)
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('CREAR NUEVA REGLA', style: TextStyle(color: primaryAqua, fontSize: 10, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 12),
+          TextField(
+            onChanged: (v) => _newKeyword = v,
+            style: const TextStyle(color: white, fontSize: 13),
+            decoration: InputDecoration(
+              hintText: 'Palabra clave (ej: info, precio)...',
+              hintStyle: TextStyle(color: white.withValues(alpha: 0.3)),
+              border: InputBorder.none,
+              isDense: true,
+              prefixIcon: const Icon(Icons.key, size: 16, color: primaryAqua),
+            ),
+          ),
+          const Divider(color: white, height: 16, thickness: 0.1),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text('Respuesta del Bot', style: TextStyle(color: lightText, fontSize: 12)),
+              GestureDetector(
+                onTap: () {
+                  tempResponseController.text = _newKeywordResponse;
+                  _showExpandedEditor('Redactar Respuesta Automática', tempResponseController, null);
+                  // Actualizar el estado cuando el diálogo se cierre (aunque el editor expandido aquí es modal)
+                  // Para simplificar, usamos un listener o actualizamos al cerrar
+                  tempResponseController.addListener(() {
+                    _newKeywordResponse = tempResponseController.text;
+                    setState(() {});
+                  });
+                },
+                child: const Row(
+                  children: [
+                    Icon(Icons.open_in_full_rounded, color: primaryAqua, size: 12),
+                    SizedBox(width: 4),
+                    Text('Expandir', style: TextStyle(color: primaryAqua, fontSize: 10, fontWeight: FontWeight.bold)),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          TextField(
+            controller: TextEditingController.fromValue(
+              TextEditingValue(
+                text: _newKeywordResponse,
+                selection: TextSelection.collapsed(offset: _newKeywordResponse.length),
+              ),
+            ),
+            onChanged: (v) => _newKeywordResponse = v,
+            maxLines: 4,
+            minLines: 2,
+            style: const TextStyle(color: white, fontSize: 13, height: 1.4),
+            decoration: InputDecoration(
+              hintText: 'Escribe el mensaje que enviará el bot...',
+              hintStyle: TextStyle(color: white.withValues(alpha: 0.3)),
+              filled: true,
+              fillColor: darkBg.withValues(alpha: 0.3),
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+              contentPadding: const EdgeInsets.all(12),
+            ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            onChanged: (v) => _newKeywordImageUrl = v,
+            style: const TextStyle(color: white, fontSize: 13),
+            decoration: InputDecoration(
+              hintText: 'URL de imagen (opcional)...',
+              hintStyle: TextStyle(color: white.withValues(alpha: 0.3)),
+              border: InputBorder.none,
+              isDense: true,
+              prefixIcon: const Icon(Icons.link, size: 16, color: primaryAqua),
+            ),
+          ),
+          const SizedBox(height: 16),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton(
+              onPressed: () {
+                if (_newKeyword.isNotEmpty && (_newKeywordResponse.isNotEmpty || _newKeywordImageUrl.isNotEmpty)) {
+                  setState(() {
+                    _keywordRules.add({
+                      'keyword': _newKeyword, 
+                      'response': _newKeywordResponse,
+                      'imageUrl': _newKeywordImageUrl,
+                    });
+                    _newKeyword = ''; _newKeywordResponse = ''; _newKeywordImageUrl = '';
+                    tempResponseController.clear();
+                  });
+                }
+              },
+              style: ElevatedButton.styleFrom(
+                backgroundColor: primaryAqua.withValues(alpha: 0.1),
+                foregroundColor: primaryAqua,
+                side: const BorderSide(color: primaryAqua),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                elevation: 0,
+              ),
+              child: const Text('+ Guardar Regla', style: TextStyle(fontWeight: FontWeight.bold)),
+            ),
+          ),
+        ],
+      ),
     );
   }
 
