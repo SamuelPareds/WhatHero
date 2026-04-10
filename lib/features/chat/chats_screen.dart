@@ -6,16 +6,17 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/features/settings.dart';
+import 'package:crm_whatsapp/features/accounts.dart';
 import 'messages_view.dart';
 
 class ChatsScreen extends StatefulWidget {
-  final String sessionId;
-  final String sessionKey;
+  final String? sessionId;
+  final String? sessionKey;
   final String accountId;
 
   const ChatsScreen({
-    required this.sessionId,
-    required this.sessionKey,
+    this.sessionId,
+    this.sessionKey,
     required this.accountId,
     super.key,
   });
@@ -35,10 +36,14 @@ class _ChatsScreenState extends State<ChatsScreen> {
   @override
   void initState() {
     super.initState();
-    _setupSocketListeners();
+    if (widget.sessionId != null && widget.sessionKey != null) {
+      _setupSocketListeners();
+    }
   }
 
   void _setupSocketListeners() {
+    if (widget.sessionKey == null) return;
+    
     // Escuchar el estado de la sesión
     _statusSubscription = SocketService().statusStream.listen((event) {
       if (event.sessionKey == widget.sessionKey) {
@@ -50,7 +55,6 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 backgroundColor: Colors.red,
               ),
             );
-            // Podríamos decidir volver atrás o mostrar un aviso visual
           }
         }
       }
@@ -59,14 +63,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
     // Escuchar alertas de atención humana
     _humanAttentionSubscription = SocketService().humanAttentionStream.listen((data) {
       if (data['sessionKey'] == widget.sessionKey) {
-        // Podríamos mostrar una notificación interna o resaltar el chat
         debugPrint('[ChatsScreen] Atención humana requerida para: ${data['contactPhone']}');
       }
     });
-
-    // NOTA: El evento 'ai_toggle_result' no está explícitamente en SocketService aún,
-    // pero podemos agregarlo o manejarlo genéricamente si el backend lo envía.
-    // Por ahora, mantendremos la lógica de UI.
   }
 
   @override
@@ -224,12 +223,108 @@ class _ChatsScreenState extends State<ChatsScreen> {
   }
 
   Widget _buildChatsList() {
+    if (widget.sessionId == null) {
+      return Scaffold(
+        appBar: AppBar(
+          title: const Text('WhatHero', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 24, color: white)),
+          elevation: 0,
+        ),
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24.0),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  Icons.smartphone,
+                  size: 64,
+                  color: primaryAqua.withValues(alpha: 0.5),
+                ),
+                const SizedBox(height: 24),
+                const Text(
+                  'Bienvenido a WhatHero',
+                  style: TextStyle(
+                    fontSize: 22,
+                    fontWeight: FontWeight.bold,
+                    color: white,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                const Text(
+                  'Para comenzar a gestionar tus chats, vincula una cuenta de WhatsApp.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 16,
+                    color: lightText,
+                  ),
+                ),
+                const SizedBox(height: 32),
+                ElevatedButton.icon(
+                  onPressed: () {
+                    Navigator.push(
+                      context,
+                      PageRouteBuilder(
+                        pageBuilder: (context, animation, secondaryAnimation) => 
+                            AccountsScreen(accountId: widget.accountId),
+                        transitionsBuilder: (context, animation, secondaryAnimation, child) {
+                          return FadeTransition(
+                            opacity: animation,
+                            child: ScaleTransition(
+                              scale: Tween<double>(begin: 0.98, end: 1.0).animate(
+                                CurvedAnimation(parent: animation, curve: Curves.easeOutCubic),
+                              ),
+                              child: child,
+                            ),
+                          );
+                        },
+                        transitionDuration: const Duration(milliseconds: 400),
+                      ),
+                    );
+                  },
+                  icon: const Icon(Icons.manage_accounts_outlined),
+                  label: const Text('Gestionar Cuentas'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: primaryAqua,
+                    foregroundColor: darkBg,
+                    padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
     return Scaffold(
       appBar: AppBar(
         leading: IconButton(
           icon: const Icon(Icons.manage_accounts_outlined, color: primaryAqua),
-          onPressed: () => Navigator.pop(context),
-          tooltip: 'Volver a Mis Cuentas',
+          onPressed: () {
+            Navigator.push(
+              context,
+              PageRouteBuilder(
+                pageBuilder: (context, animation, secondaryAnimation) => 
+                    AccountsScreen(accountId: widget.accountId),
+                transitionsBuilder: (context, animation, secondaryAnimation, child) {
+                  return FadeTransition(
+                    opacity: animation,
+                    child: ScaleTransition(
+                      scale: Tween<double>(begin: 0.98, end: 1.0).animate(
+                        CurvedAnimation(parent: animation, curve: Curves.easeOutCubic),
+                      ),
+                      child: child,
+                    ),
+                  );
+                },
+                transitionDuration: const Duration(milliseconds: 400),
+              ),
+            );
+          },
+          tooltip: 'Gestionar Cuentas',
         ),
         title: Column(
           mainAxisSize: MainAxisSize.min,
@@ -237,7 +332,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
           children: [
             const Text('WhatHero', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 24, color: white)),
             Text(
-              widget.sessionId,
+              widget.sessionId!,
               style: const TextStyle(fontSize: 12, color: lightText, fontWeight: FontWeight.w400),
             ),
           ],
@@ -251,9 +346,10 @@ class _ChatsScreenState extends State<ChatsScreen> {
               context: context,
               isScrollControlled: true,
               builder: (_) => QuickResponsesPanel(
-                sessionId: widget.sessionId,
+                sessionId: widget.sessionId!,
                 accountId: widget.accountId,
               ),
+
             ),
           ),
         ],
@@ -521,8 +617,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
       ),
       body: MessagesView(
         phoneNumber: selectedChatPhone!,
-        sessionId: widget.sessionId,
-        sessionKey: widget.sessionKey,
+        sessionId: widget.sessionId!,
+        sessionKey: widget.sessionKey!,
         accountId: widget.accountId,
       ),
     );
@@ -537,7 +633,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
       ),
       builder: (context) => ContactInfoPanel(
         phoneNumber: phoneNumber,
-        sessionId: widget.sessionId,
+        sessionId: widget.sessionId!,
         accountId: widget.accountId,
       ),
     );

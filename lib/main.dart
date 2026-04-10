@@ -4,10 +4,11 @@ import 'package:flutter/services.dart';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'firebase_options.dart';
 import 'core.dart';
 import 'features/auth.dart';
-import 'features/accounts.dart';
+import 'features/chat.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -27,8 +28,56 @@ class MyApp extends StatelessWidget {
       title: 'WhatHero',
       theme: buildWhatHeroTheme(),
       home: AuthWrapper(
-        onUserAuthenticated: (accountId) => AccountsScreen(accountId: accountId),
+        onUserAuthenticated: (accountId) => SessionDispatcher(accountId: accountId),
       ),
+    );
+  }
+}
+
+class SessionDispatcher extends StatelessWidget {
+  final String accountId;
+
+  const SessionDispatcher({required this.accountId, super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<QuerySnapshot>(
+      stream: FirebaseFirestore.instance
+          .collection('accounts')
+          .doc(accountId)
+          .collection('whatsapp_sessions')
+          .where('status', isEqualTo: 'connected')
+          .limit(1)
+          .snapshots(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Scaffold(
+            body: Center(
+              child: CircularProgressIndicator(color: primaryAqua),
+            ),
+          );
+        }
+
+        final docs = snapshot.data?.docs ?? [];
+
+        if (docs.isNotEmpty) {
+          final doc = docs.first;
+          final sessionId = doc.id;
+          final sessionKey = doc['session_key'] as String?;
+
+          if (sessionKey != null) {
+            return ChatsScreen(
+              sessionId: sessionId,
+              sessionKey: sessionKey,
+              accountId: accountId,
+            );
+          }
+        }
+
+        // If no connected session, go to ChatsScreen anyway but with null session
+        // It will show the "Welcome / Manage Accounts" empty state
+        return ChatsScreen(accountId: accountId);
+      },
     );
   }
 }

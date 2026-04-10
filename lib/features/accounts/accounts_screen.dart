@@ -20,7 +20,6 @@ class AccountsScreen extends StatefulWidget {
 }
 
 class _AccountsScreenState extends State<AccountsScreen> {
-  bool _autoNavigated = false;
 
   @override
   void initState() {
@@ -125,38 +124,6 @@ class _AccountsScreenState extends State<AccountsScreen> {
           }
 
           final sessions = snapshot.data!.docs;
-
-          // Auto-navigate to ChatsScreen if a connected session exists
-          if (!_autoNavigated && sessions.isNotEmpty) {
-            QueryDocumentSnapshot? connectedSession;
-            for (final doc in sessions) {
-              if ((doc['status'] ?? 'disconnected') == 'connected') {
-                connectedSession = doc;
-                break;
-              }
-            }
-
-            if (connectedSession != null) {
-              _autoNavigated = true;
-              final phoneNumber = connectedSession.id;
-              final sessionKey = connectedSession['session_key'] as String?;
-              if (sessionKey != null) {
-                WidgetsBinding.instance.addPostFrameCallback((_) {
-                  if (!mounted) return;
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => ChatsScreen(
-                        sessionId: phoneNumber,
-                        sessionKey: sessionKey,
-                        accountId: widget.accountId,
-                      ),
-                    ),
-                  );
-                });
-              }
-            }
-          }
 
           if (sessions.isEmpty) {
             return Center(
