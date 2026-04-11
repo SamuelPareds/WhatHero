@@ -5,6 +5,7 @@ import 'dart:ui';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
+import 'package:crm_whatsapp/core/services/storage_service.dart';
 import 'package:crm_whatsapp/features/settings.dart';
 import 'package:crm_whatsapp/features/accounts.dart';
 import 'messages_view.dart';
@@ -40,6 +41,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
     super.initState();
     if (widget.sessionId != null && widget.sessionKey != null) {
       _setupSocketListeners();
+      // Guardar esta sesión como la última activa
+      StorageService().saveLastSessionId(widget.sessionId!);
     }
   }
 

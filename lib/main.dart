@@ -7,6 +7,7 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'firebase_options.dart';
 import 'core.dart';
+import 'core/services/storage_service.dart';
 import 'features/auth.dart';
 import 'features/chat.dart';
 
@@ -41,16 +42,10 @@ class SessionDispatcher extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return StreamBuilder<QuerySnapshot>(
-      stream: FirebaseFirestore.instance
-          .collection('accounts')
-          .doc(accountId)
-          .collection('whatsapp_sessions')
-          .where('status', isEqualTo: 'connected')
-          .limit(1)
-          .snapshots(),
-      builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting) {
+    return FutureBuilder<String?>(
+      future: StorageService().getLastSessionId(),
+      builder: (context, lastSessionSnapshot) {
+        if (lastSessionSnapshot.connectionState == ConnectionState.waiting) {
           return const Scaffold(
             body: Center(
               child: CircularProgressIndicator(color: primaryAqua),
@@ -58,27 +53,58 @@ class SessionDispatcher extends StatelessWidget {
           );
         }
 
-        final docs = snapshot.data?.docs ?? [];
+        final lastSessionId = lastSessionSnapshot.data;
 
-        if (docs.isNotEmpty) {
-          final doc = docs.first;
-          final sessionId = doc.id;
-          final sessionKey = doc['session_key'] as String?;
-          final alias = doc['alias'] as String?;
+        return StreamBuilder<QuerySnapshot>(
+          stream: FirebaseFirestore.instance
+              .collection('accounts')
+              .doc(accountId)
+              .collection('whatsapp_sessions')
+              .where('status', isEqualTo: 'connected')
+              .snapshots(),
+          builder: (context, snapshot) {
+            if (snapshot.connectionState == ConnectionState.waiting) {
+              return const Scaffold(
+                body: Center(
+                  child: CircularProgressIndicator(color: primaryAqua),
+                ),
+              );
+            }
 
-          if (sessionKey != null) {
-            return ChatsScreen(
-              sessionId: sessionId,
-              sessionKey: sessionKey,
-              accountId: accountId,
-              initialAlias: alias,
-            );
-          }
-        }
+            final docs = snapshot.data?.docs ?? [];
 
-        // If no connected session, go to ChatsScreen anyway but with null session
-        // It will show the "Welcome / Manage Accounts" empty state
-        return ChatsScreen(accountId: accountId);
+            if (docs.isNotEmpty) {
+              // 1. Intentar encontrar la última sesión guardada que esté conectada
+              DocumentSnapshot? targetDoc;
+              if (lastSessionId != null) {
+                try {
+                  targetDoc = docs.firstWhere((doc) => doc.id == lastSessionId);
+                } catch (_) {
+                  // Si no se encuentra, targetDoc sigue siendo null
+                }
+              }
+
+              // 2. Si no hay guardada o ya no está conectada, usar la primera disponible
+              targetDoc ??= docs.first;
+
+              final sessionId = targetDoc.id;
+              final sessionKey = targetDoc['session_key'] as String?;
+              final alias = targetDoc['alias'] as String?;
+
+              if (sessionKey != null) {
+                return ChatsScreen(
+                  sessionId: sessionId,
+                  sessionKey: sessionKey,
+                  accountId: accountId,
+                  initialAlias: alias,
+                );
+              }
+            }
+
+            // If no connected session, go to ChatsScreen anyway but with null session
+            return ChatsScreen(accountId: accountId);
+          },
+        );
       },
     );
   }

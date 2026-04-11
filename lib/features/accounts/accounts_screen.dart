@@ -5,6 +5,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:http/http.dart' as http;
 import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
+import 'package:crm_whatsapp/core/services/storage_service.dart';
 import 'package:crm_whatsapp/features/auth.dart';
 import 'package:crm_whatsapp/features/accounts/link_account_screen.dart';
 import 'package:crm_whatsapp/features/settings.dart';
@@ -30,6 +31,8 @@ class _AccountsScreenState extends State<AccountsScreen> {
 
   Future<void> _handleLogout() async {
     try {
+      // Limpiar preferencia de última sesión
+      await StorageService().clearLastSessionId();
       // El dispose del socket se encarga de cerrar la conexión
       await FirebaseAuth.instance.signOut();
       if (!mounted) return;
