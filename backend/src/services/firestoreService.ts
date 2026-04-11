@@ -62,12 +62,50 @@ export async function saveMessageToFirestore(message: any, sessionKey: string, a
     if (!phoneNumber) return;
 
     // If we got a LID format and no mapping exists yet, try to resolve it
-    if (remoteJid.includes('@lid') && sock) {
-      const { resolveLIDViaSock } = await import('../utils/phone');
-      const resolved = await resolveLIDViaSock(phoneNumber, sock);
-      if (resolved) {
-        phoneNumber = resolved;
-        console.log(`[Firestore] Resolved LID ${extractPhoneNumber(remoteJid)} → ${phoneNumber}`);
+    if (remoteJid.includes('@lid')) {
+      let resolved = false;
+
+      // 1. Try to resolve via socket (Baileys store)
+      if (sock) {
+        const { resolveLIDViaSock } = await import('../utils/phone');
+        const sockResolved = await resolveLIDViaSock(phoneNumber, sock);
+        if (sockResolved) {
+          phoneNumber = sockResolved;
+          resolved = true;
+          console.log(`[Firestore] Resolved LID via Sock: ${extractPhoneNumber(remoteJid)} → ${phoneNumber}`);
+        }
+      }
+
+      // 2. If not resolved via socket, search in Firestore for an existing chat with this remoteJid
+      if (!resolved) {
+        try {
+          const chatsSnapshot = await getDb()
+            .collection('accounts')
+            .doc(accountId)
+            .collection('whatsapp_sessions')
+            .doc(sessionId)
+            .collection('chats')
+            .where('remoteJid', '==', remoteJid)
+            .limit(1)
+            .get();
+
+          if (!chatsSnapshot.empty) {
+            const existingChat = chatsSnapshot.docs[0];
+            phoneNumber = existingChat.id; // Use the existing phone number document ID
+            resolved = true;
+            console.log(`[Firestore] Resolved LID via DB lookup: ${remoteJid} → ${phoneNumber}`);
+            
+            // Also store in memory for future use during this session
+            const { storeLIDMapping } = await import('../utils/phone');
+            storeLIDMapping(extractPhoneNumber(remoteJid), phoneNumber);
+          }
+        } catch (dbError) {
+          console.error('[Firestore] Error looking up LID in DB:', dbError);
+        }
+      }
+      
+      if (!resolved) {
+        console.warn(`[Firestore] Could not resolve LID ${remoteJid}, will use LID as chat ID (might create duplicate)`);
       }
     }
 
