@@ -20,14 +20,22 @@ export async function initializeSession(phoneNumber: string, sessionKey: string,
       .collection('whatsapp_sessions')
       .doc(phoneNumber);
 
-    const sessionData = {
+    // Check if document already exists to preserve alias
+    const doc = await sessionDocRef.get();
+    const existingData = doc.data();
+
+    const sessionData: any = {
       phone_number: phoneNumber,
-      alias: `Sucursal - ${phoneNumber}`,
       status: 'connected',
       last_sync: admin.firestore.Timestamp.now(),
       connected_at: admin.firestore.FieldValue.serverTimestamp(),
       session_key: sessionKey,
     };
+
+    // Only set default alias if it doesn't exist yet
+    if (!existingData || !existingData.alias) {
+      sessionData.alias = `Sucursal - ${phoneNumber}`;
+    }
 
     await sessionDocRef.set(sessionData, { merge: true });
     console.log(`Session initialized for phone: ${phoneNumber} with key: ${sessionKey}`);
