@@ -64,12 +64,14 @@ class SessionDispatcher extends StatelessWidget {
           final doc = docs.first;
           final sessionId = doc.id;
           final sessionKey = doc['session_key'] as String?;
+          final alias = doc['alias'] as String?;
 
           if (sessionKey != null) {
             return ChatsScreen(
               sessionId: sessionId,
               sessionKey: sessionKey,
               accountId: accountId,
+              initialAlias: alias,
             );
           }
         }

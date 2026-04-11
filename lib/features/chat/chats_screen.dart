@@ -13,11 +13,13 @@ class ChatsScreen extends StatefulWidget {
   final String? sessionId;
   final String? sessionKey;
   final String accountId;
+  final String? initialAlias;
 
   const ChatsScreen({
     this.sessionId,
     this.sessionKey,
     required this.accountId,
+    this.initialAlias,
     super.key,
   });
 
@@ -326,16 +328,44 @@ class _ChatsScreenState extends State<ChatsScreen> {
           },
           tooltip: 'Gestionar Cuentas',
         ),
-        title: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('WhatHero', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 24, color: white)),
-            Text(
-              widget.sessionId!,
-              style: const TextStyle(fontSize: 12, color: lightText, fontWeight: FontWeight.w400),
-            ),
-          ],
+        title: StreamBuilder<DocumentSnapshot>(
+          stream: FirebaseFirestore.instance
+              .collection('accounts')
+              .doc(widget.accountId)
+              .collection('whatsapp_sessions')
+              .doc(widget.sessionId)
+              .snapshots(),
+          builder: (context, snapshot) {
+            String title = widget.initialAlias ?? 'WhatHero';
+            if (snapshot.hasData && snapshot.data!.exists) {
+              title = snapshot.data!.get('alias') ?? widget.sessionId ?? title;
+            }
+            
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 20,
+                    color: white,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                Text(
+                  widget.sessionId!,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    color: lightText,
+                    fontWeight: FontWeight.w400,
+                  ),
+                ),
+              ],
+            );
+          },
         ),
         elevation: 0,
         actions: [

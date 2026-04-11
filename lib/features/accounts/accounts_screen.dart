@@ -177,6 +177,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
                           sessionId: phoneNumber,
                           sessionKey: sessionKey ?? 'disconnected',
                           accountId: widget.accountId,
+                          initialAlias: alias,
                         ),
                       ),
                     );
