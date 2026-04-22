@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/core/services/storage_service.dart';
+import 'package:crm_whatsapp/core/services/version_service.dart';
 import 'package:crm_whatsapp/features/auth.dart';
 import 'package:crm_whatsapp/features/accounts/link_account_screen.dart';
 import 'package:crm_whatsapp/features/settings.dart';
@@ -21,12 +22,22 @@ class AccountsScreen extends StatefulWidget {
 }
 
 class _AccountsScreenState extends State<AccountsScreen> {
+  String _appVersion = '0.0.0+0';
 
   @override
   void initState() {
     super.initState();
-    // Inicializar el socket global una sola vez para este accountId
     SocketService().init(widget.accountId);
+    _loadVersion();
+  }
+
+  Future<void> _loadVersion() async {
+    final version = await VersionService.getVersion();
+    if (mounted) {
+      setState(() {
+        _appVersion = version;
+      });
+    }
   }
 
   Future<void> _handleLogout() async {
@@ -113,6 +124,19 @@ class _AccountsScreenState extends State<AccountsScreen> {
         onPressed: _startNewSession,
         backgroundColor: primaryAqua,
         child: const Icon(Icons.add),
+      ),
+      bottomNavigationBar: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: Text(
+            'WhatHero v$_appVersion',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 11,
+              color: lightText.withValues(alpha: 0.45),
+            ),
+          ),
+        ),
       ),
       body: StreamBuilder<QuerySnapshot>(
         stream: FirebaseFirestore.instance
