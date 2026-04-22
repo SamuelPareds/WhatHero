@@ -6,7 +6,7 @@ import 'package:flutter/foundation.dart';
 /// - Android emulator: 10.0.2.2:3000 (host machine access)
 String get backendUrl {
   if (kReleaseMode) {
-    return 'https://whathero-production.up.railway.app';
+    return 'https://whathero.up.railway.app';
   }
 
   if (kIsWeb) {
