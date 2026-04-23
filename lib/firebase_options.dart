@@ -72,4 +72,5 @@ class DefaultFirebaseOptions {
     storageBucket: 'whathero-73605.firebasestorage.app',
     iosBundleId: 'com.sintaxis.whathero',
   );
+
 }

@@ -2,6 +2,7 @@ import admin from 'firebase-admin';
 import { SessionData } from '../types';
 import { extractPhoneNumber } from '../utils/phone';
 import { saveMessageToFirestore } from './firestoreService';
+import { ACCOUNTS_COLLECTION } from '../config/env';
 
 interface Appointment {
   appointmentId: string;
@@ -68,7 +69,7 @@ export class ReminderService {
   static async getReminderConfig(accountId: string, sessionId: string): Promise<ReminderConfig | null> {
     try {
       const sessionDocRef = this.db
-        .collection('accounts').doc(accountId)
+        .collection(ACCOUNTS_COLLECTION).doc(accountId)
         .collection('whatsapp_sessions').doc(sessionId);
 
       const doc = await sessionDocRef.get();

@@ -21,7 +21,7 @@ class ContactInfoPanel extends StatelessWidget {
       backgroundColor: Colors.transparent,
       body: StreamBuilder<DocumentSnapshot>(
         stream: FirebaseFirestore.instance
-            .collection('accounts')
+            .collection(accountsCollection)
             .doc(accountId)
             .collection('whatsapp_sessions')
             .doc(sessionId)
@@ -42,7 +42,7 @@ class ContactInfoPanel extends StatelessWidget {
 
           return StreamBuilder<QuerySnapshot>(
             stream: FirebaseFirestore.instance
-                .collection('accounts')
+                .collection(accountsCollection)
                 .doc(accountId)
                 .collection('whatsapp_sessions')
                 .doc(sessionId)

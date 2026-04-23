@@ -19,6 +19,7 @@ import { extractPhoneNumber, storeLIDMapping, resolveLIDViaSock } from './src/ut
 import { initializeSession, saveMessageToFirestore, getAIConfig, updateContactInFirestore, consolidateLIDChat } from './src/services/firestoreService';
 import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer } from './src/services/aiService';
 import { ReminderService } from './src/services/reminderService';
+import { ACCOUNTS_COLLECTION, IS_PRODUCTION } from './src/config/env';
 
 // Ensure auth_info directory exists
 const authInfoDir = 'auth_info';
@@ -172,7 +173,7 @@ async function startSession(sessionKey: string, accountId: string) {
       if (session.phoneNumber) {
         try {
           const sessionDocRef = db
-            .collection('accounts')
+            .collection(ACCOUNTS_COLLECTION)
             .doc(session.accountId)
             .collection('whatsapp_sessions')
             .doc(session.phoneNumber);
@@ -252,7 +253,7 @@ async function startSession(sessionKey: string, accountId: string) {
           if (session.phoneNumber) {
             try {
               const sessionDocRef = db
-                .collection('accounts')
+                .collection(ACCOUNTS_COLLECTION)
                 .doc(session.accountId)
                 .collection('whatsapp_sessions')
                 .doc(session.phoneNumber);
@@ -289,7 +290,7 @@ async function startSession(sessionKey: string, accountId: string) {
         if (session.phoneNumber) {
           try {
             const sessionDocRef = db
-              .collection('accounts')
+              .collection(ACCOUNTS_COLLECTION)
               .doc(session.accountId)
               .collection('whatsapp_sessions')
               .doc(session.phoneNumber);
@@ -450,7 +451,7 @@ async function startSession(sessionKey: string, accountId: string) {
     let aiAutoResponseEnabled = true; // Default: IA enabled
     try {
       const chatDocRef = db
-        .collection('accounts')
+        .collection(ACCOUNTS_COLLECTION)
         .doc(accountId)
         .collection('whatsapp_sessions')
         .doc(session.phoneNumber)
@@ -590,7 +591,7 @@ async function performSendMessage({ to, text, imageUrl, sessionKey, accountId }:
 
   try {
     const chatDocRef = db
-      .collection('accounts')
+      .collection(ACCOUNTS_COLLECTION)
       .doc(accountId)
       .collection('whatsapp_sessions')
       .doc(session.phoneNumber)
@@ -725,7 +726,7 @@ app.post('/generate-ai-response', express.json(), async (req, res) => {
 
     // Fetch last 20 messages from chat
     const messagesRef = db
-      .collection('accounts').doc(accountId)
+      .collection(ACCOUNTS_COLLECTION).doc(accountId)
       .collection('whatsapp_sessions').doc(phoneNumber)
       .collection('chats').doc(chatPhone)
       .collection('messages')
@@ -782,7 +783,7 @@ app.post('/edit-message', express.json(), async (req, res) => {
     let jid = chatPhone.includes('@') ? chatPhone : `${chatPhone}@s.whatsapp.net`;
     try {
       const chatDocRef = db
-        .collection('accounts')
+        .collection(ACCOUNTS_COLLECTION)
         .doc(accountId)
         .collection('whatsapp_sessions')
         .doc(session.phoneNumber)
@@ -847,7 +848,7 @@ app.post('/delete-message', express.json(), async (req, res) => {
     let jid = chatPhone.includes('@') ? chatPhone : `${chatPhone}@s.whatsapp.net`;
     try {
       const chatDocRef = db
-        .collection('accounts')
+        .collection(ACCOUNTS_COLLECTION)
         .doc(accountId)
         .collection('whatsapp_sessions')
         .doc(session.phoneNumber)
@@ -913,7 +914,7 @@ app.post('/delete-chat-history', express.json(), async (req, res) => {
 
     // Delete all messages in this chat
     const chatRef = db
-      .collection('accounts')
+      .collection(ACCOUNTS_COLLECTION)
       .doc(accountId)
       .collection('whatsapp_sessions')
       .doc(sessionId)
@@ -1085,7 +1086,7 @@ async function startExistingSessions() {
     console.log('[HealthCheck] Sincronizando estados fantasma con Firestore...');
     
     // Get all account documents first to avoid collectionGroup index requirement
-    const accountsSnapshot = await db.collection('accounts').get();
+    const accountsSnapshot = await db.collection(ACCOUNTS_COLLECTION).get();
     let cleanedCount = 0;
 
     for (const accountDoc of accountsSnapshot.docs) {
@@ -1160,7 +1161,9 @@ async function startExistingSessions() {
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 httpServer.listen(PORT, async () => {
+  const envLabel = IS_PRODUCTION ? 'PRODUCTION 🚀' : 'DEVELOPMENT 🛠️';
   console.log(`Server running on port ${PORT}`);
+  console.log(`[Env] ${envLabel} | NODE_ENV=${process.env.NODE_ENV ?? 'undefined'} | Firestore collection: "${ACCOUNTS_COLLECTION}"`);
   await startExistingSessions();
 
   // Setup cron for reminders (checks every minute)

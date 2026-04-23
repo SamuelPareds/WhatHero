@@ -162,7 +162,7 @@ class _MessagesViewState extends State<MessagesView> {
   Future<void> _resetNeedsHuman() async {
     try {
       await FirebaseFirestore.instance
-          .collection('accounts')
+          .collection(accountsCollection)
           .doc(widget.accountId)
           .collection('whatsapp_sessions')
           .doc(widget.sessionId)
@@ -218,7 +218,7 @@ class _MessagesViewState extends State<MessagesView> {
   void _showQuickResponsesOverlay() async {
     try {
       final snapshot = await FirebaseFirestore.instance
-          .collection('accounts')
+          .collection(accountsCollection)
           .doc(widget.accountId)
           .collection('whatsapp_sessions')
           .doc(widget.sessionId)
@@ -417,7 +417,7 @@ class _MessagesViewState extends State<MessagesView> {
         Expanded(
           child: StreamBuilder<QuerySnapshot>(
             stream: FirebaseFirestore.instance
-                .collection('accounts')
+                .collection(accountsCollection)
                 .doc(widget.accountId)
                 .collection('whatsapp_sessions')
                 .doc(widget.sessionId)

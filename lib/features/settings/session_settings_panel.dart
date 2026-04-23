@@ -75,7 +75,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
   Future<void> _loadSettings() async {
     try {
       final doc = await FirebaseFirestore.instance
-          .collection('accounts')
+          .collection(accountsCollection)
           .doc(widget.accountId)
           .collection('whatsapp_sessions')
           .doc(widget.sessionId)
@@ -140,7 +140,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
     setState(() => _isSaving = true);
     try {
       await FirebaseFirestore.instance
-          .collection('accounts')
+          .collection(accountsCollection)
           .doc(widget.accountId)
           .collection('whatsapp_sessions')
           .doc(widget.sessionId)

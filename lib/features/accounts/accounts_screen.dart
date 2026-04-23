@@ -140,7 +140,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
       ),
       body: StreamBuilder<QuerySnapshot>(
         stream: FirebaseFirestore.instance
-            .collection('accounts')
+            .collection(accountsCollection)
             .doc(widget.accountId)
             .collection('whatsapp_sessions')
             .orderBy('connected_at', descending: true)

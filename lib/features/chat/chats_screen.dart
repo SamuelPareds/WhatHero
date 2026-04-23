@@ -333,7 +333,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
         ),
         title: StreamBuilder<DocumentSnapshot>(
           stream: FirebaseFirestore.instance
-              .collection('accounts')
+              .collection(accountsCollection)
               .doc(widget.accountId)
               .collection('whatsapp_sessions')
               .doc(widget.sessionId)
@@ -427,7 +427,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
       ),
       body: StreamBuilder<QuerySnapshot>(
         stream: FirebaseFirestore.instance
-            .collection('accounts')
+            .collection(accountsCollection)
             .doc(widget.accountId)
             .collection('whatsapp_sessions')
             .doc(widget.sessionId)
@@ -546,7 +546,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
             : null,
         title: StreamBuilder<DocumentSnapshot>(
           stream: FirebaseFirestore.instance
-              .collection('accounts')
+              .collection(accountsCollection)
               .doc(widget.accountId)
               .collection('whatsapp_sessions')
               .doc(widget.sessionId)
@@ -587,7 +587,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
           // 📌 AI Auto-Response Toggle (Activado=Aqua, Desactivado=Gris)
           StreamBuilder<DocumentSnapshot>(
             stream: FirebaseFirestore.instance
-                .collection('accounts')
+                .collection(accountsCollection)
                 .doc(widget.accountId)
                 .collection('whatsapp_sessions')
                 .doc(widget.sessionId)
@@ -625,7 +625,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
                     // Update Firestore
                     await FirebaseFirestore.instance
-                        .collection('accounts')
+                        .collection(accountsCollection)
                         .doc(widget.accountId)
                         .collection('whatsapp_sessions')
                         .doc(widget.sessionId)

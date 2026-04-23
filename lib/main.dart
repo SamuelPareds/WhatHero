@@ -57,7 +57,7 @@ class SessionDispatcher extends StatelessWidget {
 
         return StreamBuilder<QuerySnapshot>(
           stream: FirebaseFirestore.instance
-              .collection('accounts')
+              .collection(accountsCollection)
               .doc(accountId)
               .collection('whatsapp_sessions')
               .where('status', isEqualTo: 'connected')

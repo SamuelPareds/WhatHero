@@ -2,6 +2,7 @@ import admin from 'firebase-admin';
 import { toNumber } from '@whiskeysockets/baileys';
 import { SessionData } from '../types';
 import { extractPhoneNumber } from '../utils/phone';
+import { ACCOUNTS_COLLECTION } from '../config/env';
 
 // Lazy evaluation: getDb() is called only after Firebase is initialized
 function getDb() {
@@ -15,7 +16,7 @@ export const AI_CONFIG_TTL_MS = 60_000;
 export async function initializeSession(phoneNumber: string, sessionKey: string, accountId: string) {
   try {
     const sessionDocRef = getDb()
-      .collection('accounts')
+      .collection(ACCOUNTS_COLLECTION)
       .doc(accountId)
       .collection('whatsapp_sessions')
       .doc(phoneNumber);
@@ -80,7 +81,7 @@ export async function saveMessageToFirestore(message: any, sessionKey: string, a
       if (!resolved) {
         try {
           const chatsSnapshot = await getDb()
-            .collection('accounts')
+            .collection(ACCOUNTS_COLLECTION)
             .doc(accountId)
             .collection('whatsapp_sessions')
             .doc(sessionId)
@@ -120,7 +121,7 @@ export async function saveMessageToFirestore(message: any, sessionKey: string, a
 
     // New path: accounts/{accountId}/whatsapp_sessions/{sessionId}/chats/{chatId}/messages
     const chatDocRef = getDb()
-      .collection('accounts')
+      .collection(ACCOUNTS_COLLECTION)
       .doc(accountId)
       .collection('whatsapp_sessions')
       .doc(sessionId)
@@ -153,7 +154,7 @@ export async function saveMessageToFirestore(message: any, sessionKey: string, a
 
     // Also update the session document with the latest lastMessage info
     const sessionDocRef = getDb()
-      .collection('accounts')
+      .collection(ACCOUNTS_COLLECTION)
       .doc(accountId)
       .collection('whatsapp_sessions')
       .doc(sessionId);
@@ -190,7 +191,7 @@ export async function updateContactInFirestore(contact: any, sessionKey: string,
     if (!contact.name) return;
 
     const chatDocRef = getDb()
-      .collection('accounts')
+      .collection(ACCOUNTS_COLLECTION)
       .doc(accountId)
       .collection('whatsapp_sessions')
       .doc(sessionId)
@@ -221,7 +222,7 @@ export async function consolidateLIDChat(
 
     // Check if a chat exists under the LID
     const lidChatRef = db
-      .collection('accounts')
+      .collection(ACCOUNTS_COLLECTION)
       .doc(accountId)
       .collection('whatsapp_sessions')
       .doc(sessionId)
@@ -242,7 +243,7 @@ export async function consolidateLIDChat(
 
     // Check if phone number chat already exists
     const phoneChatRef = db
-      .collection('accounts')
+      .collection(ACCOUNTS_COLLECTION)
       .doc(accountId)
       .collection('whatsapp_sessions')
       .doc(sessionId)
@@ -308,7 +309,7 @@ export async function getAIConfig(session: SessionData, accountId: string) {
 
   try {
     const sessionDocRef = getDb()
-      .collection('accounts').doc(accountId)
+      .collection(ACCOUNTS_COLLECTION).doc(accountId)
       .collection('whatsapp_sessions').doc(session.phoneNumber!);
 
     const doc = await sessionDocRef.get();

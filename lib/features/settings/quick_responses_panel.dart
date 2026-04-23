@@ -36,7 +36,7 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
   Future<void> _loadQuickResponses() async {
     try {
       final snapshot = await FirebaseFirestore.instance
-          .collection('accounts')
+          .collection(accountsCollection)
           .doc(widget.accountId)
           .collection('whatsapp_sessions')
           .doc(widget.sessionId)
@@ -101,7 +101,7 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
 
     try {
       final docRef = FirebaseFirestore.instance
-          .collection('accounts')
+          .collection(accountsCollection)
           .doc(widget.accountId)
           .collection('whatsapp_sessions')
           .doc(widget.sessionId)
@@ -144,7 +144,7 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
   Future<void> _deleteQuickResponse(String id) async {
     try {
       await FirebaseFirestore.instance
-          .collection('accounts')
+          .collection(accountsCollection)
           .doc(widget.accountId)
           .collection('whatsapp_sessions')
           .doc(widget.sessionId)

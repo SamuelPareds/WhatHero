@@ -2,6 +2,7 @@ import admin from 'firebase-admin';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import OpenAI from 'openai';
 import { SessionData } from '../types';
+import { ACCOUNTS_COLLECTION } from '../config/env';
 
 // Lazy evaluation: getDb() is called only after Firebase is initialized
 function getDb() {
@@ -391,7 +392,7 @@ export async function processMessageBuffer(
 
     try {
       const historyDocs = await getDb()
-        .collection('accounts').doc(accountId)
+        .collection(ACCOUNTS_COLLECTION).doc(accountId)
         .collection('whatsapp_sessions').doc(session.phoneNumber!)
         .collection('chats').doc(contactPhone)
         .collection('messages')
@@ -433,7 +434,7 @@ export async function processMessageBuffer(
       if (classification === 'TalkToHuman') {
         try {
           const chatDocRef = getDb()
-            .collection('accounts')
+            .collection(ACCOUNTS_COLLECTION)
             .doc(accountId)
             .collection('whatsapp_sessions')
             .doc(session.phoneNumber!)

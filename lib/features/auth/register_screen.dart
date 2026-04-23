@@ -62,7 +62,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
       final user = FirebaseAuth.instance.currentUser;
       if (user != null) {
         await FirebaseFirestore.instance
-          .collection('accounts')
+          .collection(accountsCollection)
           .doc(user.uid)
           .set({
             'email': user.email,
