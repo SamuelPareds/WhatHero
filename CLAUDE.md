@@ -11,7 +11,8 @@ El proyecto utiliza una estructura jerárquica para permitir que N usuarios gest
 
 ### 1. Estructura de Datos (Firestore)
 La "Fuente de Verdad" sigue un patrón de documentos anidados para optimizar costos y velocidad:
-`accounts/{userId}/whatsapp_sessions/{phoneNumber}`
+`{accountsCollection}/{userId}/whatsapp_sessions/{phoneNumber}`
+- **Colección raíz:** `accounts` en producción, `accounts_dev` en desarrollo (ver sección *Separación de Entornos*).
 - **Atributos de Sesión:** `alias`, `phone_number`, `status`, `session_key`.
 - **Sub-colección de Mensajes:** `chats/{chatId}/messages/{messageId}`.
 
@@ -24,7 +25,34 @@ La "Fuente de Verdad" sigue un patrón de documentos anidados para optimizar cos
 ### 3. El Frontend (/lib)
 - **Tecnología:** Flutter Web/Mobile.
 - **Gestión de Sesiones:** La app permite navegar entre diferentes `whatsapp_sessions`. El `StreamBuilder` se suscribe dinámicamente al path del `phoneNumber` activo.
-- **Conectividad:** Switcher de entorno automático (`kReleaseMode`) para alternar entre Railway y Localhost.
+- **Conectividad:** Switcher de entorno automático (`kReleaseMode`) para alternar entre Railway y Localhost, y también para escoger la colección Firestore.
+
+---
+
+## 🌐 Separación de Entornos (Dev vs Prod)
+
+Para evitar que el backend local y Railway se pisen entre sí (por ejemplo, el `HealthCheck` marcando como desvinculadas las sesiones del otro), usamos **el mismo proyecto Firebase pero distintas colecciones raíz**. No usamos Flutter flavors — la separación se resuelve con una sola constante en cada extremo.
+
+### Mapeo de entornos
+
+| Entorno | Flutter | Backend | Colección raíz |
+|---|---|---|---|
+| **Producción** | Release build (APK/AAB/IPA firmado) | Railway (`NODE_ENV=production`) | `accounts` |
+| **Desarrollo** | Debug (`flutter run`) | Local (`NODE_ENV=development`) | `accounts_dev` |
+
+### Helpers centralizados
+
+- **Flutter:** `lib/core/config.dart` expone `String get accountsCollection` usando `kReleaseMode`. Se evalúa en tiempo de compilación — el APK/AAB de release no contiene siquiera el string `'accounts_dev'`.
+- **Backend:** `backend/src/config/env.ts` exporta `ACCOUNTS_COLLECTION` e `IS_PRODUCTION` leyendo `process.env.NODE_ENV`. Fail-safe: si `NODE_ENV` no está definido, cae en `accounts_dev`.
+
+### Regla obligatoria para nuevo código
+**Nunca hardcodear `collection('accounts')`.** Siempre usar el helper:
+- En Flutter: `FirebaseFirestore.instance.collection(accountsCollection).doc(...)`.
+- En Backend: `db.collection(ACCOUNTS_COLLECTION).doc(...)`.
+
+### Qué comparten y qué no ambos entornos
+- ✅ **Compartido:** Firebase Auth (mismo pool de usuarios → puedes loguearte cruzado sin romper nada; solo verás una app vacía si tu `uid` no tiene datos en esa colección).
+- ❌ **Aislado:** sesiones de WhatsApp, chats, mensajes, quick responses, configuración de IA y `auth_info` de Baileys (el filesystem local es distinto al volumen persistente de Railway).
 
 ---
 
