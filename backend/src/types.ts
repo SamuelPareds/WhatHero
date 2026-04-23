@@ -4,6 +4,7 @@ export interface SessionData {
   currentQR: string | undefined;
   phoneNumber: string | undefined;
   isReconnecting: boolean;
+  reconnectCount: number;
   accountId: string;
   aiConfig?: {
     enabled: boolean;

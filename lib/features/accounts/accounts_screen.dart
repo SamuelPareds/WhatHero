@@ -181,6 +181,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
               final alias = sessionDoc['alias'] ?? phoneNumber;
               final status = sessionDoc['status'] ?? 'disconnected';
               final isConnected = status == 'connected';
+              final isReconnecting = status == 'reconnecting';
 
               return Container(
                 margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -188,9 +189,11 @@ class _AccountsScreenState extends State<AccountsScreen> {
                   color: surfaceDark.withValues(alpha: 0.6),
                   borderRadius: BorderRadius.circular(12),
                   border: Border.all(
-                    color: isConnected 
-                        ? primaryAqua.withValues(alpha: 0.2) 
-                        : Colors.red.withValues(alpha: 0.2),
+                    color: isConnected
+                        ? primaryAqua.withValues(alpha: 0.2)
+                        : isReconnecting
+                            ? Colors.orange.withValues(alpha: 0.2)
+                            : Colors.red.withValues(alpha: 0.2),
                   ),
                 ),
                 child: InkWell(
@@ -218,16 +221,22 @@ class _AccountsScreenState extends State<AccountsScreen> {
                           width: 56,
                           height: 56,
                           decoration: BoxDecoration(
-                            color: isConnected 
+                            color: isConnected
                                 ? primaryAqua.withValues(alpha: 0.2)
-                                : Colors.red.withValues(alpha: 0.1),
+                                : isReconnecting
+                                    ? Colors.orange.withValues(alpha: 0.15)
+                                    : Colors.red.withValues(alpha: 0.1),
                             borderRadius: BorderRadius.circular(14),
                           ),
                           child: Center(
                             child: Text(
                               alias.substring(0, 1).toUpperCase(),
                               style: TextStyle(
-                                color: isConnected ? primaryAqua : Colors.red.shade400,
+                                color: isConnected
+                                    ? primaryAqua
+                                    : isReconnecting
+                                        ? Colors.orange.shade400
+                                        : Colors.red.shade400,
                                 fontWeight: FontWeight.w700,
                                 fontSize: 22,
                               ),
@@ -264,19 +273,48 @@ class _AccountsScreenState extends State<AccountsScreen> {
                             Container(
                               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                               decoration: BoxDecoration(
-                                color: isConnected ? accentAqua.withValues(alpha: 0.2) : Colors.red.withValues(alpha: 0.2),
+                                color: isConnected
+                                    ? accentAqua.withValues(alpha: 0.2)
+                                    : isReconnecting
+                                        ? Colors.orange.withValues(alpha: 0.2)
+                                        : Colors.red.withValues(alpha: 0.2),
                                 borderRadius: BorderRadius.circular(12),
                               ),
-                              child: Text(
-                                isConnected ? 'Conectado' : 'Desvinculado',
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  color: isConnected ? accentAqua : Colors.red.shade400,
-                                  fontWeight: FontWeight.w700,
-                                ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  if (isReconnecting)
+                                    SizedBox(
+                                      width: 10,
+                                      height: 10,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 1.5,
+                                        valueColor: AlwaysStoppedAnimation<Color>(
+                                          Colors.orange.shade400,
+                                        ),
+                                      ),
+                                    ),
+                                  if (isReconnecting) const SizedBox(width: 4),
+                                  Text(
+                                    isConnected
+                                        ? 'Conectado'
+                                        : isReconnecting
+                                            ? 'Reconectando...'
+                                            : 'Desvinculado',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: isConnected
+                                          ? accentAqua
+                                          : isReconnecting
+                                              ? Colors.orange.shade400
+                                              : Colors.red.shade400,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                ],
                               ),
                             ),
-                            if (!isConnected)
+                            if (!isConnected && !isReconnecting)
                               IconButton(
                                 icon: const Icon(Icons.sync, color: primaryAqua, size: 22),
                                 onPressed: _startNewSession,

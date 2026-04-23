@@ -91,13 +91,16 @@ async function startSession(sessionKey: string, accountId: string) {
   writeFileSync(`auth_info/${sessionKey}/meta.json`, JSON.stringify({ accountId }));
 
   // Initialize session data
+  const existingSession = sessions.get(sessionKey);
   sessions.set(sessionKey, {
     sock: null,
     isReady: false,
     currentQR: undefined,
-    phoneNumber: undefined,
+    phoneNumber: existingSession?.phoneNumber || undefined,
     isReconnecting: false,
+    reconnectCount: existingSession?.reconnectCount || 0,
     accountId,
+    ...(existingSession?.aiConfig && { aiConfig: existingSession.aiConfig }),
   });
 
   const sock = makeWASocket({
@@ -108,7 +111,10 @@ async function startSession(sessionKey: string, accountId: string) {
     generateHighQualityLinkPreview: true,
     syncFullHistory: false,
     markOnlineOnConnect: true,
-    printQRInTerminal: false // Desactivado para evitar logs deprecados
+    printQRInTerminal: false,
+    retryRequestDelayMs: 250,
+    defaultQueryTimeoutMs: 20000,
+    getMessage: async () => undefined,
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -229,24 +235,86 @@ async function startSession(sessionKey: string, accountId: string) {
         
         io.to(session.accountId).emit('status_update', { status: 'qr_timeout', sessionKey });
       } else {
-        // Regular disconnection - attempt normal reconnect
-        console.log(`[startSession] Connection closed (code: ${statusCode}, msg: ${errorMessage}), attempting reconnect for ${sessionKey}`);
-        
+        // Regular disconnection - attempt reconnect with exponential backoff
+        const MAX_RECONNECT_ATTEMPTS = 10;
+        const BASE_DELAY_MS = 3000;
+
+        session.reconnectCount = (session.reconnectCount || 0) + 1;
+
+        console.log(`[Reconexión] Intento ${session.reconnectCount}/${MAX_RECONNECT_ATTEMPTS} para ${sessionKey} (code: ${statusCode})`);
+
+        if (session.reconnectCount > MAX_RECONNECT_ATTEMPTS) {
+          // Reached max reconnect attempts - mark as failed
+          console.log(`[ALERTA] Sesión ${sessionKey} alcanzó máximo de intentos de reconexión (${MAX_RECONNECT_ATTEMPTS}). Marcando como fallida.`);
+          session.isReady = false;
+          sessions.delete(sessionKey);
+
+          if (session.phoneNumber) {
+            try {
+              const sessionDocRef = db
+                .collection('accounts')
+                .doc(session.accountId)
+                .collection('whatsapp_sessions')
+                .doc(session.phoneNumber);
+              await sessionDocRef.update({
+                status: 'reconnect_failed',
+                last_sync: admin.firestore.Timestamp.now(),
+              });
+            } catch (e) {}
+          }
+
+          io.to(session.accountId).emit('status_update', {
+            status: 'reconnect_failed',
+            sessionKey,
+            phoneNumber: session.phoneNumber
+          });
+          return;
+        }
+
+        // Exponential backoff: 3s, 6s, 12s, 24s, 48s, 96s, 192s, 384s, 768s, 1200s (max)
+        const delay = Math.min(BASE_DELAY_MS * Math.pow(2, session.reconnectCount - 1), 300000);
+
+        console.log(`[Reconexión] Esperando ${delay}ms antes de reintento...`);
+
+        // Notify frontend that we're reconnecting
+        io.to(session.accountId).emit('status_update', {
+          status: 'reconnecting',
+          sessionKey,
+          attempt: session.reconnectCount,
+          maxAttempts: MAX_RECONNECT_ATTEMPTS,
+          phoneNumber: session.phoneNumber,
+        });
+
+        // Update Firestore
+        if (session.phoneNumber) {
+          try {
+            const sessionDocRef = db
+              .collection('accounts')
+              .doc(session.accountId)
+              .collection('whatsapp_sessions')
+              .doc(session.phoneNumber);
+            await sessionDocRef.update({
+              status: 'reconnecting',
+              last_sync: admin.firestore.Timestamp.now(),
+            });
+          } catch (e) {}
+        }
+
         if (!session.isReconnecting) {
           session.isReconnecting = true;
           setTimeout(() => {
-            // Check again if session still exists before calling startSession
             if (sessions.has(sessionKey)) {
               startSession(sessionKey, session.accountId);
             }
             session.isReconnecting = false;
-          }, 3000);
+          }, delay);
         }
       }
     } else if (connection === 'open') {
       console.log('[startSession] Conexión abierta para sessionKey:', sessionKey);
       session.isReady = true;
       session.currentQR = undefined;
+      session.reconnectCount = 0; // Reset counter on successful connection
 
       // Extract and store the connected phone number
       if (sock.user?.id) {
