@@ -51,6 +51,11 @@ flutter_launcher_icons:
   android: true
   ios: true
   image_path: "assets/icon/logo.png"
+  web:
+    generate: true
+    image_path: "assets/icon/logo.png"
+    background_color: "#0F172A"
+    theme_color: "#06B6D4"
 
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is
