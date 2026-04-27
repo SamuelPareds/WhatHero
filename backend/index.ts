@@ -16,7 +16,7 @@ import { randomUUID } from 'crypto';
 import cron from 'node-cron';
 import { SessionData, MessageBuffer } from './src/types';
 import { extractPhoneNumber, storeLIDMapping, resolveLIDViaSock } from './src/utils/phone';
-import { initializeSession, saveMessageToFirestore, getAIConfig, updateContactInFirestore, consolidateLIDChat } from './src/services/firestoreService';
+import { initializeSession, saveMessageToFirestore, getAIConfig, updateContactInFirestore, consolidateLIDChat, incrementUnrespondedCount, resetUnrespondedCount } from './src/services/firestoreService';
 import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer } from './src/services/aiService';
 import { ReminderService } from './src/services/reminderService';
 import { ACCOUNTS_COLLECTION, IS_PRODUCTION } from './src/config/env';
@@ -342,17 +342,29 @@ async function startSession(sessionKey: string, accountId: string) {
 
     // AI auto-response: only for incoming messages (not from self)
     if (message.key.fromMe) {
-      // 📌 Cancel any pending buffer for this contact when human responds
+      // El dueño respondió (CRM web o celular físico): cancelar buffer + resetear contador
       const remoteJidForCancel = message.key.remoteJid;
       if (remoteJidForCancel && !remoteJidForCancel.endsWith('@g.us')) {
-        const contactPhoneForCancel = extractPhoneNumber(remoteJidForCancel);
+        let contactPhoneForCancel = extractPhoneNumber(remoteJidForCancel);
         if (contactPhoneForCancel) {
+          // Resolver LID al phone number real para apuntar al chat doc correcto
+          if (remoteJidForCancel.includes('@lid')) {
+            const resolved = await resolveLIDViaSock(contactPhoneForCancel, sock);
+            if (resolved) contactPhoneForCancel = resolved;
+          }
+
           const bufferKey = `${sessionKey}:${contactPhoneForCancel}`;
           const buffer = messageBuffers.get(bufferKey);
           if (buffer?.timeout) {
             clearTimeout(buffer.timeout);
             messageBuffers.delete(bufferKey);
             console.log(`[Buffer] CANCELLED: Human response detected for ${contactPhoneForCancel}`);
+          }
+
+          // Reset contador: el humano (o IA via CRM) acaba de responder
+          const sessionForReset = sessions.get(sessionKey);
+          if (sessionForReset?.phoneNumber) {
+            await resetUnrespondedCount(accountId, sessionForReset.phoneNumber, contactPhoneForCancel);
           }
         }
       }
@@ -361,13 +373,36 @@ async function startSession(sessionKey: string, accountId: string) {
     const remoteJid = message.key.remoteJid;
     if (!remoteJid || remoteJid.endsWith('@g.us')) return; // skip group messages
 
-    const messageText = message.message?.conversation ||
-                        message.message?.extendedTextMessage?.text || '';
-    if (!messageText.trim()) return; // skip media-only messages
-
     // Extract contact phone number
     const session = sessions.get(sessionKey);
     if (!session?.phoneNumber) return;
+
+    // Resolvemos contactPhone temprano: lo necesitamos para incrementar el contador
+    // de pendientes en cualquier rama donde la IA NO vaya a responder.
+    let contactPhone = extractPhoneNumber(remoteJid);
+    if (!contactPhone) return;
+    if (remoteJid.includes('@lid')) {
+      console.log(`[AI] Message from LID format: ${remoteJid}, attempting to resolve...`);
+      const resolved = await resolveLIDViaSock(contactPhone, sock);
+      if (resolved) {
+        contactPhone = resolved;
+        console.log(`[AI] Successfully resolved LID to ${contactPhone}`);
+      } else {
+        console.warn(`[AI] Could not resolve LID ${contactPhone}, will use LID as contact identifier`);
+      }
+    }
+
+    // Helper local: marca este mensaje como pendiente de respuesta humana
+    const markUnresponded = (by: number = 1) =>
+      incrementUnrespondedCount(accountId, session.phoneNumber!, contactPhone, by);
+
+    const messageText = message.message?.conversation ||
+                        message.message?.extendedTextMessage?.text || '';
+    if (!messageText.trim()) {
+      // Media-only (imagen/audio sin caption): la IA no lo procesa, requiere humano
+      await markUnresponded();
+      return;
+    }
 
     // --- KEYWORD TRIGGER FOR REMINDERS ---
     const lowerMsg = messageText.toLowerCase();
@@ -381,7 +416,7 @@ async function startSession(sessionKey: string, accountId: string) {
         .catch(err => {
           console.error(`[Reminders] Manual trigger failed for ${session.phoneNumber}`, err);
         });
-      return; // Skip AI response for this message
+      return; // Comando interno, no cuenta como pendiente
     }
 
     const aiConfig = await getAIConfig(session, accountId);
@@ -391,7 +426,7 @@ async function startSession(sessionKey: string, accountId: string) {
       if (messageText.toLowerCase().includes(rule.keyword.toLowerCase())) {
         console.log(`[AI] Keyword rule matched: "${rule.keyword}", sending canned response`);
         await new Promise(r => setTimeout(r, aiConfig.responseDelayMs > 2000 ? 2000 : aiConfig.responseDelayMs));
-        
+
         if (rule.imageUrl) {
           try {
             console.log(`[AI] Downloading image for keyword rule: ${rule.imageUrl}`);
@@ -400,9 +435,9 @@ async function startSession(sessionKey: string, accountId: string) {
               return res.arrayBuffer();
             });
             const imageBuffer = Buffer.from(imageResponse);
-            await session.sock.sendMessage(remoteJid, { 
-              image: imageBuffer, 
-              caption: rule.response || undefined 
+            await session.sock.sendMessage(remoteJid, {
+              image: imageBuffer,
+              caption: rule.response || undefined
             });
           } catch (error) {
             console.error(`[AI] Error sending image for keyword rule:`, error);
@@ -414,8 +449,8 @@ async function startSession(sessionKey: string, accountId: string) {
         } else {
           await session.sock.sendMessage(remoteJid, { text: rule.response });
         }
-        
-        return; // Important: stop here so AI doesn't also respond
+
+        return; // IA-canned respondió, no incrementar
       }
     }
 
@@ -423,27 +458,15 @@ async function startSession(sessionKey: string, accountId: string) {
     const hasValidApiKey = provider === 'openai'
       ? aiConfig.openaiApiKey
       : aiConfig.apiKey;
-    if (!aiConfig.enabled || !hasValidApiKey) return;
-
-    // Extract contact phone number
-    let contactPhone = extractPhoneNumber(remoteJid);
-    if (!contactPhone) return; // Skip if we can't extract phone number
-
-    // If we got a LID format, try to resolve it to a real phone number
-    if (remoteJid.includes('@lid')) {
-      console.log(`[AI] Message from LID format: ${remoteJid}, attempting to resolve...`);
-      const resolved = await resolveLIDViaSock(contactPhone, sock);
-      if (resolved) {
-        contactPhone = resolved;
-        console.log(`[AI] Successfully resolved LID to ${contactPhone}`);
-      } else {
-        console.warn(`[AI] Could not resolve LID ${contactPhone}, will use LID as contact identifier`);
-      }
+    if (!aiConfig.enabled || !hasValidApiKey) {
+      await markUnresponded();
+      return;
     }
 
     // Check if within active hours
     if (!isWithinActiveHours(aiConfig)) {
       console.log(`[AI] Outside active hours, skipping AI response`);
+      await markUnresponded();
       return;
     }
 
@@ -466,6 +489,7 @@ async function startSession(sessionKey: string, accountId: string) {
 
     if (!aiAutoResponseEnabled) {
       console.log(`[AI] Auto-response disabled for ${contactPhone}, skipping AI response`);
+      await markUnresponded();
       return;
     }
 

@@ -123,11 +123,11 @@ class _MessagesViewState extends State<MessagesView> {
       };
 
       // INTELIGENTE: Si el socket está conectado, enviar por ahí (Velocidad Rayo)
+      // (El backend resetea unresponded_count al detectar fromMe en messages.upsert)
       if (SocketService().isConnected) {
         print('[MessagesView] Enviando vía WebSocket...');
         SocketService().sendMessage(messageData);
         _messageController.clear();
-        _resetNeedsHuman();
       } else {
         // FALLBACK: Si no hay socket, usar HTTP (Seguridad)
         print('[MessagesView] Socket desconectado, usando fallback HTTP...');
@@ -139,7 +139,6 @@ class _MessagesViewState extends State<MessagesView> {
 
         if (response.statusCode == 200) {
           _messageController.clear();
-          _resetNeedsHuman();
         } else {
           throw Exception('Fallback HTTP falló: ${response.body}');
         }
@@ -156,21 +155,6 @@ class _MessagesViewState extends State<MessagesView> {
           _isSending = false;
         });
       }
-    }
-  }
-
-  Future<void> _resetNeedsHuman() async {
-    try {
-      await FirebaseFirestore.instance
-          .collection(accountsCollection)
-          .doc(widget.accountId)
-          .collection('whatsapp_sessions')
-          .doc(widget.sessionId)
-          .collection('chats')
-          .doc(widget.phoneNumber)
-          .update({'needs_human': false});
-    } catch (e) {
-      debugPrint('Error resetting needs_human: $e');
     }
   }
 

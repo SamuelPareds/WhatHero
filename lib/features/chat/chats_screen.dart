@@ -3,12 +3,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'dart:ui';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:flutter_slidable/flutter_slidable.dart';
 import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/core/services/storage_service.dart';
 import 'package:crm_whatsapp/features/settings.dart';
 import 'package:crm_whatsapp/features/accounts.dart';
 import 'messages_view.dart';
+import 'widgets/unread_badge.dart';
 
 class ChatsScreen extends StatefulWidget {
   final String? sessionId;
@@ -509,20 +511,42 @@ class _ChatsScreenState extends State<ChatsScreen> {
               final contactName = chatData?['contactName'] as String? ?? '';
               final lastMessage = chatData?['lastMessage'] ?? 'Sin mensajes';
               final timestamp = (chatData?['lastMessageTimestamp'] as Timestamp?)?.toDate();
-              final needsHuman = chatData?['needs_human'] as bool? ?? false;
+              final unrespondedCount = (chatData?['unresponded_count'] as num?)?.toInt() ?? 0;
 
-              return _ChatTile(
+              final tile = _ChatTile(
                 phoneNumber: phoneNumber,
                 contactName: contactName,
                 lastMessage: lastMessage,
                 timestamp: timestamp,
                 isSelected: selectedChatPhone == phoneNumber,
-                needsHuman: needsHuman,
+                unrespondedCount: unrespondedCount,
                 onTap: () {
                   setState(() {
                     selectedChatPhone = phoneNumber;
                   });
                 },
+              );
+
+              // Sin pendientes: nada que cerrar, no envolvemos en Slidable
+              if (unrespondedCount == 0) return tile;
+
+              return Slidable(
+                key: ValueKey('chat_$phoneNumber'),
+                groupTag: 'chats',
+                endActionPane: ActionPane(
+                  motion: const DrawerMotion(),
+                  extentRatio: 0.25,
+                  children: [
+                    SlidableAction(
+                      onPressed: (_) => _markAsResponded(phoneNumber),
+                      backgroundColor: const Color(0xFFF97316),
+                      foregroundColor: Colors.white,
+                      icon: Icons.mark_chat_read,
+                      label: 'Listo',
+                    ),
+                  ],
+                ),
+                child: tile,
               );
             },
           );
@@ -556,35 +580,19 @@ class _ChatsScreenState extends State<ChatsScreen> {
           builder: (context, snapshot) {
             final chatData = snapshot.data?.data() as Map<String, dynamic>?;
             final contactName = chatData?['contactName'] as String? ?? '';
-            final needsHuman = chatData?['needs_human'] as bool? ?? false;
 
             final displayName = contactName.isNotEmpty ? contactName : (selectedChatPhone ?? 'Chat');
 
-            return Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Flexible(
-                  child: Text(
-                    displayName,
-                    style: const TextStyle(fontWeight: FontWeight.bold),
-                    overflow: TextOverflow.ellipsis,
-                    maxLines: 1,
-                  ),
-                ),
-                if (needsHuman) ...[
-                  const SizedBox(width: 8),
-                  const Icon(
-                    Icons.support_agent,
-                    size: 20,
-                    color: Color(0xFFF97316),
-                  ),
-                ],
-              ],
+            return Text(
+              displayName,
+              style: const TextStyle(fontWeight: FontWeight.bold),
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
             );
           },
         ),
         actions: [
-          // 📌 AI Auto-Response Toggle (Activado=Aqua, Desactivado=Gris)
+          // Stream único: provee tanto el toggle de IA como el botón "marcar respondido"
           StreamBuilder<DocumentSnapshot>(
             stream: FirebaseFirestore.instance
                 .collection(accountsCollection)
@@ -595,7 +603,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 .doc(selectedChatPhone)
                 .snapshots(),
             builder: (context, snapshot) {
-              final aiAutoResponse = (snapshot.data?.data() as Map<String, dynamic>?)?['ai_auto_response'] as bool? ?? true;
+              final data = snapshot.data?.data() as Map<String, dynamic>?;
+              final aiAutoResponse = data?['ai_auto_response'] as bool? ?? true;
+
               return IconButton(
                 icon: Icon(
                   Icons.face_retouching_natural,
@@ -605,10 +615,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 tooltip: aiAutoResponse ? 'Desactivar IA automática' : 'Activar IA automática',
                 onPressed: () async {
                   try {
-                    // Haptic feedback - sutil vibración
                     HapticFeedback.lightImpact();
 
-                    // If disabling (turning false), cancel any pending buffer
+                    // Si desactivamos, cancelar cualquier buffer pendiente
                     if (aiAutoResponse) {
                       SocketService().sendMessage({
                         'event': 'cancel_ai_buffer',
@@ -619,11 +628,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
                       });
                       debugPrint('Emitted cancel_ai_buffer for $selectedChatPhone via SocketService');
                     } else {
-                      // If enabling, show success toast immediately (no buffer to cancel)
                       _showEtherealToast(true, 'IA activada', isActivating: true);
                     }
 
-                    // Update Firestore
                     await FirebaseFirestore.instance
                         .collection(accountsCollection)
                         .doc(widget.accountId)
@@ -631,12 +638,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
                         .doc(widget.sessionId)
                         .collection('chats')
                         .doc(selectedChatPhone)
-                        .update({
-                          'ai_auto_response': !aiAutoResponse,
-                        });
+                        .update({'ai_auto_response': !aiAutoResponse});
                   } catch (e) {
                     debugPrint('Error toggling AI: $e');
-                    // Show error toast
                     _showEtherealToast(false, 'Error al cambiar IA', isActivating: false);
                   }
                 },
@@ -661,6 +665,29 @@ class _ChatsScreenState extends State<ChatsScreen> {
     );
   }
 
+  Future<void> _markAsResponded(String contactPhone) async {
+    HapticFeedback.lightImpact();
+    try {
+      await FirebaseFirestore.instance
+          .collection(accountsCollection)
+          .doc(widget.accountId)
+          .collection('whatsapp_sessions')
+          .doc(widget.sessionId)
+          .collection('chats')
+          .doc(contactPhone)
+          .set({'unresponded_count': 0}, SetOptions(merge: true));
+
+      if (mounted) {
+        _showEtherealToast(true, 'Marcado como respondido', isActivating: true);
+      }
+    } catch (e) {
+      debugPrint('Error marking chat as responded: $e');
+      if (mounted) {
+        _showEtherealToast(false, 'Error al marcar', isActivating: false);
+      }
+    }
+  }
+
   void _showContactInfo(String phoneNumber) {
     showModalBottomSheet(
       context: context,
@@ -683,7 +710,7 @@ class _ChatTile extends StatelessWidget {
   final String lastMessage;
   final DateTime? timestamp;
   final bool isSelected;
-  final bool needsHuman;
+  final int unrespondedCount;
   final VoidCallback onTap;
 
   const _ChatTile({
@@ -692,7 +719,7 @@ class _ChatTile extends StatelessWidget {
     required this.lastMessage,
     required this.timestamp,
     required this.isSelected,
-    required this.needsHuman,
+    required this.unrespondedCount,
     required this.onTap,
   });
 
@@ -753,26 +780,14 @@ class _ChatTile extends StatelessWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Row(
-                    children: [
-                      Expanded(
-                        child: Text(
-                          displayName,
-                          style: const TextStyle(
-                            fontWeight: FontWeight.w600,
-                            fontSize: 14,
-                            color: white,
-                          ),
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                      if (needsHuman)
-                        const Icon(
-                          Icons.support_agent,
-                          size: 18,
-                          color: Color(0xFFF97316),
-                        ),
-                    ],
+                  Text(
+                    displayName,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w600,
+                      fontSize: 14,
+                      color: white,
+                    ),
+                    overflow: TextOverflow.ellipsis,
                   ),
                   const SizedBox(height: 4),
                   Text(
@@ -789,13 +804,22 @@ class _ChatTile extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 8),
-            Text(
-              _formatTimestamp(timestamp),
-              style: const TextStyle(
-                fontSize: 11,
-                color: lightText,
-                fontWeight: FontWeight.w400,
-              ),
+            // Timestamp arriba, badge abajo (estilo WhatsApp)
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text(
+                  _formatTimestamp(timestamp),
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: unrespondedCount > 0 ? const Color(0xFFF97316) : lightText,
+                    fontWeight: unrespondedCount > 0 ? FontWeight.w600 : FontWeight.w400,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                UnrespondedBadge(count: unrespondedCount),
+              ],
             ),
           ],
         ),

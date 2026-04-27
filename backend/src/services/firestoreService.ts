@@ -300,6 +300,52 @@ export async function consolidateLIDChat(
   }
 }
 
+// Incrementa el contador de mensajes pendientes de respuesta humana en un chat.
+// Se llama cuando la IA NO va a responder (IA off, fuera de horario, discriminador→humano, etc).
+export async function incrementUnrespondedCount(
+  accountId: string,
+  sessionId: string,
+  contactPhone: string,
+  by: number = 1
+) {
+  try {
+    await getDb()
+      .collection(ACCOUNTS_COLLECTION)
+      .doc(accountId)
+      .collection('whatsapp_sessions')
+      .doc(sessionId)
+      .collection('chats')
+      .doc(contactPhone)
+      .set(
+        { unresponded_count: admin.firestore.FieldValue.increment(by) },
+        { merge: true }
+      );
+  } catch (error) {
+    console.error(`[Unresponded] Error incrementing count for ${contactPhone}:`, error);
+  }
+}
+
+// Resetea el contador a 0. Se llama cuando el humano responde (CRM o celular físico)
+// o cuando la IA termina de responder exitosamente.
+export async function resetUnrespondedCount(
+  accountId: string,
+  sessionId: string,
+  contactPhone: string
+) {
+  try {
+    await getDb()
+      .collection(ACCOUNTS_COLLECTION)
+      .doc(accountId)
+      .collection('whatsapp_sessions')
+      .doc(sessionId)
+      .collection('chats')
+      .doc(contactPhone)
+      .set({ unresponded_count: 0 }, { merge: true });
+  } catch (error) {
+    console.error(`[Unresponded] Error resetting count for ${contactPhone}:`, error);
+  }
+}
+
 // Get AI config with in-memory caching
 export async function getAIConfig(session: SessionData, accountId: string) {
   const now = Date.now();

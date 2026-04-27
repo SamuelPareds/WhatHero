@@ -3,6 +3,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import OpenAI from 'openai';
 import { SessionData } from '../types';
 import { ACCOUNTS_COLLECTION } from '../config/env';
+import { incrementUnrespondedCount, resetUnrespondedCount } from './firestoreService';
 
 // Lazy evaluation: getDb() is called only after Firebase is initialized
 function getDb() {
@@ -432,23 +433,28 @@ export async function processMessageBuffer(
       console.log(`[Discriminator] Classification result: ${classification}`);
 
       if (classification === 'TalkToHuman') {
+        // Incrementamos el contador por la ráfaga completa de mensajes que el discriminador clasificó
+        await incrementUnrespondedCount(
+          accountId,
+          session.phoneNumber!,
+          contactPhone,
+          bufferedMessages.length
+        );
+
         try {
-          const chatDocRef = getDb()
+          await getDb()
             .collection(ACCOUNTS_COLLECTION)
             .doc(accountId)
             .collection('whatsapp_sessions')
             .doc(session.phoneNumber!)
             .collection('chats')
-            .doc(contactPhone);
-
-          await chatDocRef.update({
-            needs_human: true,
-            human_attention_at: admin.firestore.FieldValue.serverTimestamp(),
-          });
-
-          console.log(`[Buffer] Chat ${contactPhone} marked as needs_human=true`);
+            .doc(contactPhone)
+            .set(
+              { human_attention_at: admin.firestore.FieldValue.serverTimestamp() },
+              { merge: true }
+            );
         } catch (error) {
-          console.error('[Buffer] Error marking chat as needing human attention:', error);
+          console.error('[Buffer] Error stamping human_attention_at:', error);
         }
 
         getIO().to(accountId).emit('human_attention_required', {
@@ -459,7 +465,7 @@ export async function processMessageBuffer(
         });
 
         console.log(
-          `[Buffer] Emitted human_attention_required for ${contactPhone} (Session: ${session.phoneNumber})`
+          `[Buffer] Emitted human_attention_required for ${contactPhone} (+${bufferedMessages.length} unresponded)`
         );
         return; // Skip AI response
       }
@@ -481,6 +487,8 @@ export async function processMessageBuffer(
     if (aiResponse) {
       await sendChunkedResponse(session.sock, remoteJid, aiResponse);
       console.log(`[Buffer] Auto-responded to ${remoteJid} en chunks`);
+      // La IA respondió: cualquier pendiente previo queda cubierto
+      await resetUnrespondedCount(accountId, session.phoneNumber!, contactPhone);
     }
   } catch (error) {
     console.error('[Buffer] Error processing message buffer:', error);

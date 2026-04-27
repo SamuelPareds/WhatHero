@@ -11,6 +11,7 @@ import 'package:crm_whatsapp/features/auth.dart';
 import 'package:crm_whatsapp/features/accounts/link_account_screen.dart';
 import 'package:crm_whatsapp/features/settings.dart';
 import 'package:crm_whatsapp/features/chat.dart';
+import 'package:crm_whatsapp/features/chat/widgets/unread_badge.dart';
 
 class AccountsScreen extends StatefulWidget {
   final String accountId;
@@ -217,31 +218,63 @@ class _AccountsScreenState extends State<AccountsScreen> {
                     padding: const EdgeInsets.all(16),
                     child: Row(
                       children: [
-                        Container(
-                          width: 56,
-                          height: 56,
-                          decoration: BoxDecoration(
-                            color: isConnected
-                                ? primaryAqua.withValues(alpha: 0.2)
-                                : isReconnecting
-                                    ? Colors.orange.withValues(alpha: 0.15)
-                                    : Colors.red.withValues(alpha: 0.1),
-                            borderRadius: BorderRadius.circular(14),
-                          ),
-                          child: Center(
-                            child: Text(
-                              alias.substring(0, 1).toUpperCase(),
-                              style: TextStyle(
+                        Stack(
+                          clipBehavior: Clip.none,
+                          children: [
+                            Container(
+                              width: 56,
+                              height: 56,
+                              decoration: BoxDecoration(
                                 color: isConnected
-                                    ? primaryAqua
+                                    ? primaryAqua.withValues(alpha: 0.2)
                                     : isReconnecting
-                                        ? Colors.orange.shade400
-                                        : Colors.red.shade400,
-                                fontWeight: FontWeight.w700,
-                                fontSize: 22,
+                                        ? Colors.orange.withValues(alpha: 0.15)
+                                        : Colors.red.withValues(alpha: 0.1),
+                                borderRadius: BorderRadius.circular(14),
+                              ),
+                              child: Center(
+                                child: Text(
+                                  alias.substring(0, 1).toUpperCase(),
+                                  style: TextStyle(
+                                    color: isConnected
+                                        ? primaryAqua
+                                        : isReconnecting
+                                            ? Colors.orange.shade400
+                                            : Colors.red.shade400,
+                                    fontWeight: FontWeight.w700,
+                                    fontSize: 22,
+                                  ),
+                                ),
                               ),
                             ),
-                          ),
+                            // Badge de chats pendientes (estilo iOS app icon)
+                            Positioned(
+                              top: -6,
+                              right: -6,
+                              child: StreamBuilder<QuerySnapshot>(
+                                stream: FirebaseFirestore.instance
+                                    .collection(accountsCollection)
+                                    .doc(widget.accountId)
+                                    .collection('whatsapp_sessions')
+                                    .doc(phoneNumber)
+                                    .collection('chats')
+                                    .where('unresponded_count', isGreaterThan: 0)
+                                    .snapshots(),
+                                builder: (context, snap) {
+                                  final count = snap.data?.docs.length ?? 0;
+                                  if (count <= 0) return const SizedBox.shrink();
+                                  // Borde para separar visualmente del avatar
+                                  return Container(
+                                    decoration: BoxDecoration(
+                                      borderRadius: BorderRadius.circular(12),
+                                      border: Border.all(color: darkBg, width: 2),
+                                    ),
+                                    child: UnrespondedBadge(count: count),
+                                  );
+                                },
+                              ),
+                            ),
+                          ],
                         ),
                         const SizedBox(width: 16),
                         Expanded(
