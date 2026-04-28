@@ -676,10 +676,6 @@ class _ChatsScreenState extends State<ChatsScreen> {
           .collection('chats')
           .doc(contactPhone)
           .set({'unresponded_count': 0}, SetOptions(merge: true));
-
-      if (mounted) {
-        _showEtherealToast(true, 'Marcado como respondido', isActivating: true);
-      }
     } catch (e) {
       debugPrint('Error marking chat as responded: $e');
       if (mounted) {
