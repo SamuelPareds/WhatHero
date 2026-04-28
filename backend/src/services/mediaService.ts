@@ -1,8 +1,8 @@
-// Pipeline de medios (Fase 2): descifra el archivo de WhatsApp, lo sube
-// a Firebase Storage y actualiza el doc del mensaje con la URL final.
+// Pipeline de medios: extracción + descarga + upload + URL.
 //
-// Se ejecuta fire-and-forget: el mensaje ya quedó visible en el CRM con
-// su thumbnail (Fase 1). Esta función agrega la imagen full-res "encima".
+// Ejecutado fire-and-forget desde firestoreService.ts. El operador ve la
+// burbuja del mensaje al instante (con thumbnail si aplica); el archivo
+// completo aparece cuando este job termina vía Firestore stream.
 
 import admin from 'firebase-admin';
 import { downloadMediaMessage } from '@whiskeysockets/baileys';
@@ -15,6 +15,18 @@ const mediaLogger = pino({ level: 'warn' }).child({ module: 'media' });
 const MAX_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 2000;
 
+export type MediaType = 'image' | 'sticker' | 'document';
+
+export interface MediaInfo {
+  type: MediaType;
+  mime: string;
+  ext: string;
+  fileName?: string;
+  // Campos a persistir en el doc de Firestore al guardar el mensaje (Fase 1).
+  // El job de upload completará luego mediaUrl + mediaSize + mediaStatus='ready'.
+  firestoreFields: Record<string, any>;
+}
+
 function extFromMime(mime: string): string {
   if (mime.includes('png')) return 'png';
   if (mime.includes('webp')) return 'webp';
@@ -22,20 +34,96 @@ function extFromMime(mime: string): string {
   return 'jpg';
 }
 
-export async function processImageMediaAsync(
+function extFromFileName(fileName: string, fallbackMime: string): string {
+  const dot = fileName.lastIndexOf('.');
+  if (dot > 0 && dot < fileName.length - 1) {
+    return fileName.substring(dot + 1).toLowerCase();
+  }
+  if (fallbackMime.includes('pdf')) return 'pdf';
+  if (fallbackMime.includes('msword') || fallbackMime.includes('wordprocessingml')) return 'docx';
+  if (fallbackMime.includes('spreadsheet') || fallbackMime.includes('excel')) return 'xlsx';
+  return 'bin';
+}
+
+// Detecta el tipo de media en un mensaje WhatsApp. Si no hay media soportada
+// en este mensaje, retorna null (texto plano u otro tipo aún no soportado).
+export function extractMediaInfo(message: any): MediaInfo | null {
+  const m = message?.message;
+  if (!m) return null;
+
+  if (m.imageMessage) {
+    const img = m.imageMessage;
+    const mime = img.mimetype || 'image/jpeg';
+    const thumb = img.jpegThumbnail;
+    return {
+      type: 'image',
+      mime,
+      ext: extFromMime(mime),
+      firestoreFields: {
+        mediaType: 'image',
+        mediaMime: mime,
+        mediaWidth: img.width || null,
+        mediaHeight: img.height || null,
+        mediaThumbBase64: thumb ? Buffer.from(thumb).toString('base64') : null,
+        mediaStatus: 'thumb_only',
+      },
+    };
+  }
+
+  if (m.stickerMessage) {
+    const st = m.stickerMessage;
+    const mime = st.mimetype || 'image/webp';
+    return {
+      type: 'sticker',
+      mime,
+      ext: 'webp',
+      firestoreFields: {
+        mediaType: 'sticker',
+        mediaMime: mime,
+        mediaWidth: st.width || null,
+        mediaHeight: st.height || null,
+        // Stickers no traen jpegThumbnail; vamos directo al full-res (~30-50KB).
+        mediaStatus: 'pending',
+      },
+    };
+  }
+
+  // Documentos pueden venir como documentMessage o como documentWithCaptionMessage
+  // (wrapper que WhatsApp introdujo cuando agregó captions a documentos).
+  const doc = m.documentMessage
+    || m.documentWithCaptionMessage?.message?.documentMessage
+    || null;
+  if (doc) {
+    const mime = doc.mimetype || 'application/octet-stream';
+    const fileName = doc.fileName || `archivo-${Date.now()}`;
+    return {
+      type: 'document',
+      mime,
+      ext: extFromFileName(fileName, mime),
+      fileName,
+      firestoreFields: {
+        mediaType: 'document',
+        mediaMime: mime,
+        mediaFileName: fileName,
+        mediaSize: doc.fileLength ? Number(doc.fileLength) : null,
+        mediaStatus: 'pending',
+      },
+    };
+  }
+
+  return null;
+}
+
+export async function processMediaAsync(
   message: any,
+  info: MediaInfo,
   sock: any,
   accountId: string,
   sessionId: string,
   contactPhone: string,
   messageId: string
 ): Promise<void> {
-  const imageMessage = message.message?.imageMessage;
-  if (!imageMessage) return;
-
-  const mime = imageMessage.mimetype || 'image/jpeg';
-  const ext = extFromMime(mime);
-  const path = `${ACCOUNTS_COLLECTION}/${accountId}/whatsapp_sessions/${sessionId}/chats/${contactPhone}/media/${messageId}.${ext}`;
+  const path = `${ACCOUNTS_COLLECTION}/${accountId}/whatsapp_sessions/${sessionId}/chats/${contactPhone}/media/${messageId}.${info.ext}`;
 
   const messageRef = admin.firestore()
     .collection(ACCOUNTS_COLLECTION).doc(accountId)
@@ -45,9 +133,6 @@ export async function processImageMediaAsync(
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      // 'buffer' devuelve los bytes ya descifrados con la mediaKey del mensaje.
-      // reuploadRequest permite a Baileys pedir re-upload al sender si la URL
-      // del CDN de WA expiró (mensajes viejos).
       const buffer = (await downloadMediaMessage(
         message,
         'buffer',
@@ -64,13 +149,10 @@ export async function processImageMediaAsync(
 
       const bucket = admin.storage().bucket();
       const file = bucket.file(path);
-
-      // Token de descarga estilo Firebase: el cliente puede usar la URL
-      // directamente con Image.network sin necesitar el SDK de Storage.
       const downloadToken = randomUUID();
 
       await file.save(buffer, {
-        contentType: mime,
+        contentType: info.mime,
         metadata: {
           metadata: { firebaseStorageDownloadTokens: downloadToken },
         },
@@ -86,19 +168,18 @@ export async function processImageMediaAsync(
         mediaStatus: 'ready',
       }, { merge: true });
 
-      console.log(`[Media] Imagen subida: ${messageId} (${buffer.length} bytes) → ${path}`);
+      console.log(`[Media] ${info.type} subido: ${messageId} (${buffer.length} bytes) → ${path}`);
       return;
     } catch (error: any) {
       const errMsg = error?.message ?? String(error);
-      console.warn(`[Media] Intento ${attempt}/${MAX_RETRIES} falló para ${messageId}: ${errMsg}`);
+      console.warn(`[Media] Intento ${attempt}/${MAX_RETRIES} falló para ${info.type} ${messageId}: ${errMsg}`);
 
       if (attempt === MAX_RETRIES) {
         try {
           await messageRef.set({ mediaStatus: 'failed' }, { merge: true });
         } catch (_) { /* noop */ }
-        console.error(`[Media] Imagen marcada como FAILED: ${messageId}`);
+        console.error(`[Media] ${info.type} marcado como FAILED: ${messageId}`);
       } else {
-        // Backoff lineal: 2s, 4s
         await new Promise(r => setTimeout(r, attempt * RETRY_BASE_DELAY_MS));
       }
     }

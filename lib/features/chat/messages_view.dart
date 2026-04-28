@@ -460,6 +460,8 @@ class _MessagesViewState extends State<MessagesView> {
                     mediaHeight: (data['mediaHeight'] as num?)?.toDouble(),
                     mediaUrl: data['mediaUrl'] as String?,
                     mediaStatus: data['mediaStatus'] as String?,
+                    mediaFileName: data['mediaFileName'] as String?,
+                    mediaSize: (data['mediaSize'] as num?)?.toInt(),
                   );
                 },
               );

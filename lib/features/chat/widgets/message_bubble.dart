@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
+import 'package:url_launcher/url_launcher.dart';
 import 'package:crm_whatsapp/core.dart';
 
 class MessageBubble extends StatefulWidget {
@@ -22,6 +23,8 @@ class MessageBubble extends StatefulWidget {
   final double? mediaHeight;
   final String? mediaUrl;
   final String? mediaStatus;
+  final String? mediaFileName;
+  final int? mediaSize;
 
   const MessageBubble({
     super.key,
@@ -38,6 +41,8 @@ class MessageBubble extends StatefulWidget {
     this.mediaHeight,
     this.mediaUrl,
     this.mediaStatus,
+    this.mediaFileName,
+    this.mediaSize,
   });
 
   @override
@@ -145,6 +150,186 @@ class _MessageBubbleState extends State<MessageBubble> {
     );
   }
 
+  // ============================================
+  // Stickers (Fase 3a): render sin burbuja, tamaño fijo estilo WhatsApp.
+  // ============================================
+  Widget _buildStickerBubble() {
+    final url = widget.mediaUrl;
+    final isReady = url != null && url.isNotEmpty;
+    final isFailed = widget.mediaStatus == 'failed';
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Align(
+        alignment: widget.fromMe ? Alignment.centerRight : Alignment.centerLeft,
+        child: Column(
+          crossAxisAlignment:
+              widget.fromMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+          children: [
+            GestureDetector(
+              onLongPress: _showMessageOptions,
+              onTap: isReady ? () => _openFullscreen(url) : null,
+              child: SizedBox(
+                width: 140,
+                height: 140,
+                child: isReady
+                    ? Image.network(
+                        url,
+                        fit: BoxFit.contain,
+                        gaplessPlayback: true,
+                        errorBuilder: (_, __, ___) => const Icon(
+                          Icons.broken_image,
+                          color: lightText,
+                          size: 32,
+                        ),
+                      )
+                    : Container(
+                        decoration: BoxDecoration(
+                          color: surfaceDark.withValues(alpha: 0.5),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Center(
+                          child: isFailed
+                              ? const Icon(Icons.error_outline,
+                                  color: Color(0xFFF87171), size: 24)
+                              : const SizedBox(
+                                  width: 20,
+                                  height: 20,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    valueColor:
+                                        AlwaysStoppedAnimation(primaryAqua),
+                                  ),
+                                ),
+                        ),
+                      ),
+              ),
+            ),
+            const SizedBox(height: 6),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: Text(
+                _formatTime(widget.timestamp),
+                style: const TextStyle(
+                    color: lightText,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w400),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ============================================
+  // Documentos (Fase 3a): card con icono + nombre + tamaño. Tap → abrir
+  // en navegador externo / app de PDF nativa via url_launcher.
+  // ============================================
+  Widget _buildDocumentCard() {
+    final fileName = widget.mediaFileName ?? 'Documento';
+    final size = widget.mediaSize;
+    final ext = fileName.contains('.')
+        ? fileName.split('.').last.toLowerCase()
+        : '';
+
+    IconData icon;
+    if (ext == 'pdf') {
+      icon = Icons.picture_as_pdf;
+    } else if (ext == 'doc' || ext == 'docx') {
+      icon = Icons.description;
+    } else if (ext == 'xls' || ext == 'xlsx' || ext == 'csv') {
+      icon = Icons.table_chart;
+    } else if (ext == 'zip' || ext == 'rar' || ext == '7z') {
+      icon = Icons.folder_zip;
+    } else {
+      icon = Icons.insert_drive_file;
+    }
+
+    final url = widget.mediaUrl;
+    final canOpen =
+        url != null && url.isNotEmpty && widget.mediaStatus == 'ready';
+    final isFailed = widget.mediaStatus == 'failed';
+    final color = widget.fromMe ? darkBg : white;
+    final dimColor = color.withValues(alpha: 0.7);
+
+    return InkWell(
+      onTap: canOpen ? () => _openDocument(url) : null,
+      borderRadius: BorderRadius.circular(8),
+      child: Padding(
+        padding: const EdgeInsets.all(8),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 32, color: color),
+            const SizedBox(width: 10),
+            Flexible(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    fileName,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: color,
+                      fontWeight: FontWeight.w500,
+                      fontSize: 14,
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: Text(
+                      isFailed
+                          ? 'No disponible'
+                          : (size != null ? _formatSize(size) : ''),
+                      style: TextStyle(color: dimColor, fontSize: 11),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (!canOpen && !isFailed)
+              Padding(
+                padding: const EdgeInsets.only(left: 8),
+                child: SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    valueColor: AlwaysStoppedAnimation(dimColor),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _formatSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    return '${(bytes / 1024 / 1024).toStringAsFixed(1)} MB';
+  }
+
+  Future<void> _openDocument(String url) async {
+    final uri = Uri.parse(url);
+    try {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('No se pudo abrir el documento: $e'),
+            backgroundColor: Colors.red.shade600,
+          ),
+        );
+      }
+    }
+  }
+
   Future<void> _copyToClipboard() async {
     await Clipboard.setData(ClipboardData(text: widget.text));
     if (mounted) {
@@ -240,10 +425,10 @@ class _MessageBubbleState extends State<MessageBubble> {
   }
 
   void _showMessageOptions() {
-    // En mensajes de imagen no tiene sentido editar texto; copiar solo si hay caption.
-    final isImage = widget.mediaType == 'image';
+    // En mensajes con media no tiene sentido editar texto; copiar solo si hay caption.
+    final hasMedia = widget.mediaType != null;
     final canCopy = widget.text.isNotEmpty;
-    final canEdit = widget.fromMe && !isImage;
+    final canEdit = widget.fromMe && !hasMedia;
 
     showModalBottomSheet(
       context: context,
@@ -383,7 +568,13 @@ class _MessageBubbleState extends State<MessageBubble> {
       );
     }
 
+    // Sticker: render alternativo sin Container de burbuja, tamaño fijo.
+    if (widget.mediaType == 'sticker') {
+      return _buildStickerBubble();
+    }
+
     final hasImage = widget.mediaType == 'image' && widget.mediaThumbBase64 != null;
+    final isDocument = widget.mediaType == 'document';
     final hasCaption = widget.text.isNotEmpty;
 
     return Padding(
@@ -409,7 +600,7 @@ class _MessageBubbleState extends State<MessageBubble> {
                           width: 1,
                         ),
                 ),
-                padding: hasImage
+                padding: (hasImage || isDocument)
                     ? const EdgeInsets.all(4)
                     : const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                 child: hasImage
@@ -433,15 +624,36 @@ class _MessageBubbleState extends State<MessageBubble> {
                             ),
                         ],
                       )
-                    : Text(
-                        widget.text,
-                        style: TextStyle(
-                          color: widget.fromMe ? darkBg : white,
-                          fontSize: 15,
-                          fontWeight: FontWeight.w400,
-                          height: 1.4,
-                        ),
-                      ),
+                    : isDocument
+                        ? Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              _buildDocumentCard(),
+                              if (hasCaption)
+                                Padding(
+                                  padding: const EdgeInsets.fromLTRB(10, 4, 10, 6),
+                                  child: Text(
+                                    widget.text,
+                                    style: TextStyle(
+                                      color: widget.fromMe ? darkBg : white,
+                                      fontSize: 15,
+                                      fontWeight: FontWeight.w400,
+                                      height: 1.4,
+                                    ),
+                                  ),
+                                ),
+                            ],
+                          )
+                        : Text(
+                            widget.text,
+                            style: TextStyle(
+                              color: widget.fromMe ? darkBg : white,
+                              fontSize: 15,
+                              fontWeight: FontWeight.w400,
+                              height: 1.4,
+                            ),
+                          ),
               ),
             ),
             const SizedBox(height: 6),

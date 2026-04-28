@@ -41,6 +41,7 @@ dependencies:
   package_info_plus: ^8.0.0
   flutter_launcher_icons: ^0.14.4
   flutter_slidable: ^4.0.3
+  url_launcher: ^6.3.0
 
 
 
