@@ -6,6 +6,13 @@ export interface SessionData {
   isReconnecting: boolean;
   reconnectCount: number;
   accountId: string;
+  // Cache en memoria de nombres de agenda (phoneNumber -> name).
+  // Se llena con contacts.upsert/contacts.update sin tocar Firestore.
+  // Se persiste a un chat doc solo cuando hay un mensaje real para ese contacto
+  // o durante la reconciliación post-connect.
+  contactNames: Map<string, string>;
+  // Timer para debouncear la reconciliación de nombres tras contacts.upsert.
+  reconcileTimer?: NodeJS.Timeout;
   aiConfig?: {
     enabled: boolean;
     apiKey: string;

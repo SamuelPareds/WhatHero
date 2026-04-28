@@ -180,14 +180,21 @@ export async function saveMessageToFirestore(message: any, sessionKey: string, a
     // Update the chat document with lastMessage (for efficient list display)
     // IMPORTANT: Store the remoteJid so we can use the correct format when replying
     // (e.g., if it's @lid format, we need to use that exact format to send messages)
-    await chatDocRef.set({
+    // Si tenemos el nombre de agenda en el cache de la sesión, lo incluimos en el
+    // mismo write (cero writes adicionales sobre el flujo normal).
+    const cachedName = session.contactNames?.get(phoneNumber);
+    const chatDocPayload: Record<string, any> = {
       phoneNumber,
-      remoteJid, // Store the full JID to preserve @lid or other formats
+      remoteJid,
       lastMessage: lastMessagePreview.substring(0, 100),
       lastMessageTimestamp: admin.firestore.Timestamp.fromDate(new Date(messageTimestamp)),
       lastMessageId: messageId,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    }, { merge: true });
+    };
+    if (cachedName) {
+      chatDocPayload.contactName = cachedName;
+    }
+    await chatDocRef.set(chatDocPayload, { merge: true });
 
     // Also update the session document with the latest lastMessage info
     const sessionDocRef = getDb()
@@ -217,41 +224,124 @@ export async function saveMessageToFirestore(message: any, sessionKey: string, a
   }
 }
 
-export async function updateContactInFirestore(contact: any, sessionKey: string, accountId: string, sessions: Map<string, SessionData>) {
+// Extrae phoneNumber + name del payload de un evento de contacts.
+// Devuelve null si no es un contacto procesable (grupo, sin name, etc).
+function extractContactInfo(contact: any): { phoneNumber: string; name: string } | null {
+  // En Baileys v7, si contact.id es un LID, contact.phoneNumber trae el JID real.
+  const rawJid = (contact.phoneNumber ?? contact.id) as string;
+  if (!rawJid || rawJid.endsWith('@g.us')) return null;
+
+  const phoneNumber = extractPhoneNumber(rawJid);
+  if (!phoneNumber) return null;
+
+  // Solo nos importa 'name' (nombre de agenda).
+  // Ignoramos 'notify' (pushName) por decisión de producto.
+  if (!contact.name) return null;
+
+  return { phoneNumber, name: contact.name };
+}
+
+// Cachea el nombre de agenda en memoria sin tocar Firestore.
+// Usado por contacts.upsert (que llega masivamente al conectar).
+export function cacheContactName(contact: any, sessionKey: string, sessions: Map<string, SessionData>) {
+  const session = sessions.get(sessionKey);
+  if (!session) return;
+
+  const info = extractContactInfo(contact);
+  if (!info) return;
+
+  session.contactNames.set(info.phoneNumber, info.name);
+}
+
+// Aplica un cambio de nombre: cachea + actualiza el chat doc SI existe.
+// Usado por contacts.update (deltas reales: renombre en agenda, etc).
+// Si el chat no existe, sólo queda en memoria — se persistirá cuando llegue
+// un mensaje de ese contacto o en la próxima reconciliación.
+export async function applyContactUpdate(contact: any, sessionKey: string, accountId: string, sessions: Map<string, SessionData>) {
+  const session = sessions.get(sessionKey);
+  if (!session?.phoneNumber) return;
+
+  const info = extractContactInfo(contact);
+  if (!info) return;
+
+  session.contactNames.set(info.phoneNumber, info.name);
+
+  // Intentamos actualizar el chat doc. Si no existe, update() falla con
+  // NOT_FOUND (gRPC code 5) — lo silenciamos porque ese es el caso esperado
+  // para contactos que aún no tienen chat real.
   try {
-    const session = sessions.get(sessionKey);
-    if (!session?.phoneNumber) return;
-
-    const sessionId = session.phoneNumber;
-
-    // In Baileys v7, if contact.id is a LID, contact.phoneNumber contains the real PN JID
-    const rawJid = (contact.phoneNumber ?? contact.id) as string;
-    if (!rawJid || rawJid.endsWith('@g.us')) return; // Skip groups
-
-    const phoneNumber = extractPhoneNumber(rawJid);
-    if (!phoneNumber) return;
-
-    // We only care about 'name' (agenda name).
-    // We ignore 'notify' (pushName) as per requirements.
-    if (!contact.name) return;
-
     const chatDocRef = getDb()
       .collection(ACCOUNTS_COLLECTION)
       .doc(accountId)
       .collection('whatsapp_sessions')
-      .doc(sessionId)
+      .doc(session.phoneNumber)
       .collection('chats')
-      .doc(phoneNumber);
+      .doc(info.phoneNumber);
 
-    await chatDocRef.set({
-      contactName: contact.name,
+    await chatDocRef.update({
+      contactName: info.name,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    }, { merge: true });
-
-    console.log(`Contact name updated for ${phoneNumber}: ${contact.name}`);
-  } catch (error) {
-    console.error('Error updating contact in Firestore:', error);
+    });
+    console.log(`[ContactUpdate] Nombre actualizado en chat existente: ${info.phoneNumber} → ${info.name}`);
+  } catch (error: any) {
+    // code 5 = NOT_FOUND. Ignorar: el chat no existe, no hay nada que actualizar.
+    if (error?.code === 5) return;
+    console.error('[ContactUpdate] Error actualizando contact:', error);
   }
+}
+
+// Reconciliación post-connect: pagina sobre los chats existentes y escribe
+// contactName en aquellos que tienen entrada en el cache pero el doc aún no
+// la tiene (o difiere). O(chatsReales) en lugar de O(agendaCompleta).
+export async function reconcileContactNames(sessionKey: string, accountId: string, sessions: Map<string, SessionData>) {
+  const session = sessions.get(sessionKey);
+  if (!session?.phoneNumber) return;
+  if (session.contactNames.size === 0) return;
+
+  const sessionId = session.phoneNumber;
+  const chatsRef = getDb()
+    .collection(ACCOUNTS_COLLECTION)
+    .doc(accountId)
+    .collection('whatsapp_sessions')
+    .doc(sessionId)
+    .collection('chats');
+
+  let updated = 0;
+  let scanned = 0;
+  let lastDoc: FirebaseFirestore.QueryDocumentSnapshot | null = null;
+  const PAGE_SIZE = 200;
+
+  while (true) {
+    let query = chatsRef.orderBy('__name__').limit(PAGE_SIZE);
+    if (lastDoc) query = query.startAfter(lastDoc);
+
+    const snap = await query.get();
+    if (snap.empty) break;
+
+    const batch = getDb().batch();
+    let writesInBatch = 0;
+
+    for (const doc of snap.docs) {
+      scanned++;
+      const cachedName = session.contactNames.get(doc.id);
+      if (!cachedName) continue;
+      const currentName = doc.get('contactName');
+      if (currentName === cachedName) continue;
+      batch.set(doc.ref, {
+        contactName: cachedName,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+      writesInBatch++;
+      updated++;
+    }
+
+    if (writesInBatch > 0) await batch.commit();
+
+    if (snap.size < PAGE_SIZE) break;
+    lastDoc = snap.docs[snap.docs.length - 1];
+  }
+
+  console.log(`[Reconcile] Sesión ${sessionId}: ${scanned} chats escaneados, ${updated} nombres actualizados.`);
 }
 
 // Consolidate duplicate chats when LID-to-Phone mapping is discovered

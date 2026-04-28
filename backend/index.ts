@@ -16,7 +16,7 @@ import { randomUUID } from 'crypto';
 import cron from 'node-cron';
 import { SessionData, MessageBuffer } from './src/types';
 import { extractPhoneNumber, storeLIDMapping, resolveLIDViaSock, isConversationalJid } from './src/utils/phone';
-import { initializeSession, saveMessageToFirestore, getAIConfig, updateContactInFirestore, consolidateLIDChat, incrementUnrespondedCount, resetUnrespondedCount } from './src/services/firestoreService';
+import { initializeSession, saveMessageToFirestore, getAIConfig, cacheContactName, applyContactUpdate, reconcileContactNames, consolidateLIDChat, incrementUnrespondedCount, resetUnrespondedCount } from './src/services/firestoreService';
 import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer } from './src/services/aiService';
 import { ReminderService } from './src/services/reminderService';
 import { ACCOUNTS_COLLECTION, IS_PRODUCTION } from './src/config/env';
@@ -106,6 +106,8 @@ async function startSession(sessionKey: string, accountId: string) {
     isReconnecting: false,
     reconnectCount: existingSession?.reconnectCount || 0,
     accountId,
+    // Preservamos el cache de nombres si la sesión se está reconectando.
+    contactNames: existingSession?.contactNames ?? new Map<string, string>(),
     ...(existingSession?.aiConfig && { aiConfig: existingSession.aiConfig }),
   });
 
@@ -125,16 +127,28 @@ async function startSession(sessionKey: string, accountId: string) {
 
   sock.ev.on('creds.update', saveCreds);
 
-  // Listen for contact updates to capture agenda names
+  // contacts.upsert llega masivamente al conectar (toda la agenda).
+  // Solo cacheamos en memoria — no escribimos Firestore por contacto.
+  // Tras 3s de silencio disparamos reconcileContactNames() que sólo escribe
+  // en los chats que ya existen.
   sock.ev.on('contacts.upsert', (contacts) => {
     for (const contact of contacts) {
-      updateContactInFirestore(contact, sessionKey, accountId, sessions);
+      cacheContactName(contact, sessionKey, sessions);
     }
+    const session = sessions.get(sessionKey);
+    if (!session) return;
+    if (session.reconcileTimer) clearTimeout(session.reconcileTimer);
+    session.reconcileTimer = setTimeout(() => {
+      reconcileContactNames(sessionKey, accountId, sessions)
+        .catch(err => console.error('[Reconcile] Error:', err));
+    }, 3000);
   });
 
+  // contacts.update son deltas (renombre en agenda, etc).
+  // Cacheamos + actualizamos el chat doc si ya existe (si no, queda en cache).
   sock.ev.on('contacts.update', (updates) => {
     for (const update of updates) {
-      updateContactInFirestore(update, sessionKey, accountId, sessions);
+      applyContactUpdate(update, sessionKey, accountId, sessions);
     }
   });
 
