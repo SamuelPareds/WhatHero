@@ -444,15 +444,22 @@ class _MessagesViewState extends State<MessagesView> {
                   }
 
                   final msg = messages[index];
+                  final data = msg.data() as Map<String, dynamic>;
                   return MessageBubble(
                     key: ValueKey(msg.id),
-                    text: msg['text'] ?? '',
-                    fromMe: msg['fromMe'] ?? false,
-                    timestamp: (msg['timestamp'] as Timestamp).toDate(),
+                    text: (data['text'] as String?) ?? '',
+                    fromMe: (data['fromMe'] as bool?) ?? false,
+                    timestamp: (data['timestamp'] as Timestamp).toDate(),
                     messageId: msg.id,
                     chatPhone: widget.phoneNumber,
                     sessionKey: widget.sessionKey,
                     accountId: widget.accountId,
+                    mediaType: data['mediaType'] as String?,
+                    mediaThumbBase64: data['mediaThumbBase64'] as String?,
+                    mediaWidth: (data['mediaWidth'] as num?)?.toDouble(),
+                    mediaHeight: (data['mediaHeight'] as num?)?.toDouble(),
+                    mediaUrl: data['mediaUrl'] as String?,
+                    mediaStatus: data['mediaStatus'] as String?,
                   );
                 },
               );

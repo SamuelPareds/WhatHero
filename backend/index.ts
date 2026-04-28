@@ -52,8 +52,13 @@ if (process.env.FIREBASE_CONFIG) {
   process.exit(1);
 }
 
+// Bucket de Firebase Storage. Hardcoded por proyecto único; sobreescribible
+// vía env si en algún momento desplegamos a otro proyecto Firebase.
+const storageBucket = process.env.FIREBASE_STORAGE_BUCKET || 'whathero-73605.firebasestorage.app';
+
 admin.initializeApp({
   credential: admin.credential.cert(firebaseCredential),
+  storageBucket,
 });
 
 const app = express();

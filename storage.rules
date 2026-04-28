@@ -1,0 +1,25 @@
+// Reglas de Firebase Storage para WhatHero — espejo del árbol Firestore.
+//
+// Solo el dueño (Firebase UID) puede leer/escribir bajo su carpeta de cuenta.
+// El backend (firebase-admin) bypassea las reglas; estas previenen escrituras
+// no autorizadas desde clientes.
+//
+// Las URLs públicas con token de descarga que genera el backend funcionan
+// independientemente de estas reglas (el token es la credencial), así que
+// el visor del CRM seguirá viendo las imágenes aunque endurezcamos esto.
+
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Producción: accounts/{userId}/...
+    match /accounts/{userId}/{allPaths=**} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+    // Desarrollo: accounts_dev/{userId}/...
+    match /accounts_dev/{userId}/{allPaths=**} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+    // Resto: deny por defecto.
+  }
+}

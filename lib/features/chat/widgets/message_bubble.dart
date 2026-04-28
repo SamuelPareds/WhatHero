@@ -12,6 +12,16 @@ class MessageBubble extends StatefulWidget {
   final String chatPhone;
   final String? sessionKey;
   final String accountId;
+  // Campos de media.
+  // - mediaThumbBase64: jpegThumbnail inline de Baileys (Fase 1, render instantáneo).
+  // - mediaUrl: URL final en Firebase Storage (Fase 2, full-res sobre la miniatura).
+  // - mediaStatus: 'thumb_only' | 'ready' | 'failed'.
+  final String? mediaType;
+  final String? mediaThumbBase64;
+  final double? mediaWidth;
+  final double? mediaHeight;
+  final String? mediaUrl;
+  final String? mediaStatus;
 
   const MessageBubble({
     super.key,
@@ -22,6 +32,12 @@ class MessageBubble extends StatefulWidget {
     required this.chatPhone,
     this.sessionKey,
     required this.accountId,
+    this.mediaType,
+    this.mediaThumbBase64,
+    this.mediaWidth,
+    this.mediaHeight,
+    this.mediaUrl,
+    this.mediaStatus,
   });
 
   @override
@@ -56,6 +72,77 @@ class _MessageBubbleState extends State<MessageBubble> {
     final hour = dateTime.hour.toString().padLeft(2, '0');
     final minute = dateTime.minute.toString().padLeft(2, '0');
     return '$hour:$minute';
+  }
+
+  // Renderiza la imagen del mensaje. El thumbnail base64 (Baileys) actúa como
+  // placeholder instantáneo; cuando llega `mediaUrl` desde Storage se monta
+  // el full-res encima sin saltos de layout. Tap → visor con zoom.
+  Widget _buildImageThumb() {
+    final bytes = base64Decode(widget.mediaThumbBase64!);
+    final w = widget.mediaWidth ?? 0;
+    final h = widget.mediaHeight ?? 0;
+    final aspectRatio = (w > 0 && h > 0) ? (w / h) : 1.0;
+
+    final hasFullRes = widget.mediaUrl != null && widget.mediaUrl!.isNotEmpty;
+    final isFailed = widget.mediaStatus == 'failed';
+
+    return GestureDetector(
+      onTap: hasFullRes ? () => _openFullscreen(widget.mediaUrl!) : null,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(10),
+        child: AspectRatio(
+          aspectRatio: aspectRatio,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              // Placeholder de Fase 1: siempre visible debajo.
+              Image.memory(
+                bytes,
+                fit: BoxFit.cover,
+                gaplessPlayback: true,
+                filterQuality: FilterQuality.medium,
+              ),
+              // Full-res cuando ya está en Storage. Mientras carga, dejamos el
+              // thumb visible (loadingBuilder devuelve SizedBox transparente).
+              if (hasFullRes)
+                Image.network(
+                  widget.mediaUrl!,
+                  fit: BoxFit.cover,
+                  gaplessPlayback: true,
+                  loadingBuilder: (context, child, progress) {
+                    if (progress == null) return child;
+                    return const SizedBox.shrink();
+                  },
+                  errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                ),
+              if (isFailed)
+                Positioned(
+                  right: 6,
+                  bottom: 6,
+                  child: Container(
+                    padding: const EdgeInsets.all(4),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.5),
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: const Icon(Icons.error_outline, size: 14, color: Color(0xFFF87171)),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _openFullscreen(String url) {
+    Navigator.of(context).push(
+      PageRouteBuilder(
+        opaque: false,
+        barrierColor: Colors.black,
+        pageBuilder: (_, __, ___) => _FullscreenImage(url: url),
+      ),
+    );
   }
 
   Future<void> _copyToClipboard() async {
@@ -153,6 +240,11 @@ class _MessageBubbleState extends State<MessageBubble> {
   }
 
   void _showMessageOptions() {
+    // En mensajes de imagen no tiene sentido editar texto; copiar solo si hay caption.
+    final isImage = widget.mediaType == 'image';
+    final canCopy = widget.text.isNotEmpty;
+    final canEdit = widget.fromMe && !isImage;
+
     showModalBottomSheet(
       context: context,
       backgroundColor: surfaceDark,
@@ -173,15 +265,16 @@ class _MessageBubbleState extends State<MessageBubble> {
                 borderRadius: BorderRadius.circular(2),
               ),
             ),
-            ListTile(
-              leading: const Icon(Icons.copy, size: 20, color: primaryAqua),
-              title: const Text('Copiar', style: TextStyle(color: white)),
-              onTap: () {
-                Navigator.pop(context);
-                _copyToClipboard();
-              },
-            ),
-            if (widget.fromMe) ...[
+            if (canCopy)
+              ListTile(
+                leading: const Icon(Icons.copy, size: 20, color: primaryAqua),
+                title: const Text('Copiar', style: TextStyle(color: white)),
+                onTap: () {
+                  Navigator.pop(context);
+                  _copyToClipboard();
+                },
+              ),
+            if (canEdit)
               ListTile(
                 leading: const Icon(Icons.edit, size: 20, color: Color(0xFF10B981)),
                 title: const Text('Editar', style: TextStyle(color: white)),
@@ -190,6 +283,7 @@ class _MessageBubbleState extends State<MessageBubble> {
                   setState(() => _isEditing = true);
                 },
               ),
+            if (widget.fromMe)
               ListTile(
                 leading: const Icon(Icons.delete, size: 20, color: Color(0xFFF87171)),
                 title: const Text('Eliminar', style: TextStyle(color: white)),
@@ -198,7 +292,6 @@ class _MessageBubbleState extends State<MessageBubble> {
                   _showDeleteConfirmation();
                 },
               ),
-            ],
           ],
         ),
       ),
@@ -290,6 +383,9 @@ class _MessageBubbleState extends State<MessageBubble> {
       );
     }
 
+    final hasImage = widget.mediaType == 'image' && widget.mediaThumbBase64 != null;
+    final hasCaption = widget.text.isNotEmpty;
+
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
       child: Align(
@@ -313,16 +409,39 @@ class _MessageBubbleState extends State<MessageBubble> {
                           width: 1,
                         ),
                 ),
-                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                child: Text(
-                  widget.text,
-                  style: TextStyle(
-                    color: widget.fromMe ? darkBg : white,
-                    fontSize: 15,
-                    fontWeight: FontWeight.w400,
-                    height: 1.4,
-                  ),
-                ),
+                padding: hasImage
+                    ? const EdgeInsets.all(4)
+                    : const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                child: hasImage
+                    ? Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          _buildImageThumb(),
+                          if (hasCaption)
+                            Padding(
+                              padding: const EdgeInsets.fromLTRB(10, 8, 10, 4),
+                              child: Text(
+                                widget.text,
+                                style: TextStyle(
+                                  color: widget.fromMe ? darkBg : white,
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.w400,
+                                  height: 1.4,
+                                ),
+                              ),
+                            ),
+                        ],
+                      )
+                    : Text(
+                        widget.text,
+                        style: TextStyle(
+                          color: widget.fromMe ? darkBg : white,
+                          fontSize: 15,
+                          fontWeight: FontWeight.w400,
+                          height: 1.4,
+                        ),
+                      ),
               ),
             ),
             const SizedBox(height: 6),
@@ -338,6 +457,45 @@ class _MessageBubbleState extends State<MessageBubble> {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+// Visor fullscreen con zoom/pan. Sin deps extra: usamos el InteractiveViewer
+// que ya viene en Flutter.
+class _FullscreenImage extends StatelessWidget {
+  final String url;
+  const _FullscreenImage({required this.url});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        iconTheme: const IconThemeData(color: Colors.white),
+      ),
+      body: Center(
+        child: InteractiveViewer(
+          minScale: 0.5,
+          maxScale: 4,
+          child: Image.network(
+            url,
+            fit: BoxFit.contain,
+            loadingBuilder: (_, child, progress) {
+              if (progress == null) return child;
+              return const CircularProgressIndicator(
+                valueColor: AlwaysStoppedAnimation<Color>(primaryAqua),
+              );
+            },
+            errorBuilder: (_, __, ___) => const Text(
+              'No se pudo cargar la imagen',
+              style: TextStyle(color: Colors.white70),
+            ),
+          ),
         ),
       ),
     );

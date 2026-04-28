@@ -3,6 +3,7 @@ import { toNumber } from '@whiskeysockets/baileys';
 import { SessionData } from '../types';
 import { extractPhoneNumber } from '../utils/phone';
 import { ACCOUNTS_COLLECTION } from '../config/env';
+import { processImageMediaAsync } from './mediaService';
 
 // Lazy evaluation: getDb() is called only after Firebase is initialized
 function getDb() {
@@ -115,6 +116,36 @@ export async function saveMessageToFirestore(message: any, sessionKey: string, a
                         message.message?.imageMessage?.caption ||
                         '';
 
+    // ============================================
+    // FASE 1: Captura de imágenes (thumbnail inline)
+    // Baileys ya nos entrega un jpegThumbnail (~5-15 KB) embebido en el
+    // mensaje, junto con dimensiones y mimetype. Eso basta para mostrar
+    // una miniatura instantánea en el CRM sin tocar Firebase Storage.
+    // La descarga del JPEG full-res (descifrado + upload) llega en Fase 2.
+    // ============================================
+    const imageMessage = message.message?.imageMessage;
+    const isImage = !!imageMessage;
+
+    let mediaFields: Record<string, any> = {};
+    if (isImage && imageMessage) {
+      const thumb = imageMessage.jpegThumbnail;
+      mediaFields = {
+        mediaType: 'image',
+        mediaMime: imageMessage.mimetype || 'image/jpeg',
+        mediaWidth: imageMessage.width || null,
+        mediaHeight: imageMessage.height || null,
+        mediaThumbBase64: thumb ? Buffer.from(thumb).toString('base64') : null,
+        // 'thumb_only' = sólo tenemos la miniatura. En Fase 2 pasará a 'pending' y luego 'ready'.
+        mediaStatus: 'thumb_only',
+      };
+    }
+
+    // Preview que ve el operador en la lista de chats. Sin esto, una imagen
+    // sin caption mostraría "Sin mensajes".
+    const lastMessagePreview = isImage
+      ? (messageText ? `📷 ${messageText}` : '📷 Imagen')
+      : messageText;
+
     // Use toNumber() to handle potential Long type from protobuf
     const messageTimestamp = message.messageTimestamp ? toNumber(message.messageTimestamp) * 1000 : Date.now();
     const messageId = message.key.id;
@@ -138,6 +169,7 @@ export async function saveMessageToFirestore(message: any, sessionKey: string, a
       from: message.key.fromMe ? (botJid || 'bot') : phoneNumber,
       fromMe: message.key.fromMe,
       isMedia: !!message.message?.imageMessage || !!message.message?.documentMessage || !!message.message?.audioMessage,
+      ...mediaFields,
     }, { merge: true });
 
     // Update the chat document with lastMessage (for efficient list display)
@@ -146,7 +178,7 @@ export async function saveMessageToFirestore(message: any, sessionKey: string, a
     await chatDocRef.set({
       phoneNumber,
       remoteJid, // Store the full JID to preserve @lid or other formats
-      lastMessage: messageText.substring(0, 100),
+      lastMessage: lastMessagePreview.substring(0, 100),
       lastMessageTimestamp: admin.firestore.Timestamp.fromDate(new Date(messageTimestamp)),
       lastMessageId: messageId,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -160,13 +192,21 @@ export async function saveMessageToFirestore(message: any, sessionKey: string, a
       .doc(sessionId);
 
     await sessionDocRef.update({
-      last_message: messageText.substring(0, 100),
+      last_message: lastMessagePreview.substring(0, 100),
       last_message_timestamp: admin.firestore.Timestamp.fromDate(new Date(messageTimestamp)),
       last_chat_id: phoneNumber,
       last_sync: admin.firestore.Timestamp.now(),
     });
 
     console.log(`Message saved for ${phoneNumber} (Account: ${accountId}, Session: ${sessionId})`);
+
+    // Fase 2: dispara descarga + upload del full-res en segundo plano.
+    // El mensaje ya quedó visible para el operador con la miniatura;
+    // la imagen completa aparecerá apenas termine el upload (Firestore stream).
+    if (isImage && sock) {
+      processImageMediaAsync(message, sock, accountId, sessionId, phoneNumber, messageId)
+        .catch(err => console.error(`[Media] Error en upload de imagen ${messageId}:`, err));
+    }
   } catch (error) {
     console.error('Error saving message to Firestore:', error);
   }
