@@ -114,6 +114,7 @@ export async function saveMessageToFirestore(message: any, sessionKey: string, a
     const messageText = message.message?.conversation ||
                         message.message?.extendedTextMessage?.text ||
                         message.message?.imageMessage?.caption ||
+                        message.message?.videoMessage?.caption ||
                         message.message?.documentMessage?.caption ||
                         message.message?.documentWithCaptionMessage?.message?.documentMessage?.caption ||
                         '';
@@ -131,11 +132,13 @@ export async function saveMessageToFirestore(message: any, sessionKey: string, a
     const lastMessagePreview = (() => {
       if (!mediaInfo) return messageText;
       const isPtt = !!mediaInfo.firestoreFields?.mediaIsPtt;
+      const isGif = !!mediaInfo.firestoreFields?.mediaIsGif;
       const labels: Record<string, { icon: string; label: string }> = {
         image: { icon: '📷', label: 'Imagen' },
         sticker: { icon: '🏷️', label: 'Sticker' },
         document: { icon: '📄', label: mediaInfo.fileName ?? 'Documento' },
         audio: { icon: '🎤', label: isPtt ? 'Nota de voz' : 'Audio' },
+        video: { icon: '🎥', label: isGif ? 'GIF' : 'Video' },
       };
       const { icon, label } = labels[mediaInfo.type];
       return messageText ? `${icon} ${messageText}` : `${icon} ${label}`;
@@ -163,7 +166,7 @@ export async function saveMessageToFirestore(message: any, sessionKey: string, a
       timestamp: admin.firestore.Timestamp.fromDate(new Date(messageTimestamp)),
       from: message.key.fromMe ? (botJid || 'bot') : phoneNumber,
       fromMe: message.key.fromMe,
-      isMedia: !!mediaInfo || !!message.message?.videoMessage,
+      isMedia: !!mediaInfo,
       ...mediaFields,
     }, { merge: true });
 

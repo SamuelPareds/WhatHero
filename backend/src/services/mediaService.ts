@@ -15,7 +15,7 @@ const mediaLogger = pino({ level: 'warn' }).child({ module: 'media' });
 const MAX_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 2000;
 
-export type MediaType = 'image' | 'sticker' | 'document' | 'audio';
+export type MediaType = 'image' | 'sticker' | 'document' | 'audio' | 'video';
 
 export interface MediaInfo {
   type: MediaType;
@@ -77,6 +77,30 @@ export function extractMediaInfo(message: any): MediaInfo | null {
         mediaHeight: img.height || null,
         mediaThumbBase64: thumb ? Buffer.from(thumb).toString('base64') : null,
         mediaStatus: 'thumb_only',
+      },
+    };
+  }
+
+  // Video y "GIF" (en WhatsApp un GIF es un mp4 mute con loop, marcado por
+  // gifPlayback). Mismo pipeline que imagen: jpegThumbnail como poster
+  // instantáneo + descarga del mp4 completo en segundo plano.
+  if (m.videoMessage) {
+    const vd = m.videoMessage;
+    const mime = vd.mimetype || 'video/mp4';
+    const thumb = vd.jpegThumbnail;
+    return {
+      type: 'video',
+      mime,
+      ext: 'mp4',
+      firestoreFields: {
+        mediaType: 'video',
+        mediaMime: mime,
+        mediaWidth: vd.width || null,
+        mediaHeight: vd.height || null,
+        mediaDuration: vd.seconds || null,
+        mediaThumbBase64: thumb ? Buffer.from(thumb).toString('base64') : null,
+        mediaIsGif: !!vd.gifPlayback,
+        mediaStatus: thumb ? 'thumb_only' : 'pending',
       },
     };
   }

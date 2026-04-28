@@ -464,6 +464,7 @@ class _MessagesViewState extends State<MessagesView> {
                     mediaSize: (data['mediaSize'] as num?)?.toInt(),
                     mediaIsPtt: data['mediaIsPtt'] as bool?,
                     mediaDuration: (data['mediaDuration'] as num?)?.toInt(),
+                    mediaIsGif: data['mediaIsGif'] as bool?,
                   );
                 },
               );

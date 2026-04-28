@@ -43,6 +43,7 @@ dependencies:
   flutter_slidable: ^4.0.3
   url_launcher: ^6.3.0
   just_audio: ^0.9.40
+  video_player: ^2.9.2
 
 
 

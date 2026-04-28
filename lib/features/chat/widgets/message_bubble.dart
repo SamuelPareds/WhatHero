@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:just_audio/just_audio.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:video_player/video_player.dart';
 import 'package:crm_whatsapp/core.dart';
 
 // Player global compartido: solo un audio suena a la vez (estilo WhatsApp).
@@ -54,6 +55,8 @@ class MessageBubble extends StatefulWidget {
   // sin tener que descargar el audio.
   final bool? mediaIsPtt;
   final int? mediaDuration;
+  // Video (Fase 3c): mediaIsGif marca los "GIFs" de WhatsApp (mp4 mute loop).
+  final bool? mediaIsGif;
 
   const MessageBubble({
     super.key,
@@ -74,6 +77,7 @@ class MessageBubble extends StatefulWidget {
     this.mediaSize,
     this.mediaIsPtt,
     this.mediaDuration,
+    this.mediaIsGif,
   });
 
   @override
@@ -509,6 +513,106 @@ class _MessageBubbleState extends State<MessageBubble> {
     }
   }
 
+  // ============================================
+  // Video (Fase 3c): poster (jpegThumbnail) instantáneo + overlay de play.
+  // Tap → abre _FullscreenVideo. Mientras no esté ready en Storage muestra
+  // un spinner pequeño sobre el poster y desactiva el tap.
+  // ============================================
+  Widget _buildVideoBubble() {
+    final thumbB64 = widget.mediaThumbBase64;
+    final url = widget.mediaUrl;
+    final isReady = url != null && url.isNotEmpty && widget.mediaStatus == 'ready';
+    final isFailed = widget.mediaStatus == 'failed';
+    final isGif = widget.mediaIsGif ?? false;
+    final w = widget.mediaWidth ?? 0;
+    final h = widget.mediaHeight ?? 0;
+    final aspectRatio = (w > 0 && h > 0) ? (w / h) : 16 / 9;
+    final dur = Duration(seconds: widget.mediaDuration ?? 0);
+
+    return GestureDetector(
+      onTap: isReady ? () => _openFullscreenVideo(url) : null,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(10),
+        child: AspectRatio(
+          aspectRatio: aspectRatio,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              if (thumbB64 != null && thumbB64.isNotEmpty)
+                Image.memory(
+                  base64Decode(thumbB64),
+                  fit: BoxFit.cover,
+                  gaplessPlayback: true,
+                  filterQuality: FilterQuality.medium,
+                )
+              else
+                Container(color: Colors.black54),
+              // Velo oscuro para que el play resalte.
+              Container(color: Colors.black.withValues(alpha: 0.25)),
+              Center(
+                child: isReady
+                    ? const Icon(Icons.play_circle_fill,
+                        color: Colors.white, size: 56)
+                    : isFailed
+                        ? const Icon(Icons.error_outline,
+                            color: Color(0xFFF87171), size: 40)
+                        : const SizedBox(
+                            width: 32,
+                            height: 32,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              valueColor: AlwaysStoppedAnimation(Colors.white),
+                            ),
+                          ),
+              ),
+              // Chip con duración / etiqueta GIF.
+              Positioned(
+                left: 8,
+                bottom: 8,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.55),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(isGif ? Icons.gif_box : Icons.videocam,
+                          size: 12, color: Colors.white),
+                      const SizedBox(width: 3),
+                      Text(
+                        isGif
+                            ? 'GIF'
+                            : (dur.inSeconds > 0 ? _formatDuration(dur) : 'Video'),
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 10,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _openFullscreenVideo(String url) {
+    Navigator.of(context).push(
+      PageRouteBuilder(
+        opaque: false,
+        barrierColor: Colors.black,
+        pageBuilder: (_, __, ___) =>
+            _FullscreenVideo(url: url, loop: widget.mediaIsGif ?? false),
+      ),
+    );
+  }
+
   Future<void> _copyToClipboard() async {
     await Clipboard.setData(ClipboardData(text: widget.text));
     if (mounted) {
@@ -755,6 +859,7 @@ class _MessageBubbleState extends State<MessageBubble> {
     final hasImage = widget.mediaType == 'image' && widget.mediaThumbBase64 != null;
     final isDocument = widget.mediaType == 'document';
     final isAudio = widget.mediaType == 'audio';
+    final isVideo = widget.mediaType == 'video';
     final hasCaption = widget.text.isNotEmpty;
 
     return Padding(
@@ -780,11 +885,32 @@ class _MessageBubbleState extends State<MessageBubble> {
                           width: 1,
                         ),
                 ),
-                padding: (hasImage || isDocument || isAudio)
+                padding: (hasImage || isDocument || isAudio || isVideo)
                     ? const EdgeInsets.all(4)
                     : const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                 child: isAudio
                     ? _buildAudioBubble()
+                    : isVideo
+                    ? Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          _buildVideoBubble(),
+                          if (hasCaption)
+                            Padding(
+                              padding: const EdgeInsets.fromLTRB(10, 8, 10, 4),
+                              child: Text(
+                                widget.text,
+                                style: TextStyle(
+                                  color: widget.fromMe ? darkBg : white,
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.w400,
+                                  height: 1.4,
+                                ),
+                              ),
+                            ),
+                        ],
+                      )
                     : hasImage
                     ? Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
@@ -852,6 +978,153 @@ class _MessageBubbleState extends State<MessageBubble> {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+// Visor fullscreen de video con controles propios (sin chewie).
+// Autoplay al abrir, dispose al cerrar para evitar audio remanente.
+class _FullscreenVideo extends StatefulWidget {
+  final String url;
+  final bool loop;
+  const _FullscreenVideo({required this.url, required this.loop});
+
+  @override
+  State<_FullscreenVideo> createState() => _FullscreenVideoState();
+}
+
+class _FullscreenVideoState extends State<_FullscreenVideo> {
+  late final VideoPlayerController _controller;
+  bool _initialized = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = VideoPlayerController.networkUrl(Uri.parse(widget.url));
+    _controller.setLooping(widget.loop);
+    _controller.initialize().then((_) {
+      if (!mounted) return;
+      setState(() => _initialized = true);
+      _controller.play();
+    }).catchError((e) {
+      if (!mounted) return;
+      setState(() => _error = e.toString());
+    });
+    _controller.addListener(_onPlayerUpdate);
+  }
+
+  void _onPlayerUpdate() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    _controller.removeListener(_onPlayerUpdate);
+    _controller.dispose();
+    super.dispose();
+  }
+
+  String _fmt(Duration d) {
+    final m = d.inMinutes;
+    final s = d.inSeconds % 60;
+    return '$m:${s.toString().padLeft(2, '0')}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        iconTheme: const IconThemeData(color: Colors.white),
+      ),
+      body: Center(
+        child: _error != null
+            ? Text('No se pudo cargar el video',
+                style: const TextStyle(color: Colors.white70))
+            : !_initialized
+                ? const CircularProgressIndicator(
+                    valueColor: AlwaysStoppedAnimation<Color>(primaryAqua))
+                : Stack(
+                    alignment: Alignment.bottomCenter,
+                    children: [
+                      Center(
+                        child: AspectRatio(
+                          aspectRatio: _controller.value.aspectRatio,
+                          child: VideoPlayer(_controller),
+                        ),
+                      ),
+                      Container(
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.bottomCenter,
+                            end: Alignment.topCenter,
+                            colors: [
+                              Colors.black.withValues(alpha: 0.7),
+                              Colors.transparent,
+                            ],
+                          ),
+                        ),
+                        padding: const EdgeInsets.fromLTRB(12, 24, 12, 16),
+                        child: Row(
+                          children: [
+                            IconButton(
+                              icon: Icon(
+                                _controller.value.isPlaying
+                                    ? Icons.pause
+                                    : Icons.play_arrow,
+                                color: Colors.white,
+                                size: 32,
+                              ),
+                              onPressed: () {
+                                if (_controller.value.isPlaying) {
+                                  _controller.pause();
+                                } else {
+                                  _controller.play();
+                                }
+                              },
+                            ),
+                            Expanded(
+                              child: SliderTheme(
+                                data: const SliderThemeData(
+                                  trackHeight: 2.5,
+                                  thumbShape: RoundSliderThumbShape(
+                                      enabledThumbRadius: 6),
+                                  activeTrackColor: primaryAqua,
+                                  inactiveTrackColor: Colors.white24,
+                                  thumbColor: primaryAqua,
+                                ),
+                                child: Slider(
+                                  min: 0,
+                                  max: _controller.value.duration.inMilliseconds
+                                      .toDouble()
+                                      .clamp(1, double.infinity),
+                                  value: _controller.value.position.inMilliseconds
+                                      .clamp(
+                                          0,
+                                          _controller.value.duration.inMilliseconds)
+                                      .toDouble(),
+                                  onChanged: (v) {
+                                    _controller
+                                        .seekTo(Duration(milliseconds: v.toInt()));
+                                  },
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              '${_fmt(_controller.value.position)} / ${_fmt(_controller.value.duration)}',
+                              style: const TextStyle(
+                                  color: Colors.white, fontSize: 12),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
       ),
     );
   }
