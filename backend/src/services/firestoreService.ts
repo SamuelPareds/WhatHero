@@ -130,10 +130,12 @@ export async function saveMessageToFirestore(message: any, sessionKey: string, a
     // Preview que ve el operador en la lista de chats con un icono por tipo.
     const lastMessagePreview = (() => {
       if (!mediaInfo) return messageText;
+      const isPtt = !!mediaInfo.firestoreFields?.mediaIsPtt;
       const labels: Record<string, { icon: string; label: string }> = {
         image: { icon: '📷', label: 'Imagen' },
         sticker: { icon: '🏷️', label: 'Sticker' },
         document: { icon: '📄', label: mediaInfo.fileName ?? 'Documento' },
+        audio: { icon: '🎤', label: isPtt ? 'Nota de voz' : 'Audio' },
       };
       const { icon, label } = labels[mediaInfo.type];
       return messageText ? `${icon} ${messageText}` : `${icon} ${label}`;
@@ -161,9 +163,7 @@ export async function saveMessageToFirestore(message: any, sessionKey: string, a
       timestamp: admin.firestore.Timestamp.fromDate(new Date(messageTimestamp)),
       from: message.key.fromMe ? (botJid || 'bot') : phoneNumber,
       fromMe: message.key.fromMe,
-      isMedia: !!mediaInfo
-            || !!message.message?.audioMessage
-            || !!message.message?.videoMessage,
+      isMedia: !!mediaInfo || !!message.message?.videoMessage,
       ...mediaFields,
     }, { merge: true });
 

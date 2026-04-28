@@ -2,8 +2,32 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
+import 'package:just_audio/just_audio.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:crm_whatsapp/core.dart';
+
+// Player global compartido: solo un audio suena a la vez (estilo WhatsApp).
+// Cada burbuja se identifica por messageId; al darle play a otra burbuja, la
+// anterior se pausa automáticamente porque cambia el activeMessageId.
+class _AudioPlaybackController {
+  static final _AudioPlaybackController instance = _AudioPlaybackController._();
+  _AudioPlaybackController._();
+
+  final AudioPlayer player = AudioPlayer();
+  final ValueNotifier<String?> activeMessageId = ValueNotifier(null);
+
+  Future<void> playUrl(String url, String messageId) async {
+    if (activeMessageId.value != messageId) {
+      await player.stop();
+      await player.setUrl(url);
+      activeMessageId.value = messageId;
+    }
+    await player.play();
+  }
+
+  Future<void> pause() => player.pause();
+  Future<void> seek(Duration pos) => player.seek(pos);
+}
 
 class MessageBubble extends StatefulWidget {
   final String text;
@@ -25,6 +49,11 @@ class MessageBubble extends StatefulWidget {
   final String? mediaStatus;
   final String? mediaFileName;
   final int? mediaSize;
+  // Audio (Fase 3b): mediaIsPtt distingue nota de voz (true) de adjunto.
+  // mediaDuration en segundos lo manda Baileys; se usa para mostrar 0:00 / 0:23
+  // sin tener que descargar el audio.
+  final bool? mediaIsPtt;
+  final int? mediaDuration;
 
   const MessageBubble({
     super.key,
@@ -43,6 +72,8 @@ class MessageBubble extends StatefulWidget {
     this.mediaStatus,
     this.mediaFileName,
     this.mediaSize,
+    this.mediaIsPtt,
+    this.mediaDuration,
   });
 
   @override
@@ -314,6 +345,154 @@ class _MessageBubbleState extends State<MessageBubble> {
     return '${(bytes / 1024 / 1024).toStringAsFixed(1)} MB';
   }
 
+  String _formatDuration(Duration d) {
+    final m = d.inMinutes;
+    final s = d.inSeconds % 60;
+    return '$m:${s.toString().padLeft(2, '0')}';
+  }
+
+  // ============================================
+  // Audio (Fase 3b): notas de voz y adjuntos. Player único compartido —
+  // ver _AudioPlaybackController. Mientras no esté ready, mostramos spinner
+  // pequeño. Una vez listo, play/pause + slider con posición/duración live.
+  // ============================================
+  Widget _buildAudioBubble() {
+    final url = widget.mediaUrl;
+    final isReady = url != null && url.isNotEmpty && widget.mediaStatus == 'ready';
+    final isFailed = widget.mediaStatus == 'failed';
+    final isPtt = widget.mediaIsPtt ?? false;
+    final totalDuration = Duration(seconds: widget.mediaDuration ?? 0);
+    final color = widget.fromMe ? darkBg : white;
+    final dimColor = color.withValues(alpha: 0.7);
+
+    Widget content;
+    if (!isReady) {
+      content = Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(isPtt ? Icons.mic : Icons.audiotrack, size: 22, color: dimColor),
+          const SizedBox(width: 10),
+          if (isFailed)
+            Text('No disponible',
+                style: TextStyle(color: dimColor, fontSize: 13))
+          else
+            SizedBox(
+              width: 14,
+              height: 14,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                valueColor: AlwaysStoppedAnimation(dimColor),
+              ),
+            ),
+          const SizedBox(width: 10),
+          if (totalDuration.inSeconds > 0)
+            Text(_formatDuration(totalDuration),
+                style: TextStyle(color: dimColor, fontSize: 12)),
+        ],
+      );
+    } else {
+      content = ValueListenableBuilder<String?>(
+        valueListenable: _AudioPlaybackController.instance.activeMessageId,
+        builder: (context, activeId, _) {
+          final isActive = activeId == widget.messageId;
+          final player = _AudioPlaybackController.instance.player;
+
+          return StreamBuilder<PlayerState>(
+            stream: isActive ? player.playerStateStream : null,
+            builder: (context, stateSnap) {
+              final isPlaying = isActive && (stateSnap.data?.playing ?? false);
+              return StreamBuilder<Duration>(
+                stream: isActive ? player.positionStream : null,
+                builder: (context, posSnap) {
+                  final live = isActive ? player.duration : null;
+                  final dur = (live != null && live.inMilliseconds > 0)
+                      ? live
+                      : totalDuration;
+                  final pos = isActive ? (posSnap.data ?? Duration.zero) : Duration.zero;
+                  final maxMs = dur.inMilliseconds > 0 ? dur.inMilliseconds : 1;
+                  final value =
+                      pos.inMilliseconds.clamp(0, maxMs).toDouble();
+
+                  return Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(isPtt ? Icons.mic : Icons.audiotrack,
+                          size: 20, color: dimColor),
+                      const SizedBox(width: 4),
+                      InkResponse(
+                        radius: 22,
+                        onTap: () {
+                          if (isPlaying) {
+                            _AudioPlaybackController.instance.pause();
+                          } else {
+                            _AudioPlaybackController.instance
+                                .playUrl(url, widget.messageId);
+                          }
+                        },
+                        child: Padding(
+                          padding: const EdgeInsets.all(4),
+                          child: Icon(
+                            isPlaying ? Icons.pause_circle_filled : Icons.play_circle_fill,
+                            size: 32,
+                            color: color,
+                          ),
+                        ),
+                      ),
+                      SizedBox(
+                        width: 140,
+                        child: SliderTheme(
+                          data: SliderThemeData(
+                            trackHeight: 2.5,
+                            thumbShape: const RoundSliderThumbShape(
+                                enabledThumbRadius: 6),
+                            overlayShape: const RoundSliderOverlayShape(
+                                overlayRadius: 12),
+                            activeTrackColor: color,
+                            inactiveTrackColor: dimColor.withValues(alpha: 0.3),
+                            thumbColor: color,
+                            overlayColor: color.withValues(alpha: 0.15),
+                          ),
+                          child: Slider(
+                            min: 0,
+                            max: maxMs.toDouble(),
+                            value: value,
+                            onChanged: isActive
+                                ? (v) {
+                                    _AudioPlaybackController.instance
+                                        .seek(Duration(milliseconds: v.toInt()));
+                                  }
+                                : (v) {
+                                    // Iniciar reproducción al tocar el slider
+                                    // de una burbuja inactiva.
+                                    _AudioPlaybackController.instance
+                                        .playUrl(url, widget.messageId);
+                                  },
+                          ),
+                        ),
+                      ),
+                      Text(
+                        _formatDuration(isActive ? pos : dur),
+                        style: TextStyle(color: dimColor, fontSize: 11),
+                      ),
+                    ],
+                  );
+                },
+              );
+            },
+          );
+        },
+      );
+    }
+
+    return GestureDetector(
+      onLongPress: _showMessageOptions,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+        child: content,
+      ),
+    );
+  }
+
   Future<void> _openDocument(String url) async {
     final uri = Uri.parse(url);
     try {
@@ -575,6 +754,7 @@ class _MessageBubbleState extends State<MessageBubble> {
 
     final hasImage = widget.mediaType == 'image' && widget.mediaThumbBase64 != null;
     final isDocument = widget.mediaType == 'document';
+    final isAudio = widget.mediaType == 'audio';
     final hasCaption = widget.text.isNotEmpty;
 
     return Padding(
@@ -600,10 +780,12 @@ class _MessageBubbleState extends State<MessageBubble> {
                           width: 1,
                         ),
                 ),
-                padding: (hasImage || isDocument)
+                padding: (hasImage || isDocument || isAudio)
                     ? const EdgeInsets.all(4)
                     : const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                child: hasImage
+                child: isAudio
+                    ? _buildAudioBubble()
+                    : hasImage
                     ? Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         mainAxisSize: MainAxisSize.min,

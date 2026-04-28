@@ -15,7 +15,7 @@ const mediaLogger = pino({ level: 'warn' }).child({ module: 'media' });
 const MAX_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 2000;
 
-export type MediaType = 'image' | 'sticker' | 'document';
+export type MediaType = 'image' | 'sticker' | 'document' | 'audio';
 
 export interface MediaInfo {
   type: MediaType;
@@ -43,6 +43,17 @@ function extFromFileName(fileName: string, fallbackMime: string): string {
   if (fallbackMime.includes('msword') || fallbackMime.includes('wordprocessingml')) return 'docx';
   if (fallbackMime.includes('spreadsheet') || fallbackMime.includes('excel')) return 'xlsx';
   return 'bin';
+}
+
+function extFromAudioMime(mime: string): string {
+  // Las notas de voz de WhatsApp casi siempre son OGG/Opus.
+  // Audios adjuntos pueden venir en MP3, M4A, etc.
+  if (mime.includes('ogg')) return 'ogg';
+  if (mime.includes('mpeg') || mime.includes('mp3')) return 'mp3';
+  if (mime.includes('mp4') || mime.includes('m4a') || mime.includes('aac')) return 'm4a';
+  if (mime.includes('webm')) return 'webm';
+  if (mime.includes('wav')) return 'wav';
+  return 'ogg';
 }
 
 // Detecta el tipo de media en un mensaje WhatsApp. Si no hay media soportada
@@ -83,6 +94,27 @@ export function extractMediaInfo(message: any): MediaInfo | null {
         mediaWidth: st.width || null,
         mediaHeight: st.height || null,
         // Stickers no traen jpegThumbnail; vamos directo al full-res (~30-50KB).
+        mediaStatus: 'pending',
+      },
+    };
+  }
+
+  // Audio: notas de voz (ptt=true) y adjuntos de audio (ptt=false).
+  // Mismo pipeline para ambos; el campo mediaIsPtt distingue en el frontend
+  // para el icono y la duración compacta.
+  if (m.audioMessage) {
+    const au = m.audioMessage;
+    const mime = au.mimetype || 'audio/ogg';
+    const isPtt = !!au.ptt;
+    return {
+      type: 'audio',
+      mime,
+      ext: extFromAudioMime(mime),
+      firestoreFields: {
+        mediaType: 'audio',
+        mediaMime: mime,
+        mediaIsPtt: isPtt,
+        mediaDuration: au.seconds || null,
         mediaStatus: 'pending',
       },
     };
