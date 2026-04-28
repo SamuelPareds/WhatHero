@@ -90,30 +90,6 @@ class _MessagesViewState extends State<MessagesView> {
     });
 
     try {
-      // Dev command: Delete chat history with "elimhis"
-      if (text.toLowerCase() == 'elimhis') {
-        final response = await http.post(
-          Uri.parse('$backendUrl/delete-chat-history'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'phoneNumber': widget.phoneNumber,
-            'sessionKey': widget.sessionKey,
-            'sessionId': widget.sessionId,
-            'accountId': widget.accountId,
-          }),
-        ).timeout(const Duration(seconds: 10));
-
-        if (response.statusCode == 200) {
-          _messageController.clear();
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('✓ Historial eliminado'), backgroundColor: Color(0xFF06B6D4)),
-            );
-          }
-        }
-        return;
-      }
-
       final messageData = {
         'to': widget.phoneNumber,
         'text': text,

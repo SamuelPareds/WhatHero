@@ -930,8 +930,9 @@ app.post('/delete-message', express.json(), async (req, res) => {
   }
 });
 
-// DEV ONLY: Delete chat history (triggered by "elimhis" command)
-app.post('/delete-chat-history', express.json(), async (req, res) => {
+// Borrado completo de un chat: Storage + mensajes + chat doc.
+// Hard-delete irreversible. La UI exige doble confirmación antes de invocar este endpoint.
+app.post('/delete-chat', express.json(), async (req, res) => {
   try {
     const { phoneNumber, sessionKey, sessionId, accountId } = req.body;
 
@@ -948,7 +949,26 @@ app.post('/delete-chat-history', express.json(), async (req, res) => {
       return res.status(403).json({ error: 'Unauthorized' });
     }
 
-    // Delete all messages in this chat
+    // Paso 1: Storage primero. Si esto falla, preferimos quedarnos con el chat
+    // doc visible (recuperable desde la UI) en vez de archivos huérfanos sin doc.
+    const storagePrefix = `${ACCOUNTS_COLLECTION}/${accountId}/whatsapp_sessions/${sessionId}/chats/${phoneNumber}/`;
+    let deletedFiles = 0;
+    try {
+      const bucket = admin.storage().bucket();
+      const [files] = await bucket.getFiles({ prefix: storagePrefix });
+      deletedFiles = files.length;
+      if (deletedFiles > 0) {
+        await bucket.deleteFiles({ prefix: storagePrefix });
+      }
+    } catch (storageError) {
+      console.error(`[/delete-chat] Storage cleanup falló para ${phoneNumber}:`, storageError);
+      return res.status(500).json({
+        error: 'Failed to delete chat media',
+        details: (storageError as any).message,
+      });
+    }
+
+    // Paso 2: Mensajes en lotes de 500 (límite de batch de Firestore).
     const chatRef = db
       .collection(ACCOUNTS_COLLECTION)
       .doc(accountId)
@@ -958,33 +978,31 @@ app.post('/delete-chat-history', express.json(), async (req, res) => {
       .doc(phoneNumber);
 
     const messagesRef = chatRef.collection('messages');
-    const messagesSnapshot = await messagesRef.get();
+    let deletedMessages = 0;
+    while (true) {
+      const snap = await messagesRef.limit(500).get();
+      if (snap.empty) break;
+      const batch = db.batch();
+      snap.docs.forEach((doc) => batch.delete(doc.ref));
+      await batch.commit();
+      deletedMessages += snap.size;
+      if (snap.size < 500) break;
+    }
 
-    // Batch delete all messages
-    const batch = db.batch();
-    messagesSnapshot.docs.forEach((doc) => {
-      batch.delete(doc.ref);
-    });
-    await batch.commit();
+    // Paso 3: Chat doc.
+    await chatRef.delete();
 
-    // Reset chat document (keep it but clear lastMessage)
-    await chatRef.update({
-      lastMessage: '',
-      lastMessageTimestamp: null,
-      lastMessageId: '',
-    });
-
-    console.log(`[DEV] Chat history deleted for ${phoneNumber} (Account: ${accountId}, Session: ${sessionId})`);
+    console.log(`[/delete-chat] ${phoneNumber} eliminado (Account: ${accountId}, Session: ${sessionId}) — ${deletedMessages} mensajes, ${deletedFiles} archivos`);
 
     res.json({
       success: true,
-      message: 'Chat history deleted',
-      deletedCount: messagesSnapshot.size,
+      deletedMessages,
+      deletedFiles,
     });
   } catch (error) {
-    console.error('[DEV] Error deleting chat history:', error);
+    console.error('[/delete-chat] Error:', error);
     res.status(500).json({
-      error: 'Failed to delete chat history',
+      error: 'Failed to delete chat',
       details: (error as any).message,
     });
   }

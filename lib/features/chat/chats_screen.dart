@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'dart:ui';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter_slidable/flutter_slidable.dart';
+import 'package:http/http.dart' as http;
 import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/core/services/storage_service.dart';
@@ -525,6 +527,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                     selectedChatPhone = phoneNumber;
                   });
                 },
+                onLongPress: () => _showChatOptions(phoneNumber, contactName),
               );
 
               // Sin pendientes: nada que cerrar, no envolvemos en Slidable
@@ -665,6 +668,147 @@ class _ChatsScreenState extends State<ChatsScreen> {
     );
   }
 
+  // Bottom sheet de opciones al pulsar largo un chat. Mismo patrón visual que
+  // el menú de opciones de mensajes (message_bubble.dart). Aquí irán futuras
+  // acciones: archivar, marcar como listo, etc.
+  void _showChatOptions(String phoneNumber, String contactName) {
+    HapticFeedback.mediumImpact();
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: surfaceDark,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (sheetCtx) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 8),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 40,
+              height: 4,
+              margin: const EdgeInsets.only(bottom: 12),
+              decoration: BoxDecoration(
+                color: primaryAqua.withValues(alpha: 0.3),
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.delete, size: 20, color: Color(0xFFF87171)),
+              title: const Text('Eliminar chat', style: TextStyle(color: white)),
+              onTap: () {
+                Navigator.pop(sheetCtx);
+                _confirmDeleteChat(phoneNumber, contactName);
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // Hard-delete del chat: borra Storage + mensajes + chat doc en el backend.
+  // Acción irreversible: la UI exige que el usuario confirme en el AlertDialog.
+  Future<void> _confirmDeleteChat(String phoneNumber, String contactName) async {
+    final displayName = contactName.isNotEmpty ? contactName : phoneNumber;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: true,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: surfaceDark,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text(
+          '¿Eliminar chat?',
+          style: TextStyle(color: white, fontWeight: FontWeight.bold),
+        ),
+        content: RichText(
+          text: TextSpan(
+            style: const TextStyle(color: lightText, fontSize: 14, height: 1.4),
+            children: [
+              const TextSpan(text: 'Se eliminarán '),
+              const TextSpan(
+                text: 'todos los mensajes y archivos',
+                style: TextStyle(fontWeight: FontWeight.bold, color: white),
+              ),
+              const TextSpan(text: ' del chat con '),
+              TextSpan(
+                text: displayName,
+                style: const TextStyle(fontWeight: FontWeight.bold, color: white),
+              ),
+              const TextSpan(text: '.\n\n'),
+              const TextSpan(
+                text: 'Esta acción no se puede deshacer.',
+                style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFFEF4444)),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancelar', style: TextStyle(color: lightText)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text(
+              'Eliminar',
+              style: TextStyle(color: Color(0xFFEF4444), fontWeight: FontWeight.bold),
+            ),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true || !mounted) return;
+
+    try {
+      final response = await http.post(
+        Uri.parse('$backendUrl/delete-chat'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'phoneNumber': phoneNumber,
+          'sessionKey': widget.sessionKey,
+          'sessionId': widget.sessionId,
+          'accountId': widget.accountId,
+        }),
+      ).timeout(const Duration(seconds: 30));
+
+      if (!mounted) return;
+
+      if (response.statusCode == 200) {
+        // Si el chat eliminado estaba abierto en split-view, cerramos el panel.
+        if (selectedChatPhone == phoneNumber) {
+          setState(() => selectedChatPhone = null);
+        }
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Chat con $displayName eliminado'),
+            backgroundColor: primaryAqua,
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error al eliminar (${response.statusCode})'),
+            backgroundColor: const Color(0xFFEF4444),
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('Error deleting chat: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Error de conexión al eliminar el chat'),
+            backgroundColor: Color(0xFFEF4444),
+          ),
+        );
+      }
+    }
+  }
+
   Future<void> _markAsResponded(String contactPhone) async {
     HapticFeedback.lightImpact();
     try {
@@ -708,6 +852,7 @@ class _ChatTile extends StatelessWidget {
   final bool isSelected;
   final int unrespondedCount;
   final VoidCallback onTap;
+  final VoidCallback? onLongPress;
 
   const _ChatTile({
     required this.phoneNumber,
@@ -717,6 +862,7 @@ class _ChatTile extends StatelessWidget {
     required this.isSelected,
     required this.unrespondedCount,
     required this.onTap,
+    this.onLongPress,
   });
 
   String _formatTimestamp(DateTime? dateTime) {
@@ -747,6 +893,7 @@ class _ChatTile extends StatelessWidget {
 
     return GestureDetector(
       onTap: onTap,
+      onLongPress: onLongPress,
       child: Container(
         color: isSelected ? surfaceDark.withValues(alpha: 0.8) : Colors.transparent,
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
