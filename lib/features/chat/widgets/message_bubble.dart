@@ -12,7 +12,11 @@ import 'package:crm_whatsapp/core.dart';
 // anterior se pausa automáticamente porque cambia el activeMessageId.
 class _AudioPlaybackController {
   static final _AudioPlaybackController instance = _AudioPlaybackController._();
-  _AudioPlaybackController._();
+  _AudioPlaybackController._() {
+    // Autoloop: cuando el audio termina vuelve a empezar. Se rompe sólo
+    // cuando el operador pausa o le da play a otra burbuja (que llama stop).
+    player.setLoopMode(LoopMode.one);
+  }
 
   final AudioPlayer player = AudioPlayer();
   final ValueNotifier<String?> activeMessageId = ValueNotifier(null);
@@ -1036,28 +1040,36 @@ class _FullscreenVideoState extends State<_FullscreenVideo> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
+      extendBodyBehindAppBar: true,
       appBar: AppBar(
         backgroundColor: Colors.transparent,
         elevation: 0,
         iconTheme: const IconThemeData(color: Colors.white),
       ),
-      body: Center(
-        child: _error != null
-            ? Text('No se pudo cargar el video',
-                style: const TextStyle(color: Colors.white70))
-            : !_initialized
-                ? const CircularProgressIndicator(
-                    valueColor: AlwaysStoppedAnimation<Color>(primaryAqua))
-                : Stack(
-                    alignment: Alignment.bottomCenter,
-                    children: [
-                      Center(
-                        child: AspectRatio(
-                          aspectRatio: _controller.value.aspectRatio,
-                          child: VideoPlayer(_controller),
-                        ),
+      body: _error != null
+          ? Center(
+              child: Text('No se pudo cargar el video',
+                  style: const TextStyle(color: Colors.white70)),
+            )
+          : !_initialized
+              ? const Center(
+                  child: CircularProgressIndicator(
+                      valueColor: AlwaysStoppedAnimation<Color>(primaryAqua)),
+                )
+              : Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    Center(
+                      child: AspectRatio(
+                        aspectRatio: _controller.value.aspectRatio,
+                        child: VideoPlayer(_controller),
                       ),
-                      Container(
+                    ),
+                    Positioned(
+                      left: 0,
+                      right: 0,
+                      bottom: 0,
+                      child: Container(
                         decoration: BoxDecoration(
                           gradient: LinearGradient(
                             begin: Alignment.bottomCenter,
@@ -1068,7 +1080,8 @@ class _FullscreenVideoState extends State<_FullscreenVideo> {
                             ],
                           ),
                         ),
-                        padding: const EdgeInsets.fromLTRB(12, 24, 12, 16),
+                        padding: EdgeInsets.fromLTRB(
+                            12, 24, 12, 16 + MediaQuery.of(context).padding.bottom),
                         child: Row(
                           children: [
                             IconButton(
@@ -1123,9 +1136,9 @@ class _FullscreenVideoState extends State<_FullscreenVideo> {
                           ],
                         ),
                       ),
-                    ],
-                  ),
-      ),
+                    ),
+                  ],
+                ),
     );
   }
 }
