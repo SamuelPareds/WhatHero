@@ -1,7 +1,7 @@
 import admin from 'firebase-admin';
 import { toNumber } from '@whiskeysockets/baileys';
 import { SessionData } from '../types';
-import { extractPhoneNumber } from '../utils/phone';
+import { extractPhoneNumber, isConversationalJid } from '../utils/phone';
 import { ACCOUNTS_COLLECTION } from '../config/env';
 import { extractMediaInfo, processMediaAsync } from './mediaService';
 
@@ -59,6 +59,13 @@ export async function saveMessageToFirestore(message: any, sessionKey: string, a
     // Extract clean phone number from the message's remote JID
     const remoteJid = message.key.remoteJid;
     if (!remoteJid) return;
+
+    // Filtro: ignorar Estados/Stories, listas de difusión y canales.
+    // No son conversaciones 1:1 y no deben crear chats en Firestore.
+    if (!isConversationalJid(remoteJid)) {
+      console.log(`[Filter] JID no conversacional ignorado en saveMessage: ${remoteJid}`);
+      return;
+    }
 
     let phoneNumber = extractPhoneNumber(remoteJid);
     if (!phoneNumber) return;

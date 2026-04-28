@@ -15,7 +15,7 @@ import { rmSync, existsSync, readdirSync, writeFileSync, readFileSync, mkdirSync
 import { randomUUID } from 'crypto';
 import cron from 'node-cron';
 import { SessionData, MessageBuffer } from './src/types';
-import { extractPhoneNumber, storeLIDMapping, resolveLIDViaSock } from './src/utils/phone';
+import { extractPhoneNumber, storeLIDMapping, resolveLIDViaSock, isConversationalJid } from './src/utils/phone';
 import { initializeSession, saveMessageToFirestore, getAIConfig, updateContactInFirestore, consolidateLIDChat, incrementUnrespondedCount, resetUnrespondedCount } from './src/services/firestoreService';
 import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer } from './src/services/aiService';
 import { ReminderService } from './src/services/reminderService';
@@ -342,6 +342,13 @@ async function startSession(sessionKey: string, accountId: string) {
   sock.ev.on('messages.upsert', async (m) => {
     const message = m.messages?.[0];
     if (!message) return;
+
+    // Filtro temprano: descartamos Estados/Stories, listas de difusión y canales
+    // antes de tocar Firestore, IA, recordatorios o contadores. Son ruido para el CRM.
+    if (!isConversationalJid(message.key.remoteJid)) {
+      console.log(`[Filter] JID no conversacional ignorado en upsert: ${message.key.remoteJid}`);
+      return;
+    }
 
     await saveMessageToFirestore(message, sessionKey, accountId, sessions, sock.user?.id, sock);
 

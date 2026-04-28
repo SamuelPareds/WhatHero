@@ -3,6 +3,18 @@
 // This map stores discovered mappings from the "lid-mapping.update" event
 const lidToPhoneMap = new Map<string, string>();
 
+// Determina si un JID corresponde a una conversación 1:1 con un humano.
+// Excluye Estados/Stories (status@broadcast), listas de difusión (*@broadcast)
+// y canales de WhatsApp (*@newsletter). Los grupos (@g.us) NO se filtran aquí
+// porque su manejo es responsabilidad de cada caller (algunos sí los procesan).
+export function isConversationalJid(jid: string | null | undefined): boolean {
+  if (!jid) return false;
+  if (jid === 'status@broadcast') return false;
+  if (jid.endsWith('@broadcast')) return false;
+  if (jid.endsWith('@newsletter')) return false;
+  return true;
+}
+
 // Helper function to extract and clean phone number from Baileys JID
 // Handles formats:
 //   - "5215561642726:50@s.whatsapp.net" -> "5215561642726"
