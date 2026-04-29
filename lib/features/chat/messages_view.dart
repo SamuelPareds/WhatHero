@@ -5,6 +5,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:http/http.dart' as http;
 import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
+import 'package:crm_whatsapp/features/settings.dart';
 import 'widgets/message_bubble.dart';
 
 class MessagesView extends StatefulWidget {
@@ -12,12 +13,17 @@ class MessagesView extends StatefulWidget {
   final String sessionId;
   final String? sessionKey;
   final String accountId;
+  // Indica si el asistente IA está configurado a nivel sesión (ai_enabled).
+  // Cuando es false, los botones de IA se muestran apagados y guían al usuario
+  // hacia la configuración en lugar de invitar a tocar funciones rotas.
+  final bool sessionAiEnabled;
 
   const MessagesView({
     required this.phoneNumber,
     required this.sessionId,
     this.sessionKey,
     required this.accountId,
+    required this.sessionAiEnabled,
     super.key,
   });
 
@@ -132,6 +138,24 @@ class _MessagesViewState extends State<MessagesView> {
         });
       }
     }
+  }
+
+  // Abre el panel de configuración de sesión como bottom sheet. Se usa cuando
+  // el asistente IA aún no está habilitado: en lugar de bloquear al usuario,
+  // lo llevamos directo al lugar donde puede activarlo.
+  void _openSessionSettings() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: surfaceDark,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (_) => SessionSettingsPanel(
+        sessionId: widget.sessionId,
+        accountId: widget.accountId,
+      ),
+    );
   }
 
   Future<void> _generateAIResponse() async {
@@ -502,7 +526,20 @@ class _MessagesViewState extends State<MessagesView> {
                     const SizedBox(width: 8),
                     _isGenerating
                         ? const SizedBox(width: 44, height: 44, child: Padding(padding: EdgeInsets.all(8), child: CircularProgressIndicator(strokeWidth: 2, valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF06B6D4)))))
-                        : IconButton(icon: const Icon(Icons.auto_awesome, size: 20), tooltip: 'Generar respuesta con IA', color: const Color(0xFF06B6D4), onPressed: _generateAIResponse),
+                        : IconButton(
+                            icon: const Icon(Icons.auto_awesome, size: 20),
+                            tooltip: widget.sessionAiEnabled
+                                ? 'Generar respuesta con IA'
+                                : 'Configura el asistente IA primero',
+                            // Sin asistente configurado, atenuamos el icono y, al
+                            // tocarlo, abrimos directamente el panel de ajustes.
+                            color: widget.sessionAiEnabled
+                                ? const Color(0xFF06B6D4)
+                                : const Color(0xFF9CA3AF).withValues(alpha: 0.4),
+                            onPressed: widget.sessionAiEnabled
+                                ? _generateAIResponse
+                                : _openSessionSettings,
+                          ),
                     const SizedBox(width: 4),
                     Container(
                       decoration: BoxDecoration(color: primaryAqua, borderRadius: BorderRadius.circular(12)),

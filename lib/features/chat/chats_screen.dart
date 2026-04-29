@@ -558,113 +558,168 @@ class _ChatsScreenState extends State<ChatsScreen> {
     );
   }
 
-  Widget _buildMessageDetail() {
-    return Scaffold(
-      appBar: AppBar(
-        leading: MediaQuery.of(context).size.width < 600
-            ? IconButton(
-                icon: const Icon(Icons.arrow_back),
-                onPressed: () {
-                  setState(() {
-                    selectedChatPhone = null;
-                  });
-                },
-              )
-            : null,
-        title: StreamBuilder<DocumentSnapshot>(
-          stream: FirebaseFirestore.instance
-              .collection(accountsCollection)
-              .doc(widget.accountId)
-              .collection('whatsapp_sessions')
-              .doc(widget.sessionId)
-              .collection('chats')
-              .doc(selectedChatPhone)
-              .snapshots(),
-          builder: (context, snapshot) {
-            final chatData = snapshot.data?.data() as Map<String, dynamic>?;
-            final contactName = chatData?['contactName'] as String? ?? '';
-
-            final displayName = contactName.isNotEmpty ? contactName : (selectedChatPhone ?? 'Chat');
-
-            return Text(
-              displayName,
-              style: const TextStyle(fontWeight: FontWeight.bold),
-              overflow: TextOverflow.ellipsis,
-              maxLines: 1,
-            );
-          },
-        ),
-        actions: [
-          // Stream único: provee tanto el toggle de IA como el botón "marcar respondido"
-          StreamBuilder<DocumentSnapshot>(
-            stream: FirebaseFirestore.instance
-                .collection(accountsCollection)
-                .doc(widget.accountId)
-                .collection('whatsapp_sessions')
-                .doc(widget.sessionId)
-                .collection('chats')
-                .doc(selectedChatPhone)
-                .snapshots(),
-            builder: (context, snapshot) {
-              final data = snapshot.data?.data() as Map<String, dynamic>?;
-              final aiAutoResponse = data?['ai_auto_response'] as bool? ?? true;
-
-              return IconButton(
-                icon: Icon(
-                  Icons.face_retouching_natural,
-                  size: 20,
-                  color: aiAutoResponse ? const Color(0xFF06B6D4) : const Color(0xFF9CA3AF),
-                ),
-                tooltip: aiAutoResponse ? 'Desactivar IA automática' : 'Activar IA automática',
-                onPressed: () async {
-                  try {
-                    HapticFeedback.lightImpact();
-
-                    // Si desactivamos, cancelar cualquier buffer pendiente
-                    if (aiAutoResponse) {
-                      SocketService().sendMessage({
-                        'event': 'cancel_ai_buffer',
-                        'data': {
-                          'sessionKey': widget.sessionKey,
-                          'contactPhone': selectedChatPhone,
-                        }
-                      });
-                      debugPrint('Emitted cancel_ai_buffer for $selectedChatPhone via SocketService');
-                    } else {
-                      _showEtherealToast(true, 'IA activada', isActivating: true);
-                    }
-
-                    await FirebaseFirestore.instance
-                        .collection(accountsCollection)
-                        .doc(widget.accountId)
-                        .collection('whatsapp_sessions')
-                        .doc(widget.sessionId)
-                        .collection('chats')
-                        .doc(selectedChatPhone)
-                        .update({'ai_auto_response': !aiAutoResponse});
-                  } catch (e) {
-                    debugPrint('Error toggling AI: $e');
-                    _showEtherealToast(false, 'Error al cambiar IA', isActivating: false);
-                  }
-                },
-              );
-            },
-          ),
-          IconButton(
-            icon: const Icon(Icons.info_outline, size: 20),
-            onPressed: () {
-              _showContactInfo(selectedChatPhone!);
-            },
-          ),
-        ],
-        elevation: 0,
+  // Abre el panel de configuración de la sesión como bottom sheet. Lo usamos
+  // cuando los iconos de IA están en estado "no configurado": en lugar de
+  // mostrar un botón muerto, llevamos al usuario directo a activar el asistente.
+  void _openSessionSettings() {
+    if (widget.sessionId == null) return;
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: surfaceDark,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
       ),
-      body: MessagesView(
-        phoneNumber: selectedChatPhone!,
+      builder: (_) => SessionSettingsPanel(
         sessionId: widget.sessionId!,
-        sessionKey: widget.sessionKey,
         accountId: widget.accountId,
       ),
+    );
+  }
+
+  Future<void> _toggleAiAutoResponse(bool currentValue) async {
+    try {
+      HapticFeedback.lightImpact();
+
+      // Si desactivamos, cancelar cualquier buffer pendiente
+      if (currentValue) {
+        SocketService().sendMessage({
+          'event': 'cancel_ai_buffer',
+          'data': {
+            'sessionKey': widget.sessionKey,
+            'contactPhone': selectedChatPhone,
+          }
+        });
+        debugPrint('Emitted cancel_ai_buffer for $selectedChatPhone via SocketService');
+      } else {
+        _showEtherealToast(true, 'IA activada', isActivating: true);
+      }
+
+      await FirebaseFirestore.instance
+          .collection(accountsCollection)
+          .doc(widget.accountId)
+          .collection('whatsapp_sessions')
+          .doc(widget.sessionId)
+          .collection('chats')
+          .doc(selectedChatPhone)
+          .update({'ai_auto_response': !currentValue});
+    } catch (e) {
+      debugPrint('Error toggling AI: $e');
+      _showEtherealToast(false, 'Error al cambiar IA', isActivating: false);
+    }
+  }
+
+  Widget _buildMessageDetail() {
+    // StreamBuilder externo: escucha el documento de la sesión para conocer
+    // si el asistente IA fue configurado (ai_enabled). Ese estado lo necesitan
+    // tanto el toggle del AppBar como el botón "generar respuesta" dentro
+    // de MessagesView, así que lo leemos una sola vez aquí y lo propagamos.
+    return StreamBuilder<DocumentSnapshot>(
+      stream: FirebaseFirestore.instance
+          .collection(accountsCollection)
+          .doc(widget.accountId)
+          .collection('whatsapp_sessions')
+          .doc(widget.sessionId)
+          .snapshots(),
+      builder: (context, sessionSnapshot) {
+        final sessionData = sessionSnapshot.data?.data() as Map<String, dynamic>?;
+        final sessionAiEnabled = sessionData?['ai_enabled'] as bool? ?? false;
+
+        return Scaffold(
+          appBar: AppBar(
+            leading: MediaQuery.of(context).size.width < 600
+                ? IconButton(
+                    icon: const Icon(Icons.arrow_back),
+                    onPressed: () {
+                      setState(() {
+                        selectedChatPhone = null;
+                      });
+                    },
+                  )
+                : null,
+            title: StreamBuilder<DocumentSnapshot>(
+              stream: FirebaseFirestore.instance
+                  .collection(accountsCollection)
+                  .doc(widget.accountId)
+                  .collection('whatsapp_sessions')
+                  .doc(widget.sessionId)
+                  .collection('chats')
+                  .doc(selectedChatPhone)
+                  .snapshots(),
+              builder: (context, snapshot) {
+                final chatData = snapshot.data?.data() as Map<String, dynamic>?;
+                final contactName = chatData?['contactName'] as String? ?? '';
+
+                final displayName = contactName.isNotEmpty ? contactName : (selectedChatPhone ?? 'Chat');
+
+                return Text(
+                  displayName,
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                  overflow: TextOverflow.ellipsis,
+                  maxLines: 1,
+                );
+              },
+            ),
+            actions: [
+              StreamBuilder<DocumentSnapshot>(
+                stream: FirebaseFirestore.instance
+                    .collection(accountsCollection)
+                    .doc(widget.accountId)
+                    .collection('whatsapp_sessions')
+                    .doc(widget.sessionId)
+                    .collection('chats')
+                    .doc(selectedChatPhone)
+                    .snapshots(),
+                builder: (context, snapshot) {
+                  final data = snapshot.data?.data() as Map<String, dynamic>?;
+                  final aiAutoResponse = data?['ai_auto_response'] as bool? ?? true;
+
+                  // Tres estados:
+                  // 1) Asistente sin configurar → gris tenue, tap abre settings.
+                  // 2) Configurado y activo en este chat → verde, tap lo apaga.
+                  // 3) Configurado pero pausado en este chat → gris, tap lo enciende.
+                  final Color iconColor;
+                  final String tooltip;
+                  final VoidCallback onPressed;
+                  if (!sessionAiEnabled) {
+                    iconColor = const Color(0xFF9CA3AF).withValues(alpha: 0.4);
+                    tooltip = 'Configura el asistente IA primero';
+                    onPressed = _openSessionSettings;
+                  } else if (aiAutoResponse) {
+                    iconColor = const Color(0xFF10B981);
+                    tooltip = 'Desactivar IA automática';
+                    onPressed = () => _toggleAiAutoResponse(true);
+                  } else {
+                    iconColor = const Color(0xFF9CA3AF);
+                    tooltip = 'Activar IA automática';
+                    onPressed = () => _toggleAiAutoResponse(false);
+                  }
+
+                  return IconButton(
+                    icon: Icon(Icons.face_retouching_natural, size: 20, color: iconColor),
+                    tooltip: tooltip,
+                    onPressed: onPressed,
+                  );
+                },
+              ),
+              IconButton(
+                icon: const Icon(Icons.info_outline, size: 20),
+                onPressed: () {
+                  _showContactInfo(selectedChatPhone!);
+                },
+              ),
+            ],
+            elevation: 0,
+          ),
+          body: MessagesView(
+            phoneNumber: selectedChatPhone!,
+            sessionId: widget.sessionId!,
+            sessionKey: widget.sessionKey,
+            accountId: widget.accountId,
+            sessionAiEnabled: sessionAiEnabled,
+          ),
+        );
+      },
     );
   }
 
