@@ -17,7 +17,7 @@ import cron from 'node-cron';
 import { SessionData, MessageBuffer } from './src/types';
 import { extractPhoneNumber, storeLIDMapping, resolveLIDViaSock, isConversationalJid } from './src/utils/phone';
 import { initializeSession, saveMessageToFirestore, getAIConfig, cacheContactName, applyContactUpdate, reconcileContactNames, consolidateLIDChat, incrementUnrespondedCount, resetUnrespondedCount } from './src/services/firestoreService';
-import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer } from './src/services/aiService';
+import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer, emitAiState } from './src/services/aiService';
 import { extractMediaInfo, classifyIncomingMedia } from './src/services/mediaService';
 import { ReminderService } from './src/services/reminderService';
 import { ACCOUNTS_COLLECTION, IS_PRODUCTION } from './src/config/env';
@@ -386,6 +386,8 @@ async function startSession(sessionKey: string, accountId: string) {
             clearTimeout(buffer.timeout);
             messageBuffers.delete(bufferKey);
             console.log(`[Buffer] CANCELLED: Human response detected for ${contactPhoneForCancel}`);
+            // El humano tomó el control: liberamos el indicador en el frontend
+            emitAiState(accountId, sessionKey, contactPhoneForCancel, 'idle');
           }
 
           // Reset contador: el humano (o IA via CRM) acaba de responder
@@ -497,6 +499,9 @@ async function startSession(sessionKey: string, accountId: string) {
         clearTimeout(existingBuffer.timeout);
       }
       messageBuffers.delete(bufferKey);
+
+      // Media bloqueada cortó el ciclo de IA: idle para liberar el spinner
+      emitAiState(accountId, sessionKey, contactPhone, 'idle');
 
       // +1 por el mensaje multimedia que disparó el gate
       await incrementUnrespondedCount(accountId, session.phoneNumber, contactPhone, pendingTexts + 1);
@@ -623,6 +628,11 @@ async function startSession(sessionKey: string, accountId: string) {
       console.log(`[Buffer] Cleared existing timeout for ${contactPhone}`);
     }
 
+    // Notificamos al frontend: estamos esperando más mensajes del cliente.
+    // expectedRespondAt permite pintar un mini-countdown si quisiéramos.
+    const expectedRespondAt = Date.now() + aiConfig.responseDelayMs;
+    emitAiState(accountId, sessionKey, contactPhone, 'buffering', expectedRespondAt);
+
     // Set new timeout to process buffer after delay
     buffer.timeout = setTimeout(async () => {
       console.log(`[Buffer] Timeout expired for ${contactPhone}, processing ${buffer.messages.length} message(s)`);
@@ -630,7 +640,7 @@ async function startSession(sessionKey: string, accountId: string) {
       // Mark buffer as responded BEFORE processing to prevent race conditions
       buffer.responded = true;
 
-      // Process the buffered messages
+      // Process the buffered messages (emite 'thinking', 'responding' e 'idle' internamente)
       await processMessageBuffer(
         sessionKey,
         accountId,
@@ -1209,6 +1219,8 @@ io.on('connection', (socket) => {
       console.log(`[Buffer] No pending buffer found for ${contactPhone}`);
       socket.emit('ai_toggle_result', { success: true, message: 'IA desactivada', contactPhone });
     }
+    // Cualquiera de los dos caminos: el frontend ya no debe ver indicador de IA
+    emitAiState(accountId, sessionKey, contactPhone, 'idle');
   });
 });
 

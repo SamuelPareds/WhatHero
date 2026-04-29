@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'package:flutter/foundation.dart';
 import '../config.dart';
+import 'ai_state_service.dart';
 
 /// Evento de QR recibido
 class QREvent {
@@ -103,6 +104,13 @@ class SocketService {
     _socket?.on('human_attention_required', (data) {
       debugPrint('[SocketService] Atención humana requerida: $data');
       _humanAttentionController.add(Map<String, dynamic>.from(data));
+    });
+
+    // Estado del ciclo IA (buffering/thinking/responding/idle). No exponemos
+    // un Stream porque el AiStateService ya es un ChangeNotifier al que los
+    // widgets se suscriben directamente con ListenableBuilder.
+    _socket?.on('ai_state', (data) {
+      AiStateService().applySocketPayload(Map<String, dynamic>.from(data));
     });
   }
 

@@ -16,6 +16,27 @@ function getIO() {
   return (global as any).__WhatHeroIO;
 }
 
+// Estados efímeros del ciclo de vida de la IA por chat. Se emiten via Socket.io
+// (no se persisten en Firestore) para que el frontend pinte feedback en vivo
+// sin disparar writes ni lecturas adicionales.
+export type AiLifecycleState = 'buffering' | 'thinking' | 'responding' | 'idle';
+
+export function emitAiState(
+  accountId: string,
+  sessionKey: string,
+  contactPhone: string,
+  state: AiLifecycleState,
+  expectedRespondAt?: number,
+): void {
+  const io = getIO();
+  if (!io) return;
+  const payload: Record<string, unknown> = { sessionKey, contactPhone, state };
+  if (expectedRespondAt !== undefined) {
+    payload.expectedRespondAt = expectedRespondAt;
+  }
+  io.to(accountId).emit('ai_state', payload);
+}
+
 // Check if current time is within active hours
 export function isWithinActiveHours(aiConfig: any): boolean {
   if (!aiConfig.activeHours?.enabled) {
@@ -383,6 +404,11 @@ export async function processMessageBuffer(
   aiConfig: any,
   bufferedMessages: string[]
 ) {
+  // Marcamos 'thinking' al inicio: el buffer ya cerró y empieza el trabajo
+  // pesado (historial + discriminador + generación). El frontend reemplaza
+  // el icono de IA por un spinner mientras dure este bloque.
+  emitAiState(accountId, sessionKey, contactPhone, 'thinking');
+
   try {
     // Combine all buffered messages into one context
     const combinedMessage = bufferedMessages.join('\n');
@@ -467,6 +493,8 @@ export async function processMessageBuffer(
         console.log(
           `[Buffer] Emitted human_attention_required for ${contactPhone} (+${bufferedMessages.length} unresponded)`
         );
+        // Discriminador derivó a humano: terminamos el ciclo de IA → idle
+        emitAiState(accountId, sessionKey, contactPhone, 'idle');
         return; // Skip AI response
       }
 
@@ -485,6 +513,9 @@ export async function processMessageBuffer(
     );
 
     if (aiResponse) {
+      // Pasamos a 'responding' justo antes de empezar a mandar chunks: este es
+      // el momento crítico donde el usuario puede querer interceptar.
+      emitAiState(accountId, sessionKey, contactPhone, 'responding');
       await sendChunkedResponse(session.sock, remoteJid, aiResponse);
       console.log(`[Buffer] Auto-responded to ${remoteJid} en chunks`);
       // La IA respondió: cualquier pendiente previo queda cubierto
@@ -492,5 +523,9 @@ export async function processMessageBuffer(
     }
   } catch (error) {
     console.error('[Buffer] Error processing message buffer:', error);
+  } finally {
+    // Cierre garantizado del ciclo: tanto en éxito como en error volvemos a idle
+    // para que el frontend libere el spinner y muestre el icono de IA normal.
+    emitAiState(accountId, sessionKey, contactPhone, 'idle');
   }
 }

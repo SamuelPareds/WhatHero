@@ -7,11 +7,13 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter_slidable/flutter_slidable.dart';
 import 'package:http/http.dart' as http;
 import 'package:crm_whatsapp/core.dart';
+import 'package:crm_whatsapp/core/services/ai_state_service.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/core/services/storage_service.dart';
 import 'package:crm_whatsapp/features/settings.dart';
 import 'package:crm_whatsapp/features/accounts.dart';
 import 'messages_view.dart';
+import 'widgets/ai_state_indicator.dart';
 import 'widgets/unread_badge.dart';
 
 class ChatsScreen extends StatefulWidget {
@@ -522,6 +524,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 timestamp: timestamp,
                 isSelected: selectedChatPhone == phoneNumber,
                 unrespondedCount: unrespondedCount,
+                sessionKey: widget.sessionKey,
                 onTap: () {
                   setState(() {
                     selectedChatPhone = phoneNumber;
@@ -673,32 +676,83 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 builder: (context, snapshot) {
                   final data = snapshot.data?.data() as Map<String, dynamic>?;
                   final aiAutoResponse = data?['ai_auto_response'] as bool? ?? true;
+                  final unrespondedCount =
+                      (data?['unresponded_count'] as num?)?.toInt() ?? 0;
 
-                  // Tres estados:
-                  // 1) Asistente sin configurar → gris tenue, tap abre settings.
-                  // 2) Configurado y activo en este chat → verde, tap lo apaga.
-                  // 3) Configurado pero pausado en este chat → gris, tap lo enciende.
-                  final Color iconColor;
-                  final String tooltip;
-                  final VoidCallback onPressed;
-                  if (!sessionAiEnabled) {
-                    iconColor = const Color(0xFF9CA3AF).withValues(alpha: 0.4);
-                    tooltip = 'Configura el asistente IA primero';
-                    onPressed = _openSessionSettings;
-                  } else if (aiAutoResponse) {
-                    iconColor = const Color(0xFF10B981);
-                    tooltip = 'Desactivar IA automática';
-                    onPressed = () => _toggleAiAutoResponse(true);
-                  } else {
-                    iconColor = const Color(0xFF9CA3AF);
-                    tooltip = 'Activar IA automática';
-                    onPressed = () => _toggleAiAutoResponse(false);
-                  }
+                  // El estado IA en vivo manda sobre el icono estático cuando hay
+                  // un ciclo activo (buffering/thinking/responding). Cuando el
+                  // ciclo cierra y quedó humano pendiente, mostramos el contador.
+                  return ListenableBuilder(
+                    listenable: AiStateService(),
+                    builder: (context, _) {
+                      final aiStatus = widget.sessionKey == null
+                          ? null
+                          : AiStateService().statusFor(
+                              widget.sessionKey!,
+                              selectedChatPhone!,
+                            );
+                      final aiActive = aiStatus != null &&
+                          aiStatus.state != AiChatState.idle;
 
-                  return IconButton(
-                    icon: Icon(Icons.face_retouching_natural, size: 20, color: iconColor),
-                    tooltip: tooltip,
-                    onPressed: onPressed,
+                      // Caso 1: ciclo IA en curso → spinner. Tap apaga IA y
+                      // cancela el buffer en backend (mismo flujo de antes).
+                      if (aiActive) {
+                        return IconButton(
+                          tooltip: _aiStateTooltip(aiStatus.state),
+                          onPressed: () => _toggleAiAutoResponse(true),
+                          icon: const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              valueColor: AlwaysStoppedAnimation<Color>(
+                                Color(0xFF06B6D4),
+                              ),
+                            ),
+                          ),
+                        );
+                      }
+
+                      // Caso 2: ciclo cerrado y discriminador (u otro motivo)
+                      // dejó pendientes humanos → mostramos el badge en el lugar
+                      // del icono. Tap conserva el comportamiento de toggle IA.
+                      if (aiAutoResponse &&
+                          sessionAiEnabled &&
+                          unrespondedCount > 0) {
+                        return IconButton(
+                          tooltip:
+                              '$unrespondedCount mensaje(s) requieren tu atención',
+                          onPressed: () => _toggleAiAutoResponse(true),
+                          icon: _AppBarUnrespondedBadge(count: unrespondedCount),
+                        );
+                      }
+
+                      // Caso 3: render base (sin configurar / activo / pausado).
+                      final Color iconColor;
+                      final String tooltip;
+                      final VoidCallback onPressed;
+                      if (!sessionAiEnabled) {
+                        iconColor =
+                            const Color(0xFF9CA3AF).withValues(alpha: 0.4);
+                        tooltip = 'Configura el asistente IA primero';
+                        onPressed = _openSessionSettings;
+                      } else if (aiAutoResponse) {
+                        iconColor = const Color(0xFF10B981);
+                        tooltip = 'Desactivar IA automática';
+                        onPressed = () => _toggleAiAutoResponse(true);
+                      } else {
+                        iconColor = const Color(0xFF9CA3AF);
+                        tooltip = 'Activar IA automática';
+                        onPressed = () => _toggleAiAutoResponse(false);
+                      }
+
+                      return IconButton(
+                        icon: Icon(Icons.face_retouching_natural,
+                            size: 20, color: iconColor),
+                        tooltip: tooltip,
+                        onPressed: onPressed,
+                      );
+                    },
                   );
                 },
               ),
@@ -883,6 +937,21 @@ class _ChatsScreenState extends State<ChatsScreen> {
     }
   }
 
+  // Tooltip por estado del ciclo IA. Se muestra al mantener pulsado el spinner
+  // del AppBar — guía al usuario sobre qué pasa y cómo intervenir.
+  String _aiStateTooltip(AiChatState state) {
+    switch (state) {
+      case AiChatState.buffering:
+        return 'IA esperando más mensajes — toca para detener';
+      case AiChatState.thinking:
+        return 'IA pensando respuesta — toca para detener';
+      case AiChatState.responding:
+        return 'IA enviando respuesta — toca para detener';
+      case AiChatState.idle:
+        return '';
+    }
+  }
+
   void _showContactInfo(String phoneNumber) {
     showModalBottomSheet(
       context: context,
@@ -906,6 +975,10 @@ class _ChatTile extends StatelessWidget {
   final DateTime? timestamp;
   final bool isSelected;
   final int unrespondedCount;
+  // Necesario para consultar AiStateService (clave: sessionKey:contactPhone).
+  // Puede ser null si la sesión está desconectada — en ese caso nunca habrá
+  // estado de IA activo y el tile cae al render normal con el badge.
+  final String? sessionKey;
   final VoidCallback onTap;
   final VoidCallback? onLongPress;
 
@@ -916,6 +989,7 @@ class _ChatTile extends StatelessWidget {
     required this.timestamp,
     required this.isSelected,
     required this.unrespondedCount,
+    required this.sessionKey,
     required this.onTap,
     this.onLongPress,
   });
@@ -1002,24 +1076,87 @@ class _ChatTile extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 8),
-            // Timestamp arriba, badge abajo (estilo WhatsApp)
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.end,
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Text(
-                  _formatTimestamp(timestamp),
-                  style: TextStyle(
-                    fontSize: 11,
-                    color: unrespondedCount > 0 ? const Color(0xFFF97316) : lightText,
-                    fontWeight: unrespondedCount > 0 ? FontWeight.w600 : FontWeight.w400,
-                  ),
-                ),
-                const SizedBox(height: 6),
-                UnrespondedBadge(count: unrespondedCount),
-              ],
+            // Trailing: timestamp arriba + (indicador IA | badge naranja).
+            // Mientras la IA esté activa para este chat, ocultamos el badge y
+            // mostramos en su lugar el spinner con leyenda; al volver a idle,
+            // regresa el badge si hay pendientes.
+            ListenableBuilder(
+              listenable: AiStateService(),
+              builder: (context, _) {
+                final aiStatus = sessionKey == null
+                    ? null
+                    : AiStateService().statusFor(sessionKey!, phoneNumber);
+                final aiActive =
+                    aiStatus != null && aiStatus.state != AiChatState.idle;
+
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Text(
+                      _formatTimestamp(timestamp),
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: unrespondedCount > 0
+                            ? const Color(0xFFF97316)
+                            : lightText,
+                        fontWeight: unrespondedCount > 0
+                            ? FontWeight.w600
+                            : FontWeight.w400,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 220),
+                      switchInCurve: Curves.easeOut,
+                      switchOutCurve: Curves.easeIn,
+                      child: aiActive
+                          ? AiStateIndicator(
+                              key: const ValueKey('ai-indicator'),
+                              state: aiStatus.state,
+                              compact: true,
+                            )
+                          : KeyedSubtree(
+                              key: const ValueKey('unresp-badge'),
+                              child: UnrespondedBadge(count: unrespondedCount),
+                            ),
+                    ),
+                  ],
+                );
+              },
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+// Variante compacta del UnrespondedBadge para usar dentro del AppBar en lugar
+// del icono de IA: misma paleta naranja, tamaño consistente con un IconButton
+// (20px) para que la altura del AppBar no salte al alternar entre icono/badge.
+class _AppBarUnrespondedBadge extends StatelessWidget {
+  final int count;
+  const _AppBarUnrespondedBadge({required this.count});
+
+  @override
+  Widget build(BuildContext context) {
+    final label = count > 99 ? '99+' : '$count';
+    return Container(
+      constraints: const BoxConstraints(minWidth: 22, minHeight: 22),
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF97316),
+        borderRadius: BorderRadius.circular(11),
+      ),
+      alignment: Alignment.center,
+      child: Text(
+        label,
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 11,
+          fontWeight: FontWeight.w700,
+          height: 1.1,
         ),
       ),
     );
