@@ -17,6 +17,39 @@ const RETRY_BASE_DELAY_MS = 2000;
 
 export type MediaType = 'image' | 'sticker' | 'document' | 'audio' | 'video';
 
+// Resultado del gate de media que corre ANTES de la IA en messages.upsert.
+// - 'none':        el mensaje no trae media procesable.
+// - 'decorative':  sticker o GIF — la IA puede ignorarlos sin perder contexto.
+// - 'allowed':     tipo cuya lectura por IA está habilitada en la sesión.
+// - 'blocked':     tipo NO leíble por la IA → handoff a humano.
+export type MediaClass = 'none' | 'decorative' | 'allowed' | 'blocked';
+
+export interface MediaAllowlist {
+  image: boolean;
+  audio: boolean;
+  video: boolean;
+  document: boolean;
+}
+
+// Clasifica un mensaje entrante respecto al gate de media. Stickers y los
+// videos marcados como GIF (gifPlayback) son siempre decorativos: no hacen
+// handoff aunque el allowlist los tenga apagados.
+export function classifyIncomingMedia(
+  info: MediaInfo | null,
+  allowlist: MediaAllowlist
+): MediaClass {
+  if (!info) return 'none';
+  if (info.type === 'sticker') return 'decorative';
+  if (info.type === 'video' && info.firestoreFields?.mediaIsGif) return 'decorative';
+  switch (info.type) {
+    case 'image':    return allowlist.image    ? 'allowed' : 'blocked';
+    case 'audio':    return allowlist.audio    ? 'allowed' : 'blocked';
+    case 'video':    return allowlist.video    ? 'allowed' : 'blocked';
+    case 'document': return allowlist.document ? 'allowed' : 'blocked';
+  }
+  return 'none';
+}
+
 export interface MediaInfo {
   type: MediaType;
   mime: string;

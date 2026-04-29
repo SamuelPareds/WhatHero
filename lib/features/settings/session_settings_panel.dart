@@ -47,7 +47,17 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
   String _newKeywordResponse = '';
   String _newKeywordImageUrl = '';
   bool _discriminatorEnabled = false;
-  
+
+  // Allowlist de tipos de media que la IA puede leer. Por defecto todo en
+  // false: la IA es solo-texto. En Fase 1 los toggles son read-only
+  // ("próximamente") — el estado se carga y persiste para que el backend
+  // tenga el campo disponible y para evitar reescribir cuando se abra
+  // la edición en Fase 2.
+  bool _mediaAllowImage = false;
+  bool _mediaAllowAudio = false;
+  bool _mediaAllowVideo = false;
+  bool _mediaAllowDocument = false;
+
   // AgendaCool
   bool _reminderEnabled = false;
   TimeOfDay _reminderScheduledTime = const TimeOfDay(hour: 9, minute: 0);
@@ -126,6 +136,15 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
 
           _discriminatorEnabled = data['ai_discriminator_enabled'] ?? false;
           _discriminatorPromptController.text = data['ai_discriminator_prompt'] ?? '';
+
+          if (data['ai_media_allowlist'] is Map) {
+            final allow = data['ai_media_allowlist'] as Map;
+            _mediaAllowImage = allow['image'] == true;
+            _mediaAllowAudio = allow['audio'] == true;
+            _mediaAllowVideo = allow['video'] == true;
+            _mediaAllowDocument = allow['document'] == true;
+          }
+
           _isLoading = false;
         });
       } else {
@@ -162,6 +181,12 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
         'ai_keyword_rules': _keywordRules,
         'ai_discriminator_enabled': _discriminatorEnabled,
         'ai_discriminator_prompt': _discriminatorPromptController.text.trim(),
+        'ai_media_allowlist': {
+          'image': _mediaAllowImage,
+          'audio': _mediaAllowAudio,
+          'video': _mediaAllowVideo,
+          'document': _mediaAllowDocument,
+        },
         'reminder_enabled': _reminderEnabled,
         'reminder_api_url': _reminderApiUrlController.text.trim(),
         'reminder_template': _reminderTemplateController.text.trim(),
@@ -387,15 +412,149 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
                 ),
                 const SizedBox(height: 12),
                 _textField(
-                  controller: _discriminatorPromptController, 
-                  label: 'Reglas de Intervención Humana', 
-                  hint: 'Ejemplo:\n\nPasa al humano si:\n- El cliente pregunta disponibilidad de fechas específicas\n- Quiere agendar una cita\n- Pregunta por saldo o historial personal\n\nDe lo contrario, responde tú mismo.', 
+                  controller: _discriminatorPromptController,
+                  label: 'Reglas de Intervención Humana',
+                  hint: 'Ejemplo:\n\nPasa al humano si:\n- El cliente pregunta disponibilidad de fechas específicas\n- Quiere agendar una cita\n- Pregunta por saldo o historial personal\n\nDe lo contrario, responde tú mismo.',
                   maxLines: 6,
                   canExpand: true,
                   focusNode: _discriminatorFocus,
                 ),
               ],
             ),
+          ),
+          const SizedBox(height: 16),
+          _mediaFiltersCard(),
+        ],
+      ),
+    );
+  }
+
+  // Tarjeta de "Filtros de Media": informa al usuario por qué un mensaje con
+  // multimedia se redirige a humano cuando la IA aún no puede leer ese tipo.
+  // En Fase 1 los toggles son read-only ("próximamente"). En fases futuras
+  // se habilitarán cuando integremos lectura multimodal por tipo.
+  Widget _mediaFiltersCard() {
+    return Container(
+      decoration: BoxDecoration(
+        color: darkBg.withValues(alpha: 0.3),
+        borderRadius: BorderRadius.circular(16),
+      ),
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.shield_outlined, color: primaryAqua),
+              const SizedBox(width: 12),
+              const Expanded(
+                child: Text(
+                  'Filtros de Media',
+                  style: TextStyle(color: white, fontWeight: FontWeight.bold, fontSize: 15),
+                ),
+              ),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                decoration: BoxDecoration(
+                  color: primaryAqua.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Text(
+                  'SIEMPRE ACTIVO',
+                  style: TextStyle(color: primaryAqua, fontSize: 9, fontWeight: FontWeight.bold, letterSpacing: 0.5),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Text(
+            'El asistente IA solo entiende texto. Cuando un cliente envía media de un tipo que la IA aún no puede leer, su mensaje se redirige automáticamente a un humano para evitar respuestas sin contexto. Los stickers y GIFs se ignoran (son decorativos).',
+            style: TextStyle(color: lightText.withValues(alpha: 0.85), fontSize: 12, height: 1.4),
+          ),
+          const SizedBox(height: 16),
+          _mediaToggleRow(Icons.image_outlined, 'Imágenes', _mediaAllowImage, comingSoon: true),
+          const SizedBox(height: 8),
+          _mediaToggleRow(Icons.mic_none_outlined, 'Audios y notas de voz', _mediaAllowAudio, comingSoon: true),
+          const SizedBox(height: 8),
+          _mediaToggleRow(Icons.description_outlined, 'Documentos', _mediaAllowDocument, comingSoon: true),
+          const SizedBox(height: 8),
+          _mediaToggleRow(
+            Icons.videocam_outlined,
+            'Videos',
+            _mediaAllowVideo,
+            comingSoon: true,
+            note: 'Costo elevado en tokens',
+          ),
+          const SizedBox(height: 12),
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: primaryAqua.withValues(alpha: 0.08),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(Icons.info_outline, color: primaryAqua.withValues(alpha: 0.8), size: 14),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Los toggles se irán habilitando conforme la IA aprenda a leer cada tipo de media.',
+                    style: TextStyle(color: lightText.withValues(alpha: 0.8), fontSize: 11, height: 1.4),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Fila individual del filtro de media. En Fase 1 todos los toggles llegan
+  // con comingSoon=true (deshabilitados visualmente con etiqueta).
+  Widget _mediaToggleRow(IconData icon, String label, bool value, {bool comingSoon = false, String? note}) {
+    return Opacity(
+      opacity: comingSoon ? 0.55 : 1.0,
+      child: Row(
+        children: [
+          Icon(icon, color: primaryAqua, size: 18),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Text(label, style: const TextStyle(color: white, fontSize: 13, fontWeight: FontWeight.w600)),
+                    if (comingSoon) ...[
+                      const SizedBox(width: 8),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                        decoration: BoxDecoration(
+                          color: lightText.withValues(alpha: 0.15),
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: const Text(
+                          'PRÓXIMAMENTE',
+                          style: TextStyle(color: lightText, fontSize: 8, fontWeight: FontWeight.bold, letterSpacing: 0.4),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+                if (note != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: Text(note, style: TextStyle(color: lightText.withValues(alpha: 0.7), fontSize: 10)),
+                  ),
+              ],
+            ),
+          ),
+          Switch(
+            value: value,
+            activeColor: primaryAqua,
+            onChanged: comingSoon ? null : (v) {},
           ),
         ],
       ),

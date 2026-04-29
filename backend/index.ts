@@ -18,6 +18,7 @@ import { SessionData, MessageBuffer } from './src/types';
 import { extractPhoneNumber, storeLIDMapping, resolveLIDViaSock, isConversationalJid } from './src/utils/phone';
 import { initializeSession, saveMessageToFirestore, getAIConfig, cacheContactName, applyContactUpdate, reconcileContactNames, consolidateLIDChat, incrementUnrespondedCount, resetUnrespondedCount } from './src/services/firestoreService';
 import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer } from './src/services/aiService';
+import { extractMediaInfo, classifyIncomingMedia } from './src/services/mediaService';
 import { ReminderService } from './src/services/reminderService';
 import { ACCOUNTS_COLLECTION, IS_PRODUCTION } from './src/config/env';
 
@@ -424,13 +425,16 @@ async function startSession(sessionKey: string, accountId: string) {
 
     const messageText = message.message?.conversation ||
                         message.message?.extendedTextMessage?.text || '';
-    if (!messageText.trim()) {
-      // Media-only (imagen/audio sin caption): la IA no lo procesa, requiere humano
+    const mediaInfo = extractMediaInfo(message);
+
+    // Caso degenerado: ni texto ni media (mensaje desconocido). Lo contamos
+    // como pendiente y salimos para no romper flujo posterior con campos vacíos.
+    if (!messageText.trim() && !mediaInfo) {
       await markUnresponded();
       return;
     }
 
-    // --- KEYWORD TRIGGER FOR REMINDERS ---
+    // --- KEYWORD TRIGGER FOR REMINDERS (sólo texto exacto, comando del operador) ---
     const lowerMsg = messageText.toLowerCase();
     if (lowerMsg === 'enviar_recordatorios' || lowerMsg === 'enviar recordatorios') {
       console.log(`[Reminders] Manual trigger detected from ${message.key.remoteJid}`);
@@ -446,75 +450,135 @@ async function startSession(sessionKey: string, accountId: string) {
     }
 
     const aiConfig = await getAIConfig(session, accountId);
+    const mediaClass = classifyIncomingMedia(mediaInfo, aiConfig.mediaAllowlist);
 
-    // --- KEYWORD RULES (Immediate response) ---
-    for (const rule of aiConfig.keywordRules) {
-      if (messageText.toLowerCase().includes(rule.keyword.toLowerCase())) {
-        console.log(`[AI] Keyword rule matched: "${rule.keyword}", sending canned response`);
-        await new Promise(r => setTimeout(r, aiConfig.responseDelayMs > 2000 ? 2000 : aiConfig.responseDelayMs));
-
-        if (rule.imageUrl) {
-          try {
-            console.log(`[AI] Downloading image for keyword rule: ${rule.imageUrl}`);
-            const imageResponse = await fetch(rule.imageUrl).then(res => {
-              if (!res.ok) throw new Error(`Failed to fetch image: ${res.statusText}`);
-              return res.arrayBuffer();
-            });
-            const imageBuffer = Buffer.from(imageResponse);
-            await session.sock.sendMessage(remoteJid, {
-              image: imageBuffer,
-              caption: rule.response || undefined
-            });
-          } catch (error) {
-            console.error(`[AI] Error sending image for keyword rule:`, error);
-            // Fallback to text only if image fails
-            if (rule.response) {
-              await session.sock.sendMessage(remoteJid, { text: rule.response });
-            }
-          }
-        } else {
-          await session.sock.sendMessage(remoteJid, { text: rule.response });
-        }
-
-        return; // IA-canned respondió, no incrementar
-      }
-    }
-
+    // ============================================
+    // ELEGIBILIDAD DE LA IA (precondición del media gate)
+    // El gate sólo dispara handoff cuando la IA realmente iba a responder.
+    // Si la IA no es elegible, la media bloqueada igual cuenta como pendiente
+    // por el flujo normal de markUnresponded más abajo.
+    // ============================================
     const provider: 'gemini' | 'openai' = (aiConfig.provider || 'gemini') as 'gemini' | 'openai';
     const hasValidApiKey = provider === 'openai'
       ? aiConfig.openaiApiKey
       : aiConfig.apiKey;
-    if (!aiConfig.enabled || !hasValidApiKey) {
+    const baseEligible = !!aiConfig.enabled && !!hasValidApiKey && isWithinActiveHours(aiConfig);
+
+    let aiAutoResponseEnabled = true; // Default: IA habilitada para este chat
+    if (baseEligible) {
+      try {
+        const chatDoc = await db
+          .collection(ACCOUNTS_COLLECTION)
+          .doc(accountId)
+          .collection('whatsapp_sessions')
+          .doc(session.phoneNumber)
+          .collection('chats')
+          .doc(contactPhone)
+          .get();
+        aiAutoResponseEnabled = (chatDoc.data()?.ai_auto_response as boolean) ?? true;
+      } catch (error) {
+        console.warn(`[AI] Error checking ai_auto_response for ${contactPhone}:`, error);
+      }
+    }
+    const aiEligible = baseEligible && aiAutoResponseEnabled;
+
+    // ============================================
+    // MEDIA GATE: filtro pre-IA universal (NO depende del discriminador).
+    // Si la IA iba a responder pero llegó media que no puede leer, cancelamos
+    // el buffer en curso y derivamos a humano. Stickers y GIFs son decorativos
+    // (mediaClass='decorative') y no rompen este flujo.
+    // ============================================
+    if (aiEligible && mediaClass === 'blocked') {
+      const bufferKey = `${sessionKey}:${contactPhone}`;
+      const existingBuffer = messageBuffers.get(bufferKey);
+      const pendingTexts = existingBuffer?.messages.length ?? 0;
+
+      if (existingBuffer?.timeout) {
+        clearTimeout(existingBuffer.timeout);
+      }
+      messageBuffers.delete(bufferKey);
+
+      // +1 por el mensaje multimedia que disparó el gate
+      await incrementUnrespondedCount(accountId, session.phoneNumber, contactPhone, pendingTexts + 1);
+
+      try {
+        await db
+          .collection(ACCOUNTS_COLLECTION)
+          .doc(accountId)
+          .collection('whatsapp_sessions')
+          .doc(session.phoneNumber)
+          .collection('chats')
+          .doc(contactPhone)
+          .set(
+            { human_attention_at: admin.firestore.FieldValue.serverTimestamp() },
+            { merge: true }
+          );
+      } catch (error) {
+        console.error('[MediaGate] Error stamping human_attention_at:', error);
+      }
+
+      io.to(accountId).emit('human_attention_required', {
+        sessionKey,
+        chatId: contactPhone,
+        phoneNumber: session.phoneNumber,
+        timestamp: new Date().toISOString(),
+        reason: 'blocked_media',
+        mediaType: mediaInfo?.type,
+      });
+
+      console.log(
+        `[MediaGate] Handoff humano: media bloqueada (${mediaInfo?.type}) para ${contactPhone} ` +
+        `(canceló buffer con ${pendingTexts} texto(s))`
+      );
+      return;
+    }
+
+    // --- KEYWORD RULES (respuesta canned inmediata, sólo si hay texto) ---
+    if (messageText.trim()) {
+      for (const rule of aiConfig.keywordRules) {
+        if (messageText.toLowerCase().includes(rule.keyword.toLowerCase())) {
+          console.log(`[AI] Keyword rule matched: "${rule.keyword}", sending canned response`);
+          await new Promise(r => setTimeout(r, aiConfig.responseDelayMs > 2000 ? 2000 : aiConfig.responseDelayMs));
+
+          if (rule.imageUrl) {
+            try {
+              console.log(`[AI] Downloading image for keyword rule: ${rule.imageUrl}`);
+              const imageResponse = await fetch(rule.imageUrl).then(res => {
+                if (!res.ok) throw new Error(`Failed to fetch image: ${res.statusText}`);
+                return res.arrayBuffer();
+              });
+              const imageBuffer = Buffer.from(imageResponse);
+              await session.sock.sendMessage(remoteJid, {
+                image: imageBuffer,
+                caption: rule.response || undefined
+              });
+            } catch (error) {
+              console.error(`[AI] Error sending image for keyword rule:`, error);
+              // Fallback to text only if image fails
+              if (rule.response) {
+                await session.sock.sendMessage(remoteJid, { text: rule.response });
+              }
+            }
+          } else {
+            await session.sock.sendMessage(remoteJid, { text: rule.response });
+          }
+
+          return; // IA-canned respondió, no incrementar
+        }
+      }
+    }
+
+    // Si la IA no es elegible (apagada, sin API key, fuera de horario o
+    // ai_auto_response off para este chat) → contamos pendiente y salimos.
+    if (!aiEligible) {
+      console.log(`[AI] No elegible para ${contactPhone} (enabled=${aiConfig.enabled}, hasKey=${!!hasValidApiKey}, inHours=${isWithinActiveHours(aiConfig)}, chatAuto=${aiAutoResponseEnabled})`);
       await markUnresponded();
       return;
     }
 
-    // Check if within active hours
-    if (!isWithinActiveHours(aiConfig)) {
-      console.log(`[AI] Outside active hours, skipping AI response`);
-      await markUnresponded();
-      return;
-    }
-
-    // Check if AI auto-response is enabled for this specific contact
-    let aiAutoResponseEnabled = true; // Default: IA enabled
-    try {
-      const chatDocRef = db
-        .collection(ACCOUNTS_COLLECTION)
-        .doc(accountId)
-        .collection('whatsapp_sessions')
-        .doc(session.phoneNumber)
-        .collection('chats')
-        .doc(contactPhone);
-
-      const chatDoc = await chatDocRef.get();
-      aiAutoResponseEnabled = (chatDoc.data()?.ai_auto_response as boolean) ?? true;
-    } catch (error) {
-      console.warn(`[AI] Error checking ai_auto_response for ${contactPhone}:`, error);
-    }
-
-    if (!aiAutoResponseEnabled) {
-      console.log(`[AI] Auto-response disabled for ${contactPhone}, skipping AI response`);
+    // IA elegible y sin media bloqueada. Si todavía no hay texto (sticker o
+    // GIF solo, o media 'allowed' sin caption) la IA no tiene qué responder.
+    if (!messageText.trim()) {
       await markUnresponded();
       return;
     }

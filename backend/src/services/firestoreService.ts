@@ -496,6 +496,8 @@ export async function getAIConfig(session: SessionData, accountId: string) {
     const doc = await sessionDocRef.get();
     const data = doc.data();
 
+    const rawAllowlist = (data?.ai_media_allowlist ?? {}) as Record<string, unknown>;
+
     session.aiConfig = {
       enabled: data?.ai_enabled ?? false,
       apiKey: data?.ai_api_key ?? '',
@@ -509,6 +511,12 @@ export async function getAIConfig(session: SessionData, accountId: string) {
       discriminator: {
         enabled: data?.ai_discriminator_enabled ?? false,
         prompt: data?.ai_discriminator_prompt ?? '',
+      },
+      mediaAllowlist: {
+        image:    rawAllowlist.image    === true,
+        audio:    rawAllowlist.audio    === true,
+        video:    rawAllowlist.video    === true,
+        document: rawAllowlist.document === true,
       },
       loadedAt: now,
     };
@@ -528,6 +536,12 @@ export async function getAIConfig(session: SessionData, accountId: string) {
       discriminator: {
         enabled: false,
         prompt: '',
+      },
+      mediaAllowlist: {
+        image: false,
+        audio: false,
+        video: false,
+        document: false,
       },
       loadedAt: now,
     };
