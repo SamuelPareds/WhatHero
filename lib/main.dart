@@ -7,6 +7,7 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'firebase_options.dart';
 import 'core.dart';
+import 'core/services/socket_service.dart';
 import 'core/services/storage_service.dart';
 import 'features/auth.dart';
 import 'features/chat.dart';
@@ -35,10 +36,29 @@ class MyApp extends StatelessWidget {
   }
 }
 
-class SessionDispatcher extends StatelessWidget {
+class SessionDispatcher extends StatefulWidget {
   final String accountId;
 
   const SessionDispatcher({required this.accountId, super.key});
+
+  @override
+  State<SessionDispatcher> createState() => _SessionDispatcherState();
+}
+
+class _SessionDispatcherState extends State<SessionDispatcher> {
+  @override
+  void initState() {
+    super.initState();
+    // Inicializar el socket aquí — único punto de entrada tras el login que
+    // conoce el accountId y es ancestro garantizado de ChatsScreen y
+    // AccountsScreen. Si lo dejábamos sólo en AccountsScreen, en cold start
+    // con sesión guardada saltábamos directo a ChatsScreen y el listener
+    // 'ai_state' nunca se registraba (los estados IA no funcionaban hasta
+    // que el usuario entraba manualmente a AccountsScreen).
+    // SocketService.init es idempotente: si ya estamos conectados con este
+    // accountId, no hace nada.
+    SocketService().init(widget.accountId);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -58,7 +78,7 @@ class SessionDispatcher extends StatelessWidget {
         return StreamBuilder<QuerySnapshot>(
           stream: FirebaseFirestore.instance
               .collection(accountsCollection)
-              .doc(accountId)
+              .doc(widget.accountId)
               .collection('whatsapp_sessions')
               .where('status', isEqualTo: 'connected')
               .snapshots(),
@@ -95,14 +115,14 @@ class SessionDispatcher extends StatelessWidget {
                 return ChatsScreen(
                   sessionId: sessionId,
                   sessionKey: sessionKey,
-                  accountId: accountId,
+                  accountId: widget.accountId,
                   initialAlias: alias,
                 );
               }
             }
 
             // If no connected session, go to ChatsScreen anyway but with null session
-            return ChatsScreen(accountId: accountId);
+            return ChatsScreen(accountId: widget.accountId);
           },
         );
       },

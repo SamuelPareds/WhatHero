@@ -28,7 +28,10 @@ class _AccountsScreenState extends State<AccountsScreen> {
   @override
   void initState() {
     super.initState();
-    SocketService().init(widget.accountId);
+    // Nota: SocketService().init(...) vive en SessionDispatcher (main.dart)
+    // — único punto de entrada tras login con accountId disponible. Aquí no
+    // se reinicializa para no duplicar la fuente de verdad; el método es
+    // idempotente igual, así que es seguro removerlo.
     _loadVersion();
   }
 
