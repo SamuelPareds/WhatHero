@@ -42,6 +42,13 @@ class _ChatsScreenState extends State<ChatsScreen> {
   StreamSubscription? _statusSubscription;
   StreamSubscription? _humanAttentionSubscription;
 
+  // Flash efímero "cancelado": cuando el usuario apaga la IA durante un ciclo
+  // activo, marcamos este chat por ~3s para mostrar feedback en subtítulo+barra.
+  // Pasados esos segundos volvemos al estado natural (sin etiquetas), porque
+  // con la IA off en este chat ya no aplica "tu turno" — responde el humano.
+  String? _cancelledChatPhone;
+  Timer? _cancelledTimer;
+
   @override
   void initState() {
     super.initState();
@@ -84,7 +91,20 @@ class _ChatsScreenState extends State<ChatsScreen> {
     searchController.dispose();
     _statusSubscription?.cancel();
     _humanAttentionSubscription?.cancel();
+    _cancelledTimer?.cancel();
     super.dispose();
+  }
+
+  // Marca este chat como "recién cancelado" durante ~3s. Reinicia el timer si
+  // se apaga repetidamente, así no se acumulan ventanas zombies.
+  void _markChatCancelled(String chatPhone) {
+    _cancelledTimer?.cancel();
+    setState(() => _cancelledChatPhone = chatPhone);
+    _cancelledTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted) {
+        setState(() => _cancelledChatPhone = null);
+      }
+    });
   }
 
   // 📌 Ethereal Bubble Notification with face_retouching_natural icon
@@ -584,16 +604,31 @@ class _ChatsScreenState extends State<ChatsScreen> {
     try {
       HapticFeedback.lightImpact();
 
-      // Si desactivamos, cancelar cualquier buffer pendiente
       if (currentValue) {
-        SocketService().sendMessage({
-          'event': 'cancel_ai_buffer',
-          'data': {
-            'sessionKey': widget.sessionKey,
-            'contactPhone': selectedChatPhone,
-          }
+        // Apagando IA en este chat. Capturamos si había un ciclo IA activo
+        // ANTES de emitir el cancel: solo entonces vale la pena mostrar el
+        // flash "cancelado". Si la IA estaba ociosa, basta con el toast.
+        final wasAiActive = widget.sessionKey != null &&
+                selectedChatPhone != null
+            ? AiStateService()
+                .isActiveFor(widget.sessionKey!, selectedChatPhone!)
+            : false;
+
+        // Cortar el buffer pendiente en el backend. Usamos emit() directo:
+        // sendMessage() emite 'send_message_socket' (handler de mensajes
+        // WhatsApp) y rompía con "Unauthorized accountId" porque el backend
+        // intentaba leer 'to' y 'accountId' del payload de cancelación.
+        SocketService().emit('cancel_ai_buffer', {
+          'sessionKey': widget.sessionKey,
+          'contactPhone': selectedChatPhone,
         });
-        debugPrint('Emitted cancel_ai_buffer for $selectedChatPhone via SocketService');
+        debugPrint(
+            'Emitted cancel_ai_buffer for $selectedChatPhone via SocketService');
+
+        if (wasAiActive && selectedChatPhone != null) {
+          _markChatCancelled(selectedChatPhone!);
+        }
+        _showEtherealToast(true, 'IA desactivada', isActivating: false);
       } else {
         _showEtherealToast(true, 'IA activada', isActivating: true);
       }
@@ -680,65 +715,95 @@ class _ChatsScreenState extends State<ChatsScreen> {
                       overflow: TextOverflow.ellipsis,
                       maxLines: 1,
                     ),
-                    AnimatedSwitcher(
-                      duration: const Duration(milliseconds: 220),
-                      switchInCurve: Curves.easeOut,
-                      switchOutCurve: Curves.easeIn,
-                      child: needsHuman
-                          ? const Padding(
-                              key: ValueKey('appbar-subtitle-needs-human'),
-                              padding: EdgeInsets.only(top: 1),
-                              child: Text(
-                                'tu turno',
-                                style: TextStyle(
-                                  color: Color(0xFFF59E0B),
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w600,
-                                  height: 1.1,
-                                  letterSpacing: 0.2,
-                                ),
+                    // Subtítulo con prioridad:
+                    //   cancelado (3s) > ciclo IA > "tu turno" > vacío.
+                    // El flash de cancelación gana siempre durante su ventana
+                    // para dar feedback claro al usuario que acaba de apagar
+                    // el toggle. Mientras hay ciclo IA, manda la IA. Sin IA y
+                    // con pendientes, "tu turno" para el humano.
+                    ListenableBuilder(
+                      listenable: AiStateService(),
+                      builder: (context, _) {
+                        final aiStatus = widget.sessionKey == null
+                            ? null
+                            : AiStateService().statusFor(
+                                widget.sessionKey!,
+                                selectedChatPhone!,
+                              );
+                        final aiActive = aiStatus != null &&
+                            aiStatus.state != AiChatState.idle;
+                        final showCancelled =
+                            _cancelledChatPhone == selectedChatPhone;
+
+                        Widget child;
+                        if (showCancelled) {
+                          child = const Padding(
+                            key: ValueKey('appbar-subtitle-cancelled'),
+                            padding: EdgeInsets.only(top: 1),
+                            child: Text(
+                              'cancelado',
+                              style: TextStyle(
+                                color: Color(0xFF9CA3AF),
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                                height: 1.1,
+                                letterSpacing: 0.2,
                               ),
-                            )
-                          : const SizedBox.shrink(
-                              key: ValueKey('appbar-subtitle-empty'),
                             ),
+                          );
+                        } else if (aiActive) {
+                          child = Padding(
+                            key: ValueKey(
+                                'appbar-subtitle-ai-${aiStatus.state.name}'),
+                            padding: const EdgeInsets.only(top: 1),
+                            child: Text(
+                              _aiStateLabel(aiStatus.state),
+                              style: const TextStyle(
+                                color: primaryAqua,
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                                height: 1.1,
+                                letterSpacing: 0.2,
+                              ),
+                            ),
+                          );
+                        } else if (needsHuman) {
+                          child = const Padding(
+                            key: ValueKey('appbar-subtitle-needs-human'),
+                            padding: EdgeInsets.only(top: 1),
+                            child: Text(
+                              'tu turno',
+                              style: TextStyle(
+                                color: Color(0xFFF59E0B),
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                                height: 1.1,
+                                letterSpacing: 0.2,
+                              ),
+                            ),
+                          );
+                        } else {
+                          child = const SizedBox.shrink(
+                            key: ValueKey('appbar-subtitle-empty'),
+                          );
+                        }
+
+                        return AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 220),
+                          switchInCurve: Curves.easeOut,
+                          switchOutCurve: Curves.easeIn,
+                          child: child,
+                        );
+                      },
                     ),
                   ],
                 ),
                 actions: [
-                  // El icono base recupera siempre su rol de toggle 3-estados.
-                  // Sólo se reemplaza por spinner si hay un ciclo IA en vivo.
-                  // El "tu turno" ya vive en franja+subtítulo, así que aquí no
-                  // hay un tercer caso con badge naranja que confunda al tap.
-                  ListenableBuilder(
-                    listenable: AiStateService(),
-                    builder: (context, _) {
-                      final aiStatus = widget.sessionKey == null
-                          ? null
-                          : AiStateService().statusFor(
-                              widget.sessionKey!,
-                              selectedChatPhone!,
-                            );
-                      final aiActive = aiStatus != null &&
-                          aiStatus.state != AiChatState.idle;
-
-                      if (aiActive) {
-                        return IconButton(
-                          tooltip: _aiStateTooltip(aiStatus.state),
-                          onPressed: () => _toggleAiAutoResponse(true),
-                          icon: const SizedBox(
-                            width: 20,
-                            height: 20,
-                            child: CircularProgressIndicator(
-                              strokeWidth: 2,
-                              valueColor: AlwaysStoppedAnimation<Color>(
-                                Color(0xFF06B6D4),
-                              ),
-                            ),
-                          ),
-                        );
-                      }
-
+                  // Toggle puro de 2 estados: activar/desactivar IA en este
+                  // chat. Ya no muta a spinner durante el ciclo IA — la
+                  // actividad se comunica vía subtítulo + barra de carga.
+                  Builder(
+                    builder: (context) {
                       final Color iconColor;
                       final String tooltip;
                       final VoidCallback onPressed;
@@ -772,17 +837,66 @@ class _ChatsScreenState extends State<ChatsScreen> {
                     },
                   ),
                 ],
-                // Franja ámbar inferior: 2px constantes para no alterar la
-                // altura del AppBar al alternar; sólo cambia el color con un
-                // fade suave cuando hay pendientes humanos.
+                // Franja inferior 2px con cuatro modos (misma prioridad que
+                // el subtítulo para mantenerlos sincronizados):
+                // - cancelado  → gris sólida (3s).
+                // - ciclo IA   → barra de carga aqua (LinearProgressIndicator
+                //                indeterminado — efecto deslizante nativo).
+                // - tu turno   → ámbar sólida.
+                // - en reposo  → invisible.
+                // Altura constante para no saltar el AppBar al alternar.
                 bottom: PreferredSize(
                   preferredSize: const Size.fromHeight(2),
-                  child: AnimatedContainer(
-                    duration: const Duration(milliseconds: 220),
-                    height: 2,
-                    color: needsHuman
-                        ? const Color(0xFFF59E0B)
-                        : Colors.transparent,
+                  child: ListenableBuilder(
+                    listenable: AiStateService(),
+                    builder: (context, _) {
+                      final aiStatus = widget.sessionKey == null
+                          ? null
+                          : AiStateService().statusFor(
+                              widget.sessionKey!,
+                              selectedChatPhone!,
+                            );
+                      final aiActive = aiStatus != null &&
+                          aiStatus.state != AiChatState.idle;
+                      final showCancelled =
+                          _cancelledChatPhone == selectedChatPhone;
+
+                      Widget child;
+                      if (showCancelled) {
+                        child = Container(
+                          key: const ValueKey('appbar-bar-cancelled'),
+                          height: 2,
+                          color: const Color(0xFF9CA3AF),
+                        );
+                      } else if (aiActive) {
+                        child = const SizedBox(
+                          key: ValueKey('appbar-bar-ai'),
+                          height: 2,
+                          child: LinearProgressIndicator(
+                            minHeight: 2,
+                            backgroundColor: Colors.transparent,
+                            valueColor:
+                                AlwaysStoppedAnimation<Color>(primaryAqua),
+                          ),
+                        );
+                      } else if (needsHuman) {
+                        child = Container(
+                          key: const ValueKey('appbar-bar-human'),
+                          height: 2,
+                          color: const Color(0xFFF59E0B),
+                        );
+                      } else {
+                        child = const SizedBox(
+                          key: ValueKey('appbar-bar-empty'),
+                          height: 2,
+                        );
+                      }
+
+                      return AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 220),
+                        child: child,
+                      );
+                    },
                   ),
                 ),
                 elevation: 0,
@@ -961,16 +1075,16 @@ class _ChatsScreenState extends State<ChatsScreen> {
     }
   }
 
-  // Tooltip por estado del ciclo IA. Se muestra al mantener pulsado el spinner
-  // del AppBar — guía al usuario sobre qué pasa y cómo intervenir.
-  String _aiStateTooltip(AiChatState state) {
+  // Etiqueta corta del ciclo IA — se muestra en el subtítulo del AppBar
+  // mientras la IA está activa (mismo slot que "tu turno", con prioridad).
+  String _aiStateLabel(AiChatState state) {
     switch (state) {
       case AiChatState.buffering:
-        return 'IA esperando más mensajes — toca para detener';
+        return 'esperando…';
       case AiChatState.thinking:
-        return 'IA pensando respuesta — toca para detener';
+        return 'pensando…';
       case AiChatState.responding:
-        return 'IA enviando respuesta — toca para detener';
+        return 'respondiendo…';
       case AiChatState.idle:
         return '';
     }
