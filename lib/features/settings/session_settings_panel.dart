@@ -68,7 +68,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 4, vsync: this);
+    _tabController = TabController(length: 5, vsync: this);
     _aliasController = TextEditingController();
     _apiKeyController = TextEditingController();
     _openaiApiKeyController = TextEditingController();
@@ -248,6 +248,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
                 _buildGeneralTab(),
                 _buildAITab(),
                 _buildRulesTab(),
+                _buildLabelsTab(),
                 _buildIntegrationsTab(),
               ],
             ),
@@ -295,10 +296,13 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
         indicator: BoxDecoration(color: primaryAqua.withValues(alpha: 0.2), borderRadius: BorderRadius.circular(12), border: Border.all(color: primaryAqua.withValues(alpha: 0.5))),
         labelColor: primaryAqua,
         unselectedLabelColor: lightText,
+        isScrollable: true,
+        tabAlignment: TabAlignment.start,
         tabs: const [
           Tab(icon: Icon(Icons.person_outline, size: 20), text: 'Perfil'),
           Tab(icon: Icon(Icons.auto_awesome_outlined, size: 20), text: 'Asistente'),
           Tab(icon: Icon(Icons.reply_all_rounded, size: 20), text: 'Respuestas'),
+          Tab(icon: Icon(Icons.label_outline, size: 20), text: 'Etiquetas'),
           Tab(icon: Icon(Icons.electrical_services, size: 20), text: 'Conexión'),
         ],
       ),
@@ -624,6 +628,13 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
         ],
       ),
     );
+  }
+
+  // Pestaña 5: gestión de etiquetas. CRUD live sobre la subcolección `labels`
+  // de la sesión. No usa _save() del footer porque cada etiqueta se persiste
+  // al instante (modelo idéntico a quick_responses).
+  Widget _buildLabelsTab() {
+    return _LabelsTabBody(accountId: widget.accountId, sessionId: widget.sessionId);
   }
 
   Widget _buildFooter() {
@@ -1043,5 +1054,342 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
       const SizedBox(height: 8),
       Slider(value: current, min: min, max: max, activeColor: primaryAqua, inactiveColor: darkBg, onChanged: onChanged),
     ]);
+  }
+}
+
+// Cuerpo de la pestaña Etiquetas. Stateful por su cuenta para que los streams
+// y el form de creación no recarguen el resto del panel cuando el usuario
+// edita aquí. CRUD directo a Firestore — cada acción se persiste al instante.
+class _LabelsTabBody extends StatefulWidget {
+  final String accountId;
+  final String sessionId;
+
+  const _LabelsTabBody({required this.accountId, required this.sessionId});
+
+  @override
+  State<_LabelsTabBody> createState() => _LabelsTabBodyState();
+}
+
+class _LabelsTabBodyState extends State<_LabelsTabBody> {
+  CollectionReference<Map<String, dynamic>> get _ref => FirebaseFirestore
+      .instance
+      .collection(accountsCollection)
+      .doc(widget.accountId)
+      .collection('whatsapp_sessions')
+      .doc(widget.sessionId)
+      .collection('labels');
+
+  Future<void> _openEditor({ChatLabel? existing, int nextOrder = 0}) async {
+    final controller = TextEditingController(text: existing?.name ?? '');
+    String selectedHex = existing?.colorHex ?? kLabelPalette.first.hex;
+
+    await showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSt) => Dialog(
+          backgroundColor: surfaceDark,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  existing == null ? 'Nueva etiqueta' : 'Editar etiqueta',
+                  style: const TextStyle(
+                    color: white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 16),
+                TextField(
+                  controller: controller,
+                  autofocus: true,
+                  style: const TextStyle(color: white, fontSize: 14),
+                  maxLength: 24,
+                  decoration: InputDecoration(
+                    hintText: 'Ej: VIP, Urgente, Seguimiento...',
+                    hintStyle: TextStyle(color: white.withValues(alpha: 0.3)),
+                    filled: true,
+                    fillColor: darkBg.withValues(alpha: 0.4),
+                    counterStyle: const TextStyle(color: lightText, fontSize: 10),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide.none,
+                    ),
+                    contentPadding: const EdgeInsets.all(14),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                const Text(
+                  'COLOR',
+                  style: TextStyle(
+                    color: primaryAqua,
+                    fontSize: 11,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 1.2,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Wrap(
+                  spacing: 10,
+                  runSpacing: 10,
+                  children: kLabelPalette.map((c) {
+                    final isOn = c.hex.toUpperCase() == selectedHex.toUpperCase();
+                    return GestureDetector(
+                      onTap: () => setSt(() => selectedHex = c.hex),
+                      child: Container(
+                        width: 36,
+                        height: 36,
+                        decoration: BoxDecoration(
+                          color: c.color,
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: isOn ? Colors.white : Colors.transparent,
+                            width: 2.5,
+                          ),
+                          boxShadow: isOn
+                              ? [
+                                  BoxShadow(
+                                    color: c.color.withValues(alpha: 0.5),
+                                    blurRadius: 8,
+                                  ),
+                                ]
+                              : null,
+                        ),
+                        child: isOn
+                            ? const Icon(Icons.check,
+                                color: Colors.white, size: 18)
+                            : null,
+                      ),
+                    );
+                  }).toList(),
+                ),
+                const SizedBox(height: 24),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: () => Navigator.pop(ctx),
+                        style: OutlinedButton.styleFrom(
+                          side: BorderSide(
+                              color: lightText.withValues(alpha: 0.3)),
+                          padding: const EdgeInsets.symmetric(vertical: 12),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                        ),
+                        child: const Text('Cancelar',
+                            style: TextStyle(color: lightText)),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: ElevatedButton(
+                        onPressed: () async {
+                          final name = controller.text.trim();
+                          if (name.isEmpty) return;
+                          if (existing == null) {
+                            await _ref.add({
+                              'name': name,
+                              'color': selectedHex,
+                              'order': nextOrder,
+                              'createdAt': FieldValue.serverTimestamp(),
+                            });
+                          } else {
+                            await _ref.doc(existing.id).update({
+                              'name': name,
+                              'color': selectedHex,
+                            });
+                          }
+                          if (ctx.mounted) Navigator.pop(ctx);
+                        },
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: primaryAqua,
+                          foregroundColor: darkBg,
+                          padding: const EdgeInsets.symmetric(vertical: 12),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          elevation: 0,
+                        ),
+                        child: const Text('Guardar',
+                            style: TextStyle(fontWeight: FontWeight.bold)),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _confirmDelete(ChatLabel label) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: surfaceDark,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text('¿Eliminar etiqueta?',
+            style: TextStyle(color: white, fontWeight: FontWeight.bold)),
+        content: Text(
+          'Se quitará "${label.name}" de todos los chats que la tengan asignada.',
+          style: const TextStyle(color: lightText, fontSize: 14, height: 1.4),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancelar', style: TextStyle(color: lightText)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Eliminar',
+                style: TextStyle(
+                    color: Color(0xFFEF4444), fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    // Borrado simple del catálogo. Los chats que tenían el ID en `labelIds`
+    // lo mantendrán como huérfano: la UI lo ignora (resolución por catálogo)
+    // y el ID se limpiará la próxima vez que el usuario edite las etiquetas
+    // de ese chat. Evita un fan-out costoso al borrar.
+    await _ref.doc(label.id).delete();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<QuerySnapshot>(
+      stream: _ref.orderBy('order').snapshots(),
+      builder: (context, snap) {
+        if (!snap.hasData) {
+          return const Center(child: CircularProgressIndicator(color: primaryAqua));
+        }
+        final labels = snap.data!.docs.map((d) => ChatLabel.fromDoc(d)).toList();
+        final nextOrder = labels.isEmpty ? 0 : labels.last.order + 1;
+
+        return SingleChildScrollView(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'ETIQUETAS DE LA SESIÓN',
+                style: TextStyle(
+                  color: primaryAqua,
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 1.2,
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Crea etiquetas de colores para organizar tus chats. Aplican solo a esta sesión.',
+                style: TextStyle(color: lightText, fontSize: 13),
+              ),
+              const SizedBox(height: 20),
+              if (labels.isEmpty)
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(32),
+                  decoration: BoxDecoration(
+                    color: darkBg.withValues(alpha: 0.3),
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(
+                        color: lightText.withValues(alpha: 0.1), width: 1),
+                  ),
+                  child: Column(
+                    children: [
+                      Icon(Icons.label_outline,
+                          size: 40, color: lightText.withValues(alpha: 0.5)),
+                      const SizedBox(height: 12),
+                      const Text(
+                        'Aún no creaste etiquetas',
+                        style: TextStyle(
+                            color: white,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600),
+                      ),
+                      const SizedBox(height: 4),
+                      const Text(
+                        'Toca el botón de abajo para crear la primera.',
+                        style: TextStyle(color: lightText, fontSize: 12),
+                      ),
+                    ],
+                  ),
+                )
+              else
+                ...labels.map((l) => Container(
+                      margin: const EdgeInsets.only(bottom: 8),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 14, vertical: 10),
+                      decoration: BoxDecoration(
+                        color: darkBg.withValues(alpha: 0.3),
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Row(
+                        children: [
+                          Container(
+                            width: 14,
+                            height: 14,
+                            decoration: BoxDecoration(
+                              color: l.color,
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Text(
+                              l.name,
+                              style: const TextStyle(
+                                  color: white,
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.w500),
+                            ),
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.edit_outlined,
+                                size: 18, color: lightText),
+                            onPressed: () => _openEditor(existing: l),
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.delete_outline,
+                                size: 18, color: Color(0xFFEF4444)),
+                            onPressed: () => _confirmDelete(l),
+                          ),
+                        ],
+                      ),
+                    )),
+              const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  onPressed: () => _openEditor(nextOrder: nextOrder),
+                  icon: const Icon(Icons.add, size: 18),
+                  label: const Text('Crear etiqueta',
+                      style: TextStyle(fontWeight: FontWeight.bold)),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: primaryAqua.withValues(alpha: 0.1),
+                    foregroundColor: primaryAqua,
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    side: const BorderSide(color: primaryAqua),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    elevation: 0,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
   }
 }

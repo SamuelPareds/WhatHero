@@ -15,6 +15,8 @@ import 'package:crm_whatsapp/features/accounts.dart';
 import 'messages_view.dart';
 import 'widgets/ai_state_indicator.dart';
 import 'widgets/unread_badge.dart';
+import 'widgets/label_chip.dart';
+import 'widgets/labels_selector_sheet.dart';
 
 class ChatsScreen extends StatefulWidget {
   final String? sessionId;
@@ -41,6 +43,12 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
   StreamSubscription? _statusSubscription;
   StreamSubscription? _humanAttentionSubscription;
+  StreamSubscription? _labelsSubscription;
+
+  // Cache del catálogo de etiquetas de la sesión actual. Se mantiene en
+  // memoria para que cada `_ChatTile` resuelva sus chips sin abrir su propio
+  // StreamBuilder (catálogo pequeño, lookups frecuentes).
+  Map<String, ChatLabel> _labelsCatalog = const {};
 
   // Flash efímero "cancelado": cuando el usuario apaga la IA durante un ciclo
   // activo, marcamos este chat por ~3s para mostrar feedback en subtítulo+barra.
@@ -57,6 +65,27 @@ class _ChatsScreenState extends State<ChatsScreen> {
       // Guardar esta sesión como la última activa
       StorageService().saveLastSessionId(widget.sessionId!);
     }
+    if (widget.sessionId != null) {
+      _subscribeToLabels();
+    }
+  }
+
+  void _subscribeToLabels() {
+    _labelsSubscription = FirebaseFirestore.instance
+        .collection(accountsCollection)
+        .doc(widget.accountId)
+        .collection('whatsapp_sessions')
+        .doc(widget.sessionId)
+        .collection('labels')
+        .snapshots()
+        .listen((snap) {
+      if (!mounted) return;
+      setState(() {
+        _labelsCatalog = {
+          for (final d in snap.docs) d.id: ChatLabel.fromDoc(d),
+        };
+      });
+    });
   }
 
   void _setupSocketListeners() {
@@ -91,6 +120,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
     searchController.dispose();
     _statusSubscription?.cancel();
     _humanAttentionSubscription?.cancel();
+    _labelsSubscription?.cancel();
     _cancelledTimer?.cancel();
     super.dispose();
   }
@@ -536,6 +566,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
               final lastMessage = chatData?['lastMessage'] ?? 'Sin mensajes';
               final timestamp = (chatData?['lastMessageTimestamp'] as Timestamp?)?.toDate();
               final unrespondedCount = (chatData?['unresponded_count'] as num?)?.toInt() ?? 0;
+              final labelIds = ((chatData?['labelIds'] as List?) ?? const [])
+                  .whereType<String>()
+                  .toList();
 
               final tile = _ChatTile(
                 phoneNumber: phoneNumber,
@@ -545,6 +578,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 isSelected: selectedChatPhone == phoneNumber,
                 unrespondedCount: unrespondedCount,
                 sessionKey: widget.sessionKey,
+                labelIds: labelIds,
+                labelsCatalog: _labelsCatalog,
                 onTap: () {
                   setState(() {
                     selectedChatPhone = phoneNumber;
@@ -683,6 +718,10 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 chatData?['ai_auto_response'] as bool? ?? true;
             final unrespondedCount =
                 (chatData?['unresponded_count'] as num?)?.toInt() ?? 0;
+            final detailLabelIds =
+                ((chatData?['labelIds'] as List?) ?? const [])
+                    .whereType<String>()
+                    .toList();
             final displayName = contactName.isNotEmpty
                 ? contactName
                 : (selectedChatPhone ?? 'Chat');
@@ -901,12 +940,26 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 ),
                 elevation: 0,
               ),
-              body: MessagesView(
-                phoneNumber: selectedChatPhone!,
-                sessionId: widget.sessionId!,
-                sessionKey: widget.sessionKey,
-                accountId: widget.accountId,
-                sessionAiEnabled: sessionAiEnabled,
+              body: Column(
+                children: [
+                  // Strip de etiquetas asignadas al chat. Si no hay, no
+                  // reserva altura. Tap → abre el selector (atajo a Fase 2).
+                  if (detailLabelIds.isNotEmpty)
+                    _MessagesLabelsStrip(
+                      labelIds: detailLabelIds,
+                      catalog: _labelsCatalog,
+                      onTap: () => _openLabelsSelector(selectedChatPhone!),
+                    ),
+                  Expanded(
+                    child: MessagesView(
+                      phoneNumber: selectedChatPhone!,
+                      sessionId: widget.sessionId!,
+                      sessionKey: widget.sessionKey,
+                      accountId: widget.accountId,
+                      sessionAiEnabled: sessionAiEnabled,
+                    ),
+                  ),
+                ],
               ),
             );
           },
@@ -1090,6 +1143,20 @@ class _ChatsScreenState extends State<ChatsScreen> {
     }
   }
 
+  void _openLabelsSelector(String phoneNumber) {
+    if (widget.sessionId == null) return;
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => LabelsSelectorSheet(
+        accountId: widget.accountId,
+        sessionId: widget.sessionId!,
+        phoneNumber: phoneNumber,
+      ),
+    );
+  }
+
   void _showContactInfo(String phoneNumber) {
     showModalBottomSheet(
       context: context,
@@ -1106,6 +1173,58 @@ class _ChatsScreenState extends State<ChatsScreen> {
   }
 }
 
+// Franja horizontal scrollable de etiquetas que aparece justo bajo el AppBar
+// del MessagesView. Solo se renderiza si el chat tiene al menos una etiqueta.
+class _MessagesLabelsStrip extends StatelessWidget {
+  final List<String> labelIds;
+  final Map<String, ChatLabel> catalog;
+  final VoidCallback onTap;
+
+  const _MessagesLabelsStrip({
+    required this.labelIds,
+    required this.catalog,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final resolved = labelIds
+        .map((id) => catalog[id])
+        .whereType<ChatLabel>()
+        .toList()
+      ..sort((a, b) => a.order.compareTo(b.order));
+
+    if (resolved.isEmpty) return const SizedBox.shrink();
+
+    return InkWell(
+      onTap: onTap,
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: surfaceDark,
+          border: Border(
+            bottom: BorderSide(color: white.withValues(alpha: 0.05)),
+          ),
+        ),
+        child: SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: Row(
+            children: [
+              const Icon(Icons.label_outline, size: 14, color: lightText),
+              const SizedBox(width: 6),
+              ...resolved.map((l) => Padding(
+                    padding: const EdgeInsets.only(right: 6),
+                    child: LabelChip(label: l),
+                  )),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _ChatTile extends StatelessWidget {
   final String phoneNumber;
   final String contactName;
@@ -1117,6 +1236,8 @@ class _ChatTile extends StatelessWidget {
   // Puede ser null si la sesión está desconectada — en ese caso nunca habrá
   // estado de IA activo y el tile cae al render normal con el badge.
   final String? sessionKey;
+  final List<String> labelIds;
+  final Map<String, ChatLabel> labelsCatalog;
   final VoidCallback onTap;
   final VoidCallback? onLongPress;
 
@@ -1128,6 +1249,8 @@ class _ChatTile extends StatelessWidget {
     required this.isSelected,
     required this.unrespondedCount,
     required this.sessionKey,
+    required this.labelIds,
+    required this.labelsCatalog,
     required this.onTap,
     this.onLongPress,
   });
@@ -1210,6 +1333,15 @@ class _ChatTile extends StatelessWidget {
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                   ),
+                  if (labelIds.isNotEmpty) ...[
+                    const SizedBox(height: 6),
+                    LabelChipsRow(
+                      labelIds: labelIds,
+                      catalog: labelsCatalog,
+                      compact: true,
+                      maxVisible: 3,
+                    ),
+                  ],
                 ],
               ),
             ),
