@@ -628,61 +628,89 @@ class _ChatsScreenState extends State<ChatsScreen> {
         final sessionData = sessionSnapshot.data?.data() as Map<String, dynamic>?;
         final sessionAiEnabled = sessionData?['ai_enabled'] as bool? ?? false;
 
-        return Scaffold(
-          appBar: AppBar(
-            leading: MediaQuery.of(context).size.width < 600
-                ? IconButton(
-                    icon: const Icon(Icons.arrow_back),
-                    onPressed: () {
-                      setState(() {
-                        selectedChatPhone = null;
-                      });
-                    },
-                  )
-                : null,
-            title: StreamBuilder<DocumentSnapshot>(
-              stream: FirebaseFirestore.instance
-                  .collection(accountsCollection)
-                  .doc(widget.accountId)
-                  .collection('whatsapp_sessions')
-                  .doc(widget.sessionId)
-                  .collection('chats')
-                  .doc(selectedChatPhone)
-                  .snapshots(),
-              builder: (context, snapshot) {
-                final chatData = snapshot.data?.data() as Map<String, dynamic>?;
-                final contactName = chatData?['contactName'] as String? ?? '';
+        // Stream del documento del chat: lo levantamos al nivel del Scaffold
+        // para que título, acciones y franja inferior compartan los mismos
+        // datos (sin abrir tres suscripciones a la misma ruta).
+        return StreamBuilder<DocumentSnapshot>(
+          stream: FirebaseFirestore.instance
+              .collection(accountsCollection)
+              .doc(widget.accountId)
+              .collection('whatsapp_sessions')
+              .doc(widget.sessionId)
+              .collection('chats')
+              .doc(selectedChatPhone)
+              .snapshots(),
+          builder: (context, chatSnapshot) {
+            final chatData =
+                chatSnapshot.data?.data() as Map<String, dynamic>?;
+            final contactName = chatData?['contactName'] as String? ?? '';
+            final aiAutoResponse =
+                chatData?['ai_auto_response'] as bool? ?? true;
+            final unrespondedCount =
+                (chatData?['unresponded_count'] as num?)?.toInt() ?? 0;
+            final displayName = contactName.isNotEmpty
+                ? contactName
+                : (selectedChatPhone ?? 'Chat');
+            // Señal ambiental "tu turno": IA configurada y auto-on, pero hay
+            // mensajes pendientes (discriminador derivó al humano u otro flujo
+            // dejó cosas sin contestar). En vez de un badge clickable que
+            // engaña, lo mostramos como franja ámbar inferior + subtítulo.
+            final needsHuman =
+                sessionAiEnabled && aiAutoResponse && unrespondedCount > 0;
 
-                final displayName = contactName.isNotEmpty ? contactName : (selectedChatPhone ?? 'Chat');
-
-                return Text(
-                  displayName,
-                  style: const TextStyle(fontWeight: FontWeight.bold),
-                  overflow: TextOverflow.ellipsis,
-                  maxLines: 1,
-                );
-              },
-            ),
-            actions: [
-              StreamBuilder<DocumentSnapshot>(
-                stream: FirebaseFirestore.instance
-                    .collection(accountsCollection)
-                    .doc(widget.accountId)
-                    .collection('whatsapp_sessions')
-                    .doc(widget.sessionId)
-                    .collection('chats')
-                    .doc(selectedChatPhone)
-                    .snapshots(),
-                builder: (context, snapshot) {
-                  final data = snapshot.data?.data() as Map<String, dynamic>?;
-                  final aiAutoResponse = data?['ai_auto_response'] as bool? ?? true;
-                  final unrespondedCount =
-                      (data?['unresponded_count'] as num?)?.toInt() ?? 0;
-
-                  // El estado IA en vivo manda sobre el icono estático cuando hay
-                  // un ciclo activo (buffering/thinking/responding). Cuando el
-                  // ciclo cierra y quedó humano pendiente, mostramos el contador.
-                  return ListenableBuilder(
+            return Scaffold(
+              appBar: AppBar(
+                leading: MediaQuery.of(context).size.width < 600
+                    ? IconButton(
+                        icon: const Icon(Icons.arrow_back),
+                        onPressed: () {
+                          setState(() {
+                            selectedChatPhone = null;
+                          });
+                        },
+                      )
+                    : null,
+                title: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      displayName,
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                      overflow: TextOverflow.ellipsis,
+                      maxLines: 1,
+                    ),
+                    AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 220),
+                      switchInCurve: Curves.easeOut,
+                      switchOutCurve: Curves.easeIn,
+                      child: needsHuman
+                          ? const Padding(
+                              key: ValueKey('appbar-subtitle-needs-human'),
+                              padding: EdgeInsets.only(top: 1),
+                              child: Text(
+                                'tu turno',
+                                style: TextStyle(
+                                  color: Color(0xFFF59E0B),
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w600,
+                                  height: 1.1,
+                                  letterSpacing: 0.2,
+                                ),
+                              ),
+                            )
+                          : const SizedBox.shrink(
+                              key: ValueKey('appbar-subtitle-empty'),
+                            ),
+                    ),
+                  ],
+                ),
+                actions: [
+                  // El icono base recupera siempre su rol de toggle 3-estados.
+                  // Sólo se reemplaza por spinner si hay un ciclo IA en vivo.
+                  // El "tu turno" ya vive en franja+subtítulo, así que aquí no
+                  // hay un tercer caso con badge naranja que confunda al tap.
+                  ListenableBuilder(
                     listenable: AiStateService(),
                     builder: (context, _) {
                       final aiStatus = widget.sessionKey == null
@@ -694,8 +722,6 @@ class _ChatsScreenState extends State<ChatsScreen> {
                       final aiActive = aiStatus != null &&
                           aiStatus.state != AiChatState.idle;
 
-                      // Caso 1: ciclo IA en curso → spinner. Tap apaga IA y
-                      // cancela el buffer en backend (mismo flujo de antes).
                       if (aiActive) {
                         return IconButton(
                           tooltip: _aiStateTooltip(aiStatus.state),
@@ -713,21 +739,6 @@ class _ChatsScreenState extends State<ChatsScreen> {
                         );
                       }
 
-                      // Caso 2: ciclo cerrado y discriminador (u otro motivo)
-                      // dejó pendientes humanos → mostramos el badge en el lugar
-                      // del icono. Tap conserva el comportamiento de toggle IA.
-                      if (aiAutoResponse &&
-                          sessionAiEnabled &&
-                          unrespondedCount > 0) {
-                        return IconButton(
-                          tooltip:
-                              '$unrespondedCount mensaje(s) requieren tu atención',
-                          onPressed: () => _toggleAiAutoResponse(true),
-                          icon: _AppBarUnrespondedBadge(count: unrespondedCount),
-                        );
-                      }
-
-                      // Caso 3: render base (sin configurar / activo / pausado).
                       final Color iconColor;
                       final String tooltip;
                       final VoidCallback onPressed;
@@ -753,25 +764,38 @@ class _ChatsScreenState extends State<ChatsScreen> {
                         onPressed: onPressed,
                       );
                     },
-                  );
-                },
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.info_outline, size: 20),
+                    onPressed: () {
+                      _showContactInfo(selectedChatPhone!);
+                    },
+                  ),
+                ],
+                // Franja ámbar inferior: 2px constantes para no alterar la
+                // altura del AppBar al alternar; sólo cambia el color con un
+                // fade suave cuando hay pendientes humanos.
+                bottom: PreferredSize(
+                  preferredSize: const Size.fromHeight(2),
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 220),
+                    height: 2,
+                    color: needsHuman
+                        ? const Color(0xFFF59E0B)
+                        : Colors.transparent,
+                  ),
+                ),
+                elevation: 0,
               ),
-              IconButton(
-                icon: const Icon(Icons.info_outline, size: 20),
-                onPressed: () {
-                  _showContactInfo(selectedChatPhone!);
-                },
+              body: MessagesView(
+                phoneNumber: selectedChatPhone!,
+                sessionId: widget.sessionId!,
+                sessionKey: widget.sessionKey,
+                accountId: widget.accountId,
+                sessionAiEnabled: sessionAiEnabled,
               ),
-            ],
-            elevation: 0,
-          ),
-          body: MessagesView(
-            phoneNumber: selectedChatPhone!,
-            sessionId: widget.sessionId!,
-            sessionKey: widget.sessionKey,
-            accountId: widget.accountId,
-            sessionAiEnabled: sessionAiEnabled,
-          ),
+            );
+          },
         );
       },
     );
@@ -1132,33 +1156,3 @@ class _ChatTile extends StatelessWidget {
   }
 }
 
-// Variante compacta del UnrespondedBadge para usar dentro del AppBar en lugar
-// del icono de IA: misma paleta naranja, tamaño consistente con un IconButton
-// (20px) para que la altura del AppBar no salte al alternar entre icono/badge.
-class _AppBarUnrespondedBadge extends StatelessWidget {
-  final int count;
-  const _AppBarUnrespondedBadge({required this.count});
-
-  @override
-  Widget build(BuildContext context) {
-    final label = count > 99 ? '99+' : '$count';
-    return Container(
-      constraints: const BoxConstraints(minWidth: 22, minHeight: 22),
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-      decoration: BoxDecoration(
-        color: const Color(0xFFF97316),
-        borderRadius: BorderRadius.circular(11),
-      ),
-      alignment: Alignment.center,
-      child: Text(
-        label,
-        style: const TextStyle(
-          color: Colors.white,
-          fontSize: 11,
-          fontWeight: FontWeight.w700,
-          height: 1.1,
-        ),
-      ),
-    );
-  }
-}
