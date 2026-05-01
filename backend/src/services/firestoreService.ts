@@ -507,7 +507,11 @@ export async function getAIConfig(session: SessionData, accountId: string) {
       responseDelayMs: data?.ai_response_delay_ms ?? 1500,
       model: data?.ai_model ?? 'gemini-2.5-flash',
       activeHours: data?.ai_active_hours,
-      keywordRules: data?.ai_keyword_rules ?? [],
+      // Back-compat: leer del nuevo nombre (`bot_keyword_rules`) y caer al
+      // viejo (`ai_keyword_rules`) si todavía no existe el doc migrado.
+      // La UI siempre escribe en el nuevo, así que tras el primer guardado
+      // del usuario el viejo deja de usarse.
+      keywordRules: data?.bot_keyword_rules ?? data?.ai_keyword_rules ?? [],
       discriminator: {
         enabled: data?.ai_discriminator_enabled ?? false,
         prompt: data?.ai_discriminator_prompt ?? '',

@@ -87,6 +87,23 @@ const sessions = new Map<string, SessionData>();
 // Message buffers per chat: key = `${sessionKey}:${contactPhone}`
 const messageBuffers = new Map<string, MessageBuffer>();
 
+// Cooldown anti-loop para keyword rules con trigger 'outgoing' o 'both'.
+// Key = `${sessionKey}::${contactPhone}::${keywordLower}`, valor = timestamp ms del último disparo.
+// Necesario porque la respuesta canned saliente vuelve a entrar como `fromMe` en
+// `messages.upsert`; si su contenido contuviera la misma keyword se generaría
+// un loop infinito. También evita spam si el operador manda varios mensajes
+// seguidos con la palabra clave.
+const botRuleCooldowns = new Map<string, number>();
+const BOT_RULE_COOLDOWN_MS = 30_000;
+
+// Limpieza periódica del Map de cooldowns para que no crezca indefinidamente.
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, ts] of botRuleCooldowns.entries()) {
+    if (now - ts > BOT_RULE_COOLDOWN_MS) botRuleCooldowns.delete(key);
+  }
+}, 10 * 60 * 1000);
+
 // Make io available to aiService via global variable for lazy evaluation
 (global as any).__WhatHeroIO = io;
 
@@ -394,6 +411,61 @@ async function startSession(sessionKey: string, accountId: string) {
           const sessionForReset = sessions.get(sessionKey);
           if (sessionForReset?.phoneNumber) {
             await resetUnrespondedCount(accountId, sessionForReset.phoneNumber, contactPhoneForCancel);
+          }
+
+          // --- BOT KEYWORD RULES (trigger 'outgoing' / 'both') ---
+          // Si el operador (vía WhatHero, WA Web o celular) escribió algo que
+          // matchea una regla con trigger outgoing/both, enviamos el canned
+          // como mensaje aparte tras el suyo. El cooldown anti-loop protege
+          // contra que la propia respuesta canned reactive la regla.
+          try {
+            const outgoingText = message.message?.conversation
+              || message.message?.extendedTextMessage?.text
+              || message.message?.imageMessage?.caption
+              || '';
+            if (outgoingText.trim() && sessionForReset?.phoneNumber) {
+              const aiConfig = await getAIConfig(sessionForReset, accountId);
+              for (const rule of aiConfig.keywordRules) {
+                const trigger = rule.trigger ?? 'incoming';
+                if (trigger !== 'outgoing' && trigger !== 'both') continue;
+                if (!outgoingText.toLowerCase().includes(rule.keyword.toLowerCase())) continue;
+
+                const cooldownKey = `${sessionKey}::${contactPhoneForCancel}::${rule.keyword.toLowerCase()}`;
+                const lastFired = botRuleCooldowns.get(cooldownKey) ?? 0;
+                const now = Date.now();
+                if (now - lastFired < BOT_RULE_COOLDOWN_MS) {
+                  console.log(`[BotRule] Cooldown activo para "${rule.keyword}" en ${contactPhoneForCancel}, omitiendo`);
+                  break;
+                }
+                botRuleCooldowns.set(cooldownKey, now);
+
+                console.log(`[BotRule] OUTGOING match: "${rule.keyword}" → enviando respuesta canned a ${contactPhoneForCancel}`);
+                const delayMs = aiConfig.responseDelayMs > 2000 ? 2000 : aiConfig.responseDelayMs;
+                await new Promise(r => setTimeout(r, delayMs));
+
+                try {
+                  if (rule.imageUrl) {
+                    const imageResponse = await fetch(rule.imageUrl).then(res => {
+                      if (!res.ok) throw new Error(`Failed to fetch image: ${res.statusText}`);
+                      return res.arrayBuffer();
+                    });
+                    const imageBuffer = Buffer.from(imageResponse);
+                    await sessionForReset.sock.sendMessage(remoteJidForCancel, {
+                      image: imageBuffer,
+                      caption: rule.response || undefined,
+                    });
+                  } else if (rule.response) {
+                    await sessionForReset.sock.sendMessage(remoteJidForCancel, { text: rule.response });
+                  }
+                } catch (sendErr) {
+                  console.error('[BotRule] Error enviando canned outgoing:', sendErr);
+                }
+
+                break; // Primera regla que matchea gana, igual que el flujo incoming.
+              }
+            }
+          } catch (botRuleErr) {
+            console.error('[BotRule] Error procesando keyword rules outgoing:', botRuleErr);
           }
         }
       }

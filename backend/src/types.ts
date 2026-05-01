@@ -27,7 +27,17 @@ export interface SessionData {
       start: string;
       end: string;
     };
-    keywordRules: { keyword: string; response: string; imageUrl?: string }[];
+    keywordRules: {
+      keyword: string;
+      response: string;
+      imageUrl?: string;
+      // Cuándo se dispara la regla:
+      //   'incoming' → solo cuando el cliente escribe la keyword (comportamiento histórico).
+      //   'outgoing' → solo cuando nosotros (operador o WA Web) enviamos un mensaje con la keyword.
+      //   'both'     → en cualquiera de los dos casos.
+      // Si el campo no existe en Firestore, se asume 'incoming' por back-compat.
+      trigger?: 'incoming' | 'outgoing' | 'both';
+    }[];
     discriminator?: {
       enabled: boolean;
       prompt: string;

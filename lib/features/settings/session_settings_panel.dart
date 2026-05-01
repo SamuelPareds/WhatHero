@@ -42,10 +42,16 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
   String _activeHoursTimezone = 'America/Mexico_City';
   TimeOfDay _activeHoursStart = const TimeOfDay(hour: 9, minute: 0);
   TimeOfDay _activeHoursEnd = const TimeOfDay(hour: 18, minute: 0);
-  List<Map<String, dynamic>> _keywordRules = [];
+  // Reglas del bot por palabra clave. Persistido en Firestore como
+  // `bot_keyword_rules` (antes `ai_keyword_rules`); el rename refleja que
+  // estas respuestas son canned, no generadas por la IA.
+  List<Map<String, dynamic>> _botKeywordRules = [];
   String _newKeyword = '';
   String _newKeywordResponse = '';
   String _newKeywordImageUrl = '';
+  // Trigger por defecto al crear regla nueva: 'both' permite que dispare tanto
+  // con mensajes entrantes como con salientes (decisión del usuario).
+  String _newKeywordTrigger = 'both';
   bool _discriminatorEnabled = false;
 
   // Allowlist de tipos de media que la IA puede leer. Por defecto todo en
@@ -126,11 +132,17 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
             }
           }
 
-          if (data['ai_keyword_rules'] is List) {
-            _keywordRules = List<Map<String, dynamic>>.from((data['ai_keyword_rules'] as List).map((rule) => {
+          // Back-compat: leer del nuevo nombre (`bot_keyword_rules`) primero
+          // y caer al viejo (`ai_keyword_rules`) si todavía no se migró.
+          // Reglas sin campo `trigger` se asumen como 'incoming' para preservar
+          // su comportamiento histórico hasta que el usuario las edite.
+          final rawRules = data['bot_keyword_rules'] ?? data['ai_keyword_rules'];
+          if (rawRules is List) {
+            _botKeywordRules = List<Map<String, dynamic>>.from(rawRules.map((rule) => {
               'keyword': rule['keyword'] as String? ?? '',
               'response': rule['response'] as String? ?? '',
               'imageUrl': rule['imageUrl'] as String? ?? '',
+              'trigger': (rule['trigger'] as String?) ?? 'incoming',
             }));
           }
 
@@ -178,7 +190,9 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
           'start': '${_activeHoursStart.hour.toString().padLeft(2, '0')}:${_activeHoursStart.minute.toString().padLeft(2, '0')}',
           'end': '${_activeHoursEnd.hour.toString().padLeft(2, '0')}:${_activeHoursEnd.minute.toString().padLeft(2, '0')}',
         },
-        'ai_keyword_rules': _keywordRules,
+        // Escritura siempre en el nuevo campo. El viejo (`ai_keyword_rules`)
+        // queda intacto en Firestore como respaldo hasta que confirmes el cambio.
+        'bot_keyword_rules': _botKeywordRules,
         'ai_discriminator_enabled': _discriminatorEnabled,
         'ai_discriminator_prompt': _discriminatorPromptController.text.trim(),
         'ai_media_allowlist': {
@@ -573,9 +587,18 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
         children: [
           _sectionTitle('Respuestas Automáticas'),
           const SizedBox(height: 8),
-          const Text('Si el mensaje del cliente contiene alguna de estas palabras, el bot responderá de forma inmediata ignorando a la IA.', style: TextStyle(color: lightText, fontSize: 13)),
+          const Text(
+            'Cuando un mensaje contiene la palabra clave, el bot envía una respuesta inmediata sin pasar por la IA. Elige si la regla se dispara con mensajes del cliente, con los que tú envías (desde aquí, WhatsApp Web o el celular), o con ambos.',
+            style: TextStyle(color: lightText, fontSize: 13),
+          ),
           const SizedBox(height: 20),
-          ..._keywordRules.asMap().entries.map((e) => _keywordTile(e.key, e.value['keyword']!, e.value['response']!, e.value['imageUrl'])),
+          ..._botKeywordRules.asMap().entries.map((e) => _keywordTile(
+                e.key,
+                e.value['keyword'] as String? ?? '',
+                e.value['response'] as String? ?? '',
+                e.value['imageUrl'] as String?,
+                e.value['trigger'] as String? ?? 'incoming',
+              )),
           _addKeywordSection(),
         ],
       ),
@@ -901,26 +924,90 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
     );
   }
 
-  Widget _keywordTile(int index, String key, String resp, String? imageUrl) {
+  Widget _keywordTile(int index, String key, String resp, String? imageUrl, String trigger) {
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
       decoration: BoxDecoration(color: darkBg.withValues(alpha: 0.2), borderRadius: BorderRadius.circular(12)),
-      child: Row(children: [
-        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Row(
-            children: [
-              Text(key, style: const TextStyle(color: primaryAqua, fontWeight: FontWeight.bold)),
-              if (imageUrl != null && imageUrl.isNotEmpty) ...[
-                const SizedBox(width: 8),
-                const Icon(Icons.image, color: primaryAqua, size: 14),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Flexible(
+                      child: Text(
+                        key,
+                        style: const TextStyle(color: primaryAqua, fontWeight: FontWeight.bold),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    if (imageUrl != null && imageUrl.isNotEmpty) ...[
+                      const SizedBox(width: 8),
+                      const Icon(Icons.image, color: primaryAqua, size: 14),
+                    ],
+                  ],
+                ),
+                const SizedBox(height: 4),
+                _triggerBadge(trigger),
+                if (resp.isNotEmpty) ...[
+                  const SizedBox(height: 4),
+                  Text(resp, style: const TextStyle(color: lightText, fontSize: 12), maxLines: 1, overflow: TextOverflow.ellipsis),
+                ],
               ],
-            ],
+            ),
           ),
-          Text(resp, style: const TextStyle(color: lightText, fontSize: 12), maxLines: 1, overflow: TextOverflow.ellipsis),
-        ])),
-        IconButton(icon: const Icon(Icons.delete_outline, color: Colors.red, size: 20), onPressed: () => setState(() => _keywordRules.removeAt(index))),
-      ]),
+          IconButton(
+            icon: const Icon(Icons.delete_outline, color: Colors.red, size: 20),
+            onPressed: () => setState(() => _botKeywordRules.removeAt(index)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Etiqueta visual del trigger en cada regla. Colores e iconos consistentes
+  // con el segmented control del formulario para que sean reconocibles.
+  Widget _triggerBadge(String trigger) {
+    late final IconData icon;
+    late final String label;
+    late final Color color;
+    switch (trigger) {
+      case 'outgoing':
+        icon = Icons.outbox;
+        label = 'Cuando yo escribo';
+        color = const Color(0xFFF59E0B); // ámbar
+        break;
+      case 'both':
+        icon = Icons.swap_horiz;
+        label = 'Ambos';
+        color = primaryAqua;
+        break;
+      case 'incoming':
+      default:
+        icon = Icons.inbox;
+        label = 'Cuando el cliente escribe';
+        color = const Color(0xFF10B981); // verde saturado
+        break;
+    }
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        border: Border.all(color: color.withValues(alpha: 0.4)),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 11, color: color),
+          const SizedBox(width: 4),
+          Text(label, style: TextStyle(color: color, fontSize: 10, fontWeight: FontWeight.w600)),
+        ],
+      ),
     );
   }
 
@@ -1012,18 +1099,57 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
             ),
           ),
           const SizedBox(height: 16),
+          // Selector de trigger: cuándo debe dispararse la regla.
+          // Default 'both' como pidió el usuario; las reglas existentes mantienen
+          // su trigger original (típicamente 'incoming') hasta que se editen.
+          const Text(
+            'Disparar cuando…',
+            style: TextStyle(color: lightText, fontSize: 12, fontWeight: FontWeight.w600),
+          ),
+          const SizedBox(height: 8),
+          SegmentedButton<String>(
+            segments: const [
+              ButtonSegment(
+                value: 'incoming',
+                label: Text('Cliente', style: TextStyle(fontSize: 11)),
+                icon: Icon(Icons.inbox, size: 14),
+              ),
+              ButtonSegment(
+                value: 'outgoing',
+                label: Text('Yo', style: TextStyle(fontSize: 11)),
+                icon: Icon(Icons.outbox, size: 14),
+              ),
+              ButtonSegment(
+                value: 'both',
+                label: Text('Ambos', style: TextStyle(fontSize: 11)),
+                icon: Icon(Icons.swap_horiz, size: 14),
+              ),
+            ],
+            selected: {_newKeywordTrigger},
+            onSelectionChanged: (selection) => setState(() => _newKeywordTrigger = selection.first),
+            style: ButtonStyle(
+              backgroundColor: WidgetStateProperty.resolveWith((states) =>
+                  states.contains(WidgetState.selected) ? primaryAqua.withValues(alpha: 0.2) : Colors.transparent),
+              foregroundColor: WidgetStateProperty.resolveWith((states) =>
+                  states.contains(WidgetState.selected) ? primaryAqua : lightText),
+              side: WidgetStateProperty.all(BorderSide(color: primaryAqua.withValues(alpha: 0.3))),
+            ),
+          ),
+          const SizedBox(height: 16),
           SizedBox(
             width: double.infinity,
             child: ElevatedButton(
               onPressed: () {
                 if (_newKeyword.isNotEmpty && (_newKeywordResponse.isNotEmpty || _newKeywordImageUrl.isNotEmpty)) {
                   setState(() {
-                    _keywordRules.add({
-                      'keyword': _newKeyword, 
+                    _botKeywordRules.add({
+                      'keyword': _newKeyword,
                       'response': _newKeywordResponse,
                       'imageUrl': _newKeywordImageUrl,
+                      'trigger': _newKeywordTrigger,
                     });
                     _newKeyword = ''; _newKeywordResponse = ''; _newKeywordImageUrl = '';
+                    _newKeywordTrigger = 'both'; // reset al default
                     tempResponseController.clear();
                   });
                 }
