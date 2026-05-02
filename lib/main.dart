@@ -8,6 +8,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'firebase_options.dart';
 import 'core.dart';
 import 'core/services/socket_service.dart';
+import 'core/services/notification_service.dart';
 import 'core/services/storage_service.dart';
 import 'features/auth.dart';
 import 'features/chat.dart';
@@ -58,6 +59,14 @@ class _SessionDispatcherState extends State<SessionDispatcher> {
     // SocketService.init es idempotente: si ya estamos conectados con este
     // accountId, no hace nada.
     SocketService().init(widget.accountId);
+
+    // NotificationService.init sigue el MISMO patrón canónico: vive aquí, no
+    // dentro de pantallas hijas. Si el día de mañana se agrega una pantalla
+    // raíz post-login, el init de FCM tiene que estar arriba de ella —
+    // de otro modo en cold-start con sesión guardada el token nunca se
+    // registraría hasta que el usuario navegara manualmente.
+    // Es async pero no esperamos: la UI no debe bloquearse por permisos/red.
+    NotificationService().init(widget.accountId);
   }
 
   @override

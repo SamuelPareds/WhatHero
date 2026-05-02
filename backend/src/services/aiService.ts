@@ -4,6 +4,7 @@ import OpenAI from 'openai';
 import { SessionData } from '../types';
 import { ACCOUNTS_COLLECTION } from '../config/env';
 import { incrementUnrespondedCount, resetUnrespondedCount } from './firestoreService';
+import { sendHumanAttentionNotification } from './notificationService';
 
 // Lazy evaluation: getDb() is called only after Firebase is initialized
 function getDb() {
@@ -489,6 +490,17 @@ export async function processMessageBuffer(
           phoneNumber: session.phoneNumber,
           timestamp: new Date().toISOString(),
         });
+
+        // Push FCM en paralelo: el flujo de IA no espera al envío de notificación.
+        // Errores de FCM no deben romper el procesamiento del mensaje.
+        sendHumanAttentionNotification({
+          accountId,
+          sessionPhone: session.phoneNumber!,
+          sessionKey,
+          chatId: contactPhone,
+          reason: 'discriminator',
+          messagePreview: combinedMessage,
+        }).catch((err) => console.error('[Notify] discriminator push falló:', err));
 
         console.log(
           `[Buffer] Emitted human_attention_required for ${contactPhone} (+${bufferedMessages.length} unresponded)`

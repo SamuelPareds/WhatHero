@@ -1,4 +1,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Android 13+ exige permiso explícito para notificaciones; en versiones
+         anteriores se concede al instalar. Sin este flag, requestPermission()
+         devuelve "denied" en API 33+ aunque la app ya esté permitida. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:label="WhatHero"
         android:name="${applicationName}"
@@ -30,6 +35,18 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+
+        <!-- FCM: icono monocromo para la barra de estado. Sin esto, Android
+             muestra el ic_launcher que se ve como un cuadrado gris. -->
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_icon"
+            android:resource="@drawable/ic_notification" />
+
+        <!-- FCM: canal por defecto si una notif llega sin channelId. El backend
+             ya manda 'human_attention'; este es solo el fallback. -->
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_channel_id"
+            android:value="human_attention" />
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

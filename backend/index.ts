@@ -20,6 +20,7 @@ import { initializeSession, saveMessageToFirestore, getAIConfig, cacheContactNam
 import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer, emitAiState } from './src/services/aiService';
 import { extractMediaInfo, classifyIncomingMedia } from './src/services/mediaService';
 import { ReminderService } from './src/services/reminderService';
+import { sendHumanAttentionNotification } from './src/services/notificationService';
 import { ACCOUNTS_COLLECTION, IS_PRODUCTION } from './src/config/env';
 
 // Ensure auth_info directory exists
@@ -602,6 +603,16 @@ async function startSession(sessionKey: string, accountId: string) {
         reason: 'blocked_media',
         mediaType: mediaInfo?.type,
       });
+
+      // Push FCM para media bloqueada. No bloqueamos el flujo principal.
+      sendHumanAttentionNotification({
+        accountId,
+        sessionPhone: session.phoneNumber,
+        sessionKey,
+        chatId: contactPhone,
+        reason: 'blocked_media',
+        mediaType: mediaInfo?.type,
+      }).catch((err) => console.error('[Notify] blocked_media push falló:', err));
 
       console.log(
         `[MediaGate] Handoff humano: media bloqueada (${mediaInfo?.type}) para ${contactPhone} ` +

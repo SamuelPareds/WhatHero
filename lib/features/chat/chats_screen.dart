@@ -8,6 +8,7 @@ import 'package:flutter_slidable/flutter_slidable.dart';
 import 'package:http/http.dart' as http;
 import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/services/ai_state_service.dart';
+import 'package:crm_whatsapp/core/services/notification_service.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/core/services/storage_service.dart';
 import 'package:crm_whatsapp/features/settings.dart';
@@ -44,6 +45,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
   StreamSubscription? _statusSubscription;
   StreamSubscription? _humanAttentionSubscription;
   StreamSubscription? _labelsSubscription;
+  StreamSubscription? _pushTapSubscription;
 
   // Cache del catálogo de etiquetas de la sesión actual. Se mantiene en
   // memoria para que cada `_ChatTile` resuelva sus chips sin abrir su propio
@@ -68,6 +70,38 @@ class _ChatsScreenState extends State<ChatsScreen> {
     if (widget.sessionId != null) {
       _subscribeToLabels();
     }
+
+    // Cold-start: si la app abrió por un tap a una notificación push,
+    // NotificationService dejó la info esperando. La consumimos una vez.
+    // Hacemos addPostFrameCallback para no llamar setState dentro de initState.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final pending = NotificationService().consumePendingInitialTap();
+      if (pending != null) _handlePushTap(pending);
+    });
+
+    // Tap a notif con app en background (ya estaba viva): navegar al chat.
+    _pushTapSubscription = NotificationService().tapStream.listen((push) {
+      _handlePushTap(push);
+    });
+  }
+
+  // Abre el chat indicado por el push si pertenece a la sesión activa.
+  // Si el push apunta a otra sesión, por ahora lo logueamos: el usuario
+  // ya está viendo otra cuenta; cambiar de sesión automáticamente requiere
+  // reconstruir SessionDispatcher (Fase 4).
+  void _handlePushTap(HumanAttentionPush push) {
+    if (!mounted) return;
+    if (!push.isValid) return;
+    if (push.sessionPhone.isNotEmpty &&
+        widget.sessionId != null &&
+        push.sessionPhone != widget.sessionId) {
+      debugPrint(
+        '[ChatsScreen] Push para sesión ${push.sessionPhone}, '
+        'pero la activa es ${widget.sessionId}. Skip deep-link por ahora.',
+      );
+      return;
+    }
+    setState(() => selectedChatPhone = push.chatId);
   }
 
   void _subscribeToLabels() {
@@ -121,6 +155,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
     _statusSubscription?.cancel();
     _humanAttentionSubscription?.cancel();
     _labelsSubscription?.cancel();
+    _pushTapSubscription?.cancel();
     _cancelledTimer?.cancel();
     super.dispose();
   }
