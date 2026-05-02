@@ -540,6 +540,8 @@ async function startSession(sessionKey: string, accountId: string) {
     const baseEligible = !!aiConfig.enabled && !!hasValidApiKey && isWithinActiveHours(aiConfig);
 
     let aiAutoResponseEnabled = true; // Default: IA habilitada para este chat
+    // -1 marca "no leído todavía" — el push coalescido de ai_off lo lee bajo demanda.
+    let prevUnrespondedCount = -1;
     if (baseEligible) {
       try {
         const chatDoc = await db
@@ -550,7 +552,9 @@ async function startSession(sessionKey: string, accountId: string) {
           .collection('chats')
           .doc(contactPhone)
           .get();
-        aiAutoResponseEnabled = (chatDoc.data()?.ai_auto_response as boolean) ?? true;
+        const chatData = chatDoc.data();
+        aiAutoResponseEnabled = (chatData?.ai_auto_response as boolean) ?? true;
+        prevUnrespondedCount = (chatData?.unresponded_count as number) ?? 0;
       } catch (error) {
         console.warn(`[AI] Error checking ai_auto_response for ${contactPhone}:`, error);
       }
@@ -660,6 +664,51 @@ async function startSession(sessionKey: string, accountId: string) {
     // ai_auto_response off para este chat) → contamos pendiente y salimos.
     if (!aiEligible) {
       console.log(`[AI] No elegible para ${contactPhone} (enabled=${aiConfig.enabled}, hasKey=${!!hasValidApiKey}, inHours=${isWithinActiveHours(aiConfig)}, chatAuto=${aiAutoResponseEnabled})`);
+
+      // ===========================================================
+      // PUSH COALESCIDO ai_off
+      // Disparamos sólo cuando el usuario apagó la IA explícitamente
+      // (sesión o chat). NO empujamos por config (out-of-hours / sin
+      // API key) porque eso es silencio intencional o problema admin.
+      // Coalescing: notificamos únicamente en la transición 0 → 1 del
+      // unresponded_count, así una racha de mensajes seguidos genera
+      // un solo aviso. Cuando el humano responde, el contador se
+      // resetea a 0 y el siguiente mensaje vuelve a notificar.
+      // ===========================================================
+      const aiTurnedOff = !aiConfig.enabled || (baseEligible && !aiAutoResponseEnabled);
+      if (aiTurnedOff) {
+        let prevCount = prevUnrespondedCount;
+        // Si arriba no leímos el doc (sesión apagada → baseEligible false),
+        // hacemos la lectura ahora — sólo pagamos el read en chats con IA off.
+        if (prevCount < 0) {
+          try {
+            const snap = await db
+              .collection(ACCOUNTS_COLLECTION)
+              .doc(accountId)
+              .collection('whatsapp_sessions')
+              .doc(session.phoneNumber)
+              .collection('chats')
+              .doc(contactPhone)
+              .get();
+            prevCount = (snap.data()?.unresponded_count as number) ?? 0;
+          } catch (err) {
+            console.warn('[Notify] No se pudo leer unresponded_count para ai_off:', err);
+            prevCount = -1; // negativo → no empujamos (fallamos cerrado)
+          }
+        }
+        if (prevCount === 0) {
+          sendHumanAttentionNotification({
+            accountId,
+            sessionPhone: session.phoneNumber,
+            sessionKey,
+            chatId: contactPhone,
+            reason: 'ai_off',
+            messagePreview: messageText.trim() || undefined,
+            mediaType: mediaInfo?.type,
+          }).catch((err) => console.error('[Notify] ai_off push falló:', err));
+        }
+      }
+
       await markUnresponded();
       return;
     }

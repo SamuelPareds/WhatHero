@@ -36,10 +36,13 @@ const MEDIA_LABEL: Record<string, string> = {
 };
 
 function buildBody(payload: HumanAttentionPayload): string {
-  if (payload.reason === 'blocked_media' && payload.mediaType) {
+  const preview = (payload.messagePreview ?? '').replace(/\s+/g, ' ').trim();
+  // Si llegó adjunto y no hay texto/caption, mostramos etiqueta amigable.
+  // Aplica a blocked_media (siempre sin caption) y a ai_off cuando el
+  // contacto manda sólo media (sin texto que mostrar de preview).
+  if (!preview && payload.mediaType) {
     return MEDIA_LABEL[payload.mediaType] ?? '📎 Adjunto';
   }
-  const preview = (payload.messagePreview ?? '').replace(/\s+/g, ' ').trim();
   if (!preview) return 'Mensaje nuevo requiere atención';
   return preview.length > PREVIEW_MAX
     ? `${preview.slice(0, PREVIEW_MAX - 1)}…`
