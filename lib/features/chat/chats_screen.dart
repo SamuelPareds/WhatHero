@@ -71,12 +71,12 @@ class _ChatsScreenState extends State<ChatsScreen> {
       _subscribeToLabels();
     }
 
-    // Cold-start: si la app abrió por un tap a una notificación push,
-    // NotificationService dejó la info esperando. La consumimos una vez.
-    // Hacemos addPostFrameCallback para no llamar setState dentro de initState.
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      final pending = NotificationService().consumePendingInitialTap();
-      if (pending != null) _handlePushTap(pending);
+    // Cold-start: la app abrió por un tap a una notificación push.
+    // Future-based: NotificationService completa el Future cuando terminó de
+    // chequear getInitialMessage. Así no importa si esto resuelve antes o
+    // después de que ChatsScreen se montó — la race condition desaparece.
+    NotificationService().initialTapReady.then((push) {
+      if (push != null) _handlePushTap(push);
     });
 
     // Tap a notif con app en background (ya estaba viva): navegar al chat.
@@ -85,15 +85,22 @@ class _ChatsScreenState extends State<ChatsScreen> {
     });
   }
 
-  // Abre el chat indicado por el push si pertenece a la sesión activa.
-  // Si el push apunta a otra sesión, por ahora lo logueamos: el usuario
-  // ya está viendo otra cuenta; cambiar de sesión automáticamente requiere
-  // reconstruir SessionDispatcher (Fase 4).
+  // Abre el chat indicado por el push. Validaciones:
+  // - widget aún montado
+  // - payload válido (accountId + chatId)
+  // - sesión activa coincide con la del push
+  // - existe sessionId actual (sin él, _buildMessageDetail renderiza vacío y
+  //   el usuario vería pantalla en negro; mejor no navegar)
   void _handlePushTap(HumanAttentionPush push) {
     if (!mounted) return;
     if (!push.isValid) return;
+    if (widget.sessionId == null) {
+      debugPrint(
+        '[ChatsScreen] Push recibido pero no hay sessionId activa, skip deep-link',
+      );
+      return;
+    }
     if (push.sessionPhone.isNotEmpty &&
-        widget.sessionId != null &&
         push.sessionPhone != widget.sessionId) {
       debugPrint(
         '[ChatsScreen] Push para sesión ${push.sessionPhone}, '
@@ -101,6 +108,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
       );
       return;
     }
+    debugPrint('[ChatsScreen] Deep-link a chat ${push.chatId}');
     setState(() => selectedChatPhone = push.chatId);
   }
 

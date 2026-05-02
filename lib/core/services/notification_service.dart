@@ -75,13 +75,25 @@ class NotificationService {
   final _tapController = StreamController<HumanAttentionPush>.broadcast();
   Stream<HumanAttentionPush> get tapStream => _tapController.stream;
 
-  // Push pendiente desde un cold-start (la app abrió por un tap mientras
-  // estaba terminada). El widget raíz lo consume cuando ya está montado.
-  HumanAttentionPush? _pendingInitialTap;
-  HumanAttentionPush? consumePendingInitialTap() {
-    final pending = _pendingInitialTap;
-    _pendingInitialTap = null;
-    return pending;
+  // Cold-start tap: completer que resuelve cuando init() determinó si la app
+  // abrió desde un tap (con la data del push) o no (null). Usamos Future en
+  // vez de "consume-once" para evitar la race entre ChatsScreen.initState y
+  // FirebaseMessaging.getInitialMessage(): el widget puede await tranquilo.
+  Completer<HumanAttentionPush?>? _initialTapCompleter;
+
+  /// Future que resuelve con el push que abrió la app (cold-start) o null si
+  /// la app abrió normalmente. Seguro de await desde cualquier widget; si
+  /// init() todavía no fue llamado, espera. Idempotente: múltiples awaits OK.
+  Future<HumanAttentionPush?> get initialTapReady {
+    _initialTapCompleter ??= Completer<HumanAttentionPush?>();
+    return _initialTapCompleter!.future;
+  }
+
+  void _completeInitialTap(HumanAttentionPush? push) {
+    _initialTapCompleter ??= Completer<HumanAttentionPush?>();
+    if (!_initialTapCompleter!.isCompleted) {
+      _initialTapCompleter!.complete(push);
+    }
   }
 
   /// Inicializa el servicio para un usuario. Por ahora solo Android.
@@ -100,24 +112,54 @@ class NotificationService {
     }
     _currentAccountId = accountId;
 
-    if (kIsWeb) {
-      debugPrint('[NotificationService] Web: pendiente Fase 2');
-      return;
-    }
-    if (defaultTargetPlatform == TargetPlatform.iOS) {
+    if (defaultTargetPlatform == TargetPlatform.iOS && !kIsWeb) {
       debugPrint('[NotificationService] iOS: pendiente Fase 3 (APNs)');
+      _completeInitialTap(null);
       return;
     }
-    if (defaultTargetPlatform != TargetPlatform.android) {
+    // Plataformas no-móviles, no-web: nada que hacer (macOS desktop, Linux…).
+    if (!kIsWeb && defaultTargetPlatform != TargetPlatform.android) {
       debugPrint('[NotificationService] Plataforma sin push, skip');
+      _completeInitialTap(null);
+      return;
+    }
+    // Web: si la VAPID key sigue siendo el placeholder, salimos limpio.
+    // Sin VAPID, getToken() crashea con
+    // FirebaseException 'messaging/failed-service-worker-registration'.
+    // OJO: este string DEBE ser literalmente 'PASTE_VAPID_KEY_HERE' — es el
+    // valor placeholder original. Si lo cambias por la VAPID real, esta
+    // comparación se vuelve `vapid == vapid` y el init siempre sale en este
+    // return, así que el navegador nunca pediría permiso.
+    if (kIsWeb && fcmVapidKey == 'PASTE_VAPID_KEY_HERE') {
+      debugPrint(
+        '[NotificationService] Web: fcmVapidKey no configurada — skip. '
+        'Genera la key en Firebase Console y pégala en lib/core/config.dart',
+      );
+      _completeInitialTap(null);
       return;
     }
 
     try {
       final messaging = FirebaseMessaging.instance;
 
+      // 0. PRIMERO: leer el mensaje inicial. Es la operación más sensible al
+      // timing porque ChatsScreen ya está esperando este Future. Hacerlo antes
+      // que permisos/token reduce la ventana antes de que se complete.
+      // En web getInitialMessage siempre devuelve null (el SW maneja el click
+      // de manera distinta), pero la llamada es segura.
+      final initial = await messaging.getInitialMessage();
+      if (initial != null && _isHumanAttentionMessage(initial)) {
+        final push = HumanAttentionPush.fromMessage(initial);
+        debugPrint(
+          '[NotificationService] Cold-start tap detectado para chat ${push.chatId}',
+        );
+        _completeInitialTap(push);
+      } else {
+        _completeInitialTap(null);
+      }
+
       // 1. Permiso. Android 13+ lo exige explícito; versiones anteriores lo
-      // conceden al instalar (requestPermission devuelve authorized igual).
+      // conceden al instalar. Web abre el prompt nativo del navegador.
       final settings = await messaging.requestPermission(
         alert: true,
         badge: true,
@@ -132,7 +174,10 @@ class NotificationService {
       _deviceId = await _ensureDeviceId();
 
       // 3. Token FCM y persistencia en Firestore
-      final token = await messaging.getToken();
+      // En web getToken() exige vapidKey explícitamente; en mobile lo ignora.
+      final token = await messaging.getToken(
+        vapidKey: kIsWeb ? fcmVapidKey : null,
+      );
       if (token == null) {
         debugPrint('[NotificationService] getToken() devolvió null');
         return;
@@ -168,22 +213,13 @@ class NotificationService {
         }
       });
 
-      // 7. Cold-start: la app estaba cerrada y el usuario tocó la notif.
-      // Lo guardamos y el widget raíz lo consume al montarse.
-      final initial = await messaging.getInitialMessage();
-      if (initial != null && _isHumanAttentionMessage(initial)) {
-        _pendingInitialTap = HumanAttentionPush.fromMessage(initial);
-        debugPrint(
-          '[NotificationService] Cold-start tap pendiente para chat '
-          '${_pendingInitialTap!.chatId}',
-        );
-      }
-
       debugPrint(
         '[NotificationService] ✅ Inicializado (deviceId=$_deviceId, token=${token.substring(0, 12)}…)',
       );
     } catch (e, st) {
       debugPrint('[NotificationService] Error en init: $e\n$st');
+      // Aunque init falle, no dejamos a ChatsScreen colgada esperando el Future.
+      _completeInitialTap(null);
     }
   }
 

@@ -120,11 +120,13 @@ async function fetchDeviceTokens(
 }
 
 // Borra docs de dispositivos cuyos tokens FCM marcó inválidos.
-// Códigos de error que indican token muerto y debemos limpiarlo:
+// Códigos de error que indican token muerto y debemos limpiarlo.
+// IMPORTANTE: 'messaging/invalid-argument' NO va aquí — significa "mensaje
+// malformado", no "token inválido". Si lo agregamos, un bug en el payload
+// borraría todos los dispositivos de todos los usuarios. Aprendido a la mala.
 const INVALID_TOKEN_ERRORS = new Set([
   'messaging/registration-token-not-registered',
   'messaging/invalid-registration-token',
-  'messaging/invalid-argument',
 ]);
 
 async function pruneDeadTokens(
@@ -208,10 +210,24 @@ export async function sendHumanAttentionNotification(
       },
     },
     webpush: {
-      headers: { Urgency: 'high', Topic: collapseTag.slice(0, 32) },
+      // Solo Urgency. NO ponemos Topic: la RFC 8030 exige base64url y nuestro
+      // collapseTag tiene ':' que es inválido → FCM responde invalid-argument.
+      // Sin Topic, los pushes no se colapsan a nivel push service, pero el
+      // 'tag' de la Notification API sí los agrupa visualmente en el SO.
+      headers: { Urgency: 'high' },
       notification: {
+        // Repetimos title/body acá: si webpush.notification existe, FCM toma
+        // estos campos en lugar de los top-level para web clients.
+        title,
+        body,
         tag: collapseTag,
         renotify: true,
+        icon: '/icons/Icon-192.png',
+        badge: '/favicon.png',
+      },
+      fcmOptions: {
+        // Click → enfoca la app. Deep-link granular en Fase 4.
+        link: '/',
       },
     },
   };
