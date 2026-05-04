@@ -24,7 +24,7 @@ import { sendHumanAttentionNotification } from './src/services/notificationServi
 import { ACCOUNTS_COLLECTION, IS_PRODUCTION } from './src/config/env';
 import { verifyHttpAuth, verifySocketAuth, invalidateMembershipCache } from './src/middleware/auth';
 import { generateTempPassword } from './src/utils/password';
-import { resolveHumanSender, BOT_SENDER } from './src/services/senderResolver';
+import { resolveHumanSender, BOT_SENDER, invalidateHumanNameCache } from './src/services/senderResolver';
 
 // Ensure auth_info directory exists
 const authInfoDir = 'auth_info';
@@ -1307,7 +1307,13 @@ app.post('/accounts/members', express.json(), verifyHttpAuth(), async (req, res)
     if (!cleanEmail || !cleanEmail.includes('@')) {
       return res.status(400).json({ error: 'Email inválido' });
     }
-    const cleanDisplayName = (displayName || '').trim() || null;
+    // El nombre es obligatorio: lo usamos como etiqueta del autor en cada
+    // mensaje saliente (etiqueta visible arriba de cada bubble). Sin nombre
+    // los chats del CRM no muestran quién respondió.
+    const cleanDisplayName = (displayName || '').trim();
+    if (!cleanDisplayName) {
+      return res.status(400).json({ error: 'El nombre es obligatorio' });
+    }
 
     // Solo owners pueden invitar. Y solo a la cuenta de la que son owner.
     // Por ahora ownedAccountId == requesterUid (no soportamos owners de
@@ -1342,7 +1348,7 @@ app.post('/accounts/members', express.json(), verifyHttpAuth(), async (req, res)
     const newUser = await admin.auth().createUser({
       email: cleanEmail,
       password: tempPassword,
-      displayName: cleanDisplayName || undefined,
+      displayName: cleanDisplayName,
       emailVerified: false,
     });
 
@@ -1395,6 +1401,100 @@ app.post('/accounts/members', express.json(), verifyHttpAuth(), async (req, res)
     console.error('[/accounts/members] Error:', error);
     res.status(500).json({
       error: 'Failed to create member',
+      details: (error as any).message,
+    });
+  }
+});
+
+// Editar el displayName de un miembro (incluido el propio owner).
+//
+// Permisos:
+// - Cualquier usuario puede editar SU PROPIO displayName (uid == requester).
+// - Sólo el owner del accountId puede editar el displayName de otros miembros.
+//
+// Side effects: actualiza Firebase Auth + users/{uid} + mirror en
+// accounts/{aid}/members/{uid} (si existe). Invalida el cache del
+// senderResolver para que el siguiente mensaje muestre el nombre nuevo.
+app.patch('/accounts/members/:uid', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const requesterUid = req.auth!.uid;
+    const targetUid = req.params.uid;
+    const { accountId, displayName } = req.body as {
+      accountId: string;
+      displayName?: string;
+    };
+
+    const cleanDisplayName = (displayName || '').trim();
+    if (!cleanDisplayName) {
+      return res.status(400).json({ error: 'El nombre es obligatorio' });
+    }
+
+    const editingSelf = requesterUid === targetUid;
+
+    // Para edición de terceros exigimos rol owner sobre la cuenta y que el
+    // target sea efectivamente miembro de esa cuenta. Para auto-edición
+    // basta con la validación del middleware.
+    if (!editingSelf) {
+      const requesterDoc = await db.collection('users').doc(requesterUid).get();
+      if (!requesterDoc.exists) {
+        return res.status(403).json({ error: 'Requester sin doc users/' });
+      }
+      const requesterData = requesterDoc.data()!;
+      if (requesterData.role !== 'owner' || requesterData.ownedAccountId !== accountId) {
+        return res.status(403).json({ error: 'Solo el owner puede editar a otros miembros' });
+      }
+
+      const targetDoc = await db.collection('users').doc(targetUid).get();
+      if (!targetDoc.exists) {
+        return res.status(404).json({ error: 'Miembro no encontrado' });
+      }
+      const targetMemberOf = (targetDoc.data()?.memberOfAccounts as string[]) || [];
+      if (!targetMemberOf.includes(accountId)) {
+        return res.status(403).json({ error: 'El miembro no pertenece a esta cuenta' });
+      }
+    }
+
+    // 1. Firebase Auth profile
+    await admin.auth().updateUser(targetUid, { displayName: cleanDisplayName });
+
+    // 2. users/{uid}: fuente de verdad para resolveHumanSender
+    await db.collection('users').doc(targetUid).set(
+      {
+        displayName: cleanDisplayName,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+
+    // 3. Mirror en accounts/{aid}/members/{uid} (sólo existe para sub-users;
+    // el owner no tiene mirror). update() falla con NOT_FOUND si no existe,
+    // lo cual es esperado para el owner — lo ignoramos silenciosamente.
+    try {
+      await db
+        .collection(ACCOUNTS_COLLECTION)
+        .doc(accountId)
+        .collection('members')
+        .doc(targetUid)
+        .update({
+          displayName: cleanDisplayName,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+    } catch (e: any) {
+      if (e?.code !== 5) throw e; // 5 = NOT_FOUND (owner sin mirror)
+    }
+
+    // 4. Cache: el próximo mensaje del operador sale con el nuevo nombre.
+    invalidateHumanNameCache(targetUid);
+
+    console.log(
+      `[PATCH /accounts/members] uid=${requesterUid} editó nombre de ${targetUid} → "${cleanDisplayName}"`,
+    );
+
+    res.json({ success: true, uid: targetUid, displayName: cleanDisplayName });
+  } catch (error) {
+    console.error('[PATCH /accounts/members] Error:', error);
+    res.status(500).json({
+      error: 'Failed to update member',
       details: (error as any).message,
     });
   }

@@ -21,6 +21,13 @@ function extractFirstName(displayName: string | null | undefined): string {
   return trimmed.split(/\s+/)[0];
 }
 
+// Invalida el cache de nombre para un uid. Llamado desde el endpoint que
+// edita displayName, así el siguiente mensaje del operador sale ya con el
+// nombre actualizado sin esperar al TTL de 5 min.
+export function invalidateHumanNameCache(uid: string): void {
+  humanNameCache.delete(uid);
+}
+
 export async function resolveHumanSender(uid: string): Promise<SenderInfo> {
   const cached = humanNameCache.get(uid);
   if (cached && cached.expiresAt > Date.now()) {

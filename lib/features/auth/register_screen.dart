@@ -12,6 +12,7 @@ class RegisterScreen extends StatefulWidget {
 }
 
 class _RegisterScreenState extends State<RegisterScreen> {
+  final nameController = TextEditingController();
   final emailController = TextEditingController();
   final passwordController = TextEditingController();
   final confirmController = TextEditingController();
@@ -21,6 +22,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
 
   @override
   void dispose() {
+    nameController.dispose();
     emailController.dispose();
     passwordController.dispose();
     confirmController.dispose();
@@ -28,7 +30,9 @@ class _RegisterScreenState extends State<RegisterScreen> {
   }
 
   Future<void> _register() async {
-    if (emailController.text.trim().isEmpty ||
+    final fullName = nameController.text.trim();
+    if (fullName.isEmpty ||
+        emailController.text.trim().isEmpty ||
         passwordController.text.trim().isEmpty ||
         confirmController.text.trim().isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -61,6 +65,11 @@ class _RegisterScreenState extends State<RegisterScreen> {
       // Crear documento de cuenta en Firestore inmediatamente
       final user = FirebaseAuth.instance.currentUser;
       if (user != null) {
+        // Sincronizar el displayName en el perfil de Firebase Auth para que
+        // todo el ecosistema (incluyendo el helper resolveHumanSender en el
+        // backend) tenga acceso al nombre desde el primer login.
+        await user.updateDisplayName(fullName);
+
         await FirebaseFirestore.instance
           .collection(accountsCollection)
           .doc(user.uid)
@@ -80,7 +89,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
           .doc(user.uid)
           .set({
             'email': user.email,
-            'displayName': user.displayName,
+            'displayName': fullName,
             'ownedAccountId': user.uid,
             'memberOfAccounts': [user.uid],
             'role': 'owner',
@@ -127,6 +136,28 @@ class _RegisterScreenState extends State<RegisterScreen> {
         padding: const EdgeInsets.all(24),
         child: Column(
           children: [
+            TextField(
+              controller: nameController,
+              enabled: !isLoading,
+              textCapitalization: TextCapitalization.words,
+              keyboardType: TextInputType.name,
+              decoration: InputDecoration(
+                hintText: 'Nombre completo',
+                hintStyle: const TextStyle(color: lightText),
+                filled: true,
+                fillColor: surfaceDark,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: BorderSide.none,
+                ),
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 16,
+                ),
+              ),
+              style: const TextStyle(color: white),
+            ),
+            const SizedBox(height: 16),
             TextField(
               controller: emailController,
               enabled: !isLoading,

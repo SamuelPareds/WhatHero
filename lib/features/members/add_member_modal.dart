@@ -68,6 +68,10 @@ class _AddMemberSheetState extends State<_AddMemberSheet> {
     final email = _emailCtrl.text.trim().toLowerCase();
     final name = _nameCtrl.text.trim();
 
+    if (name.isEmpty) {
+      setState(() => _errorText = 'Ingresa el nombre completo');
+      return;
+    }
     if (email.isEmpty || !email.contains('@')) {
       setState(() => _errorText = 'Email inválido');
       return;
@@ -86,7 +90,7 @@ class _AddMemberSheetState extends State<_AddMemberSheet> {
             body: jsonEncode({
               'accountId': widget.accountId,
               'email': email,
-              if (name.isNotEmpty) 'displayName': name,
+              'displayName': name,
             }),
           )
           .timeout(const Duration(seconds: 15));
@@ -154,19 +158,21 @@ class _AddMemberSheetState extends State<_AddMemberSheet> {
             ),
             const SizedBox(height: 24),
             TextField(
+              controller: _nameCtrl,
+              enabled: !_loading,
+              textCapitalization: TextCapitalization.words,
+              keyboardType: TextInputType.name,
+              style: const TextStyle(color: white),
+              decoration: _inputDecoration('Nombre completo *'),
+            ),
+            const SizedBox(height: 12),
+            TextField(
               controller: _emailCtrl,
               enabled: !_loading,
               keyboardType: TextInputType.emailAddress,
               autocorrect: false,
               style: const TextStyle(color: white),
               decoration: _inputDecoration('Email *'),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _nameCtrl,
-              enabled: !_loading,
-              style: const TextStyle(color: white),
-              decoration: _inputDecoration('Nombre (opcional)'),
             ),
             if (_errorText != null) ...[
               const SizedBox(height: 12),
