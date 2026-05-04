@@ -1,7 +1,6 @@
 import admin from 'firebase-admin';
 import { SessionData } from '../types';
-import { extractPhoneNumber } from '../utils/phone';
-import { saveMessageToFirestore } from './firestoreService';
+import { BOT_SENDER } from './senderResolver';
 import { ACCOUNTS_COLLECTION } from '../config/env';
 
 interface Appointment {
@@ -129,16 +128,11 @@ export class ReminderService {
 
       const message = await session.sock.sendMessage(jid, { text: messageText });
 
-      // Save to Firestore using existing utility
-      if (message) {
-        await saveMessageToFirestore(
-          message,
-          sessionKey,
-          session.accountId,
-          sessions,
-          session.sock.user?.id,
-          session.sock
-        );
+      // Etiqueta 'bot': el mensaje saldrá por el flujo normal de
+      // messages.upsert que persiste a Firestore. Aquí sólo registramos
+      // la intención para que ese guardado lo marque como bot.
+      if (message?.key?.id) {
+        session.pendingSenders.set(message.key.id, BOT_SENDER);
       }
 
       return true;

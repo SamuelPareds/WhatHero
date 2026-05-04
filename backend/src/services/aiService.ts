@@ -5,6 +5,7 @@ import { SessionData } from '../types';
 import { ACCOUNTS_COLLECTION } from '../config/env';
 import { incrementUnrespondedCount, resetUnrespondedCount } from './firestoreService';
 import { sendHumanAttentionNotification } from './notificationService';
+import { AI_SENDER } from './senderResolver';
 
 // Lazy evaluation: getDb() is called only after Firebase is initialized
 function getDb() {
@@ -370,13 +371,21 @@ Responde SOLO con una de estas dos opciones:
   }
 }
 
-// Divide la respuesta en grupos de párrafos (alternando 2 y 3) para simular escritura humana
-async function sendChunkedResponse(sock: any, remoteJid: string, response: string): Promise<void> {
+// Divide la respuesta en grupos de párrafos (alternando 2 y 3) para simular escritura humana.
+// Cada chunk enviado se registra en pendingSenders con AI_SENDER para que el
+// upsert lo guarde con senderType='ai'.
+async function sendChunkedResponse(session: SessionData, remoteJid: string, response: string): Promise<void> {
+  const sock = session.sock;
+  const tagAi = (sent: any) => {
+    if (sent?.key?.id) session.pendingSenders.set(sent.key.id, AI_SENDER);
+  };
+
   const chunks = response.split(/\n\n+/);
 
   // Si es texto corto (1 párrafo), enviar directo sin chunking
   if (chunks.length <= 1) {
-    await sock.sendMessage(remoteJid, { text: response.trim() });
+    const sent = await sock.sendMessage(remoteJid, { text: response.trim() });
+    tagAi(sent);
     return;
   }
 
@@ -385,7 +394,8 @@ async function sendChunkedResponse(sock: any, remoteJid: string, response: strin
   while (i < chunks.length) {
     const group = chunks.slice(i, i + groupSize).join('\n\n').trim();
     if (group) {
-      await sock.sendMessage(remoteJid, { text: group });
+      const sent = await sock.sendMessage(remoteJid, { text: group });
+      tagAi(sent);
       // Delay proporcional a la longitud del chunk (mínimo 800ms, máximo 2500ms)
       const delay = Math.min(2500, Math.max(800, group.length * 10));
       await new Promise(resolve => setTimeout(resolve, delay));
@@ -528,7 +538,7 @@ export async function processMessageBuffer(
       // Pasamos a 'responding' justo antes de empezar a mandar chunks: este es
       // el momento crítico donde el usuario puede querer interceptar.
       emitAiState(accountId, sessionKey, contactPhone, 'responding');
-      await sendChunkedResponse(session.sock, remoteJid, aiResponse);
+      await sendChunkedResponse(session, remoteJid, aiResponse);
       console.log(`[Buffer] Auto-responded to ${remoteJid} en chunks`);
       // La IA respondió: cualquier pendiente previo queda cubierto
       await resetUnrespondedCount(accountId, session.phoneNumber!, contactPhone);

@@ -1,9 +1,10 @@
 import admin from 'firebase-admin';
 import { toNumber } from '@whiskeysockets/baileys';
-import { SessionData } from '../types';
+import { SessionData, SenderInfo } from '../types';
 import { extractPhoneNumber, isConversationalJid } from '../utils/phone';
 import { ACCOUNTS_COLLECTION } from '../config/env';
 import { extractMediaInfo, processMediaAsync } from './mediaService';
+import { WHATSAPP_SENDER } from './senderResolver';
 
 // Lazy evaluation: getDb() is called only after Firebase is initialized
 function getDb() {
@@ -46,7 +47,18 @@ export async function initializeSession(phoneNumber: string, sessionKey: string,
   }
 }
 
-export async function saveMessageToFirestore(message: any, sessionKey: string, accountId: string, sessions: Map<string, SessionData>, botJid?: string, sock?: any) {
+export async function saveMessageToFirestore(
+  message: any,
+  sessionKey: string,
+  accountId: string,
+  sessions: Map<string, SessionData>,
+  botJid?: string,
+  sock?: any,
+  // Override explícito (lo usan los recordatorios). Si no se pasa, el sender
+  // se resuelve consultando session.pendingSenders por messageId. Un upsert
+  // de mensaje fromMe sin entry → enviado desde el WhatsApp del teléfono.
+  explicitSenderInfo?: SenderInfo,
+) {
   try {
     const session = sessions.get(sessionKey);
     if (!session?.phoneNumber) {
@@ -166,6 +178,34 @@ export async function saveMessageToFirestore(message: any, sessionKey: string, a
 
     const messagesSubCollectionRef = chatDocRef.collection('messages');
 
+    // Resolver senderInfo SOLO para mensajes salientes (fromMe).
+    // Los entrantes no llevan campos sender (es el cliente del otro lado).
+    let senderFields: Record<string, any> = {};
+    if (message.key.fromMe) {
+      let senderInfo: SenderInfo | undefined = explicitSenderInfo;
+      if (!senderInfo) {
+        // Buscar la intención registrada por el entry point que envió.
+        // Pequeño retry para mitigar race con el await sendMessage del entry
+        // point (en la práctica el primer get acierta; este loop es defensa).
+        for (let i = 0; i < 3; i++) {
+          senderInfo = session.pendingSenders.get(messageId);
+          if (senderInfo) break;
+          if (i < 2) await new Promise(r => setTimeout(r, 30));
+        }
+        if (senderInfo) {
+          session.pendingSenders.delete(messageId);
+        } else {
+          // No registrado → enviado desde la app oficial de WhatsApp.
+          senderInfo = WHATSAPP_SENDER;
+        }
+      }
+      senderFields = {
+        senderType: senderInfo.type,
+        senderName: senderInfo.name,
+        ...(senderInfo.uid && { senderUid: senderInfo.uid }),
+      };
+    }
+
     // Save message to messages subcollection
     await messagesSubCollectionRef.doc(messageId).set({
       id: messageId,
@@ -174,6 +214,7 @@ export async function saveMessageToFirestore(message: any, sessionKey: string, a
       from: message.key.fromMe ? (botJid || 'bot') : phoneNumber,
       fromMe: message.key.fromMe,
       isMedia: !!mediaInfo,
+      ...senderFields,
       ...mediaFields,
     }, { merge: true });
 

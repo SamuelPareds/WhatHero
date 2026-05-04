@@ -455,6 +455,8 @@ class _MessagesViewState extends State<MessagesView> {
                     chatPhone: widget.phoneNumber,
                     sessionKey: widget.sessionKey,
                     accountId: widget.accountId,
+                    senderType: data['senderType'] as String?,
+                    senderName: data['senderName'] as String?,
                     mediaType: data['mediaType'] as String?,
                     mediaThumbBase64: data['mediaThumbBase64'] as String?,
                     mediaWidth: (data['mediaWidth'] as num?)?.toDouble(),

@@ -24,6 +24,7 @@ import { sendHumanAttentionNotification } from './src/services/notificationServi
 import { ACCOUNTS_COLLECTION, IS_PRODUCTION } from './src/config/env';
 import { verifyHttpAuth, verifySocketAuth, invalidateMembershipCache } from './src/middleware/auth';
 import { generateTempPassword } from './src/utils/password';
+import { resolveHumanSender, BOT_SENDER } from './src/services/senderResolver';
 
 // Ensure auth_info directory exists
 const authInfoDir = 'auth_info';
@@ -129,6 +130,9 @@ async function startSession(sessionKey: string, accountId: string) {
     accountId,
     // Preservamos el cache de nombres si la sesión se está reconectando.
     contactNames: existingSession?.contactNames ?? new Map<string, string>(),
+    // Mismo criterio para el Map de senders pendientes: si la sesión vuelve
+    // tras un reconnect, los envíos en vuelo conservan su intención.
+    pendingSenders: existingSession?.pendingSenders ?? new Map(),
     ...(existingSession?.aiConfig && { aiConfig: existingSession.aiConfig }),
   });
 
@@ -447,18 +451,23 @@ async function startSession(sessionKey: string, accountId: string) {
                 await new Promise(r => setTimeout(r, delayMs));
 
                 try {
+                  let sentBotMsg: any;
                   if (rule.imageUrl) {
                     const imageResponse = await fetch(rule.imageUrl).then(res => {
                       if (!res.ok) throw new Error(`Failed to fetch image: ${res.statusText}`);
                       return res.arrayBuffer();
                     });
                     const imageBuffer = Buffer.from(imageResponse);
-                    await sessionForReset.sock.sendMessage(remoteJidForCancel, {
+                    sentBotMsg = await sessionForReset.sock.sendMessage(remoteJidForCancel, {
                       image: imageBuffer,
                       caption: rule.response || undefined,
                     });
                   } else if (rule.response) {
-                    await sessionForReset.sock.sendMessage(remoteJidForCancel, { text: rule.response });
+                    sentBotMsg = await sessionForReset.sock.sendMessage(remoteJidForCancel, { text: rule.response });
+                  }
+                  // Etiqueta 'bot': es una respuesta automática por keyword rule.
+                  if (sentBotMsg?.key?.id) {
+                    sessionForReset.pendingSenders.set(sentBotMsg.key.id, BOT_SENDER);
                   }
                 } catch (sendErr) {
                   console.error('[BotRule] Error enviando canned outgoing:', sendErr);
@@ -634,6 +643,7 @@ async function startSession(sessionKey: string, accountId: string) {
           console.log(`[AI] Keyword rule matched: "${rule.keyword}", sending canned response`);
           await new Promise(r => setTimeout(r, aiConfig.responseDelayMs > 2000 ? 2000 : aiConfig.responseDelayMs));
 
+          let sentBotMsg: any;
           if (rule.imageUrl) {
             try {
               console.log(`[AI] Downloading image for keyword rule: ${rule.imageUrl}`);
@@ -642,7 +652,7 @@ async function startSession(sessionKey: string, accountId: string) {
                 return res.arrayBuffer();
               });
               const imageBuffer = Buffer.from(imageResponse);
-              await session.sock.sendMessage(remoteJid, {
+              sentBotMsg = await session.sock.sendMessage(remoteJid, {
                 image: imageBuffer,
                 caption: rule.response || undefined
               });
@@ -650,11 +660,16 @@ async function startSession(sessionKey: string, accountId: string) {
               console.error(`[AI] Error sending image for keyword rule:`, error);
               // Fallback to text only if image fails
               if (rule.response) {
-                await session.sock.sendMessage(remoteJid, { text: rule.response });
+                sentBotMsg = await session.sock.sendMessage(remoteJid, { text: rule.response });
               }
             }
           } else {
-            await session.sock.sendMessage(remoteJid, { text: rule.response });
+            sentBotMsg = await session.sock.sendMessage(remoteJid, { text: rule.response });
+          }
+
+          // Etiqueta 'bot': respuesta automática disparada por keyword del cliente.
+          if (sentBotMsg?.key?.id) {
+            session.pendingSenders.set(sentBotMsg.key.id, BOT_SENDER);
           }
 
           return; // IA-canned respondió, no incrementar
@@ -836,9 +851,16 @@ async function cancelSession(sessionKey: string) {
 }
 
 /**
- * Common logic to send a message via Baileys, reused by HTTP and Socket handlers
+ * Common logic to send a message via Baileys, reused by HTTP and Socket handlers.
+ *
+ * `senderUid` debe venir del middleware/handshake (req.auth.uid o
+ * socket.data.uid). Lo usamos para resolver el primer nombre del operador
+ * que respondió (etiqueta visible en cada mensaje saliente).
  */
-async function performSendMessage({ to, text, imageUrl, sessionKey, accountId }: any) {
+async function performSendMessage(
+  { to, text, imageUrl, sessionKey, accountId }: any,
+  senderUid: string,
+) {
   const session = sessions.get(sessionKey);
   if (!session?.isReady || !session?.phoneNumber) {
     throw new Error('Session not ready');
@@ -879,6 +901,13 @@ async function performSendMessage({ to, text, imageUrl, sessionKey, accountId }:
     });
   } else {
     message = await session.sock.sendMessage(jid, { text });
+  }
+
+  // Etiquetamos al humano que envió este mensaje. El handler de
+  // messages.upsert consume esta entry al guardar el doc en Firestore.
+  if (message?.key?.id) {
+    const senderInfo = await resolveHumanSender(senderUid);
+    session.pendingSenders.set(message.key.id, senderInfo);
   }
 
   return {
@@ -943,7 +972,7 @@ app.post('/cancel-session', express.json(), verifyHttpAuth(), async (req, res) =
 // REST API endpoint to send messages (now uses common logic)
 app.post('/send-message', express.json(), verifyHttpAuth(), async (req, res) => {
   try {
-    const result = await performSendMessage(req.body);
+    const result = await performSendMessage(req.body, req.auth!.uid);
     res.json(result);
   } catch (error) {
     console.error('Error sending message (HTTP):', error);
@@ -1456,11 +1485,11 @@ io.on('connection', (socket) => {
         throw new Error('Unauthorized accountId');
       }
 
-      const result = await performSendMessage(data);
-      
+      const result = await performSendMessage(data, uid);
+
       // Emit success back to the specific client
-      socket.emit('message_sent_success', { 
-        to, 
+      socket.emit('message_sent_success', {
+        to,
         messageId: result.messageId,
         tempId: data.tempId // We'll add this in Flutter for optimistic UI
       });

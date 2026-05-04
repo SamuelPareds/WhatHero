@@ -43,6 +43,14 @@ class MessageBubble extends StatefulWidget {
   final String chatPhone;
   final String? sessionKey;
   final String accountId;
+  // Identidad de quien envió este mensaje saliente. Sólo se muestra cuando
+  // fromMe == true. Los entrantes nunca llevan etiqueta (es el cliente).
+  //   - senderType: 'human' | 'ai' | 'bot' (controla el ícono asociado).
+  //   - senderName: snapshot del nombre al momento del envío
+  //                 (ej. 'Samuel', 'ai', 'bot', 'WhatsApp').
+  // Mensajes legacy sin estos campos no muestran etiqueta (UI intacta).
+  final String? senderType;
+  final String? senderName;
   // Campos de media.
   // - mediaThumbBase64: jpegThumbnail inline de Baileys (Fase 1, render instantáneo).
   // - mediaUrl: URL final en Firebase Storage (Fase 2, full-res sobre la miniatura).
@@ -72,6 +80,8 @@ class MessageBubble extends StatefulWidget {
     required this.chatPhone,
     this.sessionKey,
     required this.accountId,
+    this.senderType,
+    this.senderName,
     this.mediaType,
     this.mediaThumbBase64,
     this.mediaWidth,
@@ -117,6 +127,46 @@ class _MessageBubbleState extends State<MessageBubble> {
     final hour = dateTime.hour.toString().padLeft(2, '0');
     final minute = dateTime.minute.toString().padLeft(2, '0');
     return '$hour:$minute';
+  }
+
+  // Etiqueta de autor sobre el bubble (sólo mensajes salientes con senderName).
+  // 11px, gris claro, alineada a la derecha. Para 'ai' y 'bot' añade un
+  // mini-icono distintivo. Para humano (incluye 'WhatsApp') va sin icono
+  // para no saturar el chat con respuestas hechas a mano.
+  Widget _buildSenderLabel() {
+    if (!widget.fromMe) return const SizedBox.shrink();
+    final name = widget.senderName;
+    if (name == null || name.isEmpty) return const SizedBox.shrink();
+
+    IconData? icon;
+    Color color = lightText.withValues(alpha: 0.65);
+    if (widget.senderType == 'ai') {
+      icon = Icons.auto_awesome;
+      color = primaryAqua.withValues(alpha: 0.75);
+    } else if (widget.senderType == 'bot') {
+      icon = Icons.smart_toy_outlined;
+    }
+
+    return Padding(
+      padding: const EdgeInsets.only(right: 12, bottom: 3),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (icon != null) ...[
+            Icon(icon, size: 11, color: color),
+            const SizedBox(width: 3),
+          ],
+          Text(
+            name,
+            style: TextStyle(
+              color: color,
+              fontSize: 11,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   // Renderiza la imagen del mensaje. El thumbnail base64 (Baileys) actúa como
@@ -206,6 +256,7 @@ class _MessageBubbleState extends State<MessageBubble> {
           crossAxisAlignment:
               widget.fromMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
           children: [
+            _buildSenderLabel(),
             GestureDetector(
               onLongPress: _showMessageOptions,
               onTap: isReady ? () => _openFullscreen(url) : null,
@@ -874,6 +925,7 @@ class _MessageBubbleState extends State<MessageBubble> {
         child: Column(
           crossAxisAlignment: widget.fromMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
           children: [
+            _buildSenderLabel(),
             GestureDetector(
               onLongPress: _showMessageOptions,
               child: Container(

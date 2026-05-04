@@ -1,3 +1,14 @@
+// Quién originó cada mensaje saliente. El frontend muestra `name` arriba del
+// bubble (ej. "Samuel", "ai", "bot", "WhatsApp"). El `type` es lo único que
+// consume el contexto del asistente/discriminador para decidir routing.
+export type SenderType = 'human' | 'ai' | 'bot';
+
+export interface SenderInfo {
+  type: SenderType;
+  name: string;     // snapshot al momento de envío (no se resuelve en lectura)
+  uid?: string;     // sólo cuando type='human' y vino vía app autenticada
+}
+
 export interface SessionData {
   sock: any;
   isReady: boolean;
@@ -13,6 +24,12 @@ export interface SessionData {
   contactNames: Map<string, string>;
   // Timer para debouncear la reconciliación de nombres tras contacts.upsert.
   reconcileTimer?: NodeJS.Timeout;
+  // Intenciones de envío pendientes (messageId -> sender).
+  // Cada entry point (humano API/socket, IA, keyword rules, recordatorios)
+  // registra aquí su SenderInfo después del sock.sendMessage. El handler de
+  // messages.upsert lo consume para etiquetar el doc en Firestore. Si no hay
+  // entry → el mensaje fue enviado desde el WhatsApp oficial del teléfono.
+  pendingSenders: Map<string, SenderInfo>;
   aiConfig?: {
     enabled: boolean;
     apiKey: string;
