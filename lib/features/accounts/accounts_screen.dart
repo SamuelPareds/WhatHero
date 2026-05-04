@@ -4,6 +4,9 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:http/http.dart' as http;
 import 'package:crm_whatsapp/core.dart';
+import 'package:crm_whatsapp/core/services/account_context_service.dart';
+import 'package:crm_whatsapp/core/services/api_client.dart';
+import 'package:crm_whatsapp/core/services/notification_service.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/core/services/storage_service.dart';
 import 'package:crm_whatsapp/core/services/version_service.dart';
@@ -48,7 +51,15 @@ class _AccountsScreenState extends State<AccountsScreen> {
     try {
       // Limpiar preferencia de última sesión
       await StorageService().clearLastSessionId();
-      // El dispose del socket se encarga de cerrar la conexión
+
+      // Limpieza ordenada ANTES del signOut para evitar que cualquier listener
+      // que reaccione al cambio de auth state vea contexto stale del usuario
+      // anterior. Especialmente importante en dev: cuando cambiamos de usuario
+      // para validar que los datos no se "filtren" entre cuentas.
+      await NotificationService().unregister();
+      await SocketService().shutdown();
+      await AccountContextService().clear();
+
       await FirebaseAuth.instance.signOut();
       if (!mounted) return;
       Navigator.pushReplacement(
@@ -79,7 +90,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
       print('[AccountsScreen] POST /start-session con accountId: ${widget.accountId}');
       final response = await http.post(
         Uri.parse('$backendUrl/start-session'),
-        headers: {'Content-Type': 'application/json'},
+        headers: await authHeaders(),
         body: jsonEncode({'accountId': widget.accountId}),
       ).timeout(const Duration(seconds: 10));
 

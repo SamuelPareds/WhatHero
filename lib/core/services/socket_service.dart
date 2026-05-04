@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'package:flutter/foundation.dart';
 import '../config.dart';
@@ -27,6 +28,7 @@ class SocketService {
   IO.Socket? _socket;
   bool _isConnected = false;
   String? _currentAccountId;
+  StreamSubscription<User?>? _idTokenSub;
 
   // StreamControllers para distribuir eventos a las pantallas
   final _qrController = StreamController<QREvent>.broadcast();
@@ -42,7 +44,7 @@ class SocketService {
 
   bool get isConnected => _isConnected;
 
-  void init(String accountId) {
+  Future<void> init(String accountId) async {
     if (_socket != null && _currentAccountId == accountId) {
       debugPrint('[SocketService] Ya conectado con accountId: $accountId');
       return;
@@ -52,15 +54,42 @@ class SocketService {
     _disconnect();
 
     debugPrint('[SocketService] Conectando a $backendUrl para accountId: $accountId');
-    
+
+    // El backend valida el idToken contra Firebase Admin y verifica que el
+    // accountId esté en users/{uid}.memberOfAccounts. Sin token no se permite
+    // el handshake. getIdToken(false) usa el cacheado si sigue vigente; si
+    // expiró, Firebase lo refresca automáticamente.
+    final idToken = await FirebaseAuth.instance.currentUser?.getIdToken();
+
     _socket = IO.io(backendUrl, IO.OptionBuilder()
       .setTransports(['websocket'])
-      .setAuth({'accountId': accountId})
+      .setAuth({'accountId': accountId, 'idToken': idToken})
       .enableAutoConnect()
       .build());
 
     _setupListeners();
+    _setupTokenRefresh();
     _socket?.connect();
+  }
+
+  /// Mantiene el `auth.idToken` del socket actualizado conforme Firebase
+  /// rota el token (cada hora). En reconexiones automáticas el cliente
+  /// re-envía este `auth`, así que basta con mutarlo en su sitio.
+  void _setupTokenRefresh() {
+    _idTokenSub?.cancel();
+    _idTokenSub =
+        FirebaseAuth.instance.idTokenChanges().listen((user) async {
+      if (user == null || _socket == null) return;
+      try {
+        final fresh = await user.getIdToken();
+        final auth = _socket?.io.options?['auth'];
+        if (auth is Map) {
+          auth['idToken'] = fresh;
+        }
+      } catch (e) {
+        debugPrint('[SocketService] Error refrescando idToken: $e');
+      }
+    });
   }
 
   void _setupListeners() {
@@ -120,8 +149,18 @@ class SocketService {
     _isConnected = false;
   }
 
+  /// Cierra el socket y deja de escuchar idTokenChanges. Llamar en logout
+  /// para que el siguiente usuario no herede el listener del anterior.
+  Future<void> shutdown() async {
+    await _idTokenSub?.cancel();
+    _idTokenSub = null;
+    _disconnect();
+    _currentAccountId = null;
+  }
+
   /// Cerrar todos los streams al cerrar la app (opcional)
   void dispose() {
+    _idTokenSub?.cancel();
     _disconnect();
     _qrController.close();
     _statusController.close();

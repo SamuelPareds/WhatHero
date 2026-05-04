@@ -6,6 +6,7 @@ import 'package:just_audio/just_audio.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player/video_player.dart';
 import 'package:crm_whatsapp/core.dart';
+import 'package:crm_whatsapp/core/services/api_client.dart';
 
 // Player global compartido: solo un audio suena a la vez (estilo WhatsApp).
 // Cada burbuja se identifica por messageId; al darle play a otra burbuja, la
@@ -641,7 +642,7 @@ class _MessageBubbleState extends State<MessageBubble> {
     try {
       final response = await http.post(
         Uri.parse('$backendUrl/edit-message'),
-        headers: {'Content-Type': 'application/json'},
+        headers: await authHeaders(),
         body: jsonEncode({
           'messageId': widget.messageId,
           'chatPhone': widget.chatPhone,
@@ -679,7 +680,7 @@ class _MessageBubbleState extends State<MessageBubble> {
     try {
       final response = await http.post(
         Uri.parse('$backendUrl/delete-message'),
-        headers: {'Content-Type': 'application/json'},
+        headers: await authHeaders(),
         body: jsonEncode({
           'messageId': widget.messageId,
           'chatPhone': widget.chatPhone,

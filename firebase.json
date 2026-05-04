@@ -1,1 +1,42 @@
-{"flutter":{"platforms":{"android":{"default":{"projectId":"whathero-73605","appId":"1:316753391709:android:5b7b3b6257fa6727641db4","fileOutput":"android/app/google-services.json"}},"ios":{"default":{"projectId":"whathero-73605","appId":"1:316753391709:ios:cc1f9b4cad48d9a5641db4","uploadDebugSymbols":false,"fileOutput":"ios/Runner/GoogleService-Info.plist"}},"dart":{"lib/firebase_options.dart":{"projectId":"whathero-73605","configurations":{"android":"1:316753391709:android:5b7b3b6257fa6727641db4","ios":"1:316753391709:ios:cc1f9b4cad48d9a5641db4","web":"1:316753391709:web:ecb77f62e869e21a641db4"}}}}},"hosting":{"public":"build/web","ignore":["firebase.json","**/.*","**/node_modules/**"],"rewrites":[{"source":"**","destination":"/index.html"}]},"storage":{"rules":"storage.rules"}}
+{
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "whathero-73605",
+          "appId": "1:316753391709:android:5b7b3b6257fa6727641db4",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "ios": {
+        "default": {
+          "projectId": "whathero-73605",
+          "appId": "1:316753391709:ios:cc1f9b4cad48d9a5641db4",
+          "uploadDebugSymbols": false,
+          "fileOutput": "ios/Runner/GoogleService-Info.plist"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "whathero-73605",
+          "configurations": {
+            "android": "1:316753391709:android:5b7b3b6257fa6727641db4",
+            "ios": "1:316753391709:ios:cc1f9b4cad48d9a5641db4",
+            "web": "1:316753391709:web:ecb77f62e869e21a641db4"
+          }
+        }
+      }
+    }
+  },
+  "hosting": {
+    "public": "build/web",
+    "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+    "rewrites": [{ "source": "**", "destination": "/index.html" }]
+  },
+  "storage": {
+    "rules": "storage.rules"
+  },
+  "firestore": {
+    "rules": "firestore.rules"
+  }
+}

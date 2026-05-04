@@ -22,6 +22,7 @@ import { extractMediaInfo, classifyIncomingMedia } from './src/services/mediaSer
 import { ReminderService } from './src/services/reminderService';
 import { sendHumanAttentionNotification } from './src/services/notificationService';
 import { ACCOUNTS_COLLECTION, IS_PRODUCTION } from './src/config/env';
+import { verifyHttpAuth, verifySocketAuth, invalidateMembershipCache } from './src/middleware/auth';
 
 // Ensure auth_info directory exists
 const authInfoDir = 'auth_info';
@@ -887,7 +888,7 @@ async function performSendMessage({ to, text, imageUrl, sessionKey, accountId }:
 }
 
 // REST API endpoint to start a new session
-app.post('/start-session', express.json(), async (req, res) => {
+app.post('/start-session', express.json(), verifyHttpAuth(), async (req, res) => {
   try {
     const { accountId } = req.body;
     console.log('[/start-session] POST recibido con accountId:', accountId);
@@ -912,7 +913,7 @@ app.post('/start-session', express.json(), async (req, res) => {
 });
 
 // REST API endpoint to cancel a session
-app.post('/cancel-session', express.json(), async (req, res) => {
+app.post('/cancel-session', express.json(), verifyHttpAuth(), async (req, res) => {
   try {
     const { accountId, sessionKey } = req.body;
     console.log('[/cancel-session] POST recibido con sessionKey:', sessionKey);
@@ -939,7 +940,7 @@ app.post('/cancel-session', express.json(), async (req, res) => {
 });
 
 // REST API endpoint to send messages (now uses common logic)
-app.post('/send-message', express.json(), async (req, res) => {
+app.post('/send-message', express.json(), verifyHttpAuth(), async (req, res) => {
   try {
     const result = await performSendMessage(req.body);
     res.json(result);
@@ -954,7 +955,7 @@ app.post('/send-message', express.json(), async (req, res) => {
 
 // REST API endpoint to generate AI response (bypass discriminator)
 // Used when operator wants AI to generate a response for approval before sending
-app.post('/generate-ai-response', express.json(), async (req, res) => {
+app.post('/generate-ai-response', express.json(), verifyHttpAuth(), async (req, res) => {
   try {
     const { chatPhone, sessionKey, accountId } = req.body;
 
@@ -1022,7 +1023,7 @@ app.post('/generate-ai-response', express.json(), async (req, res) => {
 });
 
 // REST API endpoint to edit a message
-app.post('/edit-message', express.json(), async (req, res) => {
+app.post('/edit-message', express.json(), verifyHttpAuth(), async (req, res) => {
   try {
     const { messageId, chatPhone, newText, sessionKey, accountId } = req.body;
 
@@ -1087,7 +1088,7 @@ app.post('/edit-message', express.json(), async (req, res) => {
 });
 
 // REST API endpoint to delete a message
-app.post('/delete-message', express.json(), async (req, res) => {
+app.post('/delete-message', express.json(), verifyHttpAuth(), async (req, res) => {
   try {
     const { messageId, chatPhone, sessionKey, accountId } = req.body;
 
@@ -1152,7 +1153,7 @@ app.post('/delete-message', express.json(), async (req, res) => {
 
 // Borrado completo de un chat: Storage + mensajes + chat doc.
 // Hard-delete irreversible. La UI exige doble confirmación antes de invocar este endpoint.
-app.post('/delete-chat', express.json(), async (req, res) => {
+app.post('/delete-chat', express.json(), verifyHttpAuth(), async (req, res) => {
   try {
     const { phoneNumber, sessionKey, sessionId, accountId } = req.body;
 
@@ -1228,7 +1229,32 @@ app.post('/delete-chat', express.json(), async (req, res) => {
   }
 });
 
+// Endpoint que el cliente llama tras login (o tras ser agregado a una nueva
+// cuenta) para refrescar custom claims. Las claims se embeben en el ID Token
+// y son usadas por las Storage Rules (que no pueden hacer get() a Firestore).
+// El propio cliente debe luego ejecutar `currentUser.getIdToken(true)` para
+// que las claims tomen efecto en su token activo.
+app.post('/auth/refresh-claims', express.json(), verifyHttpAuth({ requireAccountId: false }), async (req, res) => {
+  try {
+    const uid = req.auth!.uid;
+    // Releemos Firestore (no usamos cache) para asegurar valor fresco.
+    const snap = await db.collection('users').doc(uid).get();
+    const memberOfAccounts: string[] =
+      (snap.exists && (snap.data()?.memberOfAccounts as string[])) || [];
+    await admin.auth().setCustomUserClaims(uid, { memberOf: memberOfAccounts });
+    invalidateMembershipCache(uid);
+    console.log(`[/auth/refresh-claims] uid=${uid} → memberOf=${memberOfAccounts.length} cuentas`);
+    res.json({ success: true, memberOfAccounts });
+  } catch (error) {
+    console.error('[/auth/refresh-claims] Error:', error);
+    res.status(500).json({ error: 'Failed to refresh claims' });
+  }
+});
+
 // REST API endpoint to send reminders manually
+// NOTA: Este endpoint NO usa verifyHttpAuth porque es invocado por cron
+// interno (sin Firebase user). Si en el futuro se expone al cliente, debe
+// pasar por el middleware de auth para validar membresía.
 app.post('/send-reminders', express.json(), async (req, res) => {
   try {
     const { sessionKey, accountId, sessionId } = req.body;
@@ -1248,15 +1274,15 @@ app.post('/send-reminders', express.json(), async (req, res) => {
   }
 });
 
-io.on('connection', (socket) => {
-  const accountId = socket.handshake.auth.accountId as string | undefined;
-  console.log('[Socket.io] Cliente conectado: socket.id=' + socket.id + ', accountId=' + accountId);
+// Handshake auth: rechazamos sockets sin idToken válido o sin membresía
+// en el accountId solicitado. Esto cierra el hueco previo donde cualquier
+// cliente podía unirse a la sala de cualquier cuenta tipeando un accountId.
+io.use(verifySocketAuth);
 
-  if (!accountId) {
-    console.warn('[Socket.io] Socket ' + socket.id + ' conectado sin accountId, desconectando');
-    socket.disconnect();
-    return;
-  }
+io.on('connection', (socket) => {
+  const accountId = socket.handshake.auth.accountId as string;
+  const uid = socket.data.uid as string;
+  console.log('[Socket.io] Cliente conectado: socket.id=' + socket.id + ', uid=' + uid + ', accountId=' + accountId);
 
   // Join this socket to a room named by accountId (for broadcasting to all their sessions)
   console.log('[Socket.io] Uniéndose a la sala: ' + accountId);

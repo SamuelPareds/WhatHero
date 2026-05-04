@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -57,8 +58,10 @@ class _SessionDispatcherState extends State<SessionDispatcher> {
     // 'ai_state' nunca se registraba (los estados IA no funcionaban hasta
     // que el usuario entraba manualmente a AccountsScreen).
     // SocketService.init es idempotente: si ya estamos conectados con este
-    // accountId, no hace nada.
-    SocketService().init(widget.accountId);
+    // accountId, no hace nada. Es async (necesita pedirle el idToken a
+    // Firebase para el handshake), pero no bloqueamos la UI: que se conecte
+    // en background.
+    unawaited(SocketService().init(widget.accountId));
 
     // NotificationService.init sigue el MISMO patrón canónico: vive aquí, no
     // dentro de pantallas hijas. Si el día de mañana se agrega una pantalla
@@ -66,7 +69,7 @@ class _SessionDispatcherState extends State<SessionDispatcher> {
     // de otro modo en cold-start con sesión guardada el token nunca se
     // registraría hasta que el usuario navegara manualmente.
     // Es async pero no esperamos: la UI no debe bloquearse por permisos/red.
-    NotificationService().init(widget.accountId);
+    unawaited(NotificationService().init(widget.accountId));
   }
 
   @override

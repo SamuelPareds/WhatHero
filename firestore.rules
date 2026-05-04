@@ -1,0 +1,72 @@
+// Reglas de Firestore para WhatHero — modelo multi-usuario por cuenta.
+//
+// Modelo:
+// - users/{uid}: doc por cada usuario Firebase. Contiene `memberOfAccounts`
+//   (lista de accountIds a los que tiene acceso). Owners están en su propia
+//   cuenta; sub-users heredan acceso a la cuenta del owner que los creó.
+// - accounts/{accountId}/**: datos de WhatsApp (sesiones, chats, mensajes,
+//   devices, etc.). Acceso permitido si el requester es miembro de esa cuenta.
+//
+// El backend (firebase-admin) bypassea estas reglas; protegen sólo escrituras
+// desde clientes (Flutter app).
+//
+// Auto-bootstrap: el cliente puede crear su propio doc users/{uid} la
+// primera vez que loguea (usuarios pre-existentes a la feature multi-user)
+// SOLO si los campos respetan el contrato de owner (no se puede auto-asignar
+// a la cuenta de otro). Updates/deletes están bloqueados desde el cliente:
+// solo el backend (Admin SDK) puede modificar membership.
+
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper: el uid autenticado es miembro de esta cuenta?
+    function isMember(accountId) {
+      return request.auth != null &&
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             accountId in get(/databases/$(database)/documents/users/$(request.auth.uid)).data.memberOfAccounts;
+    }
+
+    // users/{uid}: cada quien lee solo el suyo. Auto-bootstrap controlado.
+    match /users/{uid} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+
+      // Crear el propio doc inicial como owner. Validación estricta:
+      // - El uid del path debe coincidir con el auth.
+      // - Los campos cumplen el contrato owner (ownedAccountId == uid,
+      //   role == 'owner', memberOfAccounts == [uid], mustChangePassword false).
+      // Esto impide que un usuario malicioso auto-se asigne a la cuenta de otro.
+      allow create: if request.auth != null
+                    && request.auth.uid == uid
+                    && request.resource.data.ownedAccountId == uid
+                    && request.resource.data.role == 'owner'
+                    && request.resource.data.memberOfAccounts is list
+                    && request.resource.data.memberOfAccounts.size() == 1
+                    && request.resource.data.memberOfAccounts[0] == uid
+                    && request.resource.data.mustChangePassword == false;
+
+      // Updates/deletes: solo desde el backend (Admin SDK bypassa rules).
+      // Para sub-users, agregar miembros, etc. va vía endpoint del backend.
+      allow update, delete: if false;
+    }
+
+    // accounts/{accountId} (producción) — lectura/escritura para miembros.
+    match /accounts/{accountId} {
+      allow read, write: if isMember(accountId);
+
+      match /{document=**} {
+        allow read, write: if isMember(accountId);
+      }
+    }
+
+    // accounts_dev/{accountId} (desarrollo) — mismo contrato.
+    match /accounts_dev/{accountId} {
+      allow read, write: if isMember(accountId);
+
+      match /{document=**} {
+        allow read, write: if isMember(accountId);
+      }
+    }
+  }
+}

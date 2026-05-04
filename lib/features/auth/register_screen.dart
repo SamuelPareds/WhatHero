@@ -69,6 +69,24 @@ class _RegisterScreenState extends State<RegisterScreen> {
             'createdAt': Timestamp.now(),
             'accountId': user.uid,
           }, SetOptions(merge: true));
+
+        // Crear doc users/{uid} como owner de su propia cuenta. Este doc
+        // es la fuente de verdad para AccountContextService y para las
+        // Firestore Rules (campo memberOfAccounts). Vive fuera del switch
+        // de entorno (accounts vs accounts_dev) porque la membresía es
+        // global al usuario Firebase, no dependiente del entorno.
+        await FirebaseFirestore.instance
+          .collection('users')
+          .doc(user.uid)
+          .set({
+            'email': user.email,
+            'displayName': user.displayName,
+            'ownedAccountId': user.uid,
+            'memberOfAccounts': [user.uid],
+            'role': 'owner',
+            'mustChangePassword': false,
+            'createdAt': FieldValue.serverTimestamp(),
+          });
       }
 
       // Pequeño delay para asegurar que Firebase haya actualizado el estado

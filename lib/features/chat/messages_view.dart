@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:http/http.dart' as http;
 import 'package:crm_whatsapp/core.dart';
+import 'package:crm_whatsapp/core/services/api_client.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/features/settings.dart';
 import 'widgets/message_bubble.dart';
@@ -115,7 +116,7 @@ class _MessagesViewState extends State<MessagesView> {
         print('[MessagesView] Socket desconectado, usando fallback HTTP...');
         final response = await http.post(
           Uri.parse('$backendUrl/send-message'),
-          headers: {'Content-Type': 'application/json'},
+          headers: await authHeaders(),
           body: jsonEncode(messageData),
         ).timeout(const Duration(seconds: 10));
 
@@ -163,7 +164,7 @@ class _MessagesViewState extends State<MessagesView> {
     try {
       final response = await http.post(
         Uri.parse('$backendUrl/generate-ai-response'),
-        headers: {'Content-Type': 'application/json'},
+        headers: await authHeaders(),
         body: jsonEncode({
           'chatPhone': widget.phoneNumber,
           'sessionKey': widget.sessionKey,
@@ -376,7 +377,7 @@ class _MessagesViewState extends State<MessagesView> {
         print('[MessagesView] Socket desconectado, usando fallback HTTP para respuesta rápida...');
         final response = await http.post(
           Uri.parse('$backendUrl/send-message'),
-          headers: {'Content-Type': 'application/json'},
+          headers: await authHeaders(),
           body: jsonEncode(messageData),
         ).timeout(const Duration(seconds: 10));
 

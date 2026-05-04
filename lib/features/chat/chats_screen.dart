@@ -8,6 +8,7 @@ import 'package:flutter_slidable/flutter_slidable.dart';
 import 'package:http/http.dart' as http;
 import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/services/ai_state_service.dart';
+import 'package:crm_whatsapp/core/services/api_client.dart';
 import 'package:crm_whatsapp/core/services/notification_service.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/core/services/storage_service.dart';
@@ -1108,7 +1109,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
     try {
       final response = await http.post(
         Uri.parse('$backendUrl/delete-chat'),
-        headers: {'Content-Type': 'application/json'},
+        headers: await authHeaders(),
         body: jsonEncode({
           'phoneNumber': phoneNumber,
           'sessionKey': widget.sessionKey,

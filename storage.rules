@@ -1,24 +1,33 @@
-// Reglas de Firebase Storage para WhatHero — espejo del árbol Firestore.
+// Reglas de Firebase Storage para WhatHero — multi-usuario por cuenta.
 //
-// Solo el dueño (Firebase UID) puede leer/escribir bajo su carpeta de cuenta.
-// El backend (firebase-admin) bypassea las reglas; estas previenen escrituras
-// no autorizadas desde clientes.
+// Storage Rules NO pueden hacer get() a Firestore (no hay api equivalente).
+// Por eso la membresía se evalúa contra `request.auth.token.memberOf`,
+// custom claim que el backend setea con `setCustomUserClaims` cada vez que
+// se crea/modifica un user doc o cuando el cliente llama
+// POST /auth/refresh-claims.
 //
-// Las URLs públicas con token de descarga que genera el backend funcionan
-// independientemente de estas reglas (el token es la credencial), así que
-// el visor del CRM seguirá viendo las imágenes aunque endurezcamos esto.
+// El backend (firebase-admin) bypassea las reglas; estas previenen
+// escrituras no autorizadas desde clientes.
+//
+// Las URLs públicas con token de descarga generadas por el backend funcionan
+// independientemente (el token es la credencial), así que el visor del CRM
+// seguirá viendo las imágenes aunque endurezcamos esto.
 
 rules_version = '2';
 
 service firebase.storage {
   match /b/{bucket}/o {
-    // Producción: accounts/{userId}/...
-    match /accounts/{userId}/{allPaths=**} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+    // Producción: accounts/{accountId}/...
+    match /accounts/{accountId}/{allPaths=**} {
+      allow read, write: if request.auth != null
+                         && request.auth.token.memberOf is list
+                         && (accountId in request.auth.token.memberOf);
     }
-    // Desarrollo: accounts_dev/{userId}/...
-    match /accounts_dev/{userId}/{allPaths=**} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+    // Desarrollo: accounts_dev/{accountId}/...
+    match /accounts_dev/{accountId}/{allPaths=**} {
+      allow read, write: if request.auth != null
+                         && request.auth.token.memberOf is list
+                         && (accountId in request.auth.token.memberOf);
     }
     // Resto: deny por defecto.
   }

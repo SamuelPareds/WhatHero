@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:math';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/foundation.dart';
 import 'package:package_info_plus/package_info_plus.dart';
@@ -260,6 +261,15 @@ class NotificationService {
     return 'd-$hex';
   }
 
+  /// Doc id compuesto: `{deviceId}__{uid}`. Permite que owner y sub-user
+  /// coexistan en el mismo dispositivo físico sin pisarse el FCM token.
+  /// Si no hay usuario logueado (caso raro), cae al deviceId pelado para
+  /// no perder el dato (se reconciliará al próximo init).
+  String _deviceDocId(String deviceId) {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    return uid != null ? '${deviceId}__$uid' : deviceId;
+  }
+
   Future<void> _writeDeviceDoc(
     String accountId,
     String deviceId,
@@ -273,15 +283,17 @@ class NotificationService {
       } catch (_) {
         // package_info puede fallar en algunos runtimes; no es crítico.
       }
+      final uid = FirebaseAuth.instance.currentUser?.uid;
       await FirebaseFirestore.instance
           .collection(accountsCollection)
           .doc(accountId)
           .collection('devices')
-          .doc(deviceId)
+          .doc(_deviceDocId(deviceId))
           .set({
         'fcm_token': token,
         'platform': _platformLabel(),
         'app_version': version,
+        'uid': uid,
         'last_seen_at': FieldValue.serverTimestamp(),
       }, SetOptions(merge: true));
     } catch (e) {
@@ -292,14 +304,15 @@ class NotificationService {
   Future<void> _removeDeviceDoc(String accountId) async {
     if (_deviceId == null) return;
     try {
+      final docId = _deviceDocId(_deviceId!);
       await FirebaseFirestore.instance
           .collection(accountsCollection)
           .doc(accountId)
           .collection('devices')
-          .doc(_deviceId)
+          .doc(docId)
           .delete();
       debugPrint(
-        '[NotificationService] Doc devices/$_deviceId borrado de $accountId',
+        '[NotificationService] Doc devices/$docId borrado de $accountId',
       );
     } catch (e) {
       debugPrint('[NotificationService] Error borrando device doc: $e');
