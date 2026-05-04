@@ -12,6 +12,7 @@ import 'package:crm_whatsapp/core/services/storage_service.dart';
 import 'package:crm_whatsapp/core/services/version_service.dart';
 import 'package:crm_whatsapp/features/auth.dart';
 import 'package:crm_whatsapp/features/accounts/link_account_screen.dart';
+import 'package:crm_whatsapp/features/members/members_screen.dart';
 import 'package:crm_whatsapp/features/settings.dart';
 import 'package:crm_whatsapp/features/chat.dart';
 import 'package:crm_whatsapp/features/chat/widgets/unread_badge.dart';
@@ -128,6 +129,23 @@ class _AccountsScreenState extends State<AccountsScreen> {
         title: const Text('Mis Cuentas', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 24, color: white)),
         elevation: 0,
         actions: [
+          // El acceso a "Miembros" solo aparece para owners. Los sub-users
+          // verían una pantalla casi vacía (sin FAB) y por ahora no
+          // necesitan ver la lista — la mostramos cuando agreguemos
+          // permisos de read-only en una fase futura.
+          if (AccountContextService().isOwner)
+            IconButton(
+              icon: const Icon(Icons.group_outlined, color: lightText),
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => MembersScreen(accountId: widget.accountId),
+                  ),
+                );
+              },
+              tooltip: 'Miembros del equipo',
+            ),
           IconButton(
             icon: const Icon(Icons.logout, color: lightText),
             onPressed: _handleLogout,

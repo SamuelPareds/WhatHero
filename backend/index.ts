@@ -23,6 +23,7 @@ import { ReminderService } from './src/services/reminderService';
 import { sendHumanAttentionNotification } from './src/services/notificationService';
 import { ACCOUNTS_COLLECTION, IS_PRODUCTION } from './src/config/env';
 import { verifyHttpAuth, verifySocketAuth, invalidateMembershipCache } from './src/middleware/auth';
+import { generateTempPassword } from './src/utils/password';
 
 // Ensure auth_info directory exists
 const authInfoDir = 'auth_info';
@@ -1248,6 +1249,125 @@ app.post('/auth/refresh-claims', express.json(), verifyHttpAuth({ requireAccount
   } catch (error) {
     console.error('[/auth/refresh-claims] Error:', error);
     res.status(500).json({ error: 'Failed to refresh claims' });
+  }
+});
+
+// Crear sub-usuario para una cuenta. Solo el owner puede invitar a su
+// propia cuenta. El owner sigue logueado: la creación corre 100% con
+// Admin SDK, sin tocar el FirebaseAuth del cliente.
+//
+// Flujo:
+// 1. Validar que requester sea owner Y dueño del accountId solicitado.
+// 2. Generar password temporal CSPRNG.
+// 3. admin.auth().createUser → nuevo Firebase Auth user.
+// 4. setCustomUserClaims con memberOf = [accountId] (Storage Rules listas
+//    desde el primer login).
+// 5. Crear users/{newUid} con role 'member' y mustChangePassword true.
+// 6. Crear accounts/{accountId}/members/{newUid} (mirror para listar).
+// 7. Devolver email + tempPassword al owner una sola vez.
+app.post('/accounts/members', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const requesterUid = req.auth!.uid;
+    const { accountId, email, displayName } = req.body as {
+      accountId: string;
+      email?: string;
+      displayName?: string;
+    };
+
+    const cleanEmail = (email || '').trim().toLowerCase();
+    if (!cleanEmail || !cleanEmail.includes('@')) {
+      return res.status(400).json({ error: 'Email inválido' });
+    }
+    const cleanDisplayName = (displayName || '').trim() || null;
+
+    // Solo owners pueden invitar. Y solo a la cuenta de la que son owner.
+    // Por ahora ownedAccountId == requesterUid (no soportamos owners de
+    // múltiples cuentas todavía), así que esa es la única invariante.
+    const requesterDoc = await db.collection('users').doc(requesterUid).get();
+    if (!requesterDoc.exists) {
+      return res.status(403).json({ error: 'Requester sin doc users/' });
+    }
+    const requesterData = requesterDoc.data()!;
+    if (requesterData.role !== 'owner') {
+      return res.status(403).json({ error: 'Solo el owner puede invitar miembros' });
+    }
+    if (requesterData.ownedAccountId !== accountId) {
+      return res.status(403).json({ error: 'No puedes invitar a una cuenta que no es tuya' });
+    }
+
+    // Verificar email no exista (Firebase tira error feo si existe).
+    try {
+      await admin.auth().getUserByEmail(cleanEmail);
+      return res.status(409).json({ error: 'Ese email ya está registrado' });
+    } catch (e: any) {
+      if (e?.code !== 'auth/user-not-found') {
+        console.error('[/accounts/members] getUserByEmail error inesperado:', e);
+        return res.status(500).json({ error: 'Error verificando email' });
+      }
+      // OK: no existe, podemos crearlo.
+    }
+
+    const tempPassword = generateTempPassword();
+
+    // 1. Crear user en Firebase Auth.
+    const newUser = await admin.auth().createUser({
+      email: cleanEmail,
+      password: tempPassword,
+      displayName: cleanDisplayName || undefined,
+      emailVerified: false,
+    });
+
+    // 2. Custom claims (memberOf) inmediatamente, así su primer login ya
+    //    puede acceder a Storage sin esperar a /auth/refresh-claims.
+    await admin.auth().setCustomUserClaims(newUser.uid, {
+      memberOf: [accountId],
+    });
+
+    // 3. Doc users/{newUid} (sub-user). ownedAccountId apunta al owner.
+    await db.collection('users').doc(newUser.uid).set({
+      email: cleanEmail,
+      displayName: cleanDisplayName,
+      ownedAccountId: accountId,
+      memberOfAccounts: [accountId],
+      role: 'member',
+      mustChangePassword: true,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdBy: requesterUid,
+    });
+
+    // 4. Mirror en subcollection accounts/{accountId}/members.
+    await db
+      .collection(ACCOUNTS_COLLECTION)
+      .doc(accountId)
+      .collection('members')
+      .doc(newUser.uid)
+      .set({
+        email: cleanEmail,
+        displayName: cleanDisplayName,
+        role: 'member',
+        addedAt: admin.firestore.FieldValue.serverTimestamp(),
+        addedBy: requesterUid,
+      });
+
+    // 5. Cache: si hubiera un cache stale para el owner, da igual; lo del
+    //    sub-user ya quedó listo en Firestore + claims.
+    invalidateMembershipCache(newUser.uid);
+
+    console.log(
+      `[/accounts/members] uid=${requesterUid} creó miembro ${newUser.uid} (${cleanEmail}) en cuenta ${accountId}`,
+    );
+
+    res.json({
+      uid: newUser.uid,
+      email: cleanEmail,
+      tempPassword,
+    });
+  } catch (error) {
+    console.error('[/accounts/members] Error:', error);
+    res.status(500).json({
+      error: 'Failed to create member',
+      details: (error as any).message,
+    });
   }
 });
 
