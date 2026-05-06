@@ -74,6 +74,11 @@ class MessageBubble extends StatefulWidget {
   // chats 1:1, valor `{ emoji: String, timestamp: Timestamp }`. El backend
   // mergea las entries; acá sólo renderizamos un chip flotante en la esquina.
   final Map<String, dynamic>? reactions;
+  // edited: el cliente editó este mensaje en WhatsApp → mostramos "(editado)".
+  // revoked: el cliente eliminó este mensaje en WhatsApp → label de evidencia,
+  // pero NO borramos el contenido (decisión de producto: el operador decide).
+  final bool? edited;
+  final bool? revoked;
 
   const MessageBubble({
     super.key,
@@ -98,6 +103,8 @@ class MessageBubble extends StatefulWidget {
     this.mediaDuration,
     this.mediaIsGif,
     this.reactions,
+    this.edited,
+    this.revoked,
   });
 
   @override
@@ -1081,15 +1088,66 @@ class _MessageBubbleState extends State<MessageBubble> {
             // Reservamos espacio extra cuando hay chip de reacciones para que
             // no choque con el timestamp (chip flota -12px abajo).
             SizedBox(height: reactionsChip != null ? 18 : 6),
+            // Banner de evidencia: el cliente eliminó el mensaje en WhatsApp
+            // pero conservamos el contenido. Ámbar para que el operador note
+            // sin que se confunda con un error rojo. Discreto pero visible.
+            if (widget.revoked == true)
+              Padding(
+                padding: const EdgeInsets.only(left: 12, right: 12, bottom: 4),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFBBF24).withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                      color: const Color(0xFFFBBF24).withValues(alpha: 0.4),
+                      width: 1,
+                    ),
+                  ),
+                  child: const Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.delete_outline, size: 13, color: Color(0xFFFBBF24)),
+                      SizedBox(width: 4),
+                      Text(
+                        'Eliminado por el usuario en WhatsApp',
+                        style: TextStyle(
+                          color: Color(0xFFFBBF24),
+                          fontSize: 11,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 12),
-              child: Text(
-                _formatTime(widget.timestamp),
-                style: const TextStyle(
-                  color: lightText,
-                  fontSize: 12,
-                  fontWeight: FontWeight.w400,
-                ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    _formatTime(widget.timestamp),
+                    style: const TextStyle(
+                      color: lightText,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w400,
+                    ),
+                  ),
+                  // "(editado)" inline al estilo WhatsApp, separado del time
+                  // por un espacio. Itálica + opacidad para que quede sutil.
+                  if (widget.edited == true) ...[
+                    const SizedBox(width: 4),
+                    Text(
+                      '(editado)',
+                      style: TextStyle(
+                        color: lightText.withValues(alpha: 0.7),
+                        fontSize: 11,
+                        fontStyle: FontStyle.italic,
+                      ),
+                    ),
+                  ],
+                ],
               ),
             ),
           ],

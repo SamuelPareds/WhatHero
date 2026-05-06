@@ -469,6 +469,8 @@ class _MessagesViewState extends State<MessagesView> {
                     mediaDuration: (data['mediaDuration'] as num?)?.toInt(),
                     mediaIsGif: data['mediaIsGif'] as bool?,
                     reactions: data['reactions'] as Map<String, dynamic>?,
+                    edited: data['edited'] as bool?,
+                    revoked: data['revoked'] as bool?,
                   );
                 },
               );

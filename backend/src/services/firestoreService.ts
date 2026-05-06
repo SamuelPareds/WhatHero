@@ -185,6 +185,75 @@ export async function saveMessageToFirestore(
       return;
     }
 
+    // ============================================
+    // protocolMessage: metadata sobre un mensaje existente.
+    // Tipos relevantes (proto.Message.ProtocolMessage.Type):
+    //   0  = REVOKE         (eliminar para todos)
+    //   14 = MESSAGE_EDIT   (editar mensaje)
+    //
+    // Política WhatHero: ambos casos se mergean en el doc target; NO
+    // borramos el mensaje original. Para revokes preservamos el texto como
+    // evidencia (el operador decide manualmente si purgar). Para edits
+    // sobreescribimos el texto y marcamos `edited: true`. Otros tipos de
+    // protocolMessage (ephemeral settings, etc) los dejamos pasar — caen
+    // al flujo normal y aparecen como burbujas vacías = canary.
+    // ============================================
+    const protocolMessage = message.message?.protocolMessage;
+    if (protocolMessage && (protocolMessage.type === 0 || protocolMessage.type === 14)) {
+      const targetMessageId = protocolMessage.key?.id;
+      if (!targetMessageId) {
+        console.warn(`[Protocol] type=${protocolMessage.type} sin targetMessageId en chat ${phoneNumber}, ignorando`);
+        return;
+      }
+
+      const protocolTs = message.messageTimestamp
+        ? toNumber(message.messageTimestamp) * 1000
+        : Date.now();
+      const actor = message.key.fromMe ? 'me' : 'them';
+
+      const targetMessageRef = getDb()
+        .collection(ACCOUNTS_COLLECTION)
+        .doc(accountId)
+        .collection('whatsapp_sessions')
+        .doc(sessionId)
+        .collection('chats')
+        .doc(phoneNumber)
+        .collection('messages')
+        .doc(targetMessageId);
+
+      if (protocolMessage.type === 14) {
+        // MESSAGE_EDIT: extraemos texto nuevo del payload anidado.
+        const editedMessage = protocolMessage.editedMessage;
+        const newText = editedMessage?.conversation
+          ?? editedMessage?.extendedTextMessage?.text
+          ?? '';
+
+        if (!newText) {
+          console.warn(`[Edit] ${actor} editó ${targetMessageId} pero el payload no trae texto extraible, ignorando`);
+          return;
+        }
+
+        await targetMessageRef.set({
+          text: newText,
+          edited: true,
+          editedAt: admin.firestore.Timestamp.fromDate(new Date(protocolTs)),
+        }, { merge: true });
+
+        console.log(`[Edit] ${actor} editó ${targetMessageId} en chat ${phoneNumber}: "${newText}"`);
+        return;
+      }
+
+      // REVOKE (type 0): marcamos como eliminado, NO borramos el doc.
+      // El texto original queda intacto como evidencia para el operador.
+      await targetMessageRef.set({
+        revoked: true,
+        revokedAt: admin.firestore.Timestamp.fromDate(new Date(protocolTs)),
+      }, { merge: true });
+
+      console.log(`[Revoke] ${actor} eliminó ${targetMessageId} en chat ${phoneNumber} (preservado como evidencia)`);
+      return;
+    }
+
     const messageText = message.message?.conversation ||
                         message.message?.extendedTextMessage?.text ||
                         message.message?.imageMessage?.caption ||

@@ -389,12 +389,18 @@ async function startSession(sessionKey: string, accountId: string) {
       return;
     }
 
-    // Reacciones (emojis nativos): son metadata del mensaje original, NO una
-    // conversación nueva. saveMessageToFirestore las mergea en el doc target.
-    // Cortamos acá para que NO disparen IA, buffers, keyword rules ni el contador
-    // de pendientes — un 👍 no es ni una respuesta del operador ni un mensaje
-    // que reclame respuesta humana.
-    if (message.message?.reactionMessage) {
+    // Eventos de metadata sobre un mensaje existente: reacciones, edits y
+    // revokes. saveMessageToFirestore los mergea en el doc target. Cortamos
+    // acá para que NO disparen IA, buffers, keyword rules ni contadores de
+    // pendientes — son ediciones de algo ya existente, no conversación nueva.
+    //   protocolMessage.type 0  = REVOKE
+    //   protocolMessage.type 14 = MESSAGE_EDIT
+    const protocolType = message.message?.protocolMessage?.type;
+    const isMetadataEvent =
+      !!message.message?.reactionMessage ||
+      protocolType === 0 ||
+      protocolType === 14;
+    if (isMetadataEvent) {
       await saveMessageToFirestore(message, sessionKey, accountId, sessions, sock.user?.id, sock);
       return;
     }
