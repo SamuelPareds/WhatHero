@@ -1197,6 +1197,60 @@ app.post('/delete-message', express.json(), verifyHttpAuth(), async (req, res) =
   }
 });
 
+// Reaccionar a un mensaje (emoji nativo de WhatsApp). Soporta mensajes
+// salientes (fromMe=true) y entrantes (fromMe=false). Pasar text='' quita
+// la reacción. El backend NO escribe en Firestore acá: el `messages.upsert`
+// del propio Baileys nos llegará como reactionMessage y el handler en
+// firestoreService se encarga de mergear el campo `reactions` en el target.
+app.post('/send-reaction', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const { messageId, chatPhone, sessionKey, accountId, emoji, fromMe } = req.body;
+
+    if (!messageId || !chatPhone || !sessionKey || !accountId || typeof fromMe !== 'boolean') {
+      return res.status(400).json({ error: 'Missing required fields: messageId, chatPhone, sessionKey, accountId, fromMe' });
+    }
+
+    const session = sessions.get(sessionKey);
+    if (!session?.isReady || !session?.phoneNumber) {
+      return res.status(503).json({ error: 'Session not ready' });
+    }
+
+    // Resolver remoteJid almacenado (igual que en delete/edit) — soporta LIDs.
+    let jid = chatPhone.includes('@') ? chatPhone : `${chatPhone}@s.whatsapp.net`;
+    try {
+      const chatDocRef = db
+        .collection(ACCOUNTS_COLLECTION)
+        .doc(accountId)
+        .collection('whatsapp_sessions')
+        .doc(session.phoneNumber)
+        .collection('chats')
+        .doc(chatPhone);
+      const chatDoc = await chatDocRef.get();
+      if (chatDoc.exists && chatDoc.data()?.remoteJid) {
+        jid = chatDoc.data()!.remoteJid;
+      }
+    } catch (error) {
+      console.warn(`[/send-reaction] Error retrieving chat document:`, error);
+    }
+
+    // El key identifica el mensaje al que reacciono — fromMe del MENSAJE,
+    // no del que reacciona. Si era saliente, fromMe=true; si era entrante, false.
+    const messageKey = { remoteJid: jid, id: messageId, fromMe };
+
+    const reactionText = typeof emoji === 'string' ? emoji : '';
+    console.log(`[/send-reaction] ${reactionText ? `'${reactionText}'` : '(remove)'} -> ${messageId} (fromMe=${fromMe}) en chat ${chatPhone}`);
+
+    await session.sock.sendMessage(jid, {
+      react: { text: reactionText, key: messageKey },
+    });
+
+    res.json({ success: true, messageId, emoji: reactionText, timestamp: new Date().toISOString() });
+  } catch (error) {
+    console.error('[/send-reaction] Error:', error);
+    res.status(500).json({ error: 'Failed to send reaction', details: (error as any).message });
+  }
+});
+
 // Borrado completo de un chat: Storage + mensajes + chat doc.
 // Hard-delete irreversible. La UI exige doble confirmación antes de invocar este endpoint.
 app.post('/delete-chat', express.json(), verifyHttpAuth(), async (req, res) => {

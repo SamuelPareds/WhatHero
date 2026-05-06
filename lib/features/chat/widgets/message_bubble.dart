@@ -780,11 +780,69 @@ class _MessageBubbleState extends State<MessageBubble> {
     }
   }
 
+  // Emojis rápidos al estilo WhatsApp/iMessage. Set fijo de 6: cubre el 95%
+  // de las reacciones reales sin saturar la fila. El 7º slot es el "+" que
+  // abre el picker extendido.
+  static const List<String> _quickReactions = ['👍', '🤍', '😂', '😮', '😢', '🙏'];
+
+  // Set extendido para el picker (60 emojis). No usamos paquete externo
+  // — son strings; cualquier sistema operativo los renderiza con su font.
+  static const List<String> _extendedReactions = [
+    '👍', '👎', '❤️', '🔥', '🥰', '😂', '😅', '😮', '😢', '😭',
+    '🤔', '😡', '🙏', '👏', '🎉', '✨', '💯', '🚀', '👀', '🤝',
+    '😍', '😎', '🤩', '😴', '🤯', '😱', '🤗', '🙄', '😬', '😤',
+    '💔', '💕', '💖', '💪', '🤞', '✌️', '👌', '👋', '🫶', '🤌',
+    '☕', '🍻', '🎂', '🎁', '⭐', '🌟', '⚡', '💡', '✅', '❌',
+    '⏰', '📌', '📍', '💰', '💸', '🏆', '🎯', '🔔', '📞', '💬',
+  ];
+
+  // Emoji que YO reaccioné a este mensaje (si lo hice). Usado para
+  // resaltar el chip activo en el picker y permitir "tap mismo emoji
+  // → quitar reacción".
+  String? get _myReactionEmoji {
+    final me = widget.reactions?['me'];
+    if (me is Map) {
+      final emoji = me['emoji'];
+      if (emoji is String && emoji.isNotEmpty) return emoji;
+    }
+    return null;
+  }
+
+  // Construye un botón de emoji para la fila rápida o el grid extendido.
+  // Si coincide con mi reacción actual, lo destacamos con halo aqua y al
+  // tocarlo se interpreta como "quitar".
+  Widget _buildEmojiButton(String emoji, {double size = 26}) {
+    final isMine = _myReactionEmoji == emoji;
+    return InkResponse(
+      radius: 28,
+      onTap: () {
+        Navigator.pop(context);
+        _sendReaction(isMine ? '' : emoji);
+      },
+      child: Container(
+        width: 44,
+        height: 44,
+        alignment: Alignment.center,
+        decoration: isMine
+            ? BoxDecoration(
+                color: primaryAqua.withValues(alpha: 0.18),
+                shape: BoxShape.circle,
+                border: Border.all(color: primaryAqua, width: 1.5),
+              )
+            : null,
+        child: Text(emoji, style: TextStyle(fontSize: size)),
+      ),
+    );
+  }
+
   void _showMessageOptions() {
     // En mensajes con media no tiene sentido editar texto; copiar solo si hay caption.
     final hasMedia = widget.mediaType != null;
     final canCopy = widget.text.isNotEmpty;
     final canEdit = widget.fromMe && !hasMedia;
+    // No permitimos reaccionar a stickers/sólo-media sin contenido si el
+    // mensaje fue revocado (no tiene sentido reaccionar a evidencia).
+    final canReact = widget.revoked != true;
 
     showModalBottomSheet(
       context: context,
@@ -806,6 +864,44 @@ class _MessageBubbleState extends State<MessageBubble> {
                 borderRadius: BorderRadius.circular(2),
               ),
             ),
+            if (canReact) ...[
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    for (final emoji in _quickReactions)
+                      _buildEmojiButton(emoji),
+                    // Botón "+" → picker extendido. Mantenemos el mismo
+                    // tamaño que los emojis para que la fila luzca pareja.
+                    InkResponse(
+                      radius: 28,
+                      onTap: () {
+                        Navigator.pop(context);
+                        _showExtendedReactionPicker();
+                      },
+                      child: Container(
+                        width: 44,
+                        height: 44,
+                        alignment: Alignment.center,
+                        decoration: BoxDecoration(
+                          color: darkBg.withValues(alpha: 0.5),
+                          shape: BoxShape.circle,
+                        ),
+                        child: const Icon(Icons.add, size: 22, color: white),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Divider(
+                height: 1,
+                color: lightText.withValues(alpha: 0.1),
+                indent: 12,
+                endIndent: 12,
+              ),
+              const SizedBox(height: 4),
+            ],
             if (canCopy)
               ListTile(
                 leading: const Icon(Icons.copy, size: 20, color: primaryAqua),
@@ -819,6 +915,10 @@ class _MessageBubbleState extends State<MessageBubble> {
               ListTile(
                 leading: const Icon(Icons.edit, size: 20, color: Color(0xFF10B981)),
                 title: const Text('Editar', style: TextStyle(color: white)),
+                subtitle: Text(
+                  'También se edita en el WhatsApp del cliente',
+                  style: TextStyle(color: lightText.withValues(alpha: 0.7), fontSize: 11),
+                ),
                 onTap: () {
                   Navigator.pop(context);
                   setState(() => _isEditing = true);
@@ -854,6 +954,118 @@ class _MessageBubbleState extends State<MessageBubble> {
         ),
       ),
     );
+  }
+
+  // Picker extendido — se abre al tocar el "+" en la fila rápida. Grid de
+  // 6 columnas con scroll. Mantiene el mismo handle bar para coherencia
+  // visual con el menú principal.
+  void _showExtendedReactionPicker() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: surfaceDark,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (context) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 8),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 40,
+              height: 4,
+              margin: const EdgeInsets.only(bottom: 12),
+              decoration: BoxDecoration(
+                color: primaryAqua.withValues(alpha: 0.3),
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 0, 16, 8),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  'Elegí una reacción',
+                  style: TextStyle(color: white, fontSize: 14, fontWeight: FontWeight.w500),
+                ),
+              ),
+            ),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 320),
+              child: GridView.count(
+                shrinkWrap: true,
+                crossAxisCount: 6,
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                children: [
+                  for (final emoji in _extendedReactions)
+                    _buildEmojiButton(emoji, size: 24),
+                ],
+              ),
+            ),
+            // Si tengo reacción puesta, opción rápida para quitarla. Más
+            // descubrible que tap-mismo-emoji.
+            if (_myReactionEmoji != null) ...[
+              Divider(
+                height: 1,
+                color: lightText.withValues(alpha: 0.1),
+                indent: 12,
+                endIndent: 12,
+              ),
+              ListTile(
+                leading: const Icon(Icons.heart_broken, size: 20, color: Color(0xFFF87171)),
+                title: const Text('Quitar mi reacción', style: TextStyle(color: white)),
+                onTap: () {
+                  Navigator.pop(context);
+                  _sendReaction('');
+                },
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  // Envía la reacción al backend → Baileys → WhatsApp del cliente.
+  // emoji='' significa "quitar reacción". El backend NO escribe Firestore
+  // directo: el evento `messages.upsert` con reactionMessage que llega de
+  // vuelta es lo que actualiza la UI (mismo path que reacciones entrantes).
+  Future<void> _sendReaction(String emoji) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$backendUrl/send-reaction'),
+        headers: await authHeaders(),
+        body: jsonEncode({
+          'messageId': widget.messageId,
+          'chatPhone': widget.chatPhone,
+          'sessionKey': widget.sessionKey,
+          'accountId': widget.accountId,
+          'emoji': emoji,
+          'fromMe': widget.fromMe,
+        }),
+      ).timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200 && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(emoji.isEmpty ? 'Reacción eliminada' : 'Reaccionaste con $emoji'),
+            duration: const Duration(milliseconds: 1500),
+            behavior: SnackBarBehavior.floating,
+            margin: const EdgeInsets.only(bottom: 20, left: 20, right: 20),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error al reaccionar: ${e.toString()}'),
+            duration: const Duration(seconds: 3),
+            backgroundColor: Colors.red.shade600,
+          ),
+        );
+      }
+    }
   }
 
   // Construye el chip de reacciones que flota en la esquina inferior del bubble.
