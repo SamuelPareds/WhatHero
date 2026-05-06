@@ -47,6 +47,62 @@ export async function initializeSession(phoneNumber: string, sessionKey: string,
   }
 }
 
+// Tras un hard-delete de un mensaje, si era el último del chat hay que
+// recalcular `lastMessage` / `lastMessageTimestamp` / `lastMessageId` para que
+// la UI de chats_screen no quede mostrando un preview fantasma.
+//
+// Si el mensaje borrado NO era el último (deletedMessageId !== lastMessageId
+// del chat doc), no hace falta tocar nada — simplemente desaparece de la
+// subcolección y los demás siguen siendo correctos.
+//
+// Cuando no quedan mensajes en absoluto, limpiamos los campos con
+// FieldValue.delete() en vez de set('') para no dejar basura en el doc.
+export async function recalcChatLastMessage(
+  accountId: string,
+  sessionId: string,
+  phoneNumber: string,
+  deletedMessageId: string,
+) {
+  const chatRef = getDb()
+    .collection(ACCOUNTS_COLLECTION)
+    .doc(accountId)
+    .collection('whatsapp_sessions')
+    .doc(sessionId)
+    .collection('chats')
+    .doc(phoneNumber);
+
+  const chatSnap = await chatRef.get();
+  if (!chatSnap.exists) return;
+
+  const data = chatSnap.data() ?? {};
+  if (data.lastMessageId !== deletedMessageId) return;
+
+  const remaining = await chatRef
+    .collection('messages')
+    .orderBy('timestamp', 'desc')
+    .limit(1)
+    .get();
+
+  if (remaining.empty) {
+    await chatRef.update({
+      lastMessage: admin.firestore.FieldValue.delete(),
+      lastMessageTimestamp: admin.firestore.FieldValue.delete(),
+      lastMessageId: admin.firestore.FieldValue.delete(),
+    });
+    console.log(`[recalcChatLastMessage] chat ${phoneNumber} sin mensajes restantes, campos limpiados`);
+    return;
+  }
+
+  const newest = remaining.docs[0];
+  const newestData = newest.data();
+  await chatRef.update({
+    lastMessage: (newestData.text as string | undefined)?.substring(0, 100) ?? '',
+    lastMessageTimestamp: newestData.timestamp ?? admin.firestore.FieldValue.delete(),
+    lastMessageId: newest.id,
+  });
+  console.log(`[recalcChatLastMessage] chat ${phoneNumber} → último ahora ${newest.id}`);
+}
+
 export async function saveMessageToFirestore(
   message: any,
   sessionKey: string,
@@ -243,14 +299,23 @@ export async function saveMessageToFirestore(
         return;
       }
 
-      // REVOKE (type 0): marcamos como eliminado, NO borramos el doc.
-      // El texto original queda intacto como evidencia para el operador.
-      await targetMessageRef.set({
-        revoked: true,
-        revokedAt: admin.firestore.Timestamp.fromDate(new Date(protocolTs)),
-      }, { merge: true });
-
-      console.log(`[Revoke] ${actor} eliminó ${targetMessageId} en chat ${phoneNumber} (preservado como evidencia)`);
+      // REVOKE (type 0): comportamiento depende de quién lo originó.
+      //   actor='me'   → fui yo (operador) usando "Eliminar para todos"
+      //                  desde WhatHero o desde mi propio WhatsApp. El intento
+      //                  era purgarlo, no marcarlo como evidencia → hard-delete.
+      //   actor='them' → el cliente lo eliminó en su WhatsApp. Preservamos el
+      //                  contenido + banner ámbar (evidencia para el operador).
+      if (actor === 'me') {
+        await targetMessageRef.delete();
+        await recalcChatLastMessage(accountId, sessionId, phoneNumber, targetMessageId);
+        console.log(`[Revoke] me eliminó ${targetMessageId} en chat ${phoneNumber} → hard-delete`);
+      } else {
+        await targetMessageRef.set({
+          revoked: true,
+          revokedAt: admin.firestore.Timestamp.fromDate(new Date(protocolTs)),
+        }, { merge: true });
+        console.log(`[Revoke] them eliminó ${targetMessageId} en chat ${phoneNumber} (preservado como evidencia)`);
+      }
       return;
     }
 

@@ -1165,16 +1165,44 @@ class _MessageBubbleState extends State<MessageBubble> {
     try {
       // Borrado directo en Firestore — sin pasar por backend ni Baileys.
       // Las reglas de Firestore restringen el acceso al owner del account.
-      await FirebaseFirestore.instance
+      final chatRef = FirebaseFirestore.instance
           .collection(accountsCollection)
           .doc(widget.accountId)
           .collection('whatsapp_sessions')
           .doc(widget.sessionPhone)
           .collection('chats')
-          .doc(widget.chatPhone)
-          .collection('messages')
-          .doc(widget.messageId)
-          .delete();
+          .doc(widget.chatPhone);
+
+      await chatRef.collection('messages').doc(widget.messageId).delete();
+
+      // Si el mensaje borrado era el último del chat, recalcular
+      // `lastMessage*` para que chats_screen no muestre un preview fantasma.
+      // Misma política que el handler REVOKE en backend (recalcChatLastMessage).
+      final chatSnap = await chatRef.get();
+      final chatData = chatSnap.data();
+      if (chatData != null && chatData['lastMessageId'] == widget.messageId) {
+        final remaining = await chatRef
+            .collection('messages')
+            .orderBy('timestamp', descending: true)
+            .limit(1)
+            .get();
+        if (remaining.docs.isEmpty) {
+          await chatRef.update({
+            'lastMessage': FieldValue.delete(),
+            'lastMessageTimestamp': FieldValue.delete(),
+            'lastMessageId': FieldValue.delete(),
+          });
+        } else {
+          final newest = remaining.docs.first;
+          final newestData = newest.data();
+          final text = (newestData['text'] as String?) ?? '';
+          await chatRef.update({
+            'lastMessage': text.length > 100 ? text.substring(0, 100) : text,
+            'lastMessageTimestamp': newestData['timestamp'] ?? FieldValue.delete(),
+            'lastMessageId': newest.id,
+          });
+        }
+      }
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
