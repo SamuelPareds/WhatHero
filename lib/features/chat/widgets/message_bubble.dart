@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
@@ -43,6 +44,9 @@ class MessageBubble extends StatefulWidget {
   final String chatPhone;
   final String? sessionKey;
   final String accountId;
+  // Phone number de la sesión de WhatsApp (= doc id en whatsapp_sessions).
+  // Necesario para construir el path del mensaje en Firestore al borrar local.
+  final String sessionPhone;
   // Identidad de quien envió este mensaje saliente. Sólo se muestra cuando
   // fromMe == true. Los entrantes nunca llevan etiqueta (es el cliente).
   //   - senderType: 'human' | 'ai' | 'bot' (controla el ícono asociado).
@@ -89,6 +93,7 @@ class MessageBubble extends StatefulWidget {
     required this.chatPhone,
     this.sessionKey,
     required this.accountId,
+    required this.sessionPhone,
     this.senderType,
     this.senderName,
     this.mediaType,
@@ -822,10 +827,27 @@ class _MessageBubbleState extends State<MessageBubble> {
             if (widget.fromMe)
               ListTile(
                 leading: const Icon(Icons.delete, size: 20, color: Color(0xFFF87171)),
-                title: const Text('Eliminar', style: TextStyle(color: white)),
+                title: const Text('Eliminar para todos', style: TextStyle(color: white)),
+                subtitle: Text(
+                  'También se borra del WhatsApp del cliente',
+                  style: TextStyle(color: lightText.withValues(alpha: 0.7), fontSize: 11),
+                ),
                 onTap: () {
                   Navigator.pop(context);
                   _showDeleteConfirmation();
+                },
+              )
+            else
+              ListTile(
+                leading: const Icon(Icons.delete_sweep, size: 20, color: Color(0xFFF87171)),
+                title: const Text('Eliminar de mi historial', style: TextStyle(color: white)),
+                subtitle: Text(
+                  'Solo se borra de WhatHero. El cliente lo conserva en WhatsApp',
+                  style: TextStyle(color: lightText.withValues(alpha: 0.7), fontSize: 11),
+                ),
+                onTap: () {
+                  Navigator.pop(context);
+                  _showLocalDeleteConfirmation();
                 },
               ),
           ],
@@ -893,6 +915,76 @@ class _MessageBubbleState extends State<MessageBubble> {
         ],
       ),
     );
+  }
+
+  // Borrado SOLO local: el doc desaparece de Firestore (= de WhatHero) pero el
+  // cliente lo sigue viendo en su WhatsApp. Útil para limpiar mensajes
+  // irrelevantes y también las burbujas vacías legacy de antes del fix de
+  // reacciones/edits.
+  void _showLocalDeleteConfirmation() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: surfaceDark,
+        title: const Text('Eliminar de mi historial', style: TextStyle(color: white)),
+        content: const Text(
+          'Solo se eliminará de WhatHero. El cliente seguirá viéndolo en WhatsApp.\n\n¿Continuar?',
+          style: TextStyle(color: lightText),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: Text('Cancelar', style: TextStyle(color: lightText.withValues(alpha: 0.6))),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFF87171)),
+            onPressed: () {
+              Navigator.pop(context);
+              _deleteMessageLocal();
+            },
+            child: const Text('Eliminar', style: TextStyle(color: white)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _deleteMessageLocal() async {
+    try {
+      // Borrado directo en Firestore — sin pasar por backend ni Baileys.
+      // Las reglas de Firestore restringen el acceso al owner del account.
+      await FirebaseFirestore.instance
+          .collection(accountsCollection)
+          .doc(widget.accountId)
+          .collection('whatsapp_sessions')
+          .doc(widget.sessionPhone)
+          .collection('chats')
+          .doc(widget.chatPhone)
+          .collection('messages')
+          .doc(widget.messageId)
+          .delete();
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Eliminado de tu historial'),
+            duration: Duration(milliseconds: 1500),
+            behavior: SnackBarBehavior.floating,
+            margin: EdgeInsets.only(bottom: 20, left: 20, right: 20),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error al eliminar: $e'),
+            duration: const Duration(seconds: 3),
+            backgroundColor: Colors.red.shade600,
+          ),
+        );
+      }
+    }
   }
 
   @override
