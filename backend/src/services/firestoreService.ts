@@ -130,6 +130,61 @@ export async function saveMessageToFirestore(
       }
     }
 
+    // ============================================
+    // Reacciones nativas de WhatsApp (emoji sobre un mensaje).
+    // Llegan vía messages.upsert con message.message.reactionMessage en lugar
+    // de texto/media. NO son un mensaje propio: son metadata del mensaje
+    // original. Las guardamos como un map "reactions" en el doc del mensaje
+    // target, sin crear un documento nuevo.
+    //
+    //   reactionMessage.key.id → id del mensaje al que reaccionan
+    //   reactionMessage.text   → emoji ('' = reacción removida)
+    //   message.key.fromMe     → quién reacciona (operador vs contacto)
+    //
+    // En chats 1:1 sólo hay dos reactores posibles, así que usamos las claves
+    // 'me' / 'them' — el render en Flutter no necesita resolver JIDs.
+    // ============================================
+    const reactionMessage = message.message?.reactionMessage;
+    if (reactionMessage) {
+      const targetMessageId = reactionMessage.key?.id;
+      if (!targetMessageId) {
+        console.warn(`[Reaction] Sin targetMessageId, ignorando reacción en chat ${phoneNumber}`);
+        return;
+      }
+
+      const reactorKey = message.key.fromMe ? 'me' : 'them';
+      const emoji = reactionMessage.text ?? '';
+      const reactionTs = message.messageTimestamp
+        ? toNumber(message.messageTimestamp) * 1000
+        : Date.now();
+
+      const targetMessageRef = getDb()
+        .collection(ACCOUNTS_COLLECTION)
+        .doc(accountId)
+        .collection('whatsapp_sessions')
+        .doc(sessionId)
+        .collection('chats')
+        .doc(phoneNumber)
+        .collection('messages')
+        .doc(targetMessageId);
+
+      // Emoji vacío = el usuario removió su reacción → borramos sólo esa entry
+      // del map. set+merge sobre objeto anidado conserva las reacciones del
+      // otro reactor. Si el doc target aún no existe (race: reacción antes
+      // que el mensaje original), set+merge crea un doc parcial que se
+      // completará cuando llegue el mensaje real.
+      const reactionsPayload = emoji
+        ? { [reactorKey]: { emoji, timestamp: admin.firestore.Timestamp.fromDate(new Date(reactionTs)) } }
+        : { [reactorKey]: admin.firestore.FieldValue.delete() };
+
+      await targetMessageRef.set({ reactions: reactionsPayload }, { merge: true });
+
+      console.log(
+        `[Reaction] ${reactorKey} reaccionó "${emoji || '(removida)'}" sobre ${targetMessageId} en chat ${phoneNumber}`,
+      );
+      return;
+    }
+
     const messageText = message.message?.conversation ||
                         message.message?.extendedTextMessage?.text ||
                         message.message?.imageMessage?.caption ||

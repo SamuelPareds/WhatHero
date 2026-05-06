@@ -389,6 +389,16 @@ async function startSession(sessionKey: string, accountId: string) {
       return;
     }
 
+    // Reacciones (emojis nativos): son metadata del mensaje original, NO una
+    // conversación nueva. saveMessageToFirestore las mergea en el doc target.
+    // Cortamos acá para que NO disparen IA, buffers, keyword rules ni el contador
+    // de pendientes — un 👍 no es ni una respuesta del operador ni un mensaje
+    // que reclame respuesta humana.
+    if (message.message?.reactionMessage) {
+      await saveMessageToFirestore(message, sessionKey, accountId, sessions, sock.user?.id, sock);
+      return;
+    }
+
     await saveMessageToFirestore(message, sessionKey, accountId, sessions, sock.user?.id, sock);
 
     // AI auto-response: only for incoming messages (not from self)

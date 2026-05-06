@@ -70,6 +70,10 @@ class MessageBubble extends StatefulWidget {
   final int? mediaDuration;
   // Video (Fase 3c): mediaIsGif marca los "GIFs" de WhatsApp (mp4 mute loop).
   final bool? mediaIsGif;
+  // Reacciones (emojis nativos de WhatsApp). Map con keys 'me' / 'them' para
+  // chats 1:1, valor `{ emoji: String, timestamp: Timestamp }`. El backend
+  // mergea las entries; acá sólo renderizamos un chip flotante en la esquina.
+  final Map<String, dynamic>? reactions;
 
   const MessageBubble({
     super.key,
@@ -93,6 +97,7 @@ class MessageBubble extends StatefulWidget {
     this.mediaIsPtt,
     this.mediaDuration,
     this.mediaIsGif,
+    this.reactions,
   });
 
   @override
@@ -822,6 +827,39 @@ class _MessageBubbleState extends State<MessageBubble> {
     );
   }
 
+  // Construye el chip de reacciones que flota en la esquina inferior del bubble.
+  // Devuelve null si no hay reacciones — así el caller decide si dejar margen
+  // extra o no. Agrupamos por emoji para mostrar contador cuando ambos lados
+  // reaccionan con el mismo (👍 + 👍 → "👍 2").
+  Widget? _buildReactionsChip() {
+    final reactions = widget.reactions;
+    if (reactions == null || reactions.isEmpty) return null;
+
+    final emojiCounts = <String, int>{};
+    for (final entry in reactions.values) {
+      if (entry is! Map) continue;
+      final emoji = entry['emoji'] as String?;
+      if (emoji == null || emoji.isEmpty) continue;
+      emojiCounts[emoji] = (emojiCounts[emoji] ?? 0) + 1;
+    }
+    if (emojiCounts.isEmpty) return null;
+
+    final label = emojiCounts.entries
+        .map((e) => e.value > 1 ? '${e.key} ${e.value}' : e.key)
+        .join(' ');
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: surfaceDark,
+        borderRadius: BorderRadius.circular(20),
+        // Borde del color del fondo de pantalla → look "cortado" del bubble.
+        border: Border.all(color: darkBg, width: 2),
+      ),
+      child: Text(label, style: const TextStyle(fontSize: 13, color: white)),
+    );
+  }
+
   void _showDeleteConfirmation() {
     showDialog(
       context: context,
@@ -917,6 +955,7 @@ class _MessageBubbleState extends State<MessageBubble> {
     final isAudio = widget.mediaType == 'audio';
     final isVideo = widget.mediaType == 'video';
     final hasCaption = widget.text.isNotEmpty;
+    final reactionsChip = _buildReactionsChip();
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
@@ -926,7 +965,13 @@ class _MessageBubbleState extends State<MessageBubble> {
           crossAxisAlignment: widget.fromMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
           children: [
             _buildSenderLabel(),
-            GestureDetector(
+            // Stack permite que el chip de reacciones flote en la esquina
+            // inferior del bubble, overlapping unos píxeles para look estilo
+            // WhatsApp. Clip.none deja que el chip salga del bounding box.
+            Stack(
+              clipBehavior: Clip.none,
+              children: [
+                GestureDetector(
               onLongPress: _showMessageOptions,
               child: Container(
                 constraints: BoxConstraints(
@@ -1021,7 +1066,21 @@ class _MessageBubbleState extends State<MessageBubble> {
                           ),
               ),
             ),
-            const SizedBox(height: 6),
+                if (reactionsChip != null)
+                  Positioned(
+                    // Overflow ~12px hacia abajo: el chip "abraza" la esquina
+                    // inferior del bubble. Lado derecho para fromMe (queda hacia
+                    // afuera del centro), izquierdo para entrantes.
+                    bottom: -12,
+                    right: widget.fromMe ? null : 8,
+                    left: widget.fromMe ? 8 : null,
+                    child: reactionsChip,
+                  ),
+              ],
+            ),
+            // Reservamos espacio extra cuando hay chip de reacciones para que
+            // no choque con el timestamp (chip flota -12px abajo).
+            SizedBox(height: reactionsChip != null ? 18 : 6),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 12),
               child: Text(
