@@ -14,6 +14,111 @@ function getDb() {
 // AI config cache TTL: 60 seconds
 export const AI_CONFIG_TTL_MS = 60_000;
 
+// ============================================
+// Reply / quote support.
+//
+// Cuando el cliente (o nosotros) responde un mensaje específico, Baileys
+// expone el contexto en `contextInfo` dentro del envoltorio del mensaje:
+//   - extendedTextMessage.contextInfo (texto)
+//   - imageMessage.contextInfo / videoMessage.contextInfo / audioMessage.contextInfo
+//   - documentMessage.contextInfo / stickerMessage.contextInfo
+// Campos relevantes:
+//   contextInfo.stanzaId       → id del mensaje citado (= key.id del original)
+//   contextInfo.participant    → JID de quien envió el original
+//   contextInfo.quotedMessage  → contenido del mensaje citado
+//
+// Persistimos un snapshot mínimo (id + texto preview + fromMe) en el doc del
+// mensaje que responde. NO denormalizamos el mensaje completo — alcanza para
+// renderizar la cita y sobrevive si el original se borra/edita después.
+// ============================================
+
+const QUOTE_HOST_KEYS = [
+  'extendedTextMessage',
+  'imageMessage',
+  'videoMessage',
+  'audioMessage',
+  'documentMessage',
+  'documentWithCaptionMessage',
+  'stickerMessage',
+] as const;
+
+// Texto preview de un mensaje citado. Reusa la misma lógica de iconografía
+// que `lastMessagePreview` (📷 Imagen, 🎤 Nota de voz, etc.) para que la
+// cita se vea consistente entre la lista de chats y el bubble.
+function previewFromQuotedMessage(quotedMessage: any): string {
+  if (!quotedMessage) return '';
+
+  const text = quotedMessage.conversation
+    || quotedMessage.extendedTextMessage?.text
+    || quotedMessage.imageMessage?.caption
+    || quotedMessage.videoMessage?.caption
+    || quotedMessage.documentMessage?.caption
+    || quotedMessage.documentWithCaptionMessage?.message?.documentMessage?.caption
+    || '';
+
+  if (quotedMessage.imageMessage) {
+    return text ? `📷 ${text}` : '📷 Imagen';
+  }
+  if (quotedMessage.videoMessage) {
+    const isGif = !!quotedMessage.videoMessage.gifPlayback;
+    if (isGif) return text ? `🎥 ${text}` : '🎥 GIF';
+    return text ? `🎥 ${text}` : '🎥 Video';
+  }
+  if (quotedMessage.audioMessage) {
+    const isPtt = !!quotedMessage.audioMessage.ptt;
+    return isPtt ? '🎤 Nota de voz' : '🎤 Audio';
+  }
+  if (quotedMessage.stickerMessage) return '🏷️ Sticker';
+  if (quotedMessage.documentMessage) {
+    const fileName = quotedMessage.documentMessage.fileName || 'Documento';
+    return `📄 ${fileName}`;
+  }
+  if (quotedMessage.documentWithCaptionMessage) {
+    const inner = quotedMessage.documentWithCaptionMessage.message?.documentMessage;
+    const fileName = inner?.fileName || 'Documento';
+    return text ? `📄 ${fileName}: ${text}` : `📄 ${fileName}`;
+  }
+
+  return text;
+}
+
+// Devuelve los campos a persistir si el mensaje contiene una cita, o null si
+// no es una respuesta. `selfJid` se usa para inferir `quotedFromMe` cuando el
+// `participant` del contextInfo coincide con el JID del operador.
+export function extractQuoteInfo(message: any, selfJid?: string): {
+  quotedMessageId: string;
+  quotedText: string;
+  quotedFromMe: boolean;
+} | null {
+  if (!message?.message) return null;
+
+  let contextInfo: any = null;
+  for (const hostKey of QUOTE_HOST_KEYS) {
+    const host = message.message[hostKey];
+    if (host?.contextInfo?.stanzaId) {
+      contextInfo = host.contextInfo;
+      break;
+    }
+  }
+  if (!contextInfo) return null;
+
+  const stanzaId: string = contextInfo.stanzaId;
+  const quotedText = previewFromQuotedMessage(contextInfo.quotedMessage).substring(0, 200);
+
+  // Inferir si el mensaje citado lo envió el operador. WhatsApp pone el JID
+  // del autor original en `participant`. Si coincide con el JID propio del
+  // socket, fue nuestro. Fallback: si no hay participant, asumimos del cliente
+  // (caso típico cuando el cliente cita a un mensaje recién enviado por él).
+  const participant: string | undefined = contextInfo.participant;
+  let quotedFromMe = false;
+  if (participant && selfJid) {
+    const normalize = (jid: string) => jid.split(':')[0].split('@')[0];
+    quotedFromMe = normalize(participant) === normalize(selfJid);
+  }
+
+  return { quotedMessageId: stanzaId, quotedText, quotedFromMe };
+}
+
 // Initialize/update session document in Firestore
 export async function initializeSession(phoneNumber: string, sessionKey: string, accountId: string) {
   try {
@@ -395,6 +500,18 @@ export async function saveMessageToFirestore(
       };
     }
 
+    // Si el mensaje es una respuesta a otro, snapshot del id + texto preview
+    // del mensaje citado. Mensajes sin cita no escriben estos campos (todos
+    // los reads en Flutter usan `as String?` → legacy intacto).
+    const quoteInfo = extractQuoteInfo(message, botJid);
+    const quoteFields = quoteInfo
+      ? {
+          quotedMessageId: quoteInfo.quotedMessageId,
+          quotedText: quoteInfo.quotedText,
+          quotedFromMe: quoteInfo.quotedFromMe,
+        }
+      : {};
+
     // Save message to messages subcollection
     await messagesSubCollectionRef.doc(messageId).set({
       id: messageId,
@@ -405,6 +522,7 @@ export async function saveMessageToFirestore(
       isMedia: !!mediaInfo,
       ...senderFields,
       ...mediaFields,
+      ...quoteFields,
     }, { merge: true });
 
     // Update the chat document with lastMessage (for efficient list display)

@@ -83,6 +83,15 @@ class MessageBubble extends StatefulWidget {
   // pero NO borramos el contenido (decisión de producto: el operador decide).
   final bool? edited;
   final bool? revoked;
+  // Cita ("reply"): si este mensaje responde a otro, snapshot mínimo persistido
+  // por el backend. quotedText es un preview con icono (📷 Imagen, etc.). El
+  // id se conserva por si en el futuro queremos scrollear al original.
+  final String? quotedMessageId;
+  final String? quotedText;
+  final bool? quotedFromMe;
+  // Callback que dispara el item "Responder" del long-press menu. Lo provee
+  // MessagesView (que mantiene el ReplyDraft) — el bubble solo notifica.
+  final VoidCallback? onReplyTap;
 
   const MessageBubble({
     super.key,
@@ -110,6 +119,10 @@ class MessageBubble extends StatefulWidget {
     this.reactions,
     this.edited,
     this.revoked,
+    this.quotedMessageId,
+    this.quotedText,
+    this.quotedFromMe,
+    this.onReplyTap,
   });
 
   @override
@@ -902,6 +915,19 @@ class _MessageBubbleState extends State<MessageBubble> {
               ),
               const SizedBox(height: 4),
             ],
+            // "Responder" arriba de Copiar — gesto principal en chats
+            // conversacionales. Solo si el bubble tiene el callback (lo provee
+            // MessagesView) y el mensaje no fue revocado (no tiene sentido
+            // citar evidencia de algo borrado).
+            if (widget.onReplyTap != null && widget.revoked != true)
+              ListTile(
+                leading: const Icon(Icons.reply, size: 20, color: primaryAqua),
+                title: const Text('Responder', style: TextStyle(color: white)),
+                onTap: () {
+                  Navigator.pop(context);
+                  widget.onReplyTap!();
+                },
+              ),
             if (canCopy)
               ListTile(
                 leading: const Icon(Icons.copy, size: 20, color: primaryAqua),
@@ -1101,6 +1127,68 @@ class _MessageBubbleState extends State<MessageBubble> {
     );
   }
 
+  // Mini-preview del mensaje citado, dentro del bubble. Estilo WhatsApp:
+  // borde izquierdo de color (aqua si lo cité a ello mismo / verde más
+  // saturado si fue al cliente), texto en 2 líneas con ellipsis. Devuelve
+  // null si el mensaje no es una respuesta — así el caller no agrega un
+  // SizedBox vacío encima del contenido.
+  Widget? _buildQuotedPreview() {
+    final quoteText = widget.quotedText;
+    if (widget.quotedMessageId == null || quoteText == null) return null;
+
+    // Color del borde: aqua para "me" (continuación de mi línea), verde más
+    // saturado para "them" (lo del cliente). Consistente con la paleta del
+    // chip de reacciones y la guía de la app.
+    final accent = widget.quotedFromMe == true
+        ? primaryAqua
+        : const Color(0xFF10B981);
+
+    // El bubble fromMe es aqua sólido → el preview necesita un fondo oscuro
+    // para legibilidad. El bubble entrante es surfaceDark → preview con fondo
+    // ligeramente más oscuro (darkBg) genera contraste suficiente.
+    final bgColor = widget.fromMe
+        ? darkBg.withValues(alpha: 0.25)
+        : darkBg.withValues(alpha: 0.55);
+
+    final textColor = widget.fromMe ? darkBg : white;
+    final labelColor = widget.fromMe ? darkBg.withValues(alpha: 0.7) : lightText;
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 6),
+      padding: const EdgeInsets.fromLTRB(8, 6, 8, 6),
+      decoration: BoxDecoration(
+        color: bgColor,
+        borderRadius: BorderRadius.circular(6),
+        border: Border(left: BorderSide(color: accent, width: 3)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            widget.quotedFromMe == true ? 'Tú' : 'Cliente',
+            style: TextStyle(
+              color: labelColor,
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            quoteText.isEmpty ? '(sin contenido)' : quoteText,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: textColor.withValues(alpha: 0.85),
+              fontSize: 13,
+              height: 1.3,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   void _showDeleteConfirmation() {
     showDialog(
       context: context,
@@ -1295,6 +1383,7 @@ class _MessageBubbleState extends State<MessageBubble> {
     final isVideo = widget.mediaType == 'video';
     final hasCaption = widget.text.isNotEmpty;
     final reactionsChip = _buildReactionsChip();
+    final quotedPreview = _buildQuotedPreview();
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
@@ -1329,80 +1418,92 @@ class _MessageBubbleState extends State<MessageBubble> {
                 padding: (hasImage || isDocument || isAudio || isVideo)
                     ? const EdgeInsets.all(4)
                     : const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                child: isAudio
-                    ? _buildAudioBubble()
-                    : isVideo
-                    ? Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          _buildVideoBubble(),
-                          if (hasCaption)
-                            Padding(
-                              padding: const EdgeInsets.fromLTRB(10, 8, 10, 4),
-                              child: Text(
-                                widget.text,
-                                style: TextStyle(
-                                  color: widget.fromMe ? darkBg : white,
-                                  fontSize: 15,
-                                  fontWeight: FontWeight.w400,
-                                  height: 1.4,
-                                ),
-                              ),
-                            ),
-                        ],
-                      )
-                    : hasImage
-                    ? Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          _buildImageThumb(),
-                          if (hasCaption)
-                            Padding(
-                              padding: const EdgeInsets.fromLTRB(10, 8, 10, 4),
-                              child: Text(
-                                widget.text,
-                                style: TextStyle(
-                                  color: widget.fromMe ? darkBg : white,
-                                  fontSize: 15,
-                                  fontWeight: FontWeight.w400,
-                                  height: 1.4,
-                                ),
-                              ),
-                            ),
-                        ],
-                      )
-                    : isDocument
-                        ? Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              _buildDocumentCard(),
-                              if (hasCaption)
-                                Padding(
-                                  padding: const EdgeInsets.fromLTRB(10, 4, 10, 6),
-                                  child: Text(
-                                    widget.text,
-                                    style: TextStyle(
-                                      color: widget.fromMe ? darkBg : white,
-                                      fontSize: 15,
-                                      fontWeight: FontWeight.w400,
-                                      height: 1.4,
-                                    ),
+                child: Builder(builder: (_) {
+                  // Contenido principal del bubble (texto, audio, imagen, etc).
+                  // Lo extraemos a una variable para envolverlo con el quote
+                  // preview cuando este mensaje es una respuesta.
+                  final Widget mainContent = isAudio
+                      ? _buildAudioBubble()
+                      : isVideo
+                      ? Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            _buildVideoBubble(),
+                            if (hasCaption)
+                              Padding(
+                                padding: const EdgeInsets.fromLTRB(10, 8, 10, 4),
+                                child: Text(
+                                  widget.text,
+                                  style: TextStyle(
+                                    color: widget.fromMe ? darkBg : white,
+                                    fontSize: 15,
+                                    fontWeight: FontWeight.w400,
+                                    height: 1.4,
                                   ),
                                 ),
-                            ],
-                          )
-                        : Text(
-                            widget.text,
-                            style: TextStyle(
-                              color: widget.fromMe ? darkBg : white,
-                              fontSize: 15,
-                              fontWeight: FontWeight.w400,
-                              height: 1.4,
-                            ),
-                          ),
+                              ),
+                          ],
+                        )
+                      : hasImage
+                      ? Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            _buildImageThumb(),
+                            if (hasCaption)
+                              Padding(
+                                padding: const EdgeInsets.fromLTRB(10, 8, 10, 4),
+                                child: Text(
+                                  widget.text,
+                                  style: TextStyle(
+                                    color: widget.fromMe ? darkBg : white,
+                                    fontSize: 15,
+                                    fontWeight: FontWeight.w400,
+                                    height: 1.4,
+                                  ),
+                                ),
+                              ),
+                          ],
+                        )
+                      : isDocument
+                          ? Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                _buildDocumentCard(),
+                                if (hasCaption)
+                                  Padding(
+                                    padding: const EdgeInsets.fromLTRB(10, 4, 10, 6),
+                                    child: Text(
+                                      widget.text,
+                                      style: TextStyle(
+                                        color: widget.fromMe ? darkBg : white,
+                                        fontSize: 15,
+                                        fontWeight: FontWeight.w400,
+                                        height: 1.4,
+                                      ),
+                                    ),
+                                  ),
+                              ],
+                            )
+                          : Text(
+                              widget.text,
+                              style: TextStyle(
+                                color: widget.fromMe ? darkBg : white,
+                                fontSize: 15,
+                                fontWeight: FontWeight.w400,
+                                height: 1.4,
+                              ),
+                            );
+
+                  if (quotedPreview == null) return mainContent;
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [quotedPreview, mainContent],
+                  );
+                }),
               ),
             ),
                 if (reactionsChip != null)

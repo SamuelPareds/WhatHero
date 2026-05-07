@@ -9,6 +9,17 @@ import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/features/settings.dart';
 import 'widgets/message_bubble.dart';
 
+// Draft de "responder a este mensaje". Vive en MessagesView mientras el
+// usuario está componiendo la respuesta — al enviar (o cancelar) se limpia.
+// El bubble dispara su set vía callback; el composer renderiza la franja
+// de preview y manda los campos al backend al enviar.
+class ReplyDraft {
+  final String messageId;
+  final String text;
+  final bool fromMe;
+  const ReplyDraft({required this.messageId, required this.text, required this.fromMe});
+}
+
 class MessagesView extends StatefulWidget {
   final String phoneNumber;
   final String sessionId;
@@ -46,6 +57,57 @@ class _MessagesViewState extends State<MessagesView> {
   String _quickResponseFilter = '';
   OverlayEntry? _quickResponseOverlay;
 
+  // Draft de cita activo. null = no estamos respondiendo a nada → composer
+  // normal. ValueNotifier (en lugar de setState) para que solo se rebuilden
+  // las partes que escuchan: la franja del composer y el TextField.
+  final ValueNotifier<ReplyDraft?> _replyDraft = ValueNotifier(null);
+  // FocusNode del input → al activar un draft hacemos focus para que el
+  // teclado salte automáticamente, sin requerir tap extra.
+  final FocusNode _inputFocusNode = FocusNode();
+
+  void _setReplyDraft(ReplyDraft draft) {
+    _replyDraft.value = draft;
+    _inputFocusNode.requestFocus();
+  }
+
+  void _clearReplyDraft() {
+    _replyDraft.value = null;
+  }
+
+  // Texto de preview del mensaje cuando lo citamos en el composer. Si el
+  // mensaje tiene texto, ese; si es media sin caption, usamos el mismo prefijo
+  // con icono que el backend usa en lastMessage / quotedText (para que el
+  // operador vea el mismo formato que verá luego en el bubble).
+  String _previewForDraft(String text, String? mediaType) {
+    if (text.isNotEmpty && mediaType == null) return text;
+    String? icon;
+    String? label;
+    switch (mediaType) {
+      case 'image':
+        icon = '📷';
+        label = 'Imagen';
+        break;
+      case 'video':
+        icon = '🎥';
+        label = 'Video';
+        break;
+      case 'audio':
+        icon = '🎤';
+        label = 'Audio';
+        break;
+      case 'sticker':
+        icon = '🏷️';
+        label = 'Sticker';
+        break;
+      case 'document':
+        icon = '📄';
+        label = 'Documento';
+        break;
+    }
+    if (icon == null) return text;
+    return text.isEmpty ? '$icon $label' : '$icon $text';
+  }
+
   @override
   void initState() {
     super.initState();
@@ -59,6 +121,8 @@ class _MessagesViewState extends State<MessagesView> {
     _messageController.dispose();
     _scrollController.dispose();
     _quickResponseOverlay?.remove();
+    _replyDraft.dispose();
+    _inputFocusNode.dispose();
     super.dispose();
   }
 
@@ -97,12 +161,21 @@ class _MessagesViewState extends State<MessagesView> {
     });
 
     try {
+      // Snapshot del draft al momento del envío. Si el usuario cancela durante
+      // el await, queremos enviar lo que estaba activo cuando tocó "enviar".
+      final draft = _replyDraft.value;
+
       final messageData = {
         'to': widget.phoneNumber,
         'text': text,
         'sessionKey': widget.sessionKey,
         'accountId': widget.accountId,
         'tempId': DateTime.now().millisecondsSinceEpoch.toString(),
+        if (draft != null) ...{
+          'quotedMessageId': draft.messageId,
+          'quotedText': draft.text,
+          'quotedFromMe': draft.fromMe,
+        },
       };
 
       // INTELIGENTE: Si el socket está conectado, enviar por ahí (Velocidad Rayo)
@@ -111,6 +184,7 @@ class _MessagesViewState extends State<MessagesView> {
         print('[MessagesView] Enviando vía WebSocket...');
         SocketService().sendMessage(messageData);
         _messageController.clear();
+        _clearReplyDraft();
       } else {
         // FALLBACK: Si no hay socket, usar HTTP (Seguridad)
         print('[MessagesView] Socket desconectado, usando fallback HTTP...');
@@ -122,6 +196,7 @@ class _MessagesViewState extends State<MessagesView> {
 
         if (response.statusCode == 200) {
           _messageController.clear();
+          _clearReplyDraft();
         } else {
           throw Exception('Fallback HTTP falló: ${response.body}');
         }
@@ -446,9 +521,15 @@ class _MessagesViewState extends State<MessagesView> {
 
                   final msg = messages[index];
                   final data = msg.data() as Map<String, dynamic>;
+                  // Snapshot para el draft: el preview en la franja del composer
+                  // muestra el texto del mensaje (o un fallback si era media sin
+                  // caption — usamos el mismo prefijo del backend, ej. "📷 Imagen").
+                  final msgText = (data['text'] as String?) ?? '';
+                  final msgMediaType = data['mediaType'] as String?;
+                  final draftPreview = _previewForDraft(msgText, msgMediaType);
                   return MessageBubble(
                     key: ValueKey(msg.id),
-                    text: (data['text'] as String?) ?? '',
+                    text: msgText,
                     fromMe: (data['fromMe'] as bool?) ?? false,
                     timestamp: (data['timestamp'] as Timestamp).toDate(),
                     messageId: msg.id,
@@ -458,7 +539,7 @@ class _MessagesViewState extends State<MessagesView> {
                     sessionPhone: widget.sessionId,
                     senderType: data['senderType'] as String?,
                     senderName: data['senderName'] as String?,
-                    mediaType: data['mediaType'] as String?,
+                    mediaType: msgMediaType,
                     mediaThumbBase64: data['mediaThumbBase64'] as String?,
                     mediaWidth: (data['mediaWidth'] as num?)?.toDouble(),
                     mediaHeight: (data['mediaHeight'] as num?)?.toDouble(),
@@ -472,6 +553,14 @@ class _MessagesViewState extends State<MessagesView> {
                     reactions: data['reactions'] as Map<String, dynamic>?,
                     edited: data['edited'] as bool?,
                     revoked: data['revoked'] as bool?,
+                    quotedMessageId: data['quotedMessageId'] as String?,
+                    quotedText: data['quotedText'] as String?,
+                    quotedFromMe: data['quotedFromMe'] as bool?,
+                    onReplyTap: () => _setReplyDraft(ReplyDraft(
+                      messageId: msg.id,
+                      text: draftPreview,
+                      fromMe: (data['fromMe'] as bool?) ?? false,
+                    )),
                   );
                 },
               );
@@ -502,7 +591,68 @@ class _MessagesViewState extends State<MessagesView> {
                   );
                 }
                 
-                return Row(
+                return Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    // Franja de "respondiendo a..." arriba del input. Se muestra
+                    // sólo cuando hay un draft activo. ValueListenableBuilder
+                    // evita rebuilds del Row de input cuando cambia el draft.
+                    ValueListenableBuilder<ReplyDraft?>(
+                      valueListenable: _replyDraft,
+                      builder: (context, draft, _) {
+                        if (draft == null) return const SizedBox.shrink();
+                        final accent = draft.fromMe ? primaryAqua : const Color(0xFF10B981);
+                        return Container(
+                          margin: const EdgeInsets.only(bottom: 8),
+                          padding: const EdgeInsets.fromLTRB(10, 8, 4, 8),
+                          decoration: BoxDecoration(
+                            color: darkBg.withValues(alpha: 0.6),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border(left: BorderSide(color: accent, width: 3)),
+                          ),
+                          child: Row(
+                            children: [
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Text(
+                                      draft.fromMe ? 'Respondiéndote' : 'Respondiendo al cliente',
+                                      style: TextStyle(
+                                        color: accent,
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      draft.text.isEmpty ? '(sin contenido)' : draft.text,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        color: lightText,
+                                        fontSize: 13,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.close, size: 18),
+                                color: lightText,
+                                tooltip: 'Cancelar respuesta',
+                                onPressed: _clearReplyDraft,
+                                splashRadius: 18,
+                                padding: EdgeInsets.zero,
+                                constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+                    Row(
                   children: [
                     Expanded(
                       child: Focus(
@@ -515,6 +665,7 @@ class _MessagesViewState extends State<MessagesView> {
                         },
                         child: TextField(
                           controller: _messageController,
+                          focusNode: _inputFocusNode,
                           maxLines: null,
                           textCapitalization: TextCapitalization.sentences,
                           style: const TextStyle(color: white, fontSize: 15),
@@ -556,6 +707,8 @@ class _MessagesViewState extends State<MessagesView> {
                         onPressed: _isSending ? null : _sendMessage,
                       ),
                     ),
+                  ],
+                ),
                   ],
                 );
               },

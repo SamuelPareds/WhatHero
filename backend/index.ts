@@ -874,7 +874,7 @@ async function cancelSession(sessionKey: string) {
  * que respondió (etiqueta visible en cada mensaje saliente).
  */
 async function performSendMessage(
-  { to, text, imageUrl, sessionKey, accountId }: any,
+  { to, text, imageUrl, sessionKey, accountId, quotedMessageId, quotedText, quotedFromMe }: any,
   senderUid: string,
 ) {
   const session = sessions.get(sessionKey);
@@ -902,6 +902,23 @@ async function performSendMessage(
     console.warn(`[performSendMessage] Error retrieving chat document:`, error);
   }
 
+  // Reply: si el frontend mandó un quotedMessageId, construimos el stub
+  // mínimo que Baileys necesita para que WhatsApp renderice la cita.
+  // No necesitamos el mensaje original completo — alcanza con el stanzaId
+  // y un placeholder de texto (WhatsApp resuelve el contenido por id en
+  // el dispositivo del cliente).
+  const sendOptions: any = {};
+  if (quotedMessageId) {
+    sendOptions.quoted = {
+      key: {
+        remoteJid: jid,
+        id: quotedMessageId,
+        fromMe: !!quotedFromMe,
+      },
+      message: { conversation: typeof quotedText === 'string' ? quotedText : '' },
+    };
+  }
+
   let message;
   if (imageUrl) {
     console.log(`[performSendMessage] Downloading image from URL: ${imageUrl}`);
@@ -914,9 +931,9 @@ async function performSendMessage(
     message = await session.sock.sendMessage(jid, {
       image: imageBuffer,
       caption: text || undefined,
-    });
+    }, sendOptions);
   } else {
-    message = await session.sock.sendMessage(jid, { text });
+    message = await session.sock.sendMessage(jid, { text }, sendOptions);
   }
 
   // Etiquetamos al humano que envió este mensaje. El handler de
