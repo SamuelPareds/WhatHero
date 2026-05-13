@@ -80,6 +80,25 @@ class _MessagesViewState extends State<MessagesView> {
     _replyDraft.value = null;
   }
 
+  // Cabecera de día estilo WhatsApp: 'Hoy' / 'Ayer' / 'DD-MM-YYYY'.
+  // Compara por year/month/day para evitar el bug clásico de "23h ≠ ayer"
+  // cuando la diferencia horaria cae al otro lado de medianoche.
+  String _formatDaySeparator(DateTime date) {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final messageDay = DateTime(date.year, date.month, date.day);
+    final diffDays = today.difference(messageDay).inDays;
+    if (diffDays == 0) return 'Hoy';
+    if (diffDays == 1) return 'Ayer';
+    final dd = date.day.toString().padLeft(2, '0');
+    final mm = date.month.toString().padLeft(2, '0');
+    return '$dd-$mm-${date.year}';
+  }
+
+  bool _isSameDay(DateTime a, DateTime b) {
+    return a.year == b.year && a.month == b.month && a.day == b.day;
+  }
+
   // Texto de preview del mensaje cuando lo citamos en el composer. Si el
   // mensaje tiene texto, ese; si es media sin caption, usamos el mismo prefijo
   // con icono que el backend usa en lastMessage / quotedText (para que el
@@ -533,11 +552,27 @@ class _MessagesViewState extends State<MessagesView> {
                   final msgText = (data['text'] as String?) ?? '';
                   final msgMediaType = data['mediaType'] as String?;
                   final draftPreview = _previewForDraft(msgText, msgMediaType);
-                  return MessageBubble(
+                  final msgDate = (data['timestamp'] as Timestamp).toDate();
+
+                  // Separador de día: en lista reverse:true, index mayor = más
+                  // viejo. Mostramos cabecera arriba de este bubble si es el
+                  // mensaje más viejo de su día en el set cargado (older==null)
+                  // o si el mensaje inmediatamente más viejo es de otro día.
+                  final olderDoc = (index + 1 < messages.length) ? messages[index + 1] : null;
+                  bool showSeparator = false;
+                  if (olderDoc == null) {
+                    showSeparator = true;
+                  } else {
+                    final olderData = olderDoc.data() as Map<String, dynamic>;
+                    final olderDate = (olderData['timestamp'] as Timestamp).toDate();
+                    showSeparator = !_isSameDay(msgDate, olderDate);
+                  }
+
+                  final bubble = MessageBubble(
                     key: ValueKey(msg.id),
                     text: msgText,
                     fromMe: (data['fromMe'] as bool?) ?? false,
-                    timestamp: (data['timestamp'] as Timestamp).toDate(),
+                    timestamp: msgDate,
                     messageId: msg.id,
                     chatPhone: widget.phoneNumber,
                     sessionKey: widget.sessionKey,
@@ -567,6 +602,19 @@ class _MessagesViewState extends State<MessagesView> {
                       text: draftPreview,
                       fromMe: (data['fromMe'] as bool?) ?? false,
                     )),
+                  );
+
+                  if (!showSeparator) return bubble;
+                  // El Column NO se reversea internamente — el listview sólo
+                  // invierte el orden de items, no su contenido. Por eso el
+                  // separador va como PRIMER hijo: queda visualmente arriba
+                  // del primer mensaje del día (igual que en WhatsApp).
+                  return Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _DateSeparator(_formatDaySeparator(msgDate)),
+                      bubble,
+                    ],
                   );
                 },
               );
@@ -742,6 +790,38 @@ class _MessagesViewState extends State<MessagesView> {
           ),
         ),
       ],
+    );
+  }
+}
+
+// Chip centrado de cabecera de día, estilo WhatsApp/Apple dark. Translúcido
+// sobre el fondo del chat con borde aqua sutil para que respire sin gritar.
+class _DateSeparator extends StatelessWidget {
+  final String label;
+  const _DateSeparator(this.label);
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      child: Center(
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+          decoration: BoxDecoration(
+            color: darkBg.withValues(alpha: 0.85),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: primaryAqua.withValues(alpha: 0.15)),
+          ),
+          child: Text(
+            label,
+            style: const TextStyle(
+              color: lightText,
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
