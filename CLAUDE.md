@@ -89,6 +89,14 @@ Cómo la app comunica visualmente qué está pasando con la IA en un chat abiert
 - **Gris** (#9CA3AF): IA auto-off para este chat → tap enciende.
 - **Gris atenuado** (alpha 0.4): asistente no configurado a nivel sesión → tap abre `SessionSettingsPanel`.
 
+### Botón `auto_awesome` "generar sugerencia" (composer) — tri-estado
+Independiente del master switch del auto-responder. Se habilita por **credenciales del provider activo**, no por `ai_enabled`. Permite el modo copiloto (cliente cauteloso que apaga la IA pero quiere ver qué propondría).
+- **Aqua sólido**: credenciales + `ai_enabled=true` → `Generar respuesta con IA`.
+- **Aqua atenuado** (alpha 0.6): credenciales + `ai_enabled=false` → `Generar sugerencia (asistente apagado)`. Genera, no envía solo.
+- **Gris atenuado**: sin credenciales del provider activo → abre `SessionSettingsPanel`.
+
+Backend: `/generate-ai-response` exige sólo `hasValidApiKey`, no `aiConfig.enabled`.
+
 ### Subtítulo + franja inferior — 4 modos con prioridad estricta
 
 | Prioridad | Modo | Cuándo aparece | Subtítulo | Franja 2px |

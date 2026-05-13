@@ -1040,8 +1040,12 @@ app.post('/generate-ai-response', express.json(), verifyHttpAuth(), async (req, 
     const hasValidApiKey = provider === 'openai'
       ? aiConfig.openaiApiKey
       : aiConfig.apiKey;
-    if (!aiConfig.enabled || !hasValidApiKey) {
-      return res.status(400).json({ error: 'AI not configured for this session' });
+    // Generación manual = modo copiloto: el operador autenticado pide una
+    // sugerencia. NO depende de `ai_enabled` (master switch del auto-responder).
+    // Solo exigimos credenciales del provider activo, porque sin ellas no hay
+    // a quién pedirle la respuesta.
+    if (!hasValidApiKey) {
+      return res.status(400).json({ error: 'AI credentials not configured for this session' });
     }
 
     // Fetch last 20 messages from chat

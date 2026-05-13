@@ -741,6 +741,15 @@ class _ChatsScreenState extends State<ChatsScreen> {
       builder: (context, sessionSnapshot) {
         final sessionData = sessionSnapshot.data?.data() as Map<String, dynamic>?;
         final sessionAiEnabled = sessionData?['ai_enabled'] as bool? ?? false;
+        // Credenciales del provider activo. Sirve para habilitar el modo
+        // "copiloto" del botón "generar respuesta": el operador puede pedirle
+        // sugerencias a la IA aunque el master switch (`ai_enabled`) esté off.
+        final aiProvider = sessionData?['ai_provider'] as String? ?? 'gemini';
+        final aiApiKeyField = aiProvider == 'openai'
+            ? 'ai_openai_api_key'
+            : 'ai_api_key';
+        final sessionAiHasCredentials =
+            ((sessionData?[aiApiKeyField] as String?) ?? '').trim().isNotEmpty;
 
         // Stream del documento del chat: lo levantamos al nivel del Scaffold
         // para que título, acciones y franja inferior compartan los mismos
@@ -1001,6 +1010,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                       sessionKey: widget.sessionKey,
                       accountId: widget.accountId,
                       sessionAiEnabled: sessionAiEnabled,
+                      sessionAiHasCredentials: sessionAiHasCredentials,
                     ),
                   ),
                 ],

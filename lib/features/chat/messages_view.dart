@@ -25,10 +25,15 @@ class MessagesView extends StatefulWidget {
   final String sessionId;
   final String? sessionKey;
   final String accountId;
-  // Indica si el asistente IA está configurado a nivel sesión (ai_enabled).
-  // Cuando es false, los botones de IA se muestran apagados y guían al usuario
-  // hacia la configuración en lugar de invitar a tocar funciones rotas.
+  // Master switch del auto-responder a nivel sesión (`ai_enabled` en Firestore).
+  // Distinto de `sessionAiHasCredentials`: el asistente puede estar configurado
+  // (con API key válida) pero apagado a propósito para no responder solo.
   final bool sessionAiEnabled;
+  // Hay API key cargada para el provider activo. Habilita el "modo copiloto":
+  // el operador puede generar sugerencias manuales aunque el auto-responder
+  // esté apagado. Si es false, el botón queda en estado "sin config" y guía
+  // al usuario a SessionSettingsPanel.
+  final bool sessionAiHasCredentials;
 
   const MessagesView({
     required this.phoneNumber,
@@ -36,6 +41,7 @@ class MessagesView extends StatefulWidget {
     this.sessionKey,
     required this.accountId,
     required this.sessionAiEnabled,
+    required this.sessionAiHasCredentials,
     super.key,
   });
 
@@ -684,19 +690,39 @@ class _MessagesViewState extends State<MessagesView> {
                     const SizedBox(width: 8),
                     _isGenerating
                         ? const SizedBox(width: 44, height: 44, child: Padding(padding: EdgeInsets.all(8), child: CircularProgressIndicator(strokeWidth: 2, valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF06B6D4)))))
-                        : IconButton(
-                            icon: const Icon(Icons.auto_awesome, size: 20),
-                            tooltip: widget.sessionAiEnabled
-                                ? 'Generar respuesta con IA'
-                                : 'Configura el asistente IA primero',
-                            // Sin asistente configurado, atenuamos el icono y, al
-                            // tocarlo, abrimos directamente el panel de ajustes.
-                            color: widget.sessionAiEnabled
-                                ? const Color(0xFF06B6D4)
-                                : const Color(0xFF9CA3AF).withValues(alpha: 0.4),
-                            onPressed: widget.sessionAiEnabled
-                                ? _generateAIResponse
-                                : _openSessionSettings,
+                        : Builder(
+                            builder: (_) {
+                              // Tri-estado del botón "generar sugerencia":
+                              //  1. Sin credenciales → gris, lleva a settings.
+                              //  2. Credenciales + auto-responder ON → aqua sólido.
+                              //  3. Credenciales + auto-responder OFF (copiloto) →
+                              //     aqua atenuado para indicar "IA disponible pero
+                              //     apagada, te sugiere sin enviar nada solo".
+                              final hasCreds = widget.sessionAiHasCredentials;
+                              final autoOn = widget.sessionAiEnabled;
+                              final String tooltip;
+                              final Color color;
+                              final VoidCallback onPressed;
+                              if (!hasCreds) {
+                                tooltip = 'Configura el asistente IA primero';
+                                color = const Color(0xFF9CA3AF).withValues(alpha: 0.4);
+                                onPressed = _openSessionSettings;
+                              } else if (autoOn) {
+                                tooltip = 'Generar respuesta con IA';
+                                color = const Color(0xFF06B6D4);
+                                onPressed = _generateAIResponse;
+                              } else {
+                                tooltip = 'Generar sugerencia (asistente apagado)';
+                                color = const Color(0xFF06B6D4).withValues(alpha: 0.6);
+                                onPressed = _generateAIResponse;
+                              }
+                              return IconButton(
+                                icon: const Icon(Icons.auto_awesome, size: 20),
+                                tooltip: tooltip,
+                                color: color,
+                                onPressed: onPressed,
+                              );
+                            },
                           ),
                     const SizedBox(width: 4),
                     Container(
