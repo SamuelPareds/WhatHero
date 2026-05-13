@@ -30,7 +30,7 @@ class MessagesView extends StatefulWidget {
   // (con API key válida) pero apagado a propósito para no responder solo.
   final bool sessionAiEnabled;
   // Hay API key cargada para el provider activo. Habilita el "modo copiloto":
-  // el operador puede generar sugerencias manuales aunque el auto-responder
+  // el operador puede Sugerir respuesta con IAs manuales aunque el auto-responder
   // esté apagado. Si es false, el botón queda en estado "sin config" y guía
   // al usuario a SessionSettingsPanel.
   final bool sessionAiHasCredentials;
@@ -692,7 +692,7 @@ class _MessagesViewState extends State<MessagesView> {
                         ? const SizedBox(width: 44, height: 44, child: Padding(padding: EdgeInsets.all(8), child: CircularProgressIndicator(strokeWidth: 2, valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF06B6D4)))))
                         : Builder(
                             builder: (_) {
-                              // Tri-estado del botón "generar sugerencia":
+                              // Tri-estado del botón "Sugerir respuesta con IA":
                               //  1. Sin credenciales → gris, lleva a settings.
                               //  2. Credenciales + auto-responder ON → aqua sólido.
                               //  3. Credenciales + auto-responder OFF (copiloto) →
@@ -712,7 +712,7 @@ class _MessagesViewState extends State<MessagesView> {
                                 color = const Color(0xFF06B6D4);
                                 onPressed = _generateAIResponse;
                               } else {
-                                tooltip = 'Generar sugerencia (asistente apagado)';
+                                tooltip = 'Sugerir respuesta con IA (asistente apagado)';
                                 color = const Color(0xFF06B6D4).withValues(alpha: 0.6);
                                 onPressed = _generateAIResponse;
                               }
