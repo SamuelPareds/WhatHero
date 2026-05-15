@@ -84,22 +84,32 @@ export function isWithinActiveHours(aiConfig: any): boolean {
   }
 }
 
-// Generate AI response using Gemini or OpenAI with conversation history
+// Generate AI response using Gemini or OpenAI.
+//
+// Contrato: `history` ya contiene la conversación completa incluyendo el
+// último turn del cliente al final (los mensajes del buffer se persisten en
+// Firestore ANTES de que dispare `processMessageBuffer`, así que el history
+// recuperado los incluye como turns naturales). No hay un `userMessage`
+// separado para evitar duplicación.
 export async function generateAIResponse(
   apiKey: string,
   systemPrompt: string,
-  userMessage: string,
-  history?: { role: 'user' | 'model'; parts: { text: string }[] }[],
+  history: { role: 'user' | 'model'; parts: { text: string }[] }[],
   modelName: string = 'gemini-2.5-flash',
   provider: 'gemini' | 'openai' = 'gemini',
   openaiApiKey?: string
 ): Promise<string | null> {
   try {
+    // Sin historial no hay nada que responder (caso muy edge: Firestore vacío).
+    if (!history || history.length === 0) {
+      console.warn('[AI] generateAIResponse llamado con history vacío, abortando.');
+      return null;
+    }
+
     if (provider === 'openai') {
       return await generateAIResponseOpenAI(
         openaiApiKey || apiKey,
         systemPrompt,
-        userMessage,
         history,
         modelName
       );
@@ -107,7 +117,6 @@ export async function generateAIResponse(
       return await generateAIResponseGemini(
         apiKey,
         systemPrompt,
-        userMessage,
         history,
         modelName
       );
@@ -122,33 +131,35 @@ export async function generateAIResponse(
 async function generateAIResponseGemini(
   apiKey: string,
   systemPrompt: string,
-  userMessage: string,
-  history?: { role: 'user' | 'model'; parts: { text: string }[] }[],
+  history: { role: 'user' | 'model'; parts: { text: string }[] }[],
   modelName: string = 'gemini-2.5-flash'
 ): Promise<string | null> {
   try {
     const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({ model: modelName });
 
-    // If we have history, use multi-turn chat with system prompt prepended to the first user message
-    if (history && history.length > 0) {
-      // Inject system prompt at the beginning of the history by prepending to first user message
-      const enhancedHistory = [...history];
-      if (enhancedHistory.length > 0 && enhancedHistory[0].role === 'user') {
-        enhancedHistory[0] = {
-          role: 'user',
-          parts: [{ text: `${systemPrompt}\n\n${enhancedHistory[0].parts[0]?.text || ''}` }],
+    // El SDK v0.3.x no soporta `systemInstruction`. Workaround estándar:
+    // prependeamos el system prompt al primer turn user del historial. El
+    // resto del historial queda intacto y termina con el último mensaje del
+    // cliente (lo que Gemini debe responder).
+    const enhancedHistory = history.map((turn, idx) => {
+      if (idx === 0 && turn.role === 'user') {
+        return {
+          role: 'user' as const,
+          parts: [{ text: `${systemPrompt}\n\n${turn.parts[0]?.text || ''}` }],
         };
       }
-      const chat = model.startChat({ history: enhancedHistory });
-      const result = await chat.sendMessage(userMessage);
-      return result.response.text();
-    } else {
-      // Single turn: include system prompt in the message
-      const fullPrompt = `${systemPrompt}\n\n${userMessage}`;
-      const result = await model.generateContent(fullPrompt);
-      return result.response.text();
-    }
+      return turn;
+    });
+
+    // Usamos `generateContent` directo (no `startChat`) porque el historial
+    // termina en `user` y eso es justamente lo que Gemini necesita para
+    // generar el siguiente turn model. `startChat` espera que el historial
+    // termine en `model` y manda el siguiente user via `sendMessage`.
+    const result = await model.generateContent({
+      contents: enhancedHistory,
+    });
+    return result.response.text();
   } catch (error) {
     console.error('[AI] Error calling Gemini:', error);
     return null;
@@ -159,36 +170,22 @@ async function generateAIResponseGemini(
 async function generateAIResponseOpenAI(
   apiKey: string,
   systemPrompt: string,
-  userMessage: string,
-  history?: { role: 'user' | 'model'; parts: { text: string }[] }[],
+  history: { role: 'user' | 'model'; parts: { text: string }[] }[],
   modelName: string = 'gpt-4o-mini'
 ): Promise<string | null> {
   try {
     const client = new OpenAI({ apiKey });
 
-    // Convert Gemini history format to OpenAI format
     const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
       {
         role: 'system',
         content: systemPrompt,
       },
+      ...history.map(msg => ({
+        role: (msg.role === 'user' ? 'user' : 'assistant') as 'user' | 'assistant',
+        content: msg.parts[0]?.text || '',
+      })),
     ];
-
-    // Add conversation history
-    if (history && history.length > 0) {
-      for (const msg of history) {
-        messages.push({
-          role: msg.role === 'user' ? 'user' : 'assistant',
-          content: msg.parts[0]?.text || '',
-        });
-      }
-    }
-
-    // Add current user message
-    messages.push({
-      role: 'user',
-      content: userMessage,
-    });
 
     const response = await client.chat.completions.create({
       model: modelName,
@@ -216,26 +213,67 @@ export function normalizeHistory(
     }));
 }
 
+// Construye el transcripto de la conversación en texto plano para que el
+// discriminador lo lea como contexto. Etiquetas en español; agrupamos los
+// últimos turns user contiguos como "intención más reciente" implícita
+// (el LLM la identifica sola a partir del orden).
+function buildTranscript(
+  history: { role: 'user' | 'model'; parts: { text: string }[] }[]
+): string {
+  if (!history || history.length === 0) return '(historial vacío)';
+  return history
+    .map(msg => {
+      const role = msg.role === 'user' ? 'Cliente' : 'Asistente';
+      return `${role}: ${msg.parts[0]?.text || ''}`;
+    })
+    .join('\n');
+}
+
+// Parser tolerante: busca "Decisión: X" donde X ∈ {AI, ASISTENTE, SI, HUMANO,
+// HUMAN, NO}. Si no parsea, defaultea a TalkToAiAssistant (seguro: dejamos
+// que la IA responda en vez de bloquear al cliente).
+function parseDiscriminatorDecision(
+  raw: string
+): { decision: 'TalkToAiAssistant' | 'TalkToHuman'; reason: string } {
+  const text = (raw || '').trim();
+  const upper = text.toUpperCase();
+
+  const decisionMatch = upper.match(/DECISI[ÓO]N\s*:\s*(AI|ASISTENTE|SI|S[IÍ]|HUMANO|HUMAN|NO)/);
+  const reasonMatch = text.match(/Raz[óo]n\s*:\s*(.+?)(?:\n|$)/i);
+  const reason = reasonMatch?.[1]?.trim() || '(sin razón)';
+
+  if (decisionMatch) {
+    const token = decisionMatch[1];
+    if (token === 'HUMANO' || token === 'HUMAN' || token === 'NO') {
+      return { decision: 'TalkToHuman', reason };
+    }
+    return { decision: 'TalkToAiAssistant', reason };
+  }
+
+  // Fallback ambiguo: HUMANO. Si no pudimos parsear la respuesta del modelo,
+  // es más seguro escalar a humano que dejar que la IA responda con
+  // información posiblemente incorrecta sobre algo que ni entendimos.
+  return { decision: 'TalkToHuman', reason: `(parse fallido) ${text.substring(0, 120)}` };
+}
+
 // Classify message intent using discriminator (TalkToAiAssistant or TalkToHuman)
 //
-// HOW IT WORKS:
-// 1. User writes natural language rules (e.g., "Pass to human if client asks about availability")
-// 2. The discriminator prompt is: {USER_RULES} + {CONVERSATION_HISTORY}
-// 3. AI analyzes if the latest message matches the rules
-// 4. AI responds with "Respuesta: SI" (AI can respond) or "Respuesta: NO" (needs human)
-// 5. Backend parses the response and routes accordingly
-//
-// EXAMPLE PROMPT (what user writes):
-// "Pass messages to a human if:
-//  - Client asks about specific availability (dates, times)
-//  - Client wants to book/reschedule an appointment
-//  - Client asks about personal data or account balance
-//
-//  For anything else, you can respond directly."
+// CÓMO FUNCIONA:
+// 1. El operador escribe sus reglas en lenguaje natural (las edita en
+//    SessionSettingsPanel y se guardan en `ai_discriminator_prompt`).
+// 2. Las reglas + criterios generales se envían como `system` (OpenAI) o
+//    como sección "INSTRUCCIONES DEL OPERADOR" (Gemini v0.3.x, sin
+//    systemInstruction nativo).
+// 3. El historial completo (que ya incluye el burst del cliente al final)
+//    va como contenido a clasificar.
+// 4. El modelo responde:
+//      Decisión: AI | HUMANO
+//      Razón: <una frase>
+// 5. Parseamos y devolvemos.
 export async function classifyMessageIntent(
   apiKey: string,
   discriminatorPrompt: string,
-  conversationHistory: string,
+  history: { role: 'user' | 'model'; parts: { text: string }[] }[],
   modelName: string = 'gemini-2.5-flash',
   provider: 'gemini' | 'openai' = 'gemini',
   openaiApiKey?: string
@@ -245,128 +283,123 @@ export async function classifyMessageIntent(
       return await classifyMessageIntentOpenAI(
         openaiApiKey || apiKey,
         discriminatorPrompt,
-        conversationHistory,
+        history,
         modelName
       );
     } else {
       return await classifyMessageIntentGemini(
         apiKey,
         discriminatorPrompt,
-        conversationHistory,
+        history,
         modelName
       );
     }
   } catch (error) {
     console.error('[Discriminator] Error classifying intent:', error);
-    // Default: allow AI response on error
     return 'TalkToAiAssistant';
   }
 }
 
-// Classify using Gemini
+// Bloque común de criterios que ayudan al modelo a clasificar bien.
+// Se inyecta en el prompt junto con las reglas del operador.
+const DISCRIMINATOR_META_INSTRUCTIONS = `Eres un clasificador de intenciones en una conversación de WhatsApp entre un cliente y un asistente virtual. Tu única tarea es analizar el HISTORIAL completo y decidir si la INTENCIÓN MÁS RECIENTE del cliente (los últimos mensajes consecutivos del cliente al final del historial) puede responderla el asistente o requiere un humano.
+
+GUÍAS GENERALES:
+- Las reglas del operador pueden tener dos secciones:
+  • "Pasa al humano si: ..." → casos donde debés clasificar como HUMANO.
+  • "Pasa al asistente si: ..." → casos donde debés clasificar como AI.
+  Si la intención más reciente matchea ambas listas al mismo tiempo, prevalece HUMANO (por seguridad).
+- Si la intención más reciente no matchea claramente NINGUNA de las dos listas, preferí HUMANO. Es mejor que un humano responda algo no previsto a que el asistente entregue una respuesta incorrecta o imprecisa.
+- La intención más reciente puede estar fragmentada en varios mensajes consecutivos del cliente. Analizalos como una sola unidad de intención.
+- Si el último mensaje del cliente es una respuesta breve ("sí", "ok", "claro", "no"), interpretalo en función del último mensaje del asistente. La respuesta cobra significado por el contexto.
+- Si el historial es corto pero el mensaje del cliente es claro y general (saludo inicial, consulta sobre un servicio), clasificá por el CONTENIDO del mensaje — no escales a humano solo por falta de historial.`;
+
+// Classify using Gemini (SDK v0.3.x: sin systemInstruction nativo)
 async function classifyMessageIntentGemini(
   apiKey: string,
   discriminatorPrompt: string,
-  conversationHistory: string,
+  history: { role: 'user' | 'model'; parts: { text: string }[] }[],
   modelName: string = 'gemini-2.5-flash'
 ): Promise<'TalkToAiAssistant' | 'TalkToHuman'> {
   try {
     const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({ model: modelName });
 
-    // Always include conversation history with user rules
-    const userPrompt = `${discriminatorPrompt}
+    const transcript = buildTranscript(history);
 
----HISTORIAL DE CONVERSACIÓN---
-${conversationHistory}
+    const prompt = `### INSTRUCCIONES DEL OPERADOR (reglas del negocio)
+${discriminatorPrompt}
 
----INSTRUCCIONES---
-Analiza el último mensaje del cliente basándote en las reglas anteriores.
-Responde SOLO con una de estas dos opciones:
-- Respuesta: SI (si el asistente puede responder)
-- Respuesta: NO (si requiere intervención humana)`;
+### CONTEXTO Y CRITERIOS
+${DISCRIMINATOR_META_INSTRUCTIONS}
 
-    const result = await model.generateContent(userPrompt);
-    const responseText = result.response.text().toUpperCase();
+### HISTORIAL DE LA CONVERSACIÓN
+${transcript}
 
-    console.log(`[Discriminator] Gemini response: ${responseText.substring(0, 100)}`);
+### TU RESPUESTA (formato obligatorio, sin texto extra)
+Decisión: <AI | HUMANO>
+Razón: <una frase breve explicando por qué>`;
 
-    // Check response for explicit YES/NO keywords
-    if (responseText.includes('RESPUESTA: NO')) {
-      console.log('[Discriminator] Decision: TalkToHuman (NO detected)');
-      return 'TalkToHuman';
-    }
+    const result = await model.generateContent({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.1,
+        maxOutputTokens: 200,
+      },
+    });
 
-    if (responseText.includes('RESPUESTA: SI')) {
-      console.log('[Discriminator] Decision: TalkToAiAssistant (SI detected)');
-      return 'TalkToAiAssistant';
-    }
+    const responseText = result.response.text();
+    console.log(`[Discriminator] Gemini raw response: ${responseText.substring(0, 200)}`);
 
-    // If response is ambiguous, default to AI response (safety: prefer responding to blocking)
-    console.log('[Discriminator] Decision: TalkToAiAssistant (ambiguous, defaulting to AI)');
-    return 'TalkToAiAssistant';
+    const { decision } = parseDiscriminatorDecision(responseText);
+    return decision;
   } catch (error) {
     console.error('[Discriminator] Error classifying intent with Gemini:', error);
-    // Default: allow AI response on error
     return 'TalkToAiAssistant';
   }
 }
 
-// Classify using OpenAI
+// Classify using OpenAI (sí tiene `role: system` nativo)
 async function classifyMessageIntentOpenAI(
   apiKey: string,
   discriminatorPrompt: string,
-  conversationHistory: string,
+  history: { role: 'user' | 'model'; parts: { text: string }[] }[],
   modelName: string = 'gpt-4o-mini'
 ): Promise<'TalkToAiAssistant' | 'TalkToHuman'> {
   try {
     const client = new OpenAI({ apiKey });
 
-    // Always include conversation history with user rules
-    const userPrompt = `${discriminatorPrompt}
+    const transcript = buildTranscript(history);
 
----HISTORIAL DE CONVERSACIÓN---
-${conversationHistory}
+    const systemContent = `${DISCRIMINATOR_META_INSTRUCTIONS}
 
----INSTRUCCIONES---
-Analiza el último mensaje del cliente basándote en las reglas anteriores.
-Responde SOLO con una de estas dos opciones:
-- Respuesta: SI (si el asistente puede responder)
-- Respuesta: NO (si requiere intervención humana)`;
+### REGLAS DEL OPERADOR
+${discriminatorPrompt}`;
+
+    const userContent = `### HISTORIAL DE LA CONVERSACIÓN
+${transcript}
+
+### TU RESPUESTA (formato obligatorio, sin texto extra)
+Decisión: <AI | HUMANO>
+Razón: <una frase breve explicando por qué>`;
 
     const response = await client.chat.completions.create({
       model: modelName,
       messages: [
-        {
-          role: 'user',
-          content: userPrompt,
-        },
+        { role: 'system', content: systemContent },
+        { role: 'user', content: userContent },
       ],
-      temperature: 0.2,
-      max_tokens: 100,
+      temperature: 0.1,
+      max_tokens: 200,
     });
 
-    const responseText = (response.choices[0]?.message.content || '').toUpperCase();
+    const responseText = response.choices[0]?.message.content || '';
+    console.log(`[Discriminator] OpenAI raw response: ${responseText.substring(0, 200)}`);
 
-    console.log(`[Discriminator] OpenAI response: ${responseText.substring(0, 100)}`);
-
-    // Check response for explicit YES/NO keywords
-    if (responseText.includes('RESPUESTA: NO')) {
-      console.log('[Discriminator] Decision: TalkToHuman (NO detected)');
-      return 'TalkToHuman';
-    }
-
-    if (responseText.includes('RESPUESTA: SI')) {
-      console.log('[Discriminator] Decision: TalkToAiAssistant (SI detected)');
-      return 'TalkToAiAssistant';
-    }
-
-    // If response is ambiguous, default to AI response (safety: prefer responding to blocking)
-    console.log('[Discriminator] Decision: TalkToAiAssistant (ambiguous, defaulting to AI)');
-    return 'TalkToAiAssistant';
+    const { decision } = parseDiscriminatorDecision(responseText);
+    return decision;
   } catch (error) {
     console.error('[Discriminator] Error classifying intent with OpenAI:', error);
-    // Default: allow AI response on error
     return 'TalkToAiAssistant';
   }
 }
@@ -446,28 +479,21 @@ export async function processMessageBuffer(
 
     // DISCRIMINATOR: Check if message should be handled by AI or human
     if (aiConfig.discriminator?.enabled && aiConfig.discriminator?.prompt) {
-      console.log(`[Discriminator] Enabled for ${contactPhone}, prompt length: ${aiConfig.discriminator.prompt.length}`);
-      console.log(`[Discriminator] Message: "${combinedMessage.substring(0, 80)}..."`);
+      console.log(`[Discriminator] Enabled for ${contactPhone}, prompt length: ${aiConfig.discriminator.prompt.length}, history turns: ${history.length}`);
+      console.log(`[Discriminator] Last burst (${bufferedMessages.length} msg): "${combinedMessage.substring(0, 80)}..."`);
 
-      const historyText = history
-        .map((msg) => {
-          const role = msg.role === 'user' ? 'Customer' : 'Assistant';
-          return `${role}: ${msg.parts[0]?.text || ''}`;
-        })
-        .join('\n');
-
-      const conversationContext = `${historyText}\nCustomer: ${combinedMessage}`;
-
+      // El historial ya contiene el burst del cliente como turns naturales
+      // al final (todos los mensajes se persisten antes de que dispare el
+      // buffer). Lo pasamos completo al discriminador; él identifica la
+      // "intención más reciente" a partir del orden.
       const classification = await classifyMessageIntent(
         aiConfig.apiKey,
         aiConfig.discriminator.prompt,
-        conversationContext,
+        history,
         aiConfig.model,
         aiConfig.provider || 'gemini',
         aiConfig.openaiApiKey
       );
-
-      console.log(`[Discriminator] Classification result: ${classification}`);
 
       if (classification === 'TalkToHuman') {
         // Incrementamos el contador por la ráfaga completa de mensajes que el discriminador clasificó
@@ -523,11 +549,14 @@ export async function processMessageBuffer(
       console.log(`[Buffer] Discriminator classification: ${classification}, proceeding with AI response`);
     }
 
-    // Generate and send AI response
+    // Generate and send AI response. El history ya termina en el burst del
+    // cliente (los mensajes están persistidos en Firestore antes de que el
+    // buffer dispare), por eso no pasamos un userMessage separado: estaría
+    // duplicado y confunde al modelo (Gemini además rechaza dos turns user
+    // consecutivos en el flujo de chat).
     const aiResponse = await generateAIResponse(
       aiConfig.apiKey,
       aiConfig.systemPrompt || 'Eres un asistente útil.',
-      combinedMessage,
       history,
       aiConfig.model,
       aiConfig.provider || 'gemini',

@@ -1061,14 +1061,12 @@ app.post('/generate-ai-response', express.json(), verifyHttpAuth(), async (req, 
     const rawDocs = snapshot.docs.reverse().map(d => d.data());
     const history = normalizeHistory(rawDocs);
 
-    // Get last user message for context
-    const lastUserMsg = rawDocs.filter(m => !m.fromMe).at(-1)?.text ?? '';
-
-    // Generate response directly (bypass discriminator)
+    // El history ya incluye el último mensaje del cliente al final; no
+    // hace falta extraerlo aparte. `generateAIResponse` lo trata como el
+    // turn user actual y responde como model.
     const suggestedText = await generateAIResponse(
       aiConfig.apiKey,
       aiConfig.systemPrompt,
-      lastUserMsg,
       history,
       aiConfig.model,
       provider,
