@@ -16,7 +16,7 @@ import { randomUUID } from 'crypto';
 import cron from 'node-cron';
 import { SessionData, MessageBuffer } from './src/types';
 import { extractPhoneNumber, storeLIDMapping, resolveLIDViaSock, isConversationalJid } from './src/utils/phone';
-import { initializeSession, saveMessageToFirestore, getAIConfig, cacheContactName, applyContactUpdate, reconcileContactNames, consolidateLIDChat, incrementUnrespondedCount, resetUnrespondedCount } from './src/services/firestoreService';
+import { initializeSession, saveMessageToFirestore, getAIConfig, cacheContactName, applyContactUpdate, reconcileContactNames, consolidateLIDChat, incrementUnrespondedCount, resetUnrespondedCount, writeMediaIndexEntry, isIndexableMedia } from './src/services/firestoreService';
 import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer, emitAiState } from './src/services/aiService';
 import { extractMediaInfo, classifyIncomingMedia } from './src/services/mediaService';
 import { ReminderService } from './src/services/reminderService';
@@ -1584,6 +1584,106 @@ app.patch('/accounts/members/:uid', express.json(), verifyHttpAuth(), async (req
     console.error('[PATCH /accounts/members] Error:', error);
     res.status(500).json({
       error: 'Failed to update member',
+      details: (error as any).message,
+    });
+  }
+});
+
+// Backfill del media_index para una sesión existente.
+// Recorre chats → messages y popula `media_index` con todo el histórico
+// que sea indexable (image/video/document, sin GIFs). Idempotente: usa
+// `set(merge:true)` en el helper. Pensado para correrse una sola vez por
+// sesión tras desplegar la feature.
+//
+// Body: { accountId, sessionId }
+// Respuesta: { success, scannedChats, indexedCount, skippedCount }
+app.post('/backfill-media-index', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const { accountId, sessionId } = req.body as {
+      accountId?: string;
+      sessionId?: string;
+    };
+    if (!accountId || !sessionId) {
+      return res.status(400).json({ error: 'Missing accountId or sessionId' });
+    }
+    // verifyHttpAuth ya validó que el requester es miembro de accountId.
+
+    const db = admin.firestore();
+    const sessionRef = db
+      .collection(ACCOUNTS_COLLECTION)
+      .doc(accountId)
+      .collection('whatsapp_sessions')
+      .doc(sessionId);
+
+    const chatsSnap = await sessionRef.collection('chats').get();
+    let scannedChats = 0;
+    let indexedCount = 0;
+    let skippedCount = 0;
+
+    for (const chatDoc of chatsSnap.docs) {
+      scannedChats++;
+      const chatId = chatDoc.id;
+      const chatData = chatDoc.data();
+      const contactName: string | null = chatData?.contactName ?? null;
+
+      // Paginamos los mensajes de a 500 para no cargar todo en memoria si
+      // el chat es enorme. Avanzamos por `timestamp` desc + startAfter.
+      let cursor: FirebaseFirestore.QueryDocumentSnapshot | null = null;
+      while (true) {
+        let q: FirebaseFirestore.Query = chatDoc.ref
+          .collection('messages')
+          .where('isMedia', '==', true)
+          .orderBy('timestamp', 'desc')
+          .limit(500);
+        if (cursor) q = q.startAfter(cursor);
+        const page = await q.get();
+        if (page.empty) break;
+
+        for (const msgDoc of page.docs) {
+          const m = msgDoc.data();
+          const mediaFields = {
+            mediaType: m.mediaType,
+            mediaMime: m.mediaMime,
+            mediaIsGif: m.mediaIsGif,
+            mediaThumbBase64: m.mediaThumbBase64,
+            mediaUrl: m.mediaUrl,
+            mediaStatus: m.mediaStatus,
+            mediaWidth: m.mediaWidth,
+            mediaHeight: m.mediaHeight,
+            mediaFileName: m.mediaFileName,
+            mediaSize: m.mediaSize,
+            mediaDuration: m.mediaDuration,
+          };
+          if (!isIndexableMedia(mediaFields)) {
+            skippedCount++;
+            continue;
+          }
+          await writeMediaIndexEntry({
+            accountId,
+            sessionId,
+            messageId: msgDoc.id,
+            chatId,
+            contactName,
+            timestamp: m.timestamp,
+            fromMe: !!m.fromMe,
+            senderType: m.senderType,
+            senderName: m.senderName,
+            mediaFields,
+          });
+          indexedCount++;
+        }
+
+        cursor = page.docs[page.docs.length - 1];
+        if (page.size < 500) break;
+      }
+    }
+
+    console.log(`[Backfill] media_index para ${accountId}/${sessionId}: chats=${scannedChats}, indexed=${indexedCount}, skipped=${skippedCount}`);
+    res.json({ success: true, scannedChats, indexedCount, skippedCount });
+  } catch (error) {
+    console.error('[Backfill] Error:', error);
+    res.status(500).json({
+      error: 'Failed to backfill media_index',
       details: (error as any).message,
     });
   }

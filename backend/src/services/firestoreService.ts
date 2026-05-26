@@ -119,6 +119,121 @@ export function extractQuoteInfo(message: any, selfJid?: string): {
   return { quotedMessageId: stanzaId, quotedText, quotedFromMe };
 }
 
+// ============================================
+// Media Vault index (denormalizado por sesión).
+//
+// Mantenemos una colección plana `whatsapp_sessions/{sid}/media_index/{mid}`
+// con docs livianos de TODOS los mensajes con media "buscable" (imágenes,
+// videos no-GIF y documentos). Esto permite que MediaVaultScreen en Flutter
+// pagine un timeline global de la sesión con un solo `orderBy(timestamp)`
+// sin tener que barrer chat por chat.
+//
+// Excluidos del índice (decisión de producto): audio, sticker, video con
+// gifPlayback. Se vuelven ruido al buscar comprobantes/capturas.
+// ============================================
+
+const INDEXABLE_MEDIA_TYPES = new Set(['image', 'video', 'document']);
+
+export function isIndexableMedia(mediaFields: Record<string, any>): boolean {
+  const t = mediaFields?.mediaType;
+  if (!t || !INDEXABLE_MEDIA_TYPES.has(t)) return false;
+  // Los "GIF" de WhatsApp son videos con gifPlayback=true → fuera.
+  if (t === 'video' && mediaFields.mediaIsGif === true) return false;
+  return true;
+}
+
+// Construye el doc liviano del índice a partir de los campos persistidos en
+// el mensaje. Tomamos solo lo necesario para render de grilla + navegación.
+function buildMediaIndexPayload(params: {
+  messageId: string;
+  chatId: string;
+  contactName?: string | null;
+  timestamp: admin.firestore.Timestamp;
+  fromMe: boolean;
+  senderType?: string;
+  senderName?: string;
+  mediaFields: Record<string, any>;
+}): Record<string, any> {
+  const m = params.mediaFields;
+  const payload: Record<string, any> = {
+    messageId: params.messageId,
+    chatId: params.chatId,
+    timestamp: params.timestamp,
+    fromMe: params.fromMe,
+    mediaType: m.mediaType,
+    mediaMime: m.mediaMime ?? null,
+    mediaStatus: m.mediaStatus ?? 'pending',
+  };
+  if (params.contactName) payload.contactName = params.contactName;
+  if (params.senderType) payload.senderType = params.senderType;
+  if (params.senderName) payload.senderName = params.senderName;
+  if (m.mediaThumbBase64) payload.mediaThumbBase64 = m.mediaThumbBase64;
+  if (m.mediaUrl) payload.mediaUrl = m.mediaUrl;
+  if (m.mediaWidth != null) payload.mediaWidth = m.mediaWidth;
+  if (m.mediaHeight != null) payload.mediaHeight = m.mediaHeight;
+  if (m.mediaFileName) payload.mediaFileName = m.mediaFileName;
+  if (m.mediaSize != null) payload.mediaSize = m.mediaSize;
+  if (m.mediaDuration != null) payload.mediaDuration = m.mediaDuration;
+  return payload;
+}
+
+// Escribe el doc del índice. Idempotente (merge:true). No-op si el mensaje
+// no es indexable. Errores se loguean pero NO se propagan — el índice es
+// una optimización; un fallo aquí no debe tumbar el guardado del mensaje.
+export async function writeMediaIndexEntry(params: {
+  accountId: string;
+  sessionId: string;
+  messageId: string;
+  chatId: string;
+  contactName?: string | null;
+  timestamp: admin.firestore.Timestamp;
+  fromMe: boolean;
+  senderType?: string;
+  senderName?: string;
+  mediaFields: Record<string, any>;
+}): Promise<void> {
+  if (!isIndexableMedia(params.mediaFields)) return;
+  try {
+    const ref = getDb()
+      .collection(ACCOUNTS_COLLECTION)
+      .doc(params.accountId)
+      .collection('whatsapp_sessions')
+      .doc(params.sessionId)
+      .collection('media_index')
+      .doc(params.messageId);
+    await ref.set(buildMediaIndexPayload(params), { merge: true });
+  } catch (err) {
+    console.warn(`[MediaIndex] No se pudo indexar ${params.messageId}:`, err);
+  }
+}
+
+// Update parcial del índice (usado por processMediaAsync cuando el upload
+// termina y necesitamos sincronizar mediaUrl/mediaSize/mediaStatus).
+export async function updateMediaIndexEntry(params: {
+  accountId: string;
+  sessionId: string;
+  messageId: string;
+  patch: Record<string, any>;
+}): Promise<void> {
+  try {
+    const ref = getDb()
+      .collection(ACCOUNTS_COLLECTION)
+      .doc(params.accountId)
+      .collection('whatsapp_sessions')
+      .doc(params.sessionId)
+      .collection('media_index')
+      .doc(params.messageId);
+    // Si el doc no existe (mensaje no indexable, ej. audio/sticker), set merge
+    // crearía basura. Verificamos primero — barato porque el upload pipeline
+    // ya hace varias I/O.
+    const snap = await ref.get();
+    if (!snap.exists) return;
+    await ref.set(params.patch, { merge: true });
+  } catch (err) {
+    console.warn(`[MediaIndex] No se pudo actualizar ${params.messageId}:`, err);
+  }
+}
+
 // Initialize/update session document in Firestore
 export async function initializeSession(phoneNumber: string, sessionKey: string, accountId: string) {
   try {
@@ -513,10 +628,11 @@ export async function saveMessageToFirestore(
       : {};
 
     // Save message to messages subcollection
+    const msgTimestamp = admin.firestore.Timestamp.fromDate(new Date(messageTimestamp));
     await messagesSubCollectionRef.doc(messageId).set({
       id: messageId,
       text: messageText,
-      timestamp: admin.firestore.Timestamp.fromDate(new Date(messageTimestamp)),
+      timestamp: msgTimestamp,
       from: message.key.fromMe ? (botJid || 'bot') : phoneNumber,
       fromMe: message.key.fromMe,
       isMedia: !!mediaInfo,
@@ -525,22 +641,37 @@ export async function saveMessageToFirestore(
       ...quoteFields,
     }, { merge: true });
 
+    // Indexar al media_index si aplica (imágenes/videos/docs; no audios ni stickers ni gifs).
+    // Fire-and-forget — falla silenciosa para no afectar el flujo principal.
+    const cachedNameForIndex = session.contactNames?.get(phoneNumber);
+    writeMediaIndexEntry({
+      accountId,
+      sessionId,
+      messageId,
+      chatId: phoneNumber,
+      contactName: cachedNameForIndex ?? null,
+      timestamp: msgTimestamp,
+      fromMe: !!message.key.fromMe,
+      senderType: senderFields.senderType,
+      senderName: senderFields.senderName,
+      mediaFields,
+    }).catch(() => { /* ya logueado en el helper */ });
+
     // Update the chat document with lastMessage (for efficient list display)
     // IMPORTANT: Store the remoteJid so we can use the correct format when replying
     // (e.g., if it's @lid format, we need to use that exact format to send messages)
     // Si tenemos el nombre de agenda en el cache de la sesión, lo incluimos en el
     // mismo write (cero writes adicionales sobre el flujo normal).
-    const cachedName = session.contactNames?.get(phoneNumber);
     const chatDocPayload: Record<string, any> = {
       phoneNumber,
       remoteJid,
       lastMessage: lastMessagePreview.substring(0, 100),
-      lastMessageTimestamp: admin.firestore.Timestamp.fromDate(new Date(messageTimestamp)),
+      lastMessageTimestamp: msgTimestamp,
       lastMessageId: messageId,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     };
-    if (cachedName) {
-      chatDocPayload.contactName = cachedName;
+    if (cachedNameForIndex) {
+      chatDocPayload.contactName = cachedNameForIndex;
     }
     await chatDocRef.set(chatDocPayload, { merge: true });
 

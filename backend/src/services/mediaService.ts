@@ -9,6 +9,7 @@ import { downloadMediaMessage } from '@whiskeysockets/baileys';
 import { pino } from 'pino';
 import { randomUUID } from 'crypto';
 import { ACCOUNTS_COLLECTION } from '../config/env';
+import { updateMediaIndexEntry } from './firestoreService';
 
 const mediaLogger = pino({ level: 'warn' }).child({ module: 'media' });
 
@@ -251,11 +252,20 @@ export async function processMediaAsync(
       const encodedPath = encodeURIComponent(path);
       const url = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodedPath}?alt=media&token=${downloadToken}`;
 
-      await messageRef.set({
+      const readyPatch = {
         mediaUrl: url,
         mediaSize: buffer.length,
-        mediaStatus: 'ready',
-      }, { merge: true });
+        mediaStatus: 'ready' as const,
+      };
+      await messageRef.set(readyPatch, { merge: true });
+
+      // Sincronizar el media_index (no-op si este media no estaba indexado).
+      await updateMediaIndexEntry({
+        accountId,
+        sessionId,
+        messageId,
+        patch: readyPatch,
+      });
 
       console.log(`[Media] ${info.type} subido: ${messageId} (${buffer.length} bytes) → ${path}`);
       return;
@@ -266,6 +276,12 @@ export async function processMediaAsync(
       if (attempt === MAX_RETRIES) {
         try {
           await messageRef.set({ mediaStatus: 'failed' }, { merge: true });
+          await updateMediaIndexEntry({
+            accountId,
+            sessionId,
+            messageId,
+            patch: { mediaStatus: 'failed' },
+          });
         } catch (_) { /* noop */ }
         console.error(`[Media] ${info.type} marcado como FAILED: ${messageId}`);
       } else {

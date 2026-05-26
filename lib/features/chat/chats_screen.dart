@@ -15,6 +15,7 @@ import 'package:crm_whatsapp/core/services/storage_service.dart';
 import 'package:crm_whatsapp/features/settings.dart';
 import 'package:crm_whatsapp/features/accounts.dart';
 import 'messages_view.dart';
+import 'media_vault_screen.dart';
 import 'widgets/ai_state_indicator.dart';
 import 'widgets/unread_badge.dart';
 import 'widgets/label_chip.dart';
@@ -291,6 +292,26 @@ class _ChatsScreenState extends State<ChatsScreen> {
     });
   }
 
+  // Abre la galería de medios de la sesión actual. Cuando el operador toca
+  // "Ver en chat" desde el visor, MediaVaultScreen ya hizo pop de sí misma
+  // y solo nos pide saltar a ese contacto.
+  void _openMediaVault() {
+    if (widget.sessionId == null) return;
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => MediaVaultScreen(
+          accountId: widget.accountId,
+          sessionId: widget.sessionId!,
+          sessionAlias: widget.initialAlias ?? widget.sessionId!,
+          onJumpToChat: (chatId) {
+            if (!mounted) return;
+            setState(() => selectedChatPhone = chatId);
+          },
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final isMobile = MediaQuery.of(context).size.width < 600;
@@ -472,6 +493,11 @@ class _ChatsScreenState extends State<ChatsScreen> {
         ),
         elevation: 0,
         actions: [
+          IconButton(
+            icon: const Icon(Icons.photo_library_outlined, size: 20),
+            tooltip: 'Galería de medios',
+            onPressed: () => _openMediaVault(),
+          ),
           IconButton(
             icon: const Icon(Icons.flash_on, size: 20),
             tooltip: 'Respuestas rápidas',
