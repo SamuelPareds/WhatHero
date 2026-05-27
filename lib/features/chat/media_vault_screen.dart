@@ -15,8 +15,10 @@
 import 'dart:convert';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
 import 'package:crm_whatsapp/core.dart';
+import 'package:crm_whatsapp/core/services/api_client.dart';
 
 const int _pageSize = 30;
 
@@ -55,6 +57,11 @@ class _MediaVaultScreenState extends State<MediaVaultScreen> {
 
   _MediaFilter _filter = _MediaFilter.all;
   String _searchQuery = '';
+
+  // Estado del backfill manual disparado desde el empty state.
+  // - idle: aún no se intentó.
+  // - running: el endpoint está corriendo (UI bloqueada con spinner).
+  bool _backfilling = false;
 
   @override
   void initState() {
@@ -350,6 +357,16 @@ class _MediaVaultScreenState extends State<MediaVaultScreen> {
   }
 
   Widget _buildEmptyState() {
+    // El botón "Indexar histórico" solo tiene sentido cuando:
+    // - ya terminamos de paginar (_exhausted) → no es que falte cargar más;
+    // - el usuario NO está filtrando ni buscando → si filtra y queda vacío
+    //   es por el filtro, no por falta de índice;
+    // - no estamos ya corriendo un backfill.
+    final canBackfill = _exhausted &&
+        _searchQuery.isEmpty &&
+        _filter == _MediaFilter.all &&
+        !_backfilling;
+
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(32),
@@ -378,10 +395,98 @@ class _MediaVaultScreenState extends State<MediaVaultScreen> {
               textAlign: TextAlign.center,
               style: const TextStyle(fontSize: 14, color: lightText),
             ),
+            if (canBackfill) ...[
+              const SizedBox(height: 24),
+              const Text(
+                '¿Esta sesión ya tiene mensajes con imágenes?',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 13, color: lightText),
+              ),
+              const SizedBox(height: 12),
+              ElevatedButton.icon(
+                onPressed: _runBackfill,
+                icon: const Icon(Icons.history, size: 18),
+                label: const Text('Indexar histórico'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: primaryAqua,
+                  foregroundColor: darkBg,
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 20, vertical: 12),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  textStyle: const TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Recorre todos los chats y rellena la galería con\nlos medios ya recibidos. Puede tardar 1-2 minutos.',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 11, color: lightText),
+              ),
+            ],
+            if (_backfilling) ...[
+              const SizedBox(height: 24),
+              const SizedBox(
+                width: 28,
+                height: 28,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  valueColor: AlwaysStoppedAnimation(primaryAqua),
+                ),
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                'Indexando histórico...',
+                style: TextStyle(fontSize: 13, color: lightText),
+              ),
+            ],
           ],
         ),
       ),
     );
+  }
+
+  // Dispara POST /backfill-media-index para esta sesión y, al volver,
+  // reinicia la paginación para que la grilla se rellene con lo nuevo.
+  Future<void> _runBackfill() async {
+    setState(() => _backfilling = true);
+    try {
+      final resp = await http.post(
+        Uri.parse('$backendUrl/backfill-media-index'),
+        headers: await authHeaders(),
+        body: jsonEncode({
+          'accountId': widget.accountId,
+          'sessionId': widget.sessionId,
+        }),
+      );
+
+      if (!mounted) return;
+
+      if (resp.statusCode == 200) {
+        final body = jsonDecode(resp.body) as Map<String, dynamic>;
+        final indexed = body['indexedCount'] ?? 0;
+        final scanned = body['scannedChats'] ?? 0;
+        _toast('$indexed medios indexados en $scanned chats');
+        // Reiniciamos paginación: descartamos lo cargado y leemos desde 0
+        // para que aparezca lo recién indexado.
+        setState(() {
+          _items.clear();
+          _cursor = null;
+          _exhausted = false;
+        });
+        await _loadMore();
+      } else {
+        _toast('Error ${resp.statusCode}: ${resp.body}');
+      }
+    } catch (e) {
+      if (mounted) _toast('Error: $e');
+    } finally {
+      if (mounted) setState(() => _backfilling = false);
+    }
   }
 
   Widget _buildDateHeader(String label) {
