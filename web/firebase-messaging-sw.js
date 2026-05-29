@@ -49,7 +49,24 @@ messaging.onBackgroundMessage((payload) => {
     renotify: true,
     data: payload.data || {},
   };
-  return self.registration.showNotification(title, options);
+
+  // El SW no puede reproducir audio. Para que SUENE con la ventana minimizada
+  // (pestaña oculta pero viva), avisamos a las pestañas existentes para que la
+  // página reproduzca el beep con su AudioContext ya desbloqueado. Si no hay
+  // ninguna pestaña abierta, no suena nada por aquí — solo queda el sonido del
+  // SO (depende de la config de notificaciones del sistema).
+  const notifyClients = self.clients
+    .matchAll({ type: 'window', includeUncontrolled: true })
+    .then((clientsArr) => {
+      for (const client of clientsArr) {
+        client.postMessage({ type: 'whathero_play_sound' });
+      }
+    });
+
+  return Promise.all([
+    self.registration.showNotification(title, options),
+    notifyClients,
+  ]);
 });
 
 // Click en la notificación → enfocar pestaña existente o abrir una.

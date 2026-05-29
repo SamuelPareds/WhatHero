@@ -11,6 +11,7 @@ import 'core.dart';
 import 'core/services/socket_service.dart';
 import 'core/services/notification_service.dart';
 import 'core/services/storage_service.dart';
+import 'core/widgets/foreground_push_host.dart';
 import 'features/auth.dart';
 import 'features/chat.dart';
 
@@ -74,8 +75,13 @@ class _SessionDispatcherState extends State<SessionDispatcher> {
 
   @override
   Widget build(BuildContext context) {
-    return FutureBuilder<String?>(
-      future: StorageService().getLastSessionId(),
+    // Banner in-app para pushes en foreground (clave en web con la pestaña
+    // enfocada, donde el SO no muestra notificación). Vive aquí, arriba de
+    // ChatsScreen, por el mismo motivo que los init de Socket/Notification:
+    // único ancestro garantizado post-login que conoce el accountId.
+    return ForegroundPushHost(
+      child: FutureBuilder<String?>(
+        future: StorageService().getLastSessionId(),
       builder: (context, lastSessionSnapshot) {
         if (lastSessionSnapshot.connectionState == ConnectionState.waiting) {
           return const Scaffold(
@@ -137,7 +143,8 @@ class _SessionDispatcherState extends State<SessionDispatcher> {
             return ChatsScreen(accountId: widget.accountId);
           },
         );
-      },
+        },
+      ),
     );
   }
 }

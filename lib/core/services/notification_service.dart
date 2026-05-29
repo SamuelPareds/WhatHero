@@ -76,6 +76,12 @@ class NotificationService {
   final _tapController = StreamController<HumanAttentionPush>.broadcast();
   Stream<HumanAttentionPush> get tapStream => _tapController.stream;
 
+  /// Reenvía un push al canal de tap. Lo usa el banner in-app (foreground web):
+  /// cuando el operador toca el banner, reutilizamos el MISMO deep-link que ya
+  /// maneja `ChatsScreen._handlePushTap` (suscrito a `tapStream`), sin duplicar
+  /// la lógica de navegación al chat.
+  void forwardTap(HumanAttentionPush push) => _tapController.add(push);
+
   // Cold-start tap: completer que resuelve cuando init() determinó si la app
   // abrió desde un tap (con la data del push) o no (null). Usamos Future en
   // vez de "consume-once" para evitar la race entre ChatsScreen.initState y

@@ -7,6 +7,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter_slidable/flutter_slidable.dart';
 import 'package:http/http.dart' as http;
 import 'package:crm_whatsapp/core.dart';
+import 'package:crm_whatsapp/core/services/active_chat_tracker.dart';
 import 'package:crm_whatsapp/core/services/ai_state_service.dart';
 import 'package:crm_whatsapp/core/services/api_client.dart';
 import 'package:crm_whatsapp/core/services/notification_service.dart';
@@ -167,6 +168,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
     _labelsSubscription?.cancel();
     _pushTapSubscription?.cancel();
     _cancelledTimer?.cancel();
+    ActiveChatTracker.instance.clear();
     super.dispose();
   }
 
@@ -314,6 +316,14 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // Reportamos al rastreador qué chat está abierto, para que el banner de
+    // push se suprima si llega un aviso del chat que ya estás viendo. Es un
+    // contenedor de valores sin listeners → no provoca rebuilds.
+    ActiveChatTracker.instance.update(
+      sessionPhone: widget.sessionId,
+      chatId: selectedChatPhone,
+    );
+
     final isMobile = MediaQuery.of(context).size.width < 600;
 
     if (isMobile) {
