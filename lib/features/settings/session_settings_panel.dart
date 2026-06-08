@@ -23,6 +23,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
   late TextEditingController _aliasController;
   late TextEditingController _apiKeyController;
   late TextEditingController _openaiApiKeyController;
+  late TextEditingController _deepseekApiKeyController;
   late TextEditingController _systemPromptController;
   late TextEditingController _discriminatorPromptController;
   late TextEditingController _reminderApiUrlController;
@@ -78,6 +79,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
     _aliasController = TextEditingController();
     _apiKeyController = TextEditingController();
     _openaiApiKeyController = TextEditingController();
+    _deepseekApiKeyController = TextEditingController();
     _systemPromptController = TextEditingController();
     _discriminatorPromptController = TextEditingController();
     _reminderApiUrlController = TextEditingController();
@@ -105,8 +107,9 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
           _selectedProvider = data['ai_provider'] ?? 'gemini';
           _apiKeyController.text = data['ai_api_key'] ?? '';
           _openaiApiKeyController.text = data['ai_openai_api_key'] ?? '';
+          _deepseekApiKeyController.text = data['ai_deepseek_api_key'] ?? '';
           _systemPromptController.text = data['ai_system_prompt'] ?? 'Eres un asistente útil.';
-          _selectedModel = data['ai_model'] ?? (_selectedProvider == 'openai' ? 'gpt-4o-mini' : 'gemini-2.5-flash');
+          _selectedModel = data['ai_model'] ?? _defaultModelFor(_selectedProvider);
           _responseDelayMs = data['ai_response_delay_ms'] ?? 15000;
 
           _reminderEnabled = data['reminder_enabled'] ?? false;
@@ -181,6 +184,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
         'ai_provider': _selectedProvider,
         'ai_api_key': _apiKeyController.text,
         'ai_openai_api_key': _openaiApiKeyController.text,
+        'ai_deepseek_api_key': _deepseekApiKeyController.text,
         'ai_system_prompt': _systemPromptController.text,
         'ai_model': _selectedModel,
         'ai_response_delay_ms': _responseDelayMs,
@@ -224,6 +228,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
     _aliasController.dispose();
     _apiKeyController.dispose();
     _openaiApiKeyController.dispose();
+    _deepseekApiKeyController.dispose();
     _systemPromptController.dispose();
     _discriminatorPromptController.dispose();
     _reminderApiUrlController.dispose();
@@ -358,17 +363,17 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
           const SizedBox(height: 24),
           _sectionTitle('Cerebro del Asistente'),
           const SizedBox(height: 16),
-          _dropdownTile('Proveedor', _selectedProvider, ['gemini', 'openai'], (v) {
+          _dropdownTile('Proveedor', _selectedProvider, ['gemini', 'openai', 'deepseek'], (v) {
             setState(() {
               _selectedProvider = v!;
-              _selectedModel = v == 'openai' ? 'gpt-4o-mini' : 'gemini-2.5-flash';
+              _selectedModel = _defaultModelFor(v);
             });
           }),
           const SizedBox(height: 16),
           _modelDropdownTile(),
           const SizedBox(height: 16),
           _textField(
-            controller: _selectedProvider == 'gemini' ? _apiKeyController : _openaiApiKeyController,
+            controller: _activeApiKeyController,
             label: 'API Key (${_selectedProvider.toUpperCase()})',
             hint: 'Pega tu llave aquí...',
             isPassword: true,
@@ -803,12 +808,42 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
     );
   }
 
+  // Controller de la API key del proveedor activo. Cada proveedor guarda su
+  // llave en un campo Firestore aparte; aquí solo elegimos cuál editar.
+  TextEditingController get _activeApiKeyController {
+    switch (_selectedProvider) {
+      case 'openai':
+        return _openaiApiKeyController;
+      case 'deepseek':
+        return _deepseekApiKeyController;
+      default:
+        return _apiKeyController;
+    }
+  }
+
+  // Modelo por defecto al cambiar de proveedor (el "Recomendado" de cada uno).
+  String _defaultModelFor(String? provider) {
+    switch (provider) {
+      case 'openai':
+        return 'gpt-4o-mini';
+      case 'deepseek':
+        return 'deepseek-v4-flash';
+      default:
+        return 'gemini-2.5-flash';
+    }
+  }
+
   Widget _modelDropdownTile() {
-    final List<Map<String, String>> models = _selectedProvider == 'openai' 
+    final List<Map<String, String>> models = _selectedProvider == 'openai'
       ? [
           {'id': 'gpt-4o-mini', 'name': 'GPT-4o Mini', 'desc': 'Recomendado'},
           {'id': 'gpt-4o', 'name': 'GPT-4o', 'desc': 'Más potente'},
           {'id': 'gpt-4-turbo', 'name': 'GPT-4 Turbo', 'desc': 'Más rápido'},
+        ]
+      : _selectedProvider == 'deepseek'
+      ? [
+          {'id': 'deepseek-v4-flash', 'name': 'V4 Flash', 'desc': 'Recomendado'},
+          {'id': 'deepseek-v4-pro', 'name': 'V4 Pro', 'desc': 'Más potente'},
         ]
       : [
           {'id': 'gemini-2.5-flash', 'name': 'Flash 2.5', 'desc': 'Recomendado'},

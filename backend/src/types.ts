@@ -33,8 +33,11 @@ export interface SessionData {
   aiConfig?: {
     enabled: boolean;
     apiKey: string;
-    provider?: 'gemini' | 'openai';
+    provider?: 'gemini' | 'openai' | 'deepseek';
     openaiApiKey?: string;
+    // DeepSeek habla el protocolo de OpenAI: reutilizamos el SDK de OpenAI
+    // con baseURL 'https://api.deepseek.com'. Solo necesitamos su propia key.
+    deepseekApiKey?: string;
     systemPrompt: string;
     responseDelayMs: number;
     model: string;

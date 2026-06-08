@@ -23,6 +23,13 @@ function getIO() {
 // sin disparar writes ni lecturas adicionales.
 export type AiLifecycleState = 'buffering' | 'thinking' | 'responding' | 'idle';
 
+// DeepSeek es compatible con la API de OpenAI: reutilizamos el SDK de OpenAI
+// apuntando a este baseURL. Así no duplicamos las funciones de generación ni
+// las del discriminador — solo cambia el endpoint y la api key.
+const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
+
+export type AiProvider = 'gemini' | 'openai' | 'deepseek';
+
 export function emitAiState(
   accountId: string,
   sessionKey: string,
@@ -96,8 +103,9 @@ export async function generateAIResponse(
   systemPrompt: string,
   history: { role: 'user' | 'model'; parts: { text: string }[] }[],
   modelName: string = 'gemini-2.5-flash',
-  provider: 'gemini' | 'openai' = 'gemini',
-  openaiApiKey?: string
+  provider: AiProvider = 'gemini',
+  openaiApiKey?: string,
+  deepseekApiKey?: string
 ): Promise<string | null> {
   try {
     // Sin historial no hay nada que responder (caso muy edge: Firestore vacío).
@@ -106,12 +114,15 @@ export async function generateAIResponse(
       return null;
     }
 
-    if (provider === 'openai') {
+    if (provider === 'openai' || provider === 'deepseek') {
+      // Ambos comparten la misma ruta OpenAI-compatible; DeepSeek solo añade baseURL.
+      const isDeepSeek = provider === 'deepseek';
       return await generateAIResponseOpenAI(
-        openaiApiKey || apiKey,
+        (isDeepSeek ? deepseekApiKey : openaiApiKey) || apiKey,
         systemPrompt,
         history,
-        modelName
+        modelName,
+        isDeepSeek ? DEEPSEEK_BASE_URL : undefined
       );
     } else {
       return await generateAIResponseGemini(
@@ -166,15 +177,17 @@ async function generateAIResponseGemini(
   }
 }
 
-// Generate AI response using OpenAI
+// Generate AI response using OpenAI (o cualquier API compatible: DeepSeek).
+// `baseURL` undefined → OpenAI oficial; con valor → endpoint compatible.
 async function generateAIResponseOpenAI(
   apiKey: string,
   systemPrompt: string,
   history: { role: 'user' | 'model'; parts: { text: string }[] }[],
-  modelName: string = 'gpt-4o-mini'
+  modelName: string = 'gpt-4o-mini',
+  baseURL?: string
 ): Promise<string | null> {
   try {
-    const client = new OpenAI({ apiKey });
+    const client = new OpenAI({ apiKey, ...(baseURL && { baseURL }) });
 
     const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
       {
@@ -275,16 +288,20 @@ export async function classifyMessageIntent(
   discriminatorPrompt: string,
   history: { role: 'user' | 'model'; parts: { text: string }[] }[],
   modelName: string = 'gemini-2.5-flash',
-  provider: 'gemini' | 'openai' = 'gemini',
-  openaiApiKey?: string
+  provider: AiProvider = 'gemini',
+  openaiApiKey?: string,
+  deepseekApiKey?: string
 ): Promise<'TalkToAiAssistant' | 'TalkToHuman'> {
   try {
-    if (provider === 'openai') {
+    if (provider === 'openai' || provider === 'deepseek') {
+      // Ruta OpenAI-compatible compartida; DeepSeek solo cambia baseURL y key.
+      const isDeepSeek = provider === 'deepseek';
       return await classifyMessageIntentOpenAI(
-        openaiApiKey || apiKey,
+        (isDeepSeek ? deepseekApiKey : openaiApiKey) || apiKey,
         discriminatorPrompt,
         history,
-        modelName
+        modelName,
+        isDeepSeek ? DEEPSEEK_BASE_URL : undefined
       );
     } else {
       return await classifyMessageIntentGemini(
@@ -359,15 +376,17 @@ Razón: <una frase breve explicando por qué>`;
   }
 }
 
-// Classify using OpenAI (sí tiene `role: system` nativo)
+// Classify using OpenAI (sí tiene `role: system` nativo). También sirve para
+// DeepSeek vía `baseURL` (mismo protocolo).
 async function classifyMessageIntentOpenAI(
   apiKey: string,
   discriminatorPrompt: string,
   history: { role: 'user' | 'model'; parts: { text: string }[] }[],
-  modelName: string = 'gpt-4o-mini'
+  modelName: string = 'gpt-4o-mini',
+  baseURL?: string
 ): Promise<'TalkToAiAssistant' | 'TalkToHuman'> {
   try {
-    const client = new OpenAI({ apiKey });
+    const client = new OpenAI({ apiKey, ...(baseURL && { baseURL }) });
 
     const transcript = buildTranscript(history);
 
@@ -492,7 +511,8 @@ export async function processMessageBuffer(
         history,
         aiConfig.model,
         aiConfig.provider || 'gemini',
-        aiConfig.openaiApiKey
+        aiConfig.openaiApiKey,
+        aiConfig.deepseekApiKey
       );
 
       if (classification === 'TalkToHuman') {
@@ -560,7 +580,8 @@ export async function processMessageBuffer(
       history,
       aiConfig.model,
       aiConfig.provider || 'gemini',
-      aiConfig.openaiApiKey
+      aiConfig.openaiApiKey,
+      aiConfig.deepseekApiKey
     );
 
     if (aiResponse) {

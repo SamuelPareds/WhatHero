@@ -783,7 +783,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
         final aiProvider = sessionData?['ai_provider'] as String? ?? 'gemini';
         final aiApiKeyField = aiProvider == 'openai'
             ? 'ai_openai_api_key'
-            : 'ai_api_key';
+            : aiProvider == 'deepseek'
+                ? 'ai_deepseek_api_key'
+                : 'ai_api_key';
         final sessionAiHasCredentials =
             ((sessionData?[aiApiKeyField] as String?) ?? '').trim().isNotEmpty;
 

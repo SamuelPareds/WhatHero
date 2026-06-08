@@ -560,9 +560,11 @@ async function startSession(sessionKey: string, accountId: string) {
     // Si la IA no es elegible, la media bloqueada igual cuenta como pendiente
     // por el flujo normal de markUnresponded más abajo.
     // ============================================
-    const provider: 'gemini' | 'openai' = (aiConfig.provider || 'gemini') as 'gemini' | 'openai';
+    const provider: 'gemini' | 'openai' | 'deepseek' = (aiConfig.provider || 'gemini') as 'gemini' | 'openai' | 'deepseek';
     const hasValidApiKey = provider === 'openai'
       ? aiConfig.openaiApiKey
+      : provider === 'deepseek'
+      ? aiConfig.deepseekApiKey
       : aiConfig.apiKey;
     const baseEligible = !!aiConfig.enabled && !!hasValidApiKey && isWithinActiveHours(aiConfig);
 
@@ -1036,9 +1038,11 @@ app.post('/generate-ai-response', express.json(), verifyHttpAuth(), async (req, 
 
     // Load AI config
     const aiConfig = await getAIConfig(sessionData, accountId);
-    const provider: 'gemini' | 'openai' = (aiConfig.provider || 'gemini') as 'gemini' | 'openai';
+    const provider: 'gemini' | 'openai' | 'deepseek' = (aiConfig.provider || 'gemini') as 'gemini' | 'openai' | 'deepseek';
     const hasValidApiKey = provider === 'openai'
       ? aiConfig.openaiApiKey
+      : provider === 'deepseek'
+      ? aiConfig.deepseekApiKey
       : aiConfig.apiKey;
     // Generación manual = modo copiloto: el operador autenticado pide una
     // sugerencia. NO depende de `ai_enabled` (master switch del auto-responder).
@@ -1070,7 +1074,8 @@ app.post('/generate-ai-response', express.json(), verifyHttpAuth(), async (req, 
       history,
       aiConfig.model,
       provider,
-      aiConfig.openaiApiKey
+      aiConfig.openaiApiKey,
+      aiConfig.deepseekApiKey
     );
 
     if (!suggestedText) {
