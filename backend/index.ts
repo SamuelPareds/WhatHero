@@ -17,7 +17,7 @@ import cron from 'node-cron';
 import { SessionData, MessageBuffer } from './src/types';
 import { extractPhoneNumber, storeLIDMapping, resolveLIDViaSock, isConversationalJid } from './src/utils/phone';
 import { initializeSession, saveMessageToFirestore, getAIConfig, cacheContactName, applyContactUpdate, reconcileContactNames, consolidateLIDChat, incrementUnrespondedCount, resetUnrespondedCount, writeMediaIndexEntry, isIndexableMedia } from './src/services/firestoreService';
-import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer, emitAiState } from './src/services/aiService';
+import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer, emitAiState, getSessionTimezone } from './src/services/aiService';
 import { extractMediaInfo, classifyIncomingMedia } from './src/services/mediaService';
 import { ReminderService } from './src/services/reminderService';
 import { sendHumanAttentionNotification } from './src/services/notificationService';
@@ -1063,7 +1063,8 @@ app.post('/generate-ai-response', express.json(), verifyHttpAuth(), async (req, 
 
     const snapshot = await messagesRef.get();
     const rawDocs = snapshot.docs.reverse().map(d => d.data());
-    const history = normalizeHistory(rawDocs);
+    const timezone = getSessionTimezone(aiConfig);
+    const history = normalizeHistory(rawDocs, timezone);
 
     // El history ya incluye el último mensaje del cliente al final; no
     // hace falta extraerlo aparte. `generateAIResponse` lo trata como el
@@ -1075,7 +1076,8 @@ app.post('/generate-ai-response', express.json(), verifyHttpAuth(), async (req, 
       aiConfig.model,
       provider,
       aiConfig.openaiApiKey,
-      aiConfig.deepseekApiKey
+      aiConfig.deepseekApiKey,
+      timezone
     );
 
     if (!suggestedText) {

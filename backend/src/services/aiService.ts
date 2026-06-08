@@ -91,6 +91,65 @@ export function isWithinActiveHours(aiConfig: any): boolean {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Conciencia temporal del asistente
+// ─────────────────────────────────────────────────────────────────────────
+// Por defecto todos los clientes son de México. Si el negocio configuró una
+// zona horaria en sus horas activas, la respetamos; si no, caemos en MX.
+export const DEFAULT_TIMEZONE = 'America/Mexico_City';
+
+export function getSessionTimezone(aiConfig: any): string {
+  return aiConfig?.activeHours?.timezone || DEFAULT_TIMEZONE;
+}
+
+// Bloque que le dice al modelo qué fecha/hora es AHORA. Se antepone al system
+// prompt para que pueda saludar acorde al momento del día y razonar fechas al
+// agendar ("¿para qué día?" sabiendo cuál es hoy).
+export function buildTemporalContext(timezone: string): string {
+  const ahora = new Intl.DateTimeFormat('es-MX', {
+    timeZone: timezone,
+    weekday: 'long',
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  }).format(new Date());
+  return `[Contexto temporal] Ahora mismo es ${ahora} (zona horaria ${timezone}). Usa esta fecha y hora para saludar acorde al momento del día y para razonar sobre fechas al agendar.`;
+}
+
+// Nota que explica al modelo que los corchetes de fecha/hora en el historial
+// son metadata, no contenido. Clave para matar el "Hola de nuevo": si ve que
+// los mensajes llegaron con segundos de diferencia, entiende que es una
+// conversación fresca y continua, no un reencuentro tras días.
+const TIMESTAMP_METADATA_NOTE =
+  'Cada mensaje del historial viene prefijado con su fecha/hora entre corchetes, ej. "[dom 8 jun, 1:49 p. m.]". Eso es METADATA para que entiendas cuánto tiempo pasó entre mensajes: úsalo para no saludar como "de nuevo" si la conversación es continua, ni asumir que retomas algo viejo cuando en realidad acaba de empezar. NUNCA copies esos corchetes en tu respuesta.';
+
+// Formatea el timestamp de un mensaje (Firestore Timestamp, epoch ms o ISO)
+// a una etiqueta compacta en la zona del negocio. Devuelve null si no parsea.
+function formatMessageTimestamp(ts: any, timezone: string): string | null {
+  try {
+    let date: Date;
+    if (ts?.toDate) date = ts.toDate(); // Firestore Timestamp
+    else if (typeof ts?._seconds === 'number') date = new Date(ts._seconds * 1000);
+    else if (typeof ts === 'string' || typeof ts === 'number') date = new Date(ts);
+    else return null;
+    if (isNaN(date.getTime())) return null;
+    return new Intl.DateTimeFormat('es-MX', {
+      timeZone: timezone,
+      weekday: 'short',
+      day: 'numeric',
+      month: 'short',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    }).format(date);
+  } catch {
+    return null;
+  }
+}
+
 // Generate AI response using Gemini or OpenAI.
 //
 // Contrato: `history` ya contiene la conversación completa incluyendo el
@@ -105,7 +164,8 @@ export async function generateAIResponse(
   modelName: string = 'gemini-2.5-flash',
   provider: AiProvider = 'gemini',
   openaiApiKey?: string,
-  deepseekApiKey?: string
+  deepseekApiKey?: string,
+  timezone: string = DEFAULT_TIMEZONE
 ): Promise<string | null> {
   try {
     // Sin historial no hay nada que responder (caso muy edge: Firestore vacío).
@@ -114,12 +174,17 @@ export async function generateAIResponse(
       return null;
     }
 
+    // Enriquecemos el system prompt con conciencia temporal: qué hora es ahora
+    // + cómo interpretar los timestamps del historial. Esto vale para los 3
+    // providers, por eso se hace acá una sola vez.
+    const temporalSystemPrompt = `${buildTemporalContext(timezone)}\n\n${TIMESTAMP_METADATA_NOTE}\n\n${systemPrompt}`;
+
     if (provider === 'openai' || provider === 'deepseek') {
       // Ambos comparten la misma ruta OpenAI-compatible; DeepSeek solo añade baseURL.
       const isDeepSeek = provider === 'deepseek';
       return await generateAIResponseOpenAI(
         (isDeepSeek ? deepseekApiKey : openaiApiKey) || apiKey,
-        systemPrompt,
+        temporalSystemPrompt,
         history,
         modelName,
         isDeepSeek ? DEEPSEEK_BASE_URL : undefined
@@ -127,7 +192,7 @@ export async function generateAIResponse(
     } else {
       return await generateAIResponseGemini(
         apiKey,
-        systemPrompt,
+        temporalSystemPrompt,
         history,
         modelName
       );
@@ -214,16 +279,23 @@ async function generateAIResponseOpenAI(
   }
 }
 
-// Normalize message history to preserve all messages for better context
+// Normalize message history to preserve all messages for better context.
+// Cada turn se prefija con su fecha/hora ([dom 8 jun, 1:49 p. m.]) como
+// metadata para que el modelo perciba el tiempo transcurrido entre mensajes.
 export function normalizeHistory(
-  rawDocs: any[]
+  rawDocs: any[],
+  timezone: string = DEFAULT_TIMEZONE
 ): { role: 'user' | 'model'; parts: { text: string }[] }[] {
   return rawDocs
     .filter(d => d.text && d.text.trim().length > 0)
-    .map(d => ({
-      role: d.fromMe ? ('model' as const) : ('user' as const),
-      parts: [{ text: d.text as string }],
-    }));
+    .map(d => {
+      const stamp = formatMessageTimestamp(d.timestamp, timezone);
+      const text = stamp ? `[${stamp}] ${d.text}` : (d.text as string);
+      return {
+        role: d.fromMe ? ('model' as const) : ('user' as const),
+        parts: [{ text }],
+      };
+    });
 }
 
 // Construye el transcripto de la conversación en texto plano para que el
@@ -290,7 +362,8 @@ export async function classifyMessageIntent(
   modelName: string = 'gemini-2.5-flash',
   provider: AiProvider = 'gemini',
   openaiApiKey?: string,
-  deepseekApiKey?: string
+  deepseekApiKey?: string,
+  timezone: string = DEFAULT_TIMEZONE
 ): Promise<'TalkToAiAssistant' | 'TalkToHuman'> {
   try {
     if (provider === 'openai' || provider === 'deepseek') {
@@ -301,14 +374,16 @@ export async function classifyMessageIntent(
         discriminatorPrompt,
         history,
         modelName,
-        isDeepSeek ? DEEPSEEK_BASE_URL : undefined
+        isDeepSeek ? DEEPSEEK_BASE_URL : undefined,
+        timezone
       );
     } else {
       return await classifyMessageIntentGemini(
         apiKey,
         discriminatorPrompt,
         history,
-        modelName
+        modelName,
+        timezone
       );
     }
   } catch (error) {
@@ -336,7 +411,8 @@ async function classifyMessageIntentGemini(
   apiKey: string,
   discriminatorPrompt: string,
   history: { role: 'user' | 'model'; parts: { text: string }[] }[],
-  modelName: string = 'gemini-2.5-flash'
+  modelName: string = 'gemini-2.5-flash',
+  timezone: string = DEFAULT_TIMEZONE
 ): Promise<'TalkToAiAssistant' | 'TalkToHuman'> {
   try {
     const genAI = new GoogleGenerativeAI(apiKey);
@@ -346,6 +422,9 @@ async function classifyMessageIntentGemini(
 
     const prompt = `### INSTRUCCIONES DEL OPERADOR (reglas del negocio)
 ${discriminatorPrompt}
+
+### CONTEXTO TEMPORAL
+${buildTemporalContext(timezone)}
 
 ### CONTEXTO Y CRITERIOS
 ${DISCRIMINATOR_META_INSTRUCTIONS}
@@ -383,7 +462,8 @@ async function classifyMessageIntentOpenAI(
   discriminatorPrompt: string,
   history: { role: 'user' | 'model'; parts: { text: string }[] }[],
   modelName: string = 'gpt-4o-mini',
-  baseURL?: string
+  baseURL?: string,
+  timezone: string = DEFAULT_TIMEZONE
 ): Promise<'TalkToAiAssistant' | 'TalkToHuman'> {
   try {
     const client = new OpenAI({ apiKey, ...(baseURL && { baseURL }) });
@@ -391,6 +471,9 @@ async function classifyMessageIntentOpenAI(
     const transcript = buildTranscript(history);
 
     const systemContent = `${DISCRIMINATOR_META_INSTRUCTIONS}
+
+### CONTEXTO TEMPORAL
+${buildTemporalContext(timezone)}
 
 ### REGLAS DEL OPERADOR
 ${discriminatorPrompt}`;
@@ -477,6 +560,9 @@ export async function processMessageBuffer(
     const combinedMessage = bufferedMessages.join('\n');
     console.log(`[Buffer] Processing ${bufferedMessages.length} message(s) for ${contactPhone}: "${combinedMessage.substring(0, 50)}..."`);
 
+    // Zona horaria del negocio para etiquetar mensajes y el contexto "ahora".
+    const timezone = getSessionTimezone(aiConfig);
+
     // Fetch last 10 messages for conversation history
     let history: { role: 'user' | 'model'; parts: { text: string }[] }[] = [];
 
@@ -491,7 +577,7 @@ export async function processMessageBuffer(
         .get();
 
       const rawDocs = historyDocs.docs.reverse().map(d => d.data());
-      history = normalizeHistory(rawDocs);
+      history = normalizeHistory(rawDocs, timezone);
     } catch (error) {
       console.log('[Buffer] Could not fetch message history, continuing without context:', error);
     }
@@ -512,7 +598,8 @@ export async function processMessageBuffer(
         aiConfig.model,
         aiConfig.provider || 'gemini',
         aiConfig.openaiApiKey,
-        aiConfig.deepseekApiKey
+        aiConfig.deepseekApiKey,
+        timezone
       );
 
       if (classification === 'TalkToHuman') {
@@ -581,7 +668,8 @@ export async function processMessageBuffer(
       aiConfig.model,
       aiConfig.provider || 'gemini',
       aiConfig.openaiApiKey,
-      aiConfig.deepseekApiKey
+      aiConfig.deepseekApiKey,
+      timezone
     );
 
     if (aiResponse) {
