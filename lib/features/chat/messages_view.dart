@@ -259,9 +259,13 @@ class _MessagesViewState extends State<MessagesView> {
     );
   }
 
-  Future<void> _generateAIResponse() async {
+  // Genera una sugerencia de IA y la vuelca al composer. Si `operatorInstruction`
+  // viene con texto, se manda al backend como instrucción puntual de máxima
+  // prioridad para guiar ESTA respuesta (modo copiloto con dirección humana).
+  Future<void> _generateAIResponse({String? operatorInstruction}) async {
     setState(() => _isGenerating = true);
     try {
+      final instruction = operatorInstruction?.trim() ?? '';
       final response = await http.post(
         Uri.parse('$backendUrl/generate-ai-response'),
         headers: await authHeaders(),
@@ -269,6 +273,7 @@ class _MessagesViewState extends State<MessagesView> {
           'chatPhone': widget.phoneNumber,
           'sessionKey': widget.sessionKey,
           'accountId': widget.accountId,
+          if (instruction.isNotEmpty) 'operatorInstruction': instruction,
         }),
       ).timeout(const Duration(seconds: 30));
 
@@ -287,6 +292,112 @@ class _MessagesViewState extends State<MessagesView> {
         setState(() => _isGenerating = false);
       }
     }
+  }
+
+  // Abre un cuadro para que el operador escriba una instrucción puntual antes de
+  // generar (ej: "dale info de cejas HD", "hazlo más amistoso"). Se dispara con
+  // long-press sobre el botón auto_awesome. Vacío = no se envía nada (equivale al
+  // tap normal). La instrucción NO se persiste: guía solo esta generación.
+  void _promptOperatorInstruction() {
+    final controller = TextEditingController();
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: surfaceDark,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (sheetContext) {
+        // Padding que sube el sheet por encima del teclado.
+        return Padding(
+          padding: EdgeInsets.only(
+            left: 20,
+            right: 20,
+            top: 20,
+            bottom: MediaQuery.of(sheetContext).viewInsets.bottom + 20,
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.auto_awesome, color: primaryAqua, size: 20),
+                  const SizedBox(width: 8),
+                  const Text(
+                    'Instrucción para la IA',
+                    style: TextStyle(color: white, fontSize: 16, fontWeight: FontWeight.w600),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              const Text(
+                'Ej: "dale info de cejas HD" · "hazlo más amistoso" · "explícale por qué el precio es tan bajo"',
+                style: TextStyle(color: lightText, fontSize: 12.5),
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: controller,
+                autofocus: true,
+                minLines: 2,
+                maxLines: 5,
+                textInputAction: TextInputAction.newline,
+                style: const TextStyle(color: white, fontSize: 15),
+                cursorColor: primaryAqua,
+                decoration: InputDecoration(
+                  hintText: 'Escribe qué debe hacer la IA en esta respuesta…',
+                  hintStyle: TextStyle(color: lightText.withValues(alpha: 0.6)),
+                  filled: true,
+                  fillColor: darkBg,
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide: BorderSide(color: primaryAqua.withValues(alpha: 0.25)),
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide: const BorderSide(color: primaryAqua, width: 1.5),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(sheetContext),
+                    child: const Text('Cancelar', style: TextStyle(color: lightText)),
+                  ),
+                  const SizedBox(width: 8),
+                  ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: primaryAqua,
+                      foregroundColor: darkBg,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+                    ),
+                    onPressed: () {
+                      final instruction = controller.text.trim();
+                      Navigator.pop(sheetContext);
+                      if (instruction.isNotEmpty) {
+                        _generateAIResponse(operatorInstruction: instruction);
+                      }
+                    },
+                    icon: const Icon(Icons.auto_awesome, size: 18),
+                    label: const Text('Generar', style: TextStyle(fontWeight: FontWeight.w600)),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        );
+      },
+    ).whenComplete(() {
+      // Diferimos el dispose al siguiente frame: al cerrar el sheet, el TextField
+      // todavía usa el controller durante su teardown (foco/teclado) en este mismo
+      // frame. Si lo disponemos ya, revienta con "used after being disposed".
+      WidgetsBinding.instance.addPostFrameCallback((_) => controller.dispose());
+    });
   }
 
   void _handleQuickResponseInput(String value) {
@@ -756,19 +867,39 @@ class _MessagesViewState extends State<MessagesView> {
                                 color = const Color(0xFF9CA3AF).withValues(alpha: 0.4);
                                 onPressed = _openSessionSettings;
                               } else if (autoOn) {
-                                tooltip = 'Generar respuesta con IA';
+                                tooltip = 'Generar respuesta con IA · mantén pulsado para dar una instrucción';
                                 color = const Color(0xFF06B6D4);
-                                onPressed = _generateAIResponse;
+                                onPressed = () => _generateAIResponse();
                               } else {
-                                tooltip = 'Sugerir respuesta con IA (asistente apagado)';
+                                tooltip = 'Sugerir respuesta con IA (asistente apagado) · mantén pulsado para dar una instrucción';
                                 color = const Color(0xFF06B6D4).withValues(alpha: 0.6);
-                                onPressed = _generateAIResponse;
+                                onPressed = () => _generateAIResponse();
                               }
-                              return IconButton(
-                                icon: const Icon(Icons.auto_awesome, size: 20),
-                                tooltip: tooltip,
-                                color: color,
-                                onPressed: onPressed,
+                              // Con credenciales el long-press abre el cuadro de
+                              // instrucción; sin ellas, igual que el tap, lleva a
+                              // configurar el asistente.
+                              //
+                              // Ojo: NO usamos el `tooltip` del IconButton. En
+                              // móvil ese tooltip se dispara con long-press y, al
+                              // estar más adentro del árbol, gana la arena de
+                              // gestos y roba nuestro long-press. Por eso el hint
+                              // va en un Tooltip externo en modo `manual` (sigue
+                              // apareciendo al pasar el mouse en web/desktop, pero
+                              // no registra un recognizer de long-press que compita)
+                              // y el long-press lo maneja el GestureDetector.
+                              return Tooltip(
+                                message: tooltip,
+                                triggerMode: TooltipTriggerMode.manual,
+                                child: GestureDetector(
+                                  onLongPress: hasCreds
+                                      ? _promptOperatorInstruction
+                                      : _openSessionSettings,
+                                  child: IconButton(
+                                    icon: const Icon(Icons.auto_awesome, size: 20),
+                                    color: color,
+                                    onPressed: onPressed,
+                                  ),
+                                ),
                               );
                             },
                           ),

@@ -165,7 +165,8 @@ export async function generateAIResponse(
   provider: AiProvider = 'gemini',
   openaiApiKey?: string,
   deepseekApiKey?: string,
-  timezone: string = DEFAULT_TIMEZONE
+  timezone: string = DEFAULT_TIMEZONE,
+  operatorInstruction?: string
 ): Promise<string | null> {
   try {
     // Sin historial no hay nada que responder (caso muy edge: Firestore vacío).
@@ -177,7 +178,16 @@ export async function generateAIResponse(
     // Enriquecemos el system prompt con conciencia temporal: qué hora es ahora
     // + cómo interpretar los timestamps del historial. Esto vale para los 3
     // providers, por eso se hace acá una sola vez.
-    const temporalSystemPrompt = `${buildTemporalContext(timezone)}\n\n${TIMESTAMP_METADATA_NOTE}\n\n${systemPrompt}`;
+    // Instrucción puntual del operador humano (modo copiloto). Efímera: guía
+    // SOLO esta generación, no muta el system prompt de la sesión. Se anexa como
+    // bloque de máxima prioridad; vale para los 3 providers porque Gemini la
+    // prependea al primer turn user y OpenAI/DeepSeek la mandan como `system`.
+    const operatorBlock = operatorInstruction?.trim()
+      ? `\n\n=== INSTRUCCIÓN PRIORITARIA DEL OPERADOR HUMANO (máxima prioridad) ===\n` +
+        `El agente humano que supervisa esta conversación te indica explícitamente para ESTA respuesta: "${operatorInstruction.trim()}".\n` +
+        `Cumple esta instrucción al redactar tu próxima respuesta, integrándola de forma natural con el contexto y el último mensaje del cliente (por ejemplo, saluda si corresponde Y entrega lo que el operador pide). Esta indicación tiene prioridad sobre cualquier ambigüedad del historial.`
+      : '';
+    const temporalSystemPrompt = `${buildTemporalContext(timezone)}\n\n${TIMESTAMP_METADATA_NOTE}\n\n${systemPrompt}${operatorBlock}`;
 
     if (provider === 'openai' || provider === 'deepseek') {
       // Ambos comparten la misma ruta OpenAI-compatible; DeepSeek solo añade baseURL.

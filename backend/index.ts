@@ -1028,6 +1028,10 @@ app.post('/generate-ai-response', express.json(), verifyHttpAuth(), async (req, 
       return res.status(400).json({ error: 'Missing chatPhone, sessionKey, or accountId' });
     }
 
+    // Instrucción puntual opcional del operador (modo copiloto). Vacío =
+    // comportamiento clásico. Cap defensivo de longitud para no inflar el prompt.
+    const operatorInstruction = String(req.body.operatorInstruction || '').trim().slice(0, 500);
+
     // Find active session
     const sessionData = sessions.get(sessionKey);
     if (!sessionData) {
@@ -1077,7 +1081,8 @@ app.post('/generate-ai-response', express.json(), verifyHttpAuth(), async (req, 
       provider,
       aiConfig.openaiApiKey,
       aiConfig.deepseekApiKey,
-      timezone
+      timezone,
+      operatorInstruction
     );
 
     if (!suggestedText) {
