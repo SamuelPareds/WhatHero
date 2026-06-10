@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'package:qr_flutter/qr_flutter.dart';
@@ -32,11 +33,29 @@ class MyApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       title: 'WhatHero',
       theme: buildWhatHeroTheme(),
+      // Permitir arrastrar las listas/scroll horizontales con el mouse en web/desktop.
+      // Por defecto Flutter solo deja desplazar con touch, así que los filtros de
+      // etiquetas y de galería no se podían mover con el cursor. Ver _AppScrollBehavior.
+      scrollBehavior: _AppScrollBehavior(),
       home: AuthWrapper(
         onUserAuthenticated: (accountId) => SessionDispatcher(accountId: accountId),
       ),
     );
   }
+}
+
+// Habilita el arrastre con mouse y trackpad además del touch. Sin esto, en
+// Flutter web/desktop los ScrollView horizontales (filtros de etiquetas, tipos
+// de galería) solo respondían a touch y no se podían mover con el cursor.
+class _AppScrollBehavior extends MaterialScrollBehavior {
+  @override
+  Set<PointerDeviceKind> get dragDevices => {
+        PointerDeviceKind.touch,
+        PointerDeviceKind.mouse,
+        PointerDeviceKind.trackpad,
+        PointerDeviceKind.stylus,
+        PointerDeviceKind.invertedStylus,
+      };
 }
 
 class SessionDispatcher extends StatefulWidget {
