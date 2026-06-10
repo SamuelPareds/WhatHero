@@ -586,9 +586,14 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
           // Publicamos los totales por filtro para que los chips del AppBar
           // muestren su badge. Post-frame para no notificar durante el build.
+          // Un chat cuenta como "pendiente" si tiene mensajes sin responder
+          // (contador automático) O si fue marcado a mano (marked_pending).
+          // Así el chip y el filtro unifican ambas señales bajo un concepto.
           final unrespondedTotal = allChats.where((d) {
             final m = d.data() as Map<String, dynamic>?;
-            return ((m?['unresponded_count'] as num?)?.toInt() ?? 0) > 0;
+            final count = (m?['unresponded_count'] as num?)?.toInt() ?? 0;
+            final markedPending = m?['marked_pending'] as bool? ?? false;
+            return count > 0 || markedPending;
           }).length;
           final notesTotal = allChats.where((d) {
             final m = d.data() as Map<String, dynamic>?;
@@ -611,8 +616,11 @@ class _ChatsScreenState extends State<ChatsScreen> {
               case ChatFilter.todos:
                 break;
               case ChatFilter.noRespondidos:
-                if (((chatData?['unresponded_count'] as num?)?.toInt() ?? 0) ==
-                    0) {
+                final count =
+                    (chatData?['unresponded_count'] as num?)?.toInt() ?? 0;
+                final markedPending =
+                    chatData?['marked_pending'] as bool? ?? false;
+                if (count == 0 && !markedPending) {
                   return false;
                 }
               case ChatFilter.conNotas:
@@ -742,6 +750,10 @@ class _ChatsScreenState extends State<ChatsScreen> {
               final lastMessage = chatData?['lastMessage'] ?? 'Sin mensajes';
               final timestamp = (chatData?['lastMessageTimestamp'] as Timestamp?)?.toDate();
               final unrespondedCount = (chatData?['unresponded_count'] as num?)?.toInt() ?? 0;
+              final markedPending = chatData?['marked_pending'] as bool? ?? false;
+              // Un chat está "pendiente" por la señal automática o por la marca
+              // manual de seguimiento. Ambas pintan naranja y abren el swipe.
+              final isPending = unrespondedCount > 0 || markedPending;
               final labelIds = ((chatData?['labelIds'] as List?) ?? const [])
                   .whereType<String>()
                   .toList();
@@ -754,6 +766,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 timestamp: timestamp,
                 isSelected: selectedChatPhone == phoneNumber,
                 unrespondedCount: unrespondedCount,
+                markedPending: markedPending,
                 sessionKey: widget.sessionKey,
                 labelIds: labelIds,
                 labelsCatalog: _labelsCatalog,
@@ -763,13 +776,13 @@ class _ChatsScreenState extends State<ChatsScreen> {
                     selectedChatPhone = phoneNumber;
                   });
                 },
-                onLongPress: () =>
-                    _showChatOptions(phoneNumber, contactName, labelIds, note),
+                onLongPress: () => _showChatOptions(
+                    phoneNumber, contactName, labelIds, note, isPending),
               );
 
-              // Sin pendientes: nada que cerrar, no envolvemos en Slidable
-              if (unrespondedCount == 0) return tile;
-
+              // Swipe simétrico estilo WhatsApp: si el chat está pendiente,
+              // la acción lo cierra ("Listo"); si no, lo marca a mano
+              // ("Pendiente") para darle seguimiento aunque no haya pendientes.
               return Slidable(
                 key: ValueKey('chat_$phoneNumber'),
                 groupTag: 'chats',
@@ -777,13 +790,22 @@ class _ChatsScreenState extends State<ChatsScreen> {
                   motion: const DrawerMotion(),
                   extentRatio: 0.25,
                   children: [
-                    SlidableAction(
-                      onPressed: (_) => _markAsResponded(phoneNumber),
-                      backgroundColor: const Color(0xFFF97316),
-                      foregroundColor: Colors.white,
-                      icon: Icons.mark_chat_read,
-                      label: 'Listo',
-                    ),
+                    if (isPending)
+                      SlidableAction(
+                        onPressed: (_) => _markAsResponded(phoneNumber),
+                        backgroundColor: const Color(0xFFF97316),
+                        foregroundColor: Colors.white,
+                        icon: Icons.mark_chat_read,
+                        label: 'Listo',
+                      )
+                    else
+                      SlidableAction(
+                        onPressed: (_) => _markAsPending(phoneNumber),
+                        backgroundColor: const Color(0xFFF97316),
+                        foregroundColor: Colors.white,
+                        icon: Icons.mark_chat_unread,
+                        label: 'Pendiente',
+                      ),
                   ],
                 ),
                 child: tile,
@@ -1271,6 +1293,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
     String contactName,
     List<String> labelIds,
     String note,
+    bool isPending,
   ) {
     HapticFeedback.mediumImpact();
     // Si el chat ya tiene etiquetas asignadas la acción es "administrar";
@@ -1355,6 +1378,27 @@ class _ChatsScreenState extends State<ChatsScreen> {
               onTap: () {
                 Navigator.pop(sheetCtx);
                 _openLabelsSelector(phoneNumber);
+              },
+            ),
+            // Toggle de pendiente manual. Si ya está pendiente, lo cierra
+            // ("Listo"); si no, lo marca para darle seguimiento.
+            ListTile(
+              leading: Icon(
+                isPending ? Icons.mark_chat_read : Icons.mark_chat_unread,
+                size: 20,
+                color: const Color(0xFFF97316),
+              ),
+              title: Text(
+                isPending ? 'Quitar pendiente' : 'Marcar como pendiente',
+                style: const TextStyle(color: white),
+              ),
+              onTap: () {
+                Navigator.pop(sheetCtx);
+                if (isPending) {
+                  _markAsResponded(phoneNumber);
+                } else {
+                  _markAsPending(phoneNumber);
+                }
               },
             ),
             ListTile(
@@ -1473,6 +1517,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
     }
   }
 
+  // "Listo": cierra el pendiente por completo. Limpia el contador automático
+  // y también la marca manual de seguimiento, para que el chat salga del filtro
+  // "Pendientes" y vuelva a su estado neutro.
   Future<void> _markAsResponded(String contactPhone) async {
     HapticFeedback.lightImpact();
     try {
@@ -1483,9 +1530,35 @@ class _ChatsScreenState extends State<ChatsScreen> {
           .doc(widget.sessionId)
           .collection('chats')
           .doc(contactPhone)
-          .set({'unresponded_count': 0}, SetOptions(merge: true));
+          .set(
+            {'unresponded_count': 0, 'marked_pending': false},
+            SetOptions(merge: true),
+          );
     } catch (e) {
       debugPrint('Error marking chat as responded: $e');
+      if (mounted) {
+        _showEtherealToast(false, 'Error al marcar', isActivating: false);
+      }
+    }
+  }
+
+  // Marca manual de seguimiento (estilo "marcar como no leído" de WhatsApp).
+  // Escribe directo a Firestore: el backend nunca toca este campo, así que la
+  // marca sobrevive hasta que respondas (el backend la limpia en
+  // resetUnrespondedCount) o la quites con "Listo".
+  Future<void> _markAsPending(String contactPhone) async {
+    HapticFeedback.lightImpact();
+    try {
+      await FirebaseFirestore.instance
+          .collection(accountsCollection)
+          .doc(widget.accountId)
+          .collection('whatsapp_sessions')
+          .doc(widget.sessionId)
+          .collection('chats')
+          .doc(contactPhone)
+          .set({'marked_pending': true}, SetOptions(merge: true));
+    } catch (e) {
+      debugPrint('Error marking chat as pending: $e');
       if (mounted) {
         _showEtherealToast(false, 'Error al marcar', isActivating: false);
       }
@@ -1909,6 +1982,9 @@ class _ChatTile extends StatelessWidget {
   final DateTime? timestamp;
   final bool isSelected;
   final int unrespondedCount;
+  // Marca manual de seguimiento (sin número). Pinta un punto naranja en el
+  // avatar cuando no hay contador automático visible.
+  final bool markedPending;
   // Necesario para consultar AiStateService (clave: sessionKey:contactPhone).
   // Puede ser null si la sesión está desconectada — en ese caso nunca habrá
   // estado de IA activo y el tile cae al render normal con el badge.
@@ -1926,6 +2002,7 @@ class _ChatTile extends StatelessWidget {
     required this.timestamp,
     required this.isSelected,
     required this.unrespondedCount,
+    required this.markedPending,
     required this.sessionKey,
     required this.labelIds,
     required this.labelsCatalog,
@@ -1959,6 +2036,8 @@ class _ChatTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final displayName = contactName.isNotEmpty ? contactName : phoneNumber;
     final avatarLetter = displayName.substring(0, 1).toUpperCase();
+    // Pendiente = señal automática (con número) o marca manual (sin número).
+    final isPending = unrespondedCount > 0 || markedPending;
 
     return GestureDetector(
       onTap: onTap,
@@ -2008,6 +2087,22 @@ class _ChatTile extends StatelessWidget {
                       ),
                       child: UnrespondedBadge(count: unrespondedCount),
                     ),
+                  )
+                // Sin contador automático pero marcado a mano: punto naranja
+                // sólido (sin número), igual que "marcar como no leído".
+                else if (markedPending)
+                  Positioned(
+                    top: -2,
+                    right: -2,
+                    child: Container(
+                      width: 16,
+                      height: 16,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFF97316),
+                        shape: BoxShape.circle,
+                        border: Border.all(color: darkBg, width: 2),
+                      ),
+                    ),
                   ),
               ],
             ),
@@ -2040,10 +2135,10 @@ class _ChatTile extends StatelessWidget {
                             _formatTimestamp(timestamp),
                             style: TextStyle(
                               fontSize: 11,
-                              color: unrespondedCount > 0
+                              color: isPending
                                   ? const Color(0xFFF97316)
                                   : lightText,
-                              fontWeight: unrespondedCount > 0
+                              fontWeight: isPending
                                   ? FontWeight.w600
                                   : FontWeight.w400,
                             ),

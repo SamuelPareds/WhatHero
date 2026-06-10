@@ -941,6 +941,8 @@ export async function incrementUnrespondedCount(
 
 // Resetea el contador a 0. Se llama cuando el humano responde (CRM o celular físico)
 // o cuando la IA termina de responder exitosamente.
+// También limpia `marked_pending` (la marca manual de seguimiento): igual que el
+// "marcar como no leído" de WhatsApp, cualquier respuesta cierra el pendiente.
 export async function resetUnrespondedCount(
   accountId: string,
   sessionId: string,
@@ -954,7 +956,7 @@ export async function resetUnrespondedCount(
       .doc(sessionId)
       .collection('chats')
       .doc(contactPhone)
-      .set({ unresponded_count: 0 }, { merge: true });
+      .set({ unresponded_count: 0, marked_pending: false }, { merge: true });
   } catch (error) {
     console.error(`[Unresponded] Error resetting count for ${contactPhone}:`, error);
   }
