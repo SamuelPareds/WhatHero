@@ -62,6 +62,10 @@ class _MessagesViewState extends State<MessagesView> {
   bool _isGenerating = false;
   String _quickResponseFilter = '';
   OverlayEntry? _quickResponseOverlay;
+  // Rango del token "/filtro" activo en el composer (para reemplazarlo en su
+  // sitio al insertar, sin pisar el resto del texto). Se guarda al escribir
+  // porque al tocar el overlay el TextField puede perder el foco/selección.
+  TextRange? _activeTokenRange;
 
   // Draft de cita activo. null = no estamos respondiendo a nada → composer
   // normal. ValueNotifier (en lugar de setState) para que solo se rebuilden
@@ -400,15 +404,41 @@ class _MessagesViewState extends State<MessagesView> {
     });
   }
 
+  // Detecta el token "/filtro" justo antes del cursor. El "/" es válido si
+  // está al inicio del texto o precedido por un espacio/salto de línea (así
+  // "http://" o "y/o" no disparan el selector). Devuelve [inicio, cursor) o
+  // null si no hay token activo.
+  TextRange? _activeSlashToken(String text, int cursor) {
+    if (cursor < 0 || cursor > text.length) return null;
+    var i = cursor - 1;
+    while (i >= 0) {
+      final ch = text[i];
+      if (ch == ' ' || ch == '\n') return null; // espacio antes del "/" → corta
+      if (ch == '/') {
+        final prevOk = i == 0 || text[i - 1] == ' ' || text[i - 1] == '\n';
+        return prevOk ? TextRange(start: i, end: cursor) : null;
+      }
+      i--;
+    }
+    return null;
+  }
+
   void _handleQuickResponseInput(String value) {
-    if (value.startsWith('/')) {
-      final filter = value.substring(1).toLowerCase();
-      setState(() => _quickResponseFilter = filter);
-      _showQuickResponsesOverlay();
-    } else {
+    final sel = _messageController.selection;
+    final cursor = sel.isValid ? sel.baseOffset : value.length;
+    final token = _activeSlashToken(value, cursor);
+
+    if (token == null) {
+      _activeTokenRange = null;
       _quickResponseOverlay?.remove();
       _quickResponseOverlay = null;
+      return;
     }
+
+    _activeTokenRange = token;
+    final filter = value.substring(token.start + 1, token.end).toLowerCase();
+    setState(() => _quickResponseFilter = filter);
+    _showQuickResponsesOverlay();
   }
 
   void _showQuickResponsesOverlay() async {
@@ -520,9 +550,30 @@ class _MessagesViewState extends State<MessagesView> {
     if (imageUrl.isNotEmpty) {
       _showImageConfirmationDialog(title, text, imageUrl);
     } else {
-      setState(() => _messageController.text = text);
-      _messageController.selection = TextSelection.fromPosition(TextPosition(offset: text.length));
+      _insertAtToken(text);
     }
+  }
+
+  // Reemplaza el token "/filtro" por el texto de la respuesta, conservando lo
+  // que haya antes y después, y deja el cursor justo al final de lo insertado.
+  void _insertAtToken(String insert) {
+    final value = _messageController.text;
+    // Usar el token guardado al escribir; si no hay, caer al cursor/fin actual
+    final sel = _messageController.selection;
+    final cursor = sel.isValid ? sel.baseOffset : value.length;
+    final token = _activeTokenRange ?? _activeSlashToken(value, cursor);
+    final start = token?.start ?? cursor;
+    final end = token?.end ?? cursor;
+
+    final newText = value.replaceRange(start, end, insert);
+    final newCursor = start + insert.length;
+
+    setState(() => _messageController.text = newText);
+    _messageController.selection =
+        TextSelection.fromPosition(TextPosition(offset: newCursor));
+    _activeTokenRange = null;
+    // Devolver el foco al composer para seguir escribiendo sin tocar nada
+    _inputFocusNode.requestFocus();
   }
 
   void _showImageConfirmationDialog(String title, String caption, String imageUrl) {
