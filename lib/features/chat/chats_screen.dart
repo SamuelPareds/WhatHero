@@ -583,8 +583,12 @@ class _ChatsScreenState extends State<ChatsScreen> {
                     final chatData = chatDoc.data() as Map<String, dynamic>?;
                     final phoneNumber = chatData?['phoneNumber'] as String? ?? '';
                     final contactName = chatData?['contactName'] as String? ?? '';
-                    return phoneNumber.toLowerCase().contains(searchQuery) || 
-                           contactName.toLowerCase().contains(searchQuery);
+                    // La nota también es buscable: ej. "hombre" encuentra el
+                    // chat anotado "Quiere masaje pero es hombre".
+                    final note = chatData?['note'] as String? ?? '';
+                    return phoneNumber.toLowerCase().contains(searchQuery) ||
+                           contactName.toLowerCase().contains(searchQuery) ||
+                           note.toLowerCase().contains(searchQuery);
                   })
                   .toList();
 
@@ -635,8 +639,17 @@ class _ChatsScreenState extends State<ChatsScreen> {
             );
           }
 
-          return ListView.builder(
+          return ListView.separated(
             itemCount: filteredChats.length,
+            // Divisor sutil entre chats, indentado para arrancar tras el avatar.
+            separatorBuilder: (_, __) => Padding(
+              padding: const EdgeInsets.only(left: 76),
+              child: Divider(
+                height: 1,
+                thickness: 0.5,
+                color: white.withValues(alpha: 0.06),
+              ),
+            ),
             itemBuilder: (context, index) {
               final chatDoc = filteredChats[index];
               final chatData = chatDoc.data() as Map<String, dynamic>?;
@@ -649,6 +662,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
               final labelIds = ((chatData?['labelIds'] as List?) ?? const [])
                   .whereType<String>()
                   .toList();
+              final note = chatData?['note'] as String? ?? '';
 
               final tile = _ChatTile(
                 phoneNumber: phoneNumber,
@@ -660,13 +674,14 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 sessionKey: widget.sessionKey,
                 labelIds: labelIds,
                 labelsCatalog: _labelsCatalog,
+                note: note,
                 onTap: () {
                   setState(() {
                     selectedChatPhone = phoneNumber;
                   });
                 },
                 onLongPress: () =>
-                    _showChatOptions(phoneNumber, contactName, labelIds),
+                    _showChatOptions(phoneNumber, contactName, labelIds, note),
               );
 
               // Sin pendientes: nada que cerrar, no envolvemos en Slidable
@@ -814,6 +829,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 ((chatData?['labelIds'] as List?) ?? const [])
                     .whereType<String>()
                     .toList();
+            final detailNote = (chatData?['note'] as String? ?? '').trim();
             final displayName = contactName.isNotEmpty
                 ? contactName
                 : (selectedChatPhone ?? 'Chat');
@@ -1034,6 +1050,13 @@ class _ChatsScreenState extends State<ChatsScreen> {
               ),
               body: Column(
                 children: [
+                  // Strip de nota del chat. Contexto rápido al abrir; tap →
+                  // editor de nota. Solo se renderiza si hay nota.
+                  if (detailNote.isNotEmpty)
+                    _MessagesNoteStrip(
+                      note: detailNote,
+                      onTap: () => _editNote(selectedChatPhone!, detailNote),
+                    ),
                   // Strip de etiquetas asignadas al chat. Si no hay, no
                   // reserva altura. Tap → abre el selector (atajo a Fase 2).
                   if (detailLabelIds.isNotEmpty)
@@ -1068,12 +1091,14 @@ class _ChatsScreenState extends State<ChatsScreen> {
     String phoneNumber,
     String contactName,
     List<String> labelIds,
+    String note,
   ) {
     HapticFeedback.mediumImpact();
     // Si el chat ya tiene etiquetas asignadas la acción es "administrar";
     // si no, invitamos a "añadir" la primera. Mismo destino (el selector),
     // distinto copy según el contexto.
     final hasLabels = labelIds.isNotEmpty;
+    final hasNote = note.trim().isNotEmpty;
     showModalBottomSheet(
       context: context,
       backgroundColor: surfaceDark,
@@ -1093,6 +1118,38 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 color: primaryAqua.withValues(alpha: 0.3),
                 borderRadius: BorderRadius.circular(2),
               ),
+            ),
+            ListTile(
+              leading: Icon(
+                hasNote
+                    ? Icons.sticky_note_2
+                    : Icons.sticky_note_2_outlined,
+                size: 20,
+                color: const Color(0xFFF59E0B),
+              ),
+              title: Text(
+                hasNote ? 'Editar nota' : 'Añadir nota',
+                style: const TextStyle(color: white),
+              ),
+              // Vista previa de la nota actual como contexto.
+              subtitle: hasNote
+                  ? Padding(
+                      padding: const EdgeInsets.only(top: 2),
+                      child: Text(
+                        note.trim(),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: lightText,
+                          fontSize: 12,
+                        ),
+                      ),
+                    )
+                  : null,
+              onTap: () {
+                Navigator.pop(sheetCtx);
+                _editNote(phoneNumber, note);
+              },
             ),
             ListTile(
               leading: Icon(
@@ -1271,6 +1328,119 @@ class _ChatsScreenState extends State<ChatsScreen> {
     }
   }
 
+  // Editor de la nota/comentario del chat. Diálogo simple con TextField
+  // multilínea; persiste en el campo `note` del doc del chat con merge:true.
+  // Nota vacía → borra el campo para que no aparezca el chip ni cuente en
+  // búsqueda.
+  Future<void> _editNote(String phoneNumber, String currentNote) async {
+    final controller = TextEditingController(text: currentNote);
+
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => Dialog(
+        backgroundColor: surfaceDark,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Row(
+                children: [
+                  Icon(Icons.sticky_note_2_outlined,
+                      color: Color(0xFFF59E0B), size: 20),
+                  SizedBox(width: 8),
+                  Text(
+                    'Nota del chat',
+                    style: TextStyle(
+                      color: white,
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: controller,
+                autofocus: true,
+                maxLines: 4,
+                maxLength: 200,
+                style: const TextStyle(color: white, fontSize: 14),
+                decoration: InputDecoration(
+                  hintText: 'Ej: Quiere masaje pero es hombre',
+                  hintStyle: TextStyle(color: white.withValues(alpha: 0.3)),
+                  filled: true,
+                  fillColor: darkBg.withValues(alpha: 0.4),
+                  counterStyle: const TextStyle(color: lightText, fontSize: 10),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide: BorderSide.none,
+                  ),
+                  contentPadding: const EdgeInsets.all(14),
+                ),
+              ),
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton(
+                      onPressed: () => Navigator.pop(ctx, false),
+                      style: OutlinedButton.styleFrom(
+                        side: BorderSide(
+                            color: lightText.withValues(alpha: 0.3)),
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                      ),
+                      child: const Text('Cancelar',
+                          style: TextStyle(color: lightText)),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: ElevatedButton(
+                      onPressed: () => Navigator.pop(ctx, true),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: primaryAqua,
+                        foregroundColor: darkBg,
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        elevation: 0,
+                      ),
+                      child: const Text('Guardar',
+                          style: TextStyle(fontWeight: FontWeight.bold)),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    if (saved != true || widget.sessionId == null) return;
+
+    final trimmed = controller.text.trim();
+    final chatRef = FirebaseFirestore.instance
+        .collection(accountsCollection)
+        .doc(widget.accountId)
+        .collection('whatsapp_sessions')
+        .doc(widget.sessionId)
+        .collection('chats')
+        .doc(phoneNumber);
+
+    await chatRef.set(
+      {'note': trimmed.isEmpty ? FieldValue.delete() : trimmed},
+      SetOptions(merge: true),
+    );
+  }
+
   void _openLabelsSelector(String phoneNumber) {
     if (widget.sessionId == null) return;
     showModalBottomSheet(
@@ -1353,6 +1523,54 @@ class _MessagesLabelsStrip extends StatelessWidget {
   }
 }
 
+// Franja de nota/comentario bajo el AppBar del chat abierto. Mismo lenguaje
+// visual que _MessagesLabelsStrip pero en ámbar para diferenciar la anotación
+// del usuario de las etiquetas. Tap → editor de nota.
+class _MessagesNoteStrip extends StatelessWidget {
+  final String note;
+  final VoidCallback onTap;
+
+  static const Color _amber = Color(0xFFF59E0B);
+
+  const _MessagesNoteStrip({required this.note, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: _amber.withValues(alpha: 0.08),
+          border: Border(
+            bottom: BorderSide(color: white.withValues(alpha: 0.05)),
+          ),
+        ),
+        child: Row(
+          children: [
+            const Icon(Icons.sticky_note_2_outlined, size: 16, color: _amber),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                note,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: _amber,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w500,
+                  height: 1.3,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _ChatTile extends StatelessWidget {
   final String phoneNumber;
   final String contactName;
@@ -1366,6 +1584,7 @@ class _ChatTile extends StatelessWidget {
   final String? sessionKey;
   final List<String> labelIds;
   final Map<String, ChatLabel> labelsCatalog;
+  final String note;
   final VoidCallback onTap;
   final VoidCallback? onLongPress;
 
@@ -1379,6 +1598,7 @@ class _ChatTile extends StatelessWidget {
     required this.sessionKey,
     required this.labelIds,
     required this.labelsCatalog,
+    required this.note,
     required this.onTap,
     this.onLongPress,
   });
@@ -1414,41 +1634,122 @@ class _ChatTile extends StatelessWidget {
       onLongPress: onLongPress,
       child: Container(
         color: isSelected ? surfaceDark.withValues(alpha: 0.8) : Colors.transparent,
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        // Row exterior con avatar centrado verticalmente respecto a todo el
+        // contenido (nombre + mensaje + chips). El bloque de texto va en un
+        // Expanded para que la fila de chips ocupe el ancho completo hasta el
+        // borde derecho.
         child: Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
           children: [
-            // Avatar
-            Container(
-              width: 52,
-              height: 52,
-              decoration: BoxDecoration(
-                color: primaryAqua.withValues(alpha: 0.2),
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Center(
-                child: Text(
-                  avatarLetter,
-                  style: const TextStyle(
-                    color: primaryAqua,
-                    fontWeight: FontWeight.w700,
-                    fontSize: 20,
+            // Avatar circular con badge de pendientes superpuesto (estilo iOS
+            // app icon, igual que la pantalla "Mis cuentas").
+            Stack(
+              clipBehavior: Clip.none,
+              children: [
+                Container(
+                  width: 52,
+                  height: 52,
+                  decoration: BoxDecoration(
+                    color: primaryAqua.withValues(alpha: 0.2),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Center(
+                    child: Text(
+                      avatarLetter,
+                      style: const TextStyle(
+                        color: primaryAqua,
+                        fontWeight: FontWeight.w700,
+                        fontSize: 20,
+                      ),
+                    ),
                   ),
                 ),
-              ),
+                if (unrespondedCount > 0)
+                  Positioned(
+                    top: -4,
+                    right: -4,
+                    // Borde del color de fondo para separar del avatar.
+                    child: Container(
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: darkBg, width: 2),
+                      ),
+                      child: UnrespondedBadge(count: unrespondedCount),
+                    ),
+                  ),
+              ],
             ),
             const SizedBox(width: 12),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  Text(
-                    displayName,
-                    style: const TextStyle(
-                      fontWeight: FontWeight.w600,
-                      fontSize: 14,
-                      color: white,
-                    ),
-                    overflow: TextOverflow.ellipsis,
+                  // Nombre + (hora / indicador de IA) en la misma fila.
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Expanded(
+                        child: Text(
+                          displayName,
+                          style: const TextStyle(
+                            fontWeight: FontWeight.w600,
+                            fontSize: 14,
+                            color: white,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Column(
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        children: [
+                          Text(
+                            _formatTimestamp(timestamp),
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: unrespondedCount > 0
+                                  ? const Color(0xFFF97316)
+                                  : lightText,
+                              fontWeight: unrespondedCount > 0
+                                  ? FontWeight.w600
+                                  : FontWeight.w400,
+                            ),
+                          ),
+                          // Indicador de IA solo cuando hay ciclo activo.
+                          ListenableBuilder(
+                            listenable: AiStateService(),
+                            builder: (context, _) {
+                              final aiStatus = sessionKey == null
+                                  ? null
+                                  : AiStateService()
+                                      .statusFor(sessionKey!, phoneNumber);
+                              final aiActive = aiStatus != null &&
+                                  aiStatus.state != AiChatState.idle;
+
+                              return AnimatedSwitcher(
+                                duration: const Duration(milliseconds: 220),
+                                switchInCurve: Curves.easeOut,
+                                switchOutCurve: Curves.easeIn,
+                                child: aiActive
+                                    ? Padding(
+                                        padding:
+                                            const EdgeInsets.only(top: 6),
+                                        child: AiStateIndicator(
+                                          key: const ValueKey('ai-indicator'),
+                                          state: aiStatus.state,
+                                          compact: true,
+                                        ),
+                                      )
+                                    : const SizedBox(
+                                        key: ValueKey('ai-idle'), height: 0),
+                              );
+                            },
+                          ),
+                        ],
+                      ),
+                    ],
                   ),
                   const SizedBox(height: 4),
                   Text(
@@ -1461,67 +1762,49 @@ class _ChatTile extends StatelessWidget {
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                   ),
-                  if (labelIds.isNotEmpty) ...[
-                    const SizedBox(height: 6),
-                    LabelChipsRow(
-                      labelIds: labelIds,
-                      catalog: labelsCatalog,
-                      compact: true,
-                      maxVisible: 3,
-                    ),
-                  ],
-                ],
-              ),
-            ),
-            const SizedBox(width: 8),
-            // Trailing: timestamp arriba + (indicador IA | badge naranja).
-            // Mientras la IA esté activa para este chat, ocultamos el badge y
-            // mostramos en su lugar el spinner con leyenda; al volver a idle,
-            // regresa el badge si hay pendientes.
-            ListenableBuilder(
-              listenable: AiStateService(),
-              builder: (context, _) {
-                final aiStatus = sessionKey == null
-                    ? null
-                    : AiStateService().statusFor(sessionKey!, phoneNumber);
-                final aiActive =
-                    aiStatus != null && aiStatus.state != AiChatState.idle;
-
-                return Column(
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Text(
-                      _formatTimestamp(timestamp),
-                      style: TextStyle(
-                        fontSize: 11,
-                        color: unrespondedCount > 0
-                            ? const Color(0xFFF97316)
-                            : lightText,
-                        fontWeight: unrespondedCount > 0
-                            ? FontWeight.w600
-                            : FontWeight.w400,
+                  // Etiquetas + nota en UNA línea a lo ancho del Expanded.
+                  // Las etiquetas toman su ancho (acotado al 50% para no
+                  // desbordar) y la nota ocupa el resto completo con Expanded;
+                  // el Align evita que el chip se estire vacío si es corta.
+                  if (labelIds.isNotEmpty || note.isNotEmpty)
+                    LayoutBuilder(
+                      builder: (context, constraints) => Padding(
+                        padding: const EdgeInsets.only(top: 6),
+                        child: Row(
+                          children: [
+                            if (labelIds.isNotEmpty)
+                              ConstrainedBox(
+                                constraints: BoxConstraints(
+                                  maxWidth: note.isNotEmpty
+                                      ? constraints.maxWidth * 0.5
+                                      : constraints.maxWidth,
+                                ),
+                                child: LabelChipsRow(
+                                  labelIds: labelIds,
+                                  catalog: labelsCatalog,
+                                  compact: true,
+                                  maxVisible: note.isNotEmpty ? 2 : 3,
+                                ),
+                              ),
+                            if (labelIds.isNotEmpty && note.isNotEmpty)
+                              const SizedBox(width: 6),
+                            if (note.isNotEmpty)
+                              Expanded(
+                                child: Align(
+                                  alignment: Alignment.centerLeft,
+                                  child: NoteChip(
+                                    note: note,
+                                    compact: true,
+                                    maxWidth: double.infinity,
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
                       ),
                     ),
-                    const SizedBox(height: 6),
-                    AnimatedSwitcher(
-                      duration: const Duration(milliseconds: 220),
-                      switchInCurve: Curves.easeOut,
-                      switchOutCurve: Curves.easeIn,
-                      child: aiActive
-                          ? AiStateIndicator(
-                              key: const ValueKey('ai-indicator'),
-                              state: aiStatus.state,
-                              compact: true,
-                            )
-                          : KeyedSubtree(
-                              key: const ValueKey('unresp-badge'),
-                              child: UnrespondedBadge(count: unrespondedCount),
-                            ),
-                    ),
-                  ],
-                );
-              },
+                ],
+              ),
             ),
           ],
         ),
