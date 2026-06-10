@@ -665,7 +665,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
                     selectedChatPhone = phoneNumber;
                   });
                 },
-                onLongPress: () => _showChatOptions(phoneNumber, contactName),
+                onLongPress: () =>
+                    _showChatOptions(phoneNumber, contactName, labelIds),
               );
 
               // Sin pendientes: nada que cerrar, no envolvemos en Slidable
@@ -1063,8 +1064,16 @@ class _ChatsScreenState extends State<ChatsScreen> {
   // Bottom sheet de opciones al pulsar largo un chat. Mismo patrón visual que
   // el menú de opciones de mensajes (message_bubble.dart). Aquí irán futuras
   // acciones: archivar, marcar como listo, etc.
-  void _showChatOptions(String phoneNumber, String contactName) {
+  void _showChatOptions(
+    String phoneNumber,
+    String contactName,
+    List<String> labelIds,
+  ) {
     HapticFeedback.mediumImpact();
+    // Si el chat ya tiene etiquetas asignadas la acción es "administrar";
+    // si no, invitamos a "añadir" la primera. Mismo destino (el selector),
+    // distinto copy según el contexto.
+    final hasLabels = labelIds.isNotEmpty;
     showModalBottomSheet(
       context: context,
       backgroundColor: surfaceDark,
@@ -1084,6 +1093,33 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 color: primaryAqua.withValues(alpha: 0.3),
                 borderRadius: BorderRadius.circular(2),
               ),
+            ),
+            ListTile(
+              leading: Icon(
+                hasLabels ? Icons.label : Icons.label_outline,
+                size: 20,
+                color: primaryAqua,
+              ),
+              title: Text(
+                hasLabels ? 'Administrar etiquetas' : 'Añadir etiqueta',
+                style: const TextStyle(color: white),
+              ),
+              // Chips actuales como contexto cuando ya hay etiquetas asignadas.
+              subtitle: hasLabels
+                  ? Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: LabelChipsRow(
+                        labelIds: labelIds,
+                        catalog: _labelsCatalog,
+                        compact: true,
+                        maxVisible: 4,
+                      ),
+                    )
+                  : null,
+              onTap: () {
+                Navigator.pop(sheetCtx);
+                _openLabelsSelector(phoneNumber);
+              },
             ),
             ListTile(
               leading: const Icon(Icons.delete, size: 20, color: Color(0xFFF87171)),

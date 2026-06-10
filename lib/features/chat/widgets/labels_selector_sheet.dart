@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:crm_whatsapp/core.dart';
+import 'label_editor_dialog.dart';
 
 /// Bottom sheet para asignar/desasignar etiquetas a un chat. Lee el catálogo
 /// en realtime de la subcolección `labels` y persiste `labelIds` en el doc del
@@ -41,6 +42,27 @@ class _LabelsSelectorSheetState extends State<LabelsSelectorSheet> {
       .doc(widget.sessionId)
       .collection('chats')
       .doc(widget.phoneNumber);
+
+  // Crea una etiqueta nueva sin salir del selector (elimina el dead-end de
+  // tener que ir a Ajustes › Etiquetas). Calcula el siguiente `order` con un
+  // get puntual y, si se crea, la deja ya seleccionada para este chat.
+  Future<void> _createLabel() async {
+    final existing = await _labelsRef.orderBy('order').get();
+    final nextOrder = existing.docs.isEmpty
+        ? 0
+        : ((existing.docs.last.data()['order'] as num?)?.toInt() ?? 0) + 1;
+
+    if (!mounted) return;
+    final newId = await showLabelEditorDialog(
+      context: context,
+      labelsRef: _labelsRef,
+      nextOrder: nextOrder,
+    );
+
+    if (newId != null && mounted) {
+      setState(() => (_selected ??= <String>{}).add(newId));
+    }
+  }
 
   Future<void> _save() async {
     if (_selected == null) return;
@@ -154,13 +176,15 @@ class _LabelsSelectorSheetState extends State<LabelsSelectorSheet> {
                               ),
                               const SizedBox(height: 6),
                               const Text(
-                                'Crea etiquetas desde\nAjustes de Sesión › Etiquetas',
+                                'Crea tu primera etiqueta para\norganizar este y otros chats.',
                                 textAlign: TextAlign.center,
                                 style: TextStyle(
                                   color: lightText,
                                   fontSize: 13,
                                 ),
                               ),
+                              const SizedBox(height: 20),
+                              _CreateLabelButton(onPressed: _createLabel),
                             ],
                           ),
                         );
@@ -170,9 +194,16 @@ class _LabelsSelectorSheetState extends State<LabelsSelectorSheet> {
                         shrinkWrap: true,
                         padding: const EdgeInsets.symmetric(
                             horizontal: 16, vertical: 8),
-                        itemCount: labels.length,
+                        // +1: la última fila es el botón "Crear etiqueta".
+                        itemCount: labels.length + 1,
                         separatorBuilder: (_, __) => const SizedBox(height: 4),
                         itemBuilder: (_, i) {
+                          if (i == labels.length) {
+                            return Padding(
+                              padding: const EdgeInsets.only(top: 8),
+                              child: _CreateLabelButton(onPressed: _createLabel),
+                            );
+                          }
                           final l = labels[i];
                           final on = _selected?.contains(l.id) ?? false;
                           return InkWell(
@@ -283,6 +314,49 @@ class _LabelsSelectorSheetState extends State<LabelsSelectorSheet> {
                     ),
                   ),
                 ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Botón punteado "Crear etiqueta" reutilizado en el empty state y al final de
+/// la lista del selector. Estilo dashed sutil para diferenciarlo de las filas
+/// de etiquetas existentes sin competir visualmente con ellas.
+class _CreateLabelButton extends StatelessWidget {
+  final VoidCallback onPressed;
+
+  const _CreateLabelButton({required this.onPressed});
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onPressed,
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+        decoration: BoxDecoration(
+          color: primaryAqua.withValues(alpha: 0.06),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: primaryAqua.withValues(alpha: 0.4),
+            width: 1,
+          ),
+        ),
+        child: const Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.add, color: primaryAqua, size: 20),
+            SizedBox(width: 8),
+            Text(
+              'Crear etiqueta',
+              style: TextStyle(
+                color: primaryAqua,
+                fontSize: 14,
+                fontWeight: FontWeight.bold,
               ),
             ),
           ],
