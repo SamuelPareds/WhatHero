@@ -577,35 +577,17 @@ class _MessagesViewState extends State<MessagesView> {
   }
 
   void _showImageConfirmationDialog(String title, String caption, String imageUrl) {
+    // El diálogo es un widget con estado propio para que el controller del
+    // caption se libere en su dispose() (evita "used after dispose")
     showDialog(
       context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: surfaceDark,
-        title: Text(title, style: const TextStyle(color: white, fontWeight: FontWeight.w600)),
-        content: SizedBox(
-          width: double.maxFinite,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child: Image.network(imageUrl, height: 150, fit: BoxFit.cover),
-              ),
-              if (caption.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 16), child: Text(caption, style: const TextStyle(color: white, fontSize: 13))),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: Text('Cancelar', style: TextStyle(color: lightText.withValues(alpha: 0.6)))),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: primaryAqua),
-            onPressed: () {
-              Navigator.pop(context);
-              _sendQuickResponse({'text': caption, 'imageUrl': imageUrl});
-            },
-            child: const Text('Enviar', style: TextStyle(color: darkBg, fontWeight: FontWeight.w600)),
-          ),
-        ],
+      builder: (_) => _ImageCaptionDialog(
+        title: title,
+        caption: caption,
+        imageUrl: imageUrl,
+        // Enviar con el texto editado (puede quedar vacío → imagen sola)
+        onSend: (editedCaption) =>
+            _sendQuickResponse({'text': editedCaption, 'imageUrl': imageUrl}),
       ),
     );
   }
@@ -1004,6 +986,101 @@ class _DateSeparator extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+// Diálogo de confirmación para respuestas con imagen, con caption editable.
+// Es StatefulWidget para que el controller se libere en dispose() de forma
+// segura (sin "used after dispose" al cerrar el diálogo).
+class _ImageCaptionDialog extends StatefulWidget {
+  final String title;
+  final String caption;
+  final String imageUrl;
+  final void Function(String editedCaption) onSend;
+
+  const _ImageCaptionDialog({
+    required this.title,
+    required this.caption,
+    required this.imageUrl,
+    required this.onSend,
+  });
+
+  @override
+  State<_ImageCaptionDialog> createState() => _ImageCaptionDialogState();
+}
+
+class _ImageCaptionDialogState extends State<_ImageCaptionDialog> {
+  late final TextEditingController _captionController;
+
+  @override
+  void initState() {
+    super.initState();
+    _captionController = TextEditingController(text: widget.caption);
+  }
+
+  @override
+  void dispose() {
+    _captionController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: surfaceDark,
+      title: Text(widget.title, style: const TextStyle(color: white, fontWeight: FontWeight.w600)),
+      content: SizedBox(
+        width: double.maxFinite,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ClipRRect(
+              borderRadius: BorderRadius.circular(8),
+              child: Image.network(widget.imageUrl, height: 150, fit: BoxFit.cover),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: _captionController,
+              maxLines: 4,
+              minLines: 1,
+              textCapitalization: TextCapitalization.sentences,
+              style: const TextStyle(color: white, fontSize: 13),
+              decoration: InputDecoration(
+                hintText: 'Añade un texto (opcional)',
+                hintStyle: TextStyle(color: lightText.withValues(alpha: 0.5)),
+                filled: true,
+                fillColor: darkBg.withValues(alpha: 0.5),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: BorderSide(color: primaryAqua.withValues(alpha: 0.2)),
+                ),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: BorderSide(color: primaryAqua.withValues(alpha: 0.2)),
+                ),
+                contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: Text('Cancelar', style: TextStyle(color: lightText.withValues(alpha: 0.6))),
+        ),
+        ElevatedButton(
+          style: ElevatedButton.styleFrom(backgroundColor: primaryAqua),
+          onPressed: () {
+            // Capturar el texto antes de cerrar (el controller se libera al pop)
+            final edited = _captionController.text.trim();
+            Navigator.pop(context);
+            widget.onSend(edited);
+          },
+          child: const Text('Enviar', style: TextStyle(color: darkBg, fontWeight: FontWeight.w600)),
+        ),
+      ],
     );
   }
 }
