@@ -47,12 +47,6 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
   // `bot_keyword_rules` (antes `ai_keyword_rules`); el rename refleja que
   // estas respuestas son canned, no generadas por la IA.
   List<Map<String, dynamic>> _botKeywordRules = [];
-  String _newKeyword = '';
-  String _newKeywordResponse = '';
-  String _newKeywordImageUrl = '';
-  // Trigger por defecto al crear regla nueva: 'both' permite que dispare tanto
-  // con mensajes entrantes como con salientes (decisión del usuario).
-  String _newKeywordTrigger = 'both';
   bool _discriminatorEnabled = false;
 
   // Allowlist de tipos de media que la IA puede leer. Por defecto todo en
@@ -194,9 +188,9 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
           'start': '${_activeHoursStart.hour.toString().padLeft(2, '0')}:${_activeHoursStart.minute.toString().padLeft(2, '0')}',
           'end': '${_activeHoursEnd.hour.toString().padLeft(2, '0')}:${_activeHoursEnd.minute.toString().padLeft(2, '0')}',
         },
-        // Escritura siempre en el nuevo campo. El viejo (`ai_keyword_rules`)
-        // queda intacto en Firestore como respaldo hasta que confirmes el cambio.
-        'bot_keyword_rules': _botKeywordRules,
+        // `bot_keyword_rules` NO se escribe aquí: las respuestas automáticas se
+        // persisten al instante desde su editor (ver _persistRules), igual que
+        // las etiquetas. Así no dependen del footer ni chocan con otras pestañas.
         'ai_discriminator_enabled': _discriminatorEnabled,
         'ai_discriminator_prompt': _discriminatorPromptController.text.trim(),
         'ai_media_allowlist': {
@@ -597,17 +591,101 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
             style: TextStyle(color: lightText, fontSize: 13),
           ),
           const SizedBox(height: 20),
-          ..._botKeywordRules.asMap().entries.map((e) => _keywordTile(
-                e.key,
-                e.value['keyword'] as String? ?? '',
-                e.value['response'] as String? ?? '',
-                e.value['imageUrl'] as String?,
-                e.value['trigger'] as String? ?? 'incoming',
-              )),
-          _addKeywordSection(),
+          if (_botKeywordRules.isEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 12),
+              child: Text(
+                'Aún no tienes respuestas automáticas. Crea una con el botón de abajo.',
+                style: TextStyle(color: lightText.withValues(alpha: 0.6), fontSize: 13),
+              ),
+            )
+          else
+            ..._botKeywordRules.asMap().entries.map((e) => _keywordTile(
+                  e.key,
+                  e.value['keyword'] as String? ?? '',
+                  e.value['response'] as String? ?? '',
+                  e.value['imageUrl'] as String?,
+                  e.value['trigger'] as String? ?? 'incoming',
+                )),
+          const SizedBox(height: 12),
+          // Botón sutil para crear una regla nueva (abre el editor en blanco)
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: () => _showRuleEditor(),
+              icon: const Icon(Icons.add, size: 18, color: primaryAqua),
+              label: const Text('Nueva regla',
+                  style: TextStyle(color: primaryAqua, fontWeight: FontWeight.w600)),
+              style: OutlinedButton.styleFrom(
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                side: BorderSide(color: primaryAqua.withValues(alpha: 0.4)),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+            ),
+          ),
         ],
       ),
     );
+  }
+
+  // Abre el editor de regla en bottom sheet. Sin argumentos → crear; con
+  // index → editar esa regla. Cada acción (crear/editar/eliminar) se persiste
+  // de inmediato en Firestore, igual que las etiquetas → no depende del
+  // "Guardar Todos los Cambios" del footer.
+  Future<void> _showRuleEditor([int? index]) async {
+    final existing = index != null ? _botKeywordRules[index] : null;
+    final result = await showModalBottomSheet<Map<String, dynamic>>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => _KeywordRuleEditorSheet(
+        keyword: existing?['keyword'] as String? ?? '',
+        response: existing?['response'] as String? ?? '',
+        imageUrl: existing?['imageUrl'] as String? ?? '',
+        // Reglas nuevas arrancan en 'both'; las existentes conservan su trigger
+        trigger: existing?['trigger'] as String? ?? (index == null ? 'both' : 'incoming'),
+        isEditing: index != null,
+      ),
+    );
+
+    if (result == null) return; // canceló
+
+    setState(() {
+      if (result['_delete'] == true) {
+        if (index != null) _botKeywordRules.removeAt(index);
+      } else if (index != null) {
+        _botKeywordRules[index] = result;
+      } else {
+        _botKeywordRules.add(result);
+      }
+    });
+
+    await _persistRules(deleted: result['_delete'] == true);
+  }
+
+  // Persiste solo el campo de reglas de inmediato (independiente del footer),
+  // siguiendo el patrón de las etiquetas. Así el usuario no tiene que recordar
+  // guardar y se elimina el conflicto con el guardado de otras pestañas.
+  Future<void> _persistRules({bool deleted = false}) async {
+    try {
+      await FirebaseFirestore.instance
+          .collection(accountsCollection)
+          .doc(widget.accountId)
+          .collection('whatsapp_sessions')
+          .doc(widget.sessionId)
+          .update({'bot_keyword_rules': _botKeywordRules});
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(deleted ? 'Regla eliminada' : 'Regla guardada')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error al guardar: $e')),
+        );
+      }
+    }
   }
 
   Widget _buildIntegrationsTab() {
@@ -962,44 +1040,48 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
   Widget _keywordTile(int index, String key, String resp, String? imageUrl, String trigger) {
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
       decoration: BoxDecoration(color: darkBg.withValues(alpha: 0.2), borderRadius: BorderRadius.circular(12)),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: () => _showRuleEditor(index), // tocar la regla → editar
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Flexible(
-                      child: Text(
-                        key,
-                        style: const TextStyle(color: primaryAqua, fontWeight: FontWeight.bold),
-                        overflow: TextOverflow.ellipsis,
-                      ),
+                    Row(
+                      children: [
+                        Flexible(
+                          child: Text(
+                            key,
+                            style: const TextStyle(color: primaryAqua, fontWeight: FontWeight.bold),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        if (imageUrl != null && imageUrl.isNotEmpty) ...[
+                          const SizedBox(width: 8),
+                          const Icon(Icons.image, color: primaryAqua, size: 14),
+                        ],
+                      ],
                     ),
-                    if (imageUrl != null && imageUrl.isNotEmpty) ...[
-                      const SizedBox(width: 8),
-                      const Icon(Icons.image, color: primaryAqua, size: 14),
+                    const SizedBox(height: 4),
+                    _triggerBadge(trigger),
+                    if (resp.isNotEmpty) ...[
+                      const SizedBox(height: 4),
+                      Text(resp, style: const TextStyle(color: lightText, fontSize: 12), maxLines: 1, overflow: TextOverflow.ellipsis),
                     ],
                   ],
                 ),
-                const SizedBox(height: 4),
-                _triggerBadge(trigger),
-                if (resp.isNotEmpty) ...[
-                  const SizedBox(height: 4),
-                  Text(resp, style: const TextStyle(color: lightText, fontSize: 12), maxLines: 1, overflow: TextOverflow.ellipsis),
-                ],
-              ],
-            ),
+              ),
+              const SizedBox(width: 8),
+              Icon(Icons.chevron_right, color: lightText.withValues(alpha: 0.4), size: 20),
+            ],
           ),
-          IconButton(
-            icon: const Icon(Icons.delete_outline, color: Colors.red, size: 20),
-            onPressed: () => setState(() => _botKeywordRules.removeAt(index)),
-          ),
-        ],
+        ),
       ),
     );
   }
@@ -1041,164 +1123,6 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
           Icon(icon, size: 11, color: color),
           const SizedBox(width: 4),
           Text(label, style: TextStyle(color: color, fontSize: 10, fontWeight: FontWeight.w600)),
-        ],
-      ),
-    );
-  }
-
-  Widget _addKeywordSection() {
-    // Controller temporal para el editor expandido si el usuario lo requiere
-    final TextEditingController tempResponseController = TextEditingController(text: _newKeywordResponse);
-    
-    return Container(
-      margin: const EdgeInsets.only(top: 8),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: darkBg.withValues(alpha: 0.2),
-        border: Border.all(color: primaryAqua.withValues(alpha: 0.2)), 
-        borderRadius: BorderRadius.circular(16)
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text('CREAR NUEVA REGLA', style: TextStyle(color: primaryAqua, fontSize: 10, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 12),
-          TextField(
-            onChanged: (v) => _newKeyword = v,
-            style: const TextStyle(color: white, fontSize: 13),
-            decoration: InputDecoration(
-              hintText: 'Palabra clave (ej: info, precio)...',
-              hintStyle: TextStyle(color: white.withValues(alpha: 0.3)),
-              border: InputBorder.none,
-              isDense: true,
-              prefixIcon: const Icon(Icons.key, size: 16, color: primaryAqua),
-            ),
-          ),
-          const Divider(color: white, height: 16, thickness: 0.1),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              const Text('Respuesta del Bot', style: TextStyle(color: lightText, fontSize: 12)),
-              GestureDetector(
-                onTap: () {
-                  tempResponseController.text = _newKeywordResponse;
-                  _showExpandedEditor('Redactar Respuesta Automática', tempResponseController, null);
-                  // Actualizar el estado cuando el diálogo se cierre (aunque el editor expandido aquí es modal)
-                  // Para simplificar, usamos un listener o actualizamos al cerrar
-                  tempResponseController.addListener(() {
-                    _newKeywordResponse = tempResponseController.text;
-                    setState(() {});
-                  });
-                },
-                child: const Row(
-                  children: [
-                    Icon(Icons.open_in_full_rounded, color: primaryAqua, size: 12),
-                    SizedBox(width: 4),
-                    Text('Expandir', style: TextStyle(color: primaryAqua, fontSize: 10, fontWeight: FontWeight.bold)),
-                  ],
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          TextField(
-            controller: TextEditingController.fromValue(
-              TextEditingValue(
-                text: _newKeywordResponse,
-                selection: TextSelection.collapsed(offset: _newKeywordResponse.length),
-              ),
-            ),
-            onChanged: (v) => _newKeywordResponse = v,
-            maxLines: 4,
-            minLines: 2,
-            style: const TextStyle(color: white, fontSize: 13, height: 1.4),
-            decoration: InputDecoration(
-              hintText: 'Escribe el mensaje que enviará el bot...',
-              hintStyle: TextStyle(color: white.withValues(alpha: 0.3)),
-              filled: true,
-              fillColor: darkBg.withValues(alpha: 0.3),
-              border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
-              contentPadding: const EdgeInsets.all(12),
-            ),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            onChanged: (v) => _newKeywordImageUrl = v,
-            style: const TextStyle(color: white, fontSize: 13),
-            decoration: InputDecoration(
-              hintText: 'URL de imagen (opcional)...',
-              hintStyle: TextStyle(color: white.withValues(alpha: 0.3)),
-              border: InputBorder.none,
-              isDense: true,
-              prefixIcon: const Icon(Icons.link, size: 16, color: primaryAqua),
-            ),
-          ),
-          const SizedBox(height: 16),
-          // Selector de trigger: cuándo debe dispararse la regla.
-          // Default 'both' como pidió el usuario; las reglas existentes mantienen
-          // su trigger original (típicamente 'incoming') hasta que se editen.
-          const Text(
-            'Disparar cuando…',
-            style: TextStyle(color: lightText, fontSize: 12, fontWeight: FontWeight.w600),
-          ),
-          const SizedBox(height: 8),
-          SegmentedButton<String>(
-            segments: const [
-              ButtonSegment(
-                value: 'incoming',
-                label: Text('Cliente', style: TextStyle(fontSize: 11)),
-                icon: Icon(Icons.inbox, size: 14),
-              ),
-              ButtonSegment(
-                value: 'outgoing',
-                label: Text('Yo', style: TextStyle(fontSize: 11)),
-                icon: Icon(Icons.outbox, size: 14),
-              ),
-              ButtonSegment(
-                value: 'both',
-                label: Text('Ambos', style: TextStyle(fontSize: 11)),
-                icon: Icon(Icons.swap_horiz, size: 14),
-              ),
-            ],
-            selected: {_newKeywordTrigger},
-            onSelectionChanged: (selection) => setState(() => _newKeywordTrigger = selection.first),
-            style: ButtonStyle(
-              backgroundColor: WidgetStateProperty.resolveWith((states) =>
-                  states.contains(WidgetState.selected) ? primaryAqua.withValues(alpha: 0.2) : Colors.transparent),
-              foregroundColor: WidgetStateProperty.resolveWith((states) =>
-                  states.contains(WidgetState.selected) ? primaryAqua : lightText),
-              side: WidgetStateProperty.all(BorderSide(color: primaryAqua.withValues(alpha: 0.3))),
-            ),
-          ),
-          const SizedBox(height: 16),
-          SizedBox(
-            width: double.infinity,
-            child: ElevatedButton(
-              onPressed: () {
-                if (_newKeyword.isNotEmpty && (_newKeywordResponse.isNotEmpty || _newKeywordImageUrl.isNotEmpty)) {
-                  setState(() {
-                    _botKeywordRules.add({
-                      'keyword': _newKeyword,
-                      'response': _newKeywordResponse,
-                      'imageUrl': _newKeywordImageUrl,
-                      'trigger': _newKeywordTrigger,
-                    });
-                    _newKeyword = ''; _newKeywordResponse = ''; _newKeywordImageUrl = '';
-                    _newKeywordTrigger = 'both'; // reset al default
-                    tempResponseController.clear();
-                  });
-                }
-              },
-              style: ElevatedButton.styleFrom(
-                backgroundColor: primaryAqua.withValues(alpha: 0.1),
-                foregroundColor: primaryAqua,
-                side: const BorderSide(color: primaryAqua),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                elevation: 0,
-              ),
-              child: const Text('+ Guardar Regla', style: TextStyle(fontWeight: FontWeight.bold)),
-            ),
-          ),
         ],
       ),
     );
@@ -1551,6 +1475,262 @@ class _LabelsTabBodyState extends State<_LabelsTabBody> {
           ),
         );
       },
+    );
+  }
+}
+
+// Editor de una respuesta automática (regla por palabra clave), en bottom sheet
+// con la misma identidad que el panel de Respuestas Rápidas (navy, grab handle,
+// header Cancelar/Guardar). Devuelve el Map de la regla vía Navigator.pop, o
+// null si se cancela. Es StatefulWidget para manejar sus propios controllers.
+class _KeywordRuleEditorSheet extends StatefulWidget {
+  final String keyword;
+  final String response;
+  final String imageUrl;
+  final String trigger;
+  final bool isEditing;
+
+  const _KeywordRuleEditorSheet({
+    required this.keyword,
+    required this.response,
+    required this.imageUrl,
+    required this.trigger,
+    required this.isEditing,
+  });
+
+  @override
+  State<_KeywordRuleEditorSheet> createState() => _KeywordRuleEditorSheetState();
+}
+
+class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
+  late final TextEditingController _keywordController;
+  late final TextEditingController _responseController;
+  late final TextEditingController _imageUrlController;
+  late String _trigger;
+
+  @override
+  void initState() {
+    super.initState();
+    _keywordController = TextEditingController(text: widget.keyword);
+    _responseController = TextEditingController(text: widget.response);
+    _imageUrlController = TextEditingController(text: widget.imageUrl);
+    _trigger = widget.trigger;
+    // Recalcular el estado de "Guardar" al escribir
+    _keywordController.addListener(_onChanged);
+    _responseController.addListener(_onChanged);
+    _imageUrlController.addListener(_onChanged);
+  }
+
+  void _onChanged() => setState(() {});
+
+  @override
+  void dispose() {
+    _keywordController.dispose();
+    _responseController.dispose();
+    _imageUrlController.dispose();
+    super.dispose();
+  }
+
+  // Guardar habilitado si hay palabra clave + (respuesta o imagen) y, al editar,
+  // si hay algún cambio respecto al original.
+  bool get _canSave {
+    final keyword = _keywordController.text.trim();
+    final response = _responseController.text.trim();
+    final imageUrl = _imageUrlController.text.trim();
+    final isValid = keyword.isNotEmpty && (response.isNotEmpty || imageUrl.isNotEmpty);
+    if (!isValid) return false;
+    if (!widget.isEditing) return true;
+    return keyword != widget.keyword ||
+        response != widget.response ||
+        imageUrl != widget.imageUrl ||
+        _trigger != widget.trigger;
+  }
+
+  void _save() {
+    Navigator.pop(context, {
+      'keyword': _keywordController.text.trim(),
+      'response': _responseController.text.trim(),
+      'imageUrl': _imageUrlController.text.trim(),
+      'trigger': _trigger,
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final height = MediaQuery.of(context).size.height * 0.9;
+    return Container(
+      height: height,
+      decoration: const BoxDecoration(
+        color: darkBg,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // Grab handle
+          Padding(
+            padding: const EdgeInsets.only(top: 10, bottom: 4),
+            child: Center(
+              child: Container(
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: lightText.withValues(alpha: 0.3),
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+          ),
+          // Header iOS: Cancelar · título · Guardar
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            child: Row(
+              children: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('Cancelar', style: TextStyle(color: lightText)),
+                ),
+                Expanded(
+                  child: Text(
+                    widget.isEditing ? 'Editar regla' : 'Nueva regla',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      fontSize: 17,
+                      fontWeight: FontWeight.bold,
+                      color: white,
+                    ),
+                  ),
+                ),
+                TextButton(
+                  onPressed: _canSave ? _save : null,
+                  child: Text(
+                    'Guardar',
+                    style: TextStyle(
+                      color: _canSave ? primaryAqua : lightText.withValues(alpha: 0.4),
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Divider(color: primaryAqua.withValues(alpha: 0.1), height: 1),
+          Expanded(
+            child: SingleChildScrollView(
+              padding: EdgeInsets.fromLTRB(
+                20, 20, 20, 20 + MediaQuery.of(context).viewInsets.bottom,
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _label('Palabra clave'),
+                  _field(_keywordController, 'Ej: info, precio, horario'),
+                  const SizedBox(height: 20),
+                  _label('Respuesta del bot'),
+                  _field(_responseController, 'Mensaje que enviará el bot…', maxLines: 5),
+                  const SizedBox(height: 20),
+                  _label('URL de imagen (opcional)'),
+                  _field(_imageUrlController, 'https://example.com/image.jpg'),
+                  const SizedBox(height: 20),
+                  _label('Disparar cuando…'),
+                  SegmentedButton<String>(
+                    segments: const [
+                      ButtonSegment(value: 'incoming', label: Text('Cliente', style: TextStyle(fontSize: 11)), icon: Icon(Icons.inbox, size: 14)),
+                      ButtonSegment(value: 'outgoing', label: Text('Yo', style: TextStyle(fontSize: 11)), icon: Icon(Icons.outbox, size: 14)),
+                      ButtonSegment(value: 'both', label: Text('Ambos', style: TextStyle(fontSize: 11)), icon: Icon(Icons.swap_horiz, size: 14)),
+                    ],
+                    selected: {_trigger},
+                    onSelectionChanged: (s) => setState(() => _trigger = s.first),
+                    style: ButtonStyle(
+                      backgroundColor: WidgetStateProperty.resolveWith((states) =>
+                          states.contains(WidgetState.selected) ? primaryAqua.withValues(alpha: 0.2) : Colors.transparent),
+                      foregroundColor: WidgetStateProperty.resolveWith((states) =>
+                          states.contains(WidgetState.selected) ? primaryAqua : lightText),
+                      side: WidgetStateProperty.all(BorderSide(color: primaryAqua.withValues(alpha: 0.3))),
+                    ),
+                  ),
+                  // Eliminar dentro del editor (solo al editar una existente)
+                  if (widget.isEditing) ...[
+                    const SizedBox(height: 32),
+                    SizedBox(
+                      width: double.infinity,
+                      child: OutlinedButton.icon(
+                        onPressed: _confirmDelete,
+                        icon: const Icon(Icons.delete_outline, color: Colors.red, size: 20),
+                        label: const Text('Eliminar',
+                            style: TextStyle(color: Colors.red, fontWeight: FontWeight.w600)),
+                        style: OutlinedButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(vertical: 14),
+                          side: BorderSide(color: Colors.red.withValues(alpha: 0.4)),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Confirma y, si acepta, cierra devolviendo la señal de borrado al panel
+  Future<void> _confirmDelete() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: surfaceDark,
+        title: const Text('Eliminar regla', style: TextStyle(color: white)),
+        content: const Text(
+          '¿Seguro que quieres eliminar esta respuesta automática? Esta acción no se puede deshacer.',
+          style: TextStyle(color: lightText),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancelar', style: TextStyle(color: lightText)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Eliminar', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true && mounted) {
+      Navigator.pop(context, {'_delete': true});
+    }
+  }
+
+  Widget _label(String text) => Padding(
+        padding: const EdgeInsets.only(bottom: 8, left: 4),
+        child: Text(text, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: lightText)),
+      );
+
+  Widget _field(TextEditingController controller, String hint, {int maxLines = 1}) {
+    return TextField(
+      controller: controller,
+      maxLines: maxLines,
+      textCapitalization: TextCapitalization.sentences,
+      style: const TextStyle(color: white),
+      decoration: InputDecoration(
+        hintText: hint,
+        hintStyle: TextStyle(color: lightText.withValues(alpha: 0.5)),
+        filled: true,
+        fillColor: darkBg.withValues(alpha: 0.3),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: BorderSide(color: primaryAqua.withValues(alpha: 0.2)),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: BorderSide(color: primaryAqua.withValues(alpha: 0.2)),
+        ),
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      ),
     );
   }
 }
