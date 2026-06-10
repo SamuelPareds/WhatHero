@@ -1,5 +1,8 @@
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_storage/firebase_storage.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:crm_whatsapp/core.dart';
 
 class QuickResponsesPanel extends StatefulWidget {
@@ -19,7 +22,6 @@ class QuickResponsesPanel extends StatefulWidget {
 class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
   late TextEditingController _titleController;
   late TextEditingController _textController;
-  late TextEditingController _imageUrlController;
   List<Map<String, dynamic>> _quickResponses = [];
   bool _isSaving = false;
   bool _isLoading = true;
@@ -33,16 +35,22 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
   String _origText = '';
   String _origImageUrl = '';
 
+  // Estado de imagen del editor:
+  // - _imageUrl: URL ya persistida (Storage o externa legacy)
+  // - _pickedBytes: imagen recién elegida pendiente de subir (preview en memoria)
+  String _imageUrl = '';
+  Uint8List? _pickedBytes;
+  final ImagePicker _picker = ImagePicker();
+  static const int _maxImageBytes = 10 * 1024 * 1024; // tope de seguridad: 10 MB
+
   @override
   void initState() {
     super.initState();
     _titleController = TextEditingController();
     _textController = TextEditingController();
-    _imageUrlController = TextEditingController();
     // Recalcular el estado de "Guardar" mientras se edita
     _titleController.addListener(_onFieldChanged);
     _textController.addListener(_onFieldChanged);
-    _imageUrlController.addListener(_onFieldChanged);
     _loadQuickResponses();
   }
 
@@ -98,7 +106,8 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
       }
       _titleController.text = _origTitle;
       _textController.text = _origText;
-      _imageUrlController.text = _origImageUrl;
+      _imageUrl = _origImageUrl;
+      _pickedBytes = null;
       _showEditor = true;
     });
   }
@@ -110,57 +119,113 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
       _editingId = null;
       _titleController.clear();
       _textController.clear();
-      _imageUrlController.clear();
+      _imageUrl = '';
+      _pickedBytes = null;
     });
   }
+
+  // Hay imagen si hay una recién elegida (en memoria) o una URL ya persistida
+  bool get _hasImage => _pickedBytes != null || _imageUrl.isNotEmpty;
 
   // Guardar habilitado solo si es válido y (al editar) hay cambios reales.
   // Así "si no hay cambios, no pasa nada" → el botón queda inactivo.
   bool get _canSave {
     final title = _titleController.text.trim();
     final text = _textController.text.trim();
-    final imageUrl = _imageUrlController.text.trim();
-    final isValid = title.isNotEmpty && (text.isNotEmpty || imageUrl.isNotEmpty);
+    final isValid = title.isNotEmpty && (text.isNotEmpty || _hasImage);
     if (!isValid) return false;
     if (_editingId == null) return true; // crear: cualquier contenido válido
-    // editar: exige al menos un cambio respecto al original
-    return title != _origTitle || text != _origText || imageUrl != _origImageUrl;
+    // editar: exige al menos un cambio (texto o imagen) respecto al original
+    final imageChanged = _pickedBytes != null || _imageUrl != _origImageUrl;
+    return title != _origTitle || text != _origText || imageChanged;
+  }
+
+  // Path determinista en Storage: un archivo por respuesta (reemplazar =
+  // sobrescribir, sin huérfanos). Usa accountsCollection para respetar las
+  // storage.rules (accounts/... en prod, accounts_dev/... en desarrollo).
+  Reference _imageRef(String docId) => FirebaseStorage.instance.ref(
+        '$accountsCollection/${widget.accountId}/whatsapp_sessions/'
+        '${widget.sessionId}/quick_responses/$docId.jpg',
+      );
+
+  // Elige una imagen de la galería. image_picker ya redimensiona y recomprime
+  // (maxWidth 1600 / quality 80) → archivo liviano sin librería extra.
+  Future<void> _pickImage() async {
+    try {
+      final picked = await _picker.pickImage(
+        source: ImageSource.gallery,
+        maxWidth: 1600,
+        imageQuality: 80,
+      );
+      if (picked == null) return;
+
+      final bytes = await picked.readAsBytes();
+      // Red de seguridad: rechazar si aún supera el tope de 10 MB
+      if (bytes.length > _maxImageBytes) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('La imagen supera el límite de 10 MB')),
+          );
+        }
+        return;
+      }
+
+      if (mounted) setState(() => _pickedBytes = bytes);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('No se pudo cargar la imagen: $e')),
+        );
+      }
+    }
+  }
+
+  // Quita la imagen del editor (se aplica al guardar)
+  void _removeImage() {
+    setState(() {
+      _pickedBytes = null;
+      _imageUrl = '';
+    });
   }
 
   Future<void> _saveQuickResponse() async {
     final title = _titleController.text.trim();
     final text = _textController.text.trim();
-    final imageUrl = _imageUrlController.text.trim();
-
-    // Validar formato de URL si se proporcionó
-    if (imageUrl.isNotEmpty) {
-      final validScheme =
-          imageUrl.startsWith('http://') || imageUrl.startsWith('https://');
-      if (!validScheme || Uri.tryParse(imageUrl) == null) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('La URL debe comenzar con http:// o https://')),
-        );
-        return;
-      }
-    }
 
     setState(() => _isSaving = true);
 
     try {
       final isEditing = _editingId != null;
+      // Para crear necesitamos el id antes de subir la imagen (path determinista)
+      final docRef = isEditing ? _collectionRef.doc(_editingId) : _collectionRef.doc();
+      final docId = docRef.id;
+
+      // Resolver la URL final de la imagen
+      String imageUrl = _imageUrl;
+      if (_pickedBytes != null) {
+        // Subir la imagen recién elegida y obtener su URL de descarga
+        final ref = _imageRef(docId);
+        await ref.putData(
+          _pickedBytes!,
+          SettableMetadata(contentType: 'image/jpeg'),
+        );
+        imageUrl = await ref.getDownloadURL();
+      } else if (imageUrl.isEmpty && _origImageUrl.isNotEmpty) {
+        // El usuario quitó la imagen → borrar el objeto en Storage si era nuestro
+        await _deleteImageObject(docId);
+      }
 
       if (isEditing) {
         // Editar: solo campos editables, preservando 'order' y 'createdAt'
-        await _collectionRef.doc(_editingId).update({
+        await docRef.update({
           'title': title,
           'text': text,
           'imageUrl': imageUrl,
         });
       } else {
         // Crear: doc nuevo con order al final y timestamp del servidor
-        final docRef = _collectionRef.doc();
         await docRef.set({
-          'id': docRef.id,
+          'id': docId,
           'title': title,
           'text': text,
           'imageUrl': imageUrl,
@@ -189,6 +254,16 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
       }
     } finally {
       if (mounted) setState(() => _isSaving = false);
+    }
+  }
+
+  // Borra el objeto de imagen en Storage; ignora si no existe (p.ej. respuestas
+  // legacy con URL externa, que no tienen archivo en nuestro bucket).
+  Future<void> _deleteImageObject(String docId) async {
+    try {
+      await _imageRef(docId).delete();
+    } catch (_) {
+      // Sin archivo o sin permiso → no es crítico, seguimos
     }
   }
 
@@ -222,6 +297,8 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
     if (confirmed != true) return;
 
     try {
+      // Borrar también la imagen asociada en Storage (limpieza)
+      await _deleteImageObject(id);
       await _collectionRef.doc(id).delete();
       await _loadQuickResponses();
       if (mounted) {
@@ -243,7 +320,6 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
   void dispose() {
     _titleController.dispose();
     _textController.dispose();
-    _imageUrlController.dispose();
     super.dispose();
   }
 
@@ -554,18 +630,8 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
                   maxLines: 4,
                 ),
                 const SizedBox(height: 20),
-                _fieldLabel('URL de imagen (opcional)'),
-                _textField(
-                  controller: _imageUrlController,
-                  hint: 'https://example.com/image.jpg',
-                ),
-                Padding(
-                  padding: const EdgeInsets.only(top: 8),
-                  child: Text(
-                    '⚠️ La URL debe ser accesible públicamente (sin login).',
-                    style: TextStyle(color: lightText.withValues(alpha: 0.5), fontSize: 11),
-                  ),
-                ),
+                _fieldLabel('Imagen (opcional)'),
+                _imagePickerField(),
                 // Eliminar solo tiene sentido al editar una existente
                 if (isEditing) ...[
                   const SizedBox(height: 32),
@@ -593,6 +659,81 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
   }
 
   // ────────────────────────────── Helpers UI ───────────────────────────────
+
+  // Selector de imagen: muestra preview (bytes recién elegidos o URL persistida)
+  // con opción de cambiar/quitar, o un área para agregar si no hay ninguna.
+  Widget _imagePickerField() {
+    if (_hasImage) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.circular(12),
+            child: SizedBox(
+              width: double.infinity,
+              height: 180,
+              child: _pickedBytes != null
+                  ? Image.memory(_pickedBytes!, fit: BoxFit.cover)
+                  : Image.network(
+                      _imageUrl,
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, __, ___) => Container(
+                        color: surfaceDark,
+                        child: Icon(Icons.broken_image_outlined,
+                            color: lightText.withValues(alpha: 0.5), size: 40),
+                      ),
+                    ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              TextButton.icon(
+                onPressed: _pickImage,
+                icon: const Icon(Icons.swap_horiz, size: 18, color: primaryAqua),
+                label: const Text('Cambiar', style: TextStyle(color: primaryAqua)),
+              ),
+              TextButton.icon(
+                onPressed: _removeImage,
+                icon: const Icon(Icons.delete_outline, size: 18, color: Colors.red),
+                label: const Text('Quitar', style: TextStyle(color: Colors.red)),
+              ),
+            ],
+          ),
+        ],
+      );
+    }
+
+    // Sin imagen: área tappable para agregar
+    return InkWell(
+      onTap: _pickImage,
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(vertical: 28),
+        decoration: BoxDecoration(
+          color: darkBg.withValues(alpha: 0.3),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: primaryAqua.withValues(alpha: 0.2)),
+        ),
+        child: Column(
+          children: [
+            Icon(Icons.add_photo_alternate_outlined,
+                size: 32, color: primaryAqua.withValues(alpha: 0.7)),
+            const SizedBox(height: 8),
+            const Text('Agregar imagen',
+                style: TextStyle(color: primaryAqua, fontWeight: FontWeight.w600)),
+            const SizedBox(height: 4),
+            Text(
+              'Se optimiza automáticamente (máx. 10 MB)',
+              style: TextStyle(color: lightText.withValues(alpha: 0.5), fontSize: 11),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _grabHandle() => Padding(
         padding: const EdgeInsets.only(top: 10, bottom: 4),
         child: Center(
