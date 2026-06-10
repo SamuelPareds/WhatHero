@@ -514,11 +514,11 @@ class _ChatsScreenState extends State<ChatsScreen> {
             onPressed: () => showModalBottomSheet(
               context: context,
               isScrollControlled: true,
+              backgroundColor: Colors.transparent,
               builder: (_) => QuickResponsesPanel(
                 sessionId: widget.sessionId!,
                 accountId: widget.accountId,
               ),
-
             ),
           ),
         ],
