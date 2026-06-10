@@ -22,6 +22,11 @@ import 'widgets/unread_badge.dart';
 import 'widgets/label_chip.dart';
 import 'widgets/labels_selector_sheet.dart';
 
+// Filtros rápidos de la lista de chats (estilo chips de WhatsApp).
+// todos / no respondidos / con notas son fijos; `etiqueta` filtra por una
+// etiqueta concreta del catálogo (su id va en `_activeLabelId`).
+enum ChatFilter { todos, noRespondidos, conNotas, etiqueta }
+
 class ChatsScreen extends StatefulWidget {
   final String? sessionId;
   final String? sessionKey;
@@ -43,6 +48,20 @@ class ChatsScreen extends StatefulWidget {
 class _ChatsScreenState extends State<ChatsScreen> {
   String? selectedChatPhone;
   String searchQuery = '';
+  // Búsqueda expandible: colapsada muestra solo el icono 🔍 junto al nombre de
+  // la sesión; al expandir, el campo tapa nombre+número para escribir cómodo.
+  bool _searchExpanded = false;
+  // Filtro rápido activo. Se aplica en memoria sobre los chats ya descargados
+  // por el StreamBuilder, antes del filtro de búsqueda — cero lecturas extra.
+  ChatFilter _activeFilter = ChatFilter.todos;
+  // Etiqueta activa cuando `_activeFilter == ChatFilter.etiqueta`. Es el id del
+  // doc en el catálogo; null en cualquier otro filtro.
+  String? _activeLabelId;
+  // Contadores por filtro. Los chips viven en el AppBar (fuera del StreamBuilder
+  // del body), así que el body los publica aquí y los chips se suscriben sin
+  // rebuildar toda la pantalla.
+  final ValueNotifier<({int unresponded, int notes})> _filterCounts =
+      ValueNotifier((unresponded: 0, notes: 0));
   final TextEditingController searchController = TextEditingController();
 
   StreamSubscription? _statusSubscription;
@@ -168,6 +187,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
     _labelsSubscription?.cancel();
     _pushTapSubscription?.cancel();
     _cancelledTimer?.cancel();
+    _filterCounts.dispose();
     ActiveChatTracker.instance.clear();
     super.dispose();
   }
@@ -462,7 +482,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
           },
           tooltip: 'Gestionar Cuentas',
         ),
-        title: StreamBuilder<DocumentSnapshot>(
+        title: _searchExpanded
+            ? _buildSearchField()
+            : StreamBuilder<DocumentSnapshot>(
           stream: FirebaseFirestore.instance
               .collection(accountsCollection)
               .doc(widget.accountId)
@@ -502,62 +524,47 @@ class _ChatsScreenState extends State<ChatsScreen> {
           },
         ),
         elevation: 0,
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.photo_library_outlined, size: 20),
-            tooltip: 'Galería de medios',
-            onPressed: () => _openMediaVault(),
-          ),
-          IconButton(
-            icon: const Icon(Icons.flash_on, size: 20),
-            tooltip: 'Respuestas rápidas',
-            onPressed: () => showModalBottomSheet(
-              context: context,
-              isScrollControlled: true,
-              backgroundColor: Colors.transparent,
-              builder: (_) => QuickResponsesPanel(
-                sessionId: widget.sessionId!,
-                accountId: widget.accountId,
-              ),
-            ),
-          ),
-        ],
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(68),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            child: TextField(
-              controller: searchController,
-              onChanged: (value) {
-                setState(() {
-                  searchQuery = value.toLowerCase();
-                });
-              },
-              style: const TextStyle(color: white),
-              decoration: InputDecoration(
-                hintText: 'Buscar contacto...',
-                hintStyle: const TextStyle(color: lightText),
-                prefixIcon: const Icon(Icons.search, color: lightText, size: 20),
-                suffixIcon: searchQuery.isNotEmpty
-                    ? IconButton(
-                        icon: const Icon(Icons.close, color: lightText, size: 20),
-                        onPressed: () {
-                          searchController.clear();
-                          setState(() {
-                            searchQuery = '';
-                          });
-                        },
-                      )
-                    : null,
-                filled: true,
-                fillColor: surfaceDark.withValues(alpha: 0.6),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: BorderSide.none,
+        // Expandido: solo la ✕ para cerrar (máximo ancho al campo). Colapsado:
+        // 🔍 junto al nombre + galería y respuestas rápidas.
+        actions: _searchExpanded
+            ? [
+                IconButton(
+                  icon: const Icon(Icons.close, size: 20),
+                  tooltip: 'Cerrar búsqueda',
+                  onPressed: _toggleSearch,
                 ),
-                contentPadding: const EdgeInsets.symmetric(vertical: 12, horizontal: 4),
-              ),
-            ),
+              ]
+            : [
+                IconButton(
+                  icon: const Icon(Icons.search, size: 20),
+                  tooltip: 'Buscar contacto',
+                  onPressed: _toggleSearch,
+                ),
+                IconButton(
+                  icon: const Icon(Icons.photo_library_outlined, size: 20),
+                  tooltip: 'Galería de medios',
+                  onPressed: () => _openMediaVault(),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.flash_on, size: 20),
+                  tooltip: 'Respuestas rápidas',
+                  onPressed: () => showModalBottomSheet(
+                    context: context,
+                    isScrollControlled: true,
+                    backgroundColor: Colors.transparent,
+                    builder: (_) => QuickResponsesPanel(
+                      sessionId: widget.sessionId!,
+                      accountId: widget.accountId,
+                    ),
+                  ),
+                ),
+              ],
+        bottom: PreferredSize(
+          // Solo la fila de chips: la búsqueda ahora vive en el AppBar.
+          preferredSize: const Size.fromHeight(48),
+          child: Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: _buildFilterChips(),
           ),
         ),
       ),
@@ -576,35 +583,112 @@ class _ChatsScreenState extends State<ChatsScreen> {
           }
 
           final allChats = snapshot.data!.docs;
-          final filteredChats = searchQuery.isEmpty
-              ? allChats
-              : allChats
-                  .where((chatDoc) {
-                    final chatData = chatDoc.data() as Map<String, dynamic>?;
-                    final phoneNumber = chatData?['phoneNumber'] as String? ?? '';
-                    final contactName = chatData?['contactName'] as String? ?? '';
-                    // La nota también es buscable: ej. "hombre" encuentra el
-                    // chat anotado "Quiere masaje pero es hombre".
-                    final note = chatData?['note'] as String? ?? '';
-                    return phoneNumber.toLowerCase().contains(searchQuery) ||
-                           contactName.toLowerCase().contains(searchQuery) ||
-                           note.toLowerCase().contains(searchQuery);
-                  })
-                  .toList();
+
+          // Publicamos los totales por filtro para que los chips del AppBar
+          // muestren su badge. Post-frame para no notificar durante el build.
+          final unrespondedTotal = allChats.where((d) {
+            final m = d.data() as Map<String, dynamic>?;
+            return ((m?['unresponded_count'] as num?)?.toInt() ?? 0) > 0;
+          }).length;
+          final notesTotal = allChats.where((d) {
+            final m = d.data() as Map<String, dynamic>?;
+            return ((m?['note'] as String?) ?? '').trim().isNotEmpty;
+          }).length;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            final next = (unresponded: unrespondedTotal, notes: notesTotal);
+            if (mounted && _filterCounts.value != next) {
+              _filterCounts.value = next;
+            }
+          });
+
+          // 1) Filtro rápido (chip activo). 2) Búsqueda. Se encadenan: puedes
+          // buscar dentro de un filtro.
+          final filteredChats = allChats.where((chatDoc) {
+            final chatData = chatDoc.data() as Map<String, dynamic>?;
+
+            // Filtro rápido
+            switch (_activeFilter) {
+              case ChatFilter.todos:
+                break;
+              case ChatFilter.noRespondidos:
+                if (((chatData?['unresponded_count'] as num?)?.toInt() ?? 0) ==
+                    0) {
+                  return false;
+                }
+              case ChatFilter.conNotas:
+                if (((chatData?['note'] as String?) ?? '').trim().isEmpty) {
+                  return false;
+                }
+              case ChatFilter.etiqueta:
+                // Si la etiqueta activa fue eliminada del catálogo, degradamos
+                // a "todos" (no ocultamos chats por un id huérfano).
+                if (_activeLabelId != null &&
+                    _labelsCatalog.containsKey(_activeLabelId)) {
+                  final ids = ((chatData?['labelIds'] as List?) ?? const [])
+                      .whereType<String>();
+                  if (!ids.contains(_activeLabelId)) return false;
+                }
+            }
+
+            // Búsqueda (vacía = pasa todo). La nota también es buscable:
+            // ej. "hombre" encuentra el chat anotado "Quiere masaje pero es
+            // hombre".
+            if (searchQuery.isEmpty) return true;
+            final phoneNumber = chatData?['phoneNumber'] as String? ?? '';
+            final contactName = chatData?['contactName'] as String? ?? '';
+            final note = chatData?['note'] as String? ?? '';
+            return phoneNumber.toLowerCase().contains(searchQuery) ||
+                contactName.toLowerCase().contains(searchQuery) ||
+                note.toLowerCase().contains(searchQuery);
+          }).toList();
 
           if (filteredChats.isEmpty) {
+            // Empty state contextual: prioridad búsqueda > filtro activo >
+            // bandeja vacía. Así el copy explica por qué no hay nada a la vista.
+            final IconData emptyIcon;
+            final String emptyTitle;
+            final String emptySubtitle;
+            if (searchQuery.isNotEmpty) {
+              emptyIcon = Icons.search_off;
+              emptyTitle = 'No se encontraron resultados';
+              emptySubtitle = 'Intenta con otro contacto o número';
+            } else if (_activeFilter == ChatFilter.noRespondidos) {
+              emptyIcon = Icons.mark_chat_read_outlined;
+              emptyTitle = 'Todo respondido';
+              emptySubtitle = 'No tienes mensajes pendientes por responder';
+            } else if (_activeFilter == ChatFilter.conNotas) {
+              emptyIcon = Icons.sticky_note_2_outlined;
+              emptyTitle = 'Sin notas';
+              emptySubtitle = 'Ningún chat tiene una nota todavía';
+            } else if (_activeFilter == ChatFilter.etiqueta) {
+              final labelName = _labelsCatalog[_activeLabelId]?.name ?? '';
+              emptyIcon = Icons.label_off_outlined;
+              emptyTitle = 'Sin chats con esta etiqueta';
+              emptySubtitle = labelName.isEmpty
+                  ? 'Ningún chat tiene esta etiqueta'
+                  : 'Ningún chat tiene la etiqueta "$labelName"';
+            } else {
+              emptyIcon = Icons.chat_bubble_outline;
+              emptyTitle = 'Sin chats';
+              emptySubtitle =
+                  'Los chats aparecerán aquí cuando recibas mensajes';
+            }
+            // El botón "Ir a Mis Cuentas" solo tiene sentido en la bandeja
+            // realmente vacía, no cuando un filtro/búsqueda no arroja nada.
+            final showAccountsCta =
+                searchQuery.isEmpty && _activeFilter == ChatFilter.todos;
             return Center(
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
                   Icon(
-                    searchQuery.isEmpty ? Icons.chat_bubble_outline : Icons.search_off,
+                    emptyIcon,
                     size: 48,
                     color: primaryAqua.withValues(alpha: 0.5),
                   ),
                   const SizedBox(height: 16),
                   Text(
-                    searchQuery.isEmpty ? 'Sin chats' : 'No se encontraron resultados',
+                    emptyTitle,
                     style: const TextStyle(
                       fontSize: 18,
                       fontWeight: FontWeight.w600,
@@ -613,15 +697,14 @@ class _ChatsScreenState extends State<ChatsScreen> {
                   ),
                   const SizedBox(height: 8),
                   Text(
-                    searchQuery.isEmpty
-                        ? 'Los chats aparecerán aquí cuando recibas mensajes'
-                        : 'Intenta con otro contacto o número',
+                    emptySubtitle,
+                    textAlign: TextAlign.center,
                     style: const TextStyle(
                       fontSize: 14,
                       color: lightText,
                     ),
                   ),
-                  if (searchQuery.isEmpty) ...[
+                  if (showAccountsCta) ...[
                     const SizedBox(height: 24),
                     ElevatedButton.icon(
                       onPressed: () => Navigator.pop(context),
@@ -706,6 +789,102 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 child: tile,
               );
             },
+          );
+        },
+      ),
+    );
+  }
+
+  // Alterna la búsqueda expandible. Al cerrar limpia el término para no dejar
+  // la lista filtrada de forma invisible (sin el campo a la vista).
+  void _toggleSearch() {
+    setState(() {
+      _searchExpanded = !_searchExpanded;
+      if (!_searchExpanded) {
+        searchController.clear();
+        searchQuery = '';
+      }
+    });
+  }
+
+  // Campo de búsqueda que ocupa el slot del título cuando está expandido.
+  // Autofocus para que el teclado aparezca apenas se toca el icono.
+  Widget _buildSearchField() {
+    return TextField(
+      controller: searchController,
+      autofocus: true,
+      onChanged: (value) => setState(() => searchQuery = value.toLowerCase()),
+      style: const TextStyle(color: white, fontSize: 18),
+      cursorColor: primaryAqua,
+      decoration: const InputDecoration(
+        hintText: 'Buscar contacto...',
+        hintStyle: TextStyle(color: lightText, fontSize: 18),
+        border: InputBorder.none,
+        isCollapsed: true,
+      ),
+    );
+  }
+
+  // Fila horizontal de chips de filtro rápido (estilo WhatsApp). Vive en el
+  // AppBar, así que lee los contadores vía ValueListenableBuilder para que su
+  // badge se actualice sin rebuildar toda la pantalla.
+  Widget _buildFilterChips() {
+    // Etiquetas del catálogo ordenadas, para pintar un chip por cada una.
+    final labels = _labelsCatalog.values.toList()
+      ..sort((a, b) => a.order.compareTo(b.order));
+
+    return SizedBox(
+      height: 36,
+      child: ValueListenableBuilder<({int unresponded, int notes})>(
+        valueListenable: _filterCounts,
+        builder: (context, counts, _) {
+          return ListView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            children: [
+              _FilterChip(
+                label: 'Todos',
+                selected: _activeFilter == ChatFilter.todos,
+                onTap: () => setState(() {
+                  _activeFilter = ChatFilter.todos;
+                  _activeLabelId = null;
+                }),
+              ),
+              const SizedBox(width: 8),
+              _FilterChip(
+                label: 'Pendientes',
+                count: counts.unresponded,
+                selected: _activeFilter == ChatFilter.noRespondidos,
+                onTap: () => setState(() {
+                  _activeFilter = ChatFilter.noRespondidos;
+                  _activeLabelId = null;
+                }),
+              ),
+              const SizedBox(width: 8),
+              _FilterChip(
+                label: 'Con notas',
+                count: counts.notes,
+                selected: _activeFilter == ChatFilter.conNotas,
+                onTap: () => setState(() {
+                  _activeFilter = ChatFilter.conNotas;
+                  _activeLabelId = null;
+                }),
+              ),
+              // Un chip por etiqueta del catálogo, con su propio color. Tocar
+              // filtra los chats que la tengan asignada.
+              for (final label in labels) ...[
+                const SizedBox(width: 8),
+                _LabelFilterChip(
+                  label: label,
+                  selected: _activeFilter == ChatFilter.etiqueta &&
+                      _activeLabelId == label.id,
+                  onTap: () => setState(() {
+                    _activeFilter = ChatFilter.etiqueta;
+                    _activeLabelId = label.id;
+                  }),
+                ),
+              ],
+            ],
           );
         },
       ),
@@ -1369,7 +1548,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 maxLength: 200,
                 style: const TextStyle(color: white, fontSize: 14),
                 decoration: InputDecoration(
-                  hintText: 'Ej: Quiere masaje pero es hombre',
+                  hintText: 'Ej: El masajes es para dos personas',
                   hintStyle: TextStyle(color: white.withValues(alpha: 0.3)),
                   filled: true,
                   fillColor: darkBg.withValues(alpha: 0.4),
@@ -1565,6 +1744,158 @@ class _MessagesNoteStrip extends StatelessWidget {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+// Pill seleccionable de la barra de filtros rápidos. Activo: relleno aqua con
+// texto oscuro. Inactivo: superficie tenue con borde sutil. Opcionalmente
+// muestra un badge con el conteo (en `badgeColor`) cuando hay elementos.
+class _FilterChip extends StatelessWidget {
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+  final int count;
+
+  const _FilterChip({
+    required this.label,
+    required this.selected,
+    required this.onTap,
+    this.count = 0,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final Color bg = selected ? primaryAqua : surfaceDark.withValues(alpha: 0.6);
+    final Color fg = selected ? darkBg : lightText;
+
+    return Center(
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(18),
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 180),
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+            decoration: BoxDecoration(
+              color: bg,
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(
+                color: selected
+                    ? Colors.transparent
+                    : white.withValues(alpha: 0.08),
+              ),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  label,
+                  style: TextStyle(
+                    color: fg,
+                    fontSize: 13,
+                    fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                  ),
+                ),
+                // Badge de conteo neutro: mismo color que el texto del chip,
+                // sobre un pill tenue del mismo tono. Sin color propio para no
+                // recargar la barra de filtros visualmente.
+                if (count > 0) ...[
+                  const SizedBox(width: 6),
+                  Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                    decoration: BoxDecoration(
+                      color: fg.withValues(alpha: selected ? 0.22 : 0.12),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Text(
+                      '$count',
+                      style: TextStyle(
+                        color: fg,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// Chip de filtro por etiqueta. Usa el color propio de la etiqueta: seleccionado
+// va relleno (texto por luminancia para contraste); sin seleccionar muestra un
+// tinte tenue con punto de color y texto coloreado, para diferenciarse de los
+// chips fijos sin perder identidad visual.
+class _LabelFilterChip extends StatelessWidget {
+  final ChatLabel label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  const _LabelFilterChip({
+    required this.label,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final color = label.color;
+    final fgSelected =
+        color.computeLuminance() > 0.55 ? darkBg : Colors.white;
+
+    return Center(
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(18),
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 180),
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+            decoration: BoxDecoration(
+              color:
+                  selected ? color : color.withValues(alpha: 0.15),
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(
+                color: selected
+                    ? Colors.transparent
+                    : color.withValues(alpha: 0.4),
+              ),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // Punto de color solo cuando no está seleccionado (al estar
+                // seleccionado el relleno ya es el color de la etiqueta).
+                if (!selected) ...[
+                  Container(
+                    width: 8,
+                    height: 8,
+                    decoration:
+                        BoxDecoration(color: color, shape: BoxShape.circle),
+                  ),
+                  const SizedBox(width: 6),
+                ],
+                Text(
+                  label.name,
+                  style: TextStyle(
+                    color: selected ? fgSelected : color,
+                    fontSize: 13,
+                    fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                  ),
+                ),
+              ],
+            ),
+          ),
         ),
       ),
     );
