@@ -124,7 +124,7 @@ export function buildTemporalContext(timezone: string): string {
 // los mensajes llegaron con segundos de diferencia, entiende que es una
 // conversación fresca y continua, no un reencuentro tras días.
 const TIMESTAMP_METADATA_NOTE =
-  'Cada mensaje del historial viene prefijado con su fecha/hora entre corchetes, ej. "[dom 8 jun, 1:49 p. m.]". Eso es METADATA para que entiendas cuánto tiempo pasó entre mensajes: úsalo para no saludar como "de nuevo" si la conversación es continua, ni asumir que retomas algo viejo cuando en realidad acaba de empezar. NUNCA copies esos corchetes en tu respuesta.';
+  'Cada mensaje del historial viene prefijado con su fecha/hora entre corchetes, ej. "[dom 8 jun, 1:49 p. m.]". Eso es METADATA para que entiendas cuánto tiempo pasó entre mensajes: úsalo para no saludar como "de nuevo" si la conversación es continua, ni asumir que retomas algo viejo cuando en realidad acaba de empezar.En tu mensaje de salida NUNCA incluyas estos corchetes [fecha y hora] en tu respuesta.';
 
 // Formatea el timestamp de un mensaje (Firestore Timestamp, epoch ms o ISO)
 // a una etiqueta compacta en la zona del negocio. Devuelve null si no parsea.
