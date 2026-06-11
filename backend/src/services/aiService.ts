@@ -124,7 +124,17 @@ export function buildTemporalContext(timezone: string): string {
 // los mensajes llegaron con segundos de diferencia, entiende que es una
 // conversación fresca y continua, no un reencuentro tras días.
 const TIMESTAMP_METADATA_NOTE =
-  'Cada mensaje del historial viene prefijado con su fecha/hora entre corchetes, ej. "[dom 8 jun, 1:49 p. m.]". Eso es METADATA para que entiendas cuánto tiempo pasó entre mensajes: úsalo para no saludar como "de nuevo" si la conversación es continua, ni asumir que retomas algo viejo cuando en realidad acaba de empezar.En tu mensaje de salida NUNCA incluyas estos corchetes [fecha y hora] en tu respuesta.';
+  'En el historial, cada mensaje viene prefijado con su fecha/hora entre corchetes, ej. "[dom 8 jun, 1:49 p. m.]". Eso es METADATA INTERNA para que percibas cuánto tiempo pasó entre mensajes: úsalo para no saludar como "de nuevo" si la conversación es continua, ni asumir que retomas algo viejo cuando en realidad acaba de empezar.\n\nREGLA ESTRICTA DE FORMATO DE SALIDA: tu respuesta es un mensaje de WhatsApp que verá el cliente. NUNCA escribas corchetes con fecha ni hora, ni imites ese formato "[día, hora]" al inicio ni en medio de tu texto. El cliente jamás debe ver una marca de tiempo entre corchetes. Empieza tu respuesta directamente con el contenido, sin ningún corchete.';
+
+// Red de seguridad: aunque el prompt le pide explícitamente al modelo NO copiar
+// los corchetes de fecha/hora del historial, a veces igual se filtran (los LLM
+// no siguen instrucciones de formato al 100%). Acá eliminamos cualquier bloque
+// "[ ... H:MM ... ]" que el modelo haya prependeado o incrustado imitando la
+// metadata temporal. El patrón exige una hora tipo "1:49" dentro del corchete,
+// así no tocamos corchetes legítimos del negocio (ej. "[NOTA]", "[oferta 2x1]").
+function stripTimestampBrackets(text: string): string {
+  return text.replace(/\[[^\]\n]*\d{1,2}:\d{2}[^\]\n]*\]\s*/g, '').trimStart();
+}
 
 // Formatea el timestamp de un mensaje (Firestore Timestamp, epoch ms o ISO)
 // a una etiqueta compacta en la zona del negocio. Devuelve null si no parsea.
@@ -189,10 +199,11 @@ export async function generateAIResponse(
       : '';
     const temporalSystemPrompt = `${buildTemporalContext(timezone)}\n\n${TIMESTAMP_METADATA_NOTE}\n\n${systemPrompt}${operatorBlock}`;
 
+    let raw: string | null;
     if (provider === 'openai' || provider === 'deepseek') {
       // Ambos comparten la misma ruta OpenAI-compatible; DeepSeek solo añade baseURL.
       const isDeepSeek = provider === 'deepseek';
-      return await generateAIResponseOpenAI(
+      raw = await generateAIResponseOpenAI(
         (isDeepSeek ? deepseekApiKey : openaiApiKey) || apiKey,
         temporalSystemPrompt,
         history,
@@ -200,13 +211,16 @@ export async function generateAIResponse(
         isDeepSeek ? DEEPSEEK_BASE_URL : undefined
       );
     } else {
-      return await generateAIResponseGemini(
+      raw = await generateAIResponseGemini(
         apiKey,
         temporalSystemPrompt,
         history,
         modelName
       );
     }
+
+    // Red de seguridad contra fuga de la metadata temporal del historial.
+    return raw ? stripTimestampBrackets(raw) : raw;
   } catch (error) {
     console.error('[AI] Error calling AI service:', error);
     return null;
