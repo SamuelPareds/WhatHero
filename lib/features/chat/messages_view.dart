@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -279,23 +280,93 @@ class _MessagesViewState extends State<MessagesView> {
           'accountId': widget.accountId,
           if (instruction.isNotEmpty) 'operatorInstruction': instruction,
         }),
-      ).timeout(const Duration(seconds: 30));
+      ).timeout(const Duration(seconds: 45)); // > 25s del timeout backend
 
-      if (response.statusCode == 200 && mounted) {
+      if (!mounted) return;
+
+      if (response.statusCode == 200) {
         final data = jsonDecode(response.body) as Map<String, dynamic>;
-        final text = data['suggestedText'] as String? ?? '';
+        final text = (data['suggestedText'] as String? ?? '').trim();
+        if (text.isEmpty) {
+          // Caso raro: 200 pero sin texto. Avisamos en vez de quedarnos mudos.
+          _showAiError('La IA no devolvió texto. Reintenta.', operatorInstruction: operatorInstruction);
+          return;
+        }
         setState(() => _messageController.text = text);
         _messageController.selection = TextSelection.fromPosition(
           TextPosition(offset: text.length),
         );
+      } else {
+        // El backend manda `{ error, code }`. Traducimos el code a un mensaje claro.
+        String? code;
+        String? backendMsg;
+        try {
+          final body = jsonDecode(response.body) as Map<String, dynamic>;
+          code = body['code'] as String?;
+          backendMsg = body['error'] as String?;
+        } catch (_) {/* cuerpo no-JSON: usamos el status */}
+        _showAiError(
+          _friendlyAiError(code, backendMsg, response.statusCode),
+          operatorInstruction: operatorInstruction,
+        );
+      }
+    } on TimeoutException {
+      if (mounted) {
+        _showAiError('La IA tardó demasiado en responder. Reintenta.', operatorInstruction: operatorInstruction);
       }
     } catch (e) {
       debugPrint('Error generating AI response: $e');
+      if (mounted) {
+        _showAiError('No se pudo conectar para generar la respuesta.', operatorInstruction: operatorInstruction);
+      }
     } finally {
       if (mounted) {
         setState(() => _isGenerating = false);
       }
     }
+  }
+
+  // Traduce el `code` del backend a un mensaje accionable para el operador.
+  // Si no hay code conocido, cae al mensaje del backend o al status HTTP.
+  String _friendlyAiError(String? code, String? backendMsg, int status) {
+    switch (code) {
+      case 'timeout':
+        return 'La IA tardó demasiado en responder. Reintenta.';
+      case 'rate_limit':
+        return 'El proveedor de IA está saturado o llegaste al límite. Espera unos segundos y reintenta.';
+      case 'auth':
+        return 'Las credenciales del proveedor de IA no son válidas. Revísalas en ajustes.';
+      case 'provider_down':
+        return 'El proveedor de IA tuvo un error. Reintenta en un momento.';
+      case 'safety_block':
+        return 'La respuesta fue bloqueada por los filtros del modelo. Reformula con una instrucción.';
+      case 'empty_response':
+        return 'La IA no devolvió texto. Reintenta.';
+      case 'empty_history':
+        return 'No hay mensajes suficientes para generar una respuesta.';
+      default:
+        return (backendMsg != null && backendMsg.isNotEmpty)
+            ? backendMsg
+            : 'No se pudo generar la respuesta (error $status).';
+    }
+  }
+
+  // SnackBar de error rojo con acción "Reintentar" que reusa la misma instrucción
+  // del operador. Solo aplica al modo manual (botón auto_awesome) — el
+  // auto-responder no pasa por aquí.
+  void _showAiError(String message, {String? operatorInstruction}) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: Colors.red.shade600,
+        duration: const Duration(seconds: 6),
+        action: SnackBarAction(
+          label: 'Reintentar',
+          textColor: Colors.white,
+          onPressed: () => _generateAIResponse(operatorInstruction: operatorInstruction),
+        ),
+      ),
+    );
   }
 
   // Abre un cuadro para que el operador escriba una instrucción puntual antes de

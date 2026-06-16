@@ -30,6 +30,55 @@ const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
 
 export type AiProvider = 'gemini' | 'openai' | 'deepseek';
 
+// Error estructurado de IA con un `code` estable que el endpoint manual traduce
+// a HTTP + mensaje claro para el operador. SOLO se usa en el modo copiloto
+// (botón auto_awesome): el auto-responder nunca pide `throwOnError`, así que para
+// él el comportamiento sigue siendo "ante cualquier fallo, devolver null y NO
+// enviar nada". Esa garantía es intencional y no debe romperse.
+export class AiError extends Error {
+  constructor(public code: string, message: string) {
+    super(message);
+    this.name = 'AiError';
+  }
+}
+
+// Corta la espera de una promesa a los `ms` indicados. Importante: NO cancela la
+// request subyacente (el SDK la seguirá resolviendo en background), solo deja de
+// esperarla para poder responderle al operador en un tiempo acotado.
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(
+        () => reject(new AiError('timeout', `La IA no respondió en ${Math.round(ms / 1000)}s.`)),
+        ms
+      )
+    ),
+  ]);
+}
+
+// Traduce un error crudo del proveedor a un AiError con `code` estable. Mira el
+// status HTTP del SDK (OpenAI/DeepSeek lo exponen en `.status`) y, como fallback,
+// olfatea el mensaje de Gemini (que lanza al bloquear por safety).
+function classifyAiError(error: any): AiError {
+  if (error instanceof AiError) return error;
+  const status = error?.status ?? error?.response?.status;
+  const msg = error?.message || 'Error desconocido del proveedor de IA';
+  if (status === 401 || status === 403) {
+    return new AiError('auth', 'Credenciales del proveedor de IA inválidas o sin permisos.');
+  }
+  if (status === 429) {
+    return new AiError('rate_limit', 'El proveedor de IA está saturado o alcanzaste el límite de uso.');
+  }
+  if (typeof status === 'number' && status >= 500) {
+    return new AiError('provider_down', 'El proveedor de IA tuvo un error interno.');
+  }
+  if (/safety|blocked|candidate|recitation/i.test(msg)) {
+    return new AiError('safety_block', 'La respuesta fue bloqueada por los filtros de seguridad del modelo.');
+  }
+  return new AiError('provider_error', msg);
+}
+
 export function emitAiState(
   accountId: string,
   sessionKey: string,
@@ -176,11 +225,18 @@ export async function generateAIResponse(
   openaiApiKey?: string,
   deepseekApiKey?: string,
   timezone: string = DEFAULT_TIMEZONE,
-  operatorInstruction?: string
+  operatorInstruction?: string,
+  // Opciones SOLO usadas por el endpoint manual (copiloto). El auto-responder no
+  // las pasa → `throwOnError=false` y sin timeout = comportamiento idéntico al
+  // histórico: ante cualquier fallo devuelve null y el caller NO envía nada.
+  options?: { throwOnError?: boolean; timeoutMs?: number }
 ): Promise<string | null> {
+  const throwOnError = options?.throwOnError ?? false;
+  const timeoutMs = options?.timeoutMs;
   try {
     // Sin historial no hay nada que responder (caso muy edge: Firestore vacío).
     if (!history || history.length === 0) {
+      if (throwOnError) throw new AiError('empty_history', 'No hay mensajes suficientes para generar una respuesta.');
       console.warn('[AI] generateAIResponse llamado con history vacío, abortando.');
       return null;
     }
@@ -199,11 +255,11 @@ export async function generateAIResponse(
       : '';
     const temporalSystemPrompt = `${buildTemporalContext(timezone)}\n\n${TIMESTAMP_METADATA_NOTE}\n\n${systemPrompt}${operatorBlock}`;
 
-    let raw: string | null;
+    let call: Promise<string | null>;
     if (provider === 'openai' || provider === 'deepseek') {
       // Ambos comparten la misma ruta OpenAI-compatible; DeepSeek solo añade baseURL.
       const isDeepSeek = provider === 'deepseek';
-      raw = await generateAIResponseOpenAI(
+      call = generateAIResponseOpenAI(
         (isDeepSeek ? deepseekApiKey : openaiApiKey) || apiKey,
         temporalSystemPrompt,
         history,
@@ -211,7 +267,7 @@ export async function generateAIResponse(
         isDeepSeek ? DEEPSEEK_BASE_URL : undefined
       );
     } else {
-      raw = await generateAIResponseGemini(
+      call = generateAIResponseGemini(
         apiKey,
         temporalSystemPrompt,
         history,
@@ -219,9 +275,21 @@ export async function generateAIResponse(
       );
     }
 
+    // Timeout solo en modo manual (cuando se pasa timeoutMs). El auto-responder
+    // conserva su espera sin límite explícito de hoy.
+    const raw = timeoutMs ? await withTimeout(call, timeoutMs) : await call;
+
     // Red de seguridad contra fuga de la metadata temporal del historial.
-    return raw ? stripTimestampBrackets(raw) : raw;
+    const text = raw ? stripTimestampBrackets(raw) : raw;
+    if (throwOnError && (!text || !text.trim())) {
+      throw new AiError('empty_response', 'El modelo no devolvió texto.');
+    }
+    return text;
   } catch (error) {
+    // Modo manual (copiloto): propagamos un error tipado para que el endpoint lo
+    // traduzca a HTTP + mensaje claro. Modo auto-responder: tragamos el error y
+    // devolvemos null → el caller no envía nada (contrato intencional).
+    if (throwOnError) throw classifyAiError(error);
     console.error('[AI] Error calling AI service:', error);
     return null;
   }
@@ -261,8 +329,10 @@ async function generateAIResponseGemini(
     });
     return result.response.text();
   } catch (error) {
+    // Logueamos y re-lanzamos: el catch externo de generateAIResponse decide si
+    // tragar (auto-responder → null) o clasificar y propagar (manual → throw).
     console.error('[AI] Error calling Gemini:', error);
-    return null;
+    throw error;
   }
 }
 
@@ -298,8 +368,10 @@ async function generateAIResponseOpenAI(
 
     return response.choices[0]?.message.content || null;
   } catch (error) {
+    // Logueamos y re-lanzamos: el catch externo de generateAIResponse decide si
+    // tragar (auto-responder → null) o clasificar y propagar (manual → throw).
     console.error('[AI] Error calling OpenAI:', error);
-    return null;
+    throw error;
   }
 }
 

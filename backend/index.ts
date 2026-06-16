@@ -17,7 +17,20 @@ import cron from 'node-cron';
 import { SessionData, MessageBuffer } from './src/types';
 import { extractPhoneNumber, storeLIDMapping, resolveLIDViaSock, isConversationalJid } from './src/utils/phone';
 import { initializeSession, saveMessageToFirestore, getAIConfig, cacheContactName, applyContactUpdate, reconcileContactNames, consolidateLIDChat, incrementUnrespondedCount, resetUnrespondedCount, writeMediaIndexEntry, isIndexableMedia } from './src/services/firestoreService';
-import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer, emitAiState, getSessionTimezone } from './src/services/aiService';
+import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer, emitAiState, getSessionTimezone, AiError } from './src/services/aiService';
+
+// Mapeo de códigos de AiError → HTTP para el endpoint manual (copiloto). El
+// frontend usa el `code` para mostrar un mensaje claro con acción "Reintentar".
+const AI_ERROR_HTTP: Record<string, number> = {
+  timeout: 504,
+  rate_limit: 429,
+  auth: 502,
+  provider_down: 502,
+  provider_error: 502,
+  safety_block: 422,
+  empty_response: 502,
+  empty_history: 422,
+};
 import { extractMediaInfo, classifyIncomingMedia } from './src/services/mediaService';
 import { ReminderService } from './src/services/reminderService';
 import { sendHumanAttentionNotification } from './src/services/notificationService';
@@ -1073,6 +1086,10 @@ app.post('/generate-ai-response', express.json(), verifyHttpAuth(), async (req, 
     // El history ya incluye el último mensaje del cliente al final; no
     // hace falta extraerlo aparte. `generateAIResponse` lo trata como el
     // turn user actual y responde como model.
+    //
+    // throwOnError + timeoutMs: SOLO el modo manual (copiloto). Así el operador
+    // recibe un error tipado si algo falla, sin afectar al auto-responder.
+    const startedAt = Date.now();
     const suggestedText = await generateAIResponse(
       aiConfig.apiKey,
       aiConfig.systemPrompt,
@@ -1082,15 +1099,22 @@ app.post('/generate-ai-response', express.json(), verifyHttpAuth(), async (req, 
       aiConfig.openaiApiKey,
       aiConfig.deepseekApiKey,
       timezone,
-      operatorInstruction
+      operatorInstruction,
+      { throwOnError: true, timeoutMs: 25000 }
     );
-
-    if (!suggestedText) {
-      return res.status(500).json({ error: 'AI failed to generate response' });
-    }
+    console.log(
+      `[/generate-ai-response] provider=${provider} model=${aiConfig.model} historyLen=${history.length} latencyMs=${Date.now() - startedAt}`
+    );
 
     res.json({ suggestedText });
   } catch (error) {
+    // AiError tipado → status + code para que el frontend muestre el mensaje
+    // correcto. Cualquier otro error cae al 500 genérico.
+    if (error instanceof AiError) {
+      const status = AI_ERROR_HTTP[error.code] ?? 502;
+      console.warn(`[/generate-ai-response] AiError code=${error.code} status=${status} msg=${error.message}`);
+      return res.status(status).json({ error: error.message, code: error.code });
+    }
     console.error('Error generating AI response:', error);
     res.status(500).json({
       error: 'Failed to generate response',
