@@ -2,6 +2,7 @@ import admin from 'firebase-admin';
 import { toNumber } from '@whiskeysockets/baileys';
 import { SessionData, SenderInfo } from '../types';
 import { extractPhoneNumber, isConversationalJid } from '../utils/phone';
+import { unwrapMessageContent } from '../utils/message';
 import { ACCOUNTS_COLLECTION } from '../config/env';
 import { extractMediaInfo, processMediaAsync } from './mediaService';
 import { WHATSAPP_SENDER } from './senderResolver';
@@ -336,6 +337,13 @@ export async function saveMessageToFirestore(
   explicitSenderInfo?: SenderInfo,
 ) {
   try {
+    // Desempaquetar sobres (ephemeral / viewOnce) ANTES de cualquier extracción.
+    // Sin esto, en chats con mensajes temporales el contenido real queda anidado
+    // y se persistiría un mensaje vacío (burbuja fantasma). Reasignamos sobre el
+    // mismo `message` para que todas las lecturas `message.message.*` de abajo
+    // vean el contenido normalizado.
+    message = unwrapMessageContent(message);
+
     const session = sessions.get(sessionKey);
     if (!session?.phoneNumber) {
       console.warn('Session phone number not set, cannot save message');
@@ -470,11 +478,18 @@ export async function saveMessageToFirestore(
     // Política WhatHero: ambos casos se mergean en el doc target; NO
     // borramos el mensaje original. Para revokes preservamos el texto como
     // evidencia (el operador decide manualmente si purgar). Para edits
-    // sobreescribimos el texto y marcamos `edited: true`. Otros tipos de
-    // protocolMessage (ephemeral settings, etc) los dejamos pasar — caen
-    // al flujo normal y aparecen como burbujas vacías = canary.
+    // sobreescribimos el texto y marcamos `edited: true`.
+    //
+    // Cualquier OTRO tipo de protocolMessage (3 = EPHEMERAL_SETTING, 4 = sync,
+    // 6 = key-share, etc.) es metadata de configuración del chat, NO conversación.
+    // Lo descartamos sin escribir: antes caían al flujo normal y generaban
+    // burbujas vacías (el caso clásico al activar mensajes temporales).
     // ============================================
     const protocolMessage = message.message?.protocolMessage;
+    if (protocolMessage && protocolMessage.type !== 0 && protocolMessage.type !== 14) {
+      console.log(`[Protocol] type=${protocolMessage.type} (metadata no-conversacional) en chat ${phoneNumber}, ignorando`);
+      return;
+    }
     if (protocolMessage && (protocolMessage.type === 0 || protocolMessage.type === 14)) {
       const targetMessageId = protocolMessage.key?.id;
       if (!targetMessageId) {
@@ -555,6 +570,16 @@ export async function saveMessageToFirestore(
     // ============================================
     const mediaInfo = extractMediaInfo(message);
     const mediaFields = mediaInfo?.firestoreFields ?? {};
+
+    // Guardia anti-burbuja-fantasma: si tras desempaquetar no hay ni texto ni
+    // media, el mensaje no tiene nada que renderizar (sobres de sistema, payloads
+    // desconocidos, etc.). No escribimos el doc para no crear una burbuja vacía.
+    // Las reacciones y protocolos 0/14 ya retornaron antes, así que esto sólo
+    // atrapa contenido genuinamente vacío.
+    if (!messageText.trim() && !mediaInfo) {
+      console.log(`[Filter] Mensaje sin contenido renderizable en chat ${phoneNumber}, no se persiste`);
+      return;
+    }
 
     // Preview que ve el operador en la lista de chats con un icono por tipo.
     const lastMessagePreview = (() => {
