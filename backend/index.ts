@@ -16,6 +16,7 @@ import { randomUUID } from 'crypto';
 import cron from 'node-cron';
 import { SessionData, MessageBuffer } from './src/types';
 import { extractPhoneNumber, storeLIDMapping, resolveLIDViaSock, isConversationalJid } from './src/utils/phone';
+import { unwrapMessageContent } from './src/utils/message';
 import { initializeSession, saveMessageToFirestore, getAIConfig, cacheContactName, applyContactUpdate, reconcileContactNames, consolidateLIDChat, incrementUnrespondedCount, resetUnrespondedCount, writeMediaIndexEntry, isIndexableMedia } from './src/services/firestoreService';
 import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer, emitAiState, getSessionTimezone, AiError } from './src/services/aiService';
 
@@ -392,8 +393,14 @@ async function startSession(sessionKey: string, accountId: string) {
 
   // Listen for incoming and outgoing messages
   sock.ev.on('messages.upsert', async (m) => {
-    const message = m.messages?.[0];
-    if (!message) return;
+    const rawMessage = m.messages?.[0];
+    if (!rawMessage) return;
+
+    // Desempaquetar sobres (ephemeral / viewOnce) una sola vez al entrar.
+    // Así TODO el handler (detección de metadata, extracción de texto entrante,
+    // keyword rules outgoing y flujo de IA) ve el contenido real. El desempaque
+    // dentro de saveMessageToFirestore queda como no-op idempotente.
+    const message = unwrapMessageContent(rawMessage);
 
     // Filtro temprano: descartamos Estados/Stories, listas de difusión y canales
     // antes de tocar Firestore, IA, recordatorios o contadores. Son ruido para el CRM.
@@ -402,17 +409,18 @@ async function startSession(sessionKey: string, accountId: string) {
       return;
     }
 
-    // Eventos de metadata sobre un mensaje existente: reacciones, edits y
-    // revokes. saveMessageToFirestore los mergea en el doc target. Cortamos
-    // acá para que NO disparen IA, buffers, keyword rules ni contadores de
-    // pendientes — son ediciones de algo ya existente, no conversación nueva.
-    //   protocolMessage.type 0  = REVOKE
-    //   protocolMessage.type 14 = MESSAGE_EDIT
-    const protocolType = message.message?.protocolMessage?.type;
+    // Eventos de metadata, NO conversación nueva. Cortamos acá para que no
+    // disparen IA, buffers, keyword rules ni contadores de pendientes:
+    //   - reactionMessage           → emoji sobre un mensaje existente
+    //   - protocolMessage type 0/14 → revoke / edit (se mergean en el target)
+    //   - cualquier otro protocolMessage (3=ephemeral setting, 4=sync, etc.) →
+    //     metadata de configuración del chat; saveMessageToFirestore lo descarta
+    //     sin escribir. Sin este corte, en chats con mensajes temporales el
+    //     setting efímero entrante llegaría al flujo de IA y bumpearía el
+    //     contador "tu turno" con un mensaje fantasma.
     const isMetadataEvent =
       !!message.message?.reactionMessage ||
-      protocolType === 0 ||
-      protocolType === 14;
+      !!message.message?.protocolMessage;
     if (isMetadataEvent) {
       await saveMessageToFirestore(message, sessionKey, accountId, sessions, sock.user?.id, sock);
       return;
