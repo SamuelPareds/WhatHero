@@ -53,5 +53,12 @@
 	<true/>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
+	<!-- Permite que iOS despierte la app en background para entregar el
+	     payload de datos del push (FCM) y procesar el deep-link al chat. -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>remote-notification</string>
+		<string>fetch</string>
+	</array>
 </dict>
 </plist>

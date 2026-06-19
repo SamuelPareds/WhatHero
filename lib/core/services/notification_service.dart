@@ -103,9 +103,10 @@ class NotificationService {
     }
   }
 
-  /// Inicializa el servicio para un usuario. Por ahora solo Android.
-  /// Web → Fase 2 (requiere VAPID + service worker).
-  /// iOS → Fase 3 (requiere APNs Auth Key).
+  /// Inicializa el servicio para un usuario. Soporta Android e iOS.
+  /// Web → requiere VAPID + service worker (sale limpio si no está la key).
+  /// iOS → requiere APNs Auth Key (.p8) subida en Firebase Console + capability
+  /// Push Notifications en el target (ya wireada en ios/Runner.entitlements).
   Future<void> init(String accountId) async {
     if (_currentAccountId == accountId && _currentToken != null) {
       debugPrint('[NotificationService] Ya inicializado para $accountId');
@@ -119,13 +120,11 @@ class NotificationService {
     }
     _currentAccountId = accountId;
 
-    if (defaultTargetPlatform == TargetPlatform.iOS && !kIsWeb) {
-      debugPrint('[NotificationService] iOS: pendiente Fase 3 (APNs)');
-      _completeInitialTap(null);
-      return;
-    }
     // Plataformas no-móviles, no-web: nada que hacer (macOS desktop, Linux…).
-    if (!kIsWeb && defaultTargetPlatform != TargetPlatform.android) {
+    // Soportadas: web, Android e iOS. Cualquier otra sale limpio.
+    final isSupportedMobile = defaultTargetPlatform == TargetPlatform.android ||
+        defaultTargetPlatform == TargetPlatform.iOS;
+    if (!kIsWeb && !isSupportedMobile) {
       debugPrint('[NotificationService] Plataforma sin push, skip');
       _completeInitialTap(null);
       return;
@@ -179,6 +178,23 @@ class NotificationService {
 
       // 2. deviceId estable (sobrevive a refrescos de token, no a reinstall)
       _deviceId = await _ensureDeviceId();
+
+      // 2.5 iOS: getToken() exige que el APNs token ya esté asignado. En cold
+      // start el token de APNs llega async (después de registerForRemoteNotifications,
+      // que dispara el swizzling de Firebase al pedir permiso). Si llamamos a
+      // getToken() antes, devuelve null o lanza 'apns-token-not-set'. Esperamos
+      // con backoff corto. Android/Web no entran aquí.
+      if (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) {
+        final apnsToken = await _waitForApnsToken(messaging);
+        if (apnsToken == null) {
+          debugPrint(
+            '[NotificationService] iOS: APNs token no disponible tras espera. '
+            '¿Capability Push activa + .p8 en Firebase? Abortando token FCM.',
+          );
+          return;
+        }
+        debugPrint('[NotificationService] iOS: APNs token listo');
+      }
 
       // 3. Token FCM y persistencia en Firestore
       // En web getToken() exige vapidKey explícitamente; en mobile lo ignora.
@@ -247,6 +263,22 @@ class NotificationService {
   // Filtro: solo despachamos pushes que traen los campos esperados.
   bool _isHumanAttentionMessage(RemoteMessage m) {
     return m.data['chatId'] != null && m.data['accountId'] != null;
+  }
+
+  /// Sondea el APNs token de iOS con backoff corto. Devuelve el token o null
+  /// si tras ~5s no apareció (sin capability Push o sin conexión a APNs).
+  /// Hasta ~10 intentos: 250ms, 500ms, 750ms… acumulando ~5s en total.
+  Future<String?> _waitForApnsToken(FirebaseMessaging messaging) async {
+    for (var i = 1; i <= 10; i++) {
+      try {
+        final token = await messaging.getAPNSToken();
+        if (token != null && token.isNotEmpty) return token;
+      } catch (_) {
+        // getAPNSToken puede lanzar si el registro aún no terminó; reintentamos.
+      }
+      await Future.delayed(Duration(milliseconds: 250 * i));
+    }
+    return null;
   }
 
   Future<String> _ensureDeviceId() async {
