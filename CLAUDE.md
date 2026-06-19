@@ -133,10 +133,11 @@ Transiciones entre modos: `AnimatedSwitcher` 220ms para no saltar.
 ---
 
 ## 🤖 Reglas de Oro para el Desarrollo
-- **Desafío de Eficiencia:** Antes de codificar, evalúa si hay una forma más sencilla o con mejor rendimiento. Di: *"Existe una forma más sencilla de hacer esto"* si es el caso.
-- **Minimalismo:** Menos dependencias y menos líneas de código son siempre mejores.
+- **Objetivo real:** Optimiza para que el código sea *fácil de entender y mantener* por una persona nueva en el proyecto. Menos líneas y menos dependencias son medios para eso, no el objetivo: si una abstracción, estructura o cache hace el proyecto más entendible o más rápido donde importa, la inversión es válida aunque agregue código.
+- **Desafío técnico (con umbral):** Si mi propuesta tiene una alternativa significativamente más simple, robusta o rápida, dímelo ANTES de codear ("Existe una forma más sencilla...") y espera mi decisión. Si la diferencia es menor (estilo, micro-detalles, ±pocas líneas), decide tú por la opción simple y menciónalo brevemente al final — no me interrumpas por eso.
+- **Dependencias:** Prefiere lo que ya trae Flutter/Dart o lo que ya está en pubspec. Un paquete nuevo se justifica solo si resuelve un problema no-central que sería costoso mantener a mano (no para ahorrar unas líneas).
+- **Empates:** Cuando simplicidad y rendimiento compitan, gana el rendimiento en flujos de usuarios registrados (prioridad del producto) y la simplicidad en todo lo demás.
 - **Seguridad:** Los datos de la sesión (`auth_info`) nunca se suben al repo; se gestionan vía Volúmenes o Variables de Entorno.
-- **Commentarios** Si hay comentarios en el código, siempre ponlos en español, para que los vibecoding podamos entender.
 
 ---
 

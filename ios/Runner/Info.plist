@@ -43,9 +43,15 @@
 	</array>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>WhatHero necesita acceso a tus fotos para adjuntar imágenes a las respuestas rápidas.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>WhatHero necesita acceso a la cámara para tomar fotos y adjuntarlas a tus chats.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>WhatHero necesita acceso al micrófono para grabar notas de voz y videos en tus chats.</string>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 </dict>
 </plist>
