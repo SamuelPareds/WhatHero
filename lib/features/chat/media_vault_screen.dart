@@ -673,11 +673,12 @@ class _MediaVaultScreenState extends State<MediaVaultScreen> {
 
   // Acción al tocar un tile:
   // - imagen → fullscreen viewer in-app con botón "Ver en chat".
-  // - video / documento → abrir en app externa (url_launcher).
+  // - video / documento → bottom sheet de detalle in-app con "Ver en chat"
+  //   y "Abrir archivo". No abrimos el archivo externo de inmediato porque
+  //   eso saltaría al navegador y el operador perdería la opción de saltar
+  //   al chat para identificar de quién es el documento.
   Future<void> _openItem(Map<String, dynamic> d) async {
     final type = d['mediaType'] as String?;
-    final url = d['mediaUrl'] as String?;
-    final status = d['mediaStatus'] as String?;
 
     if (type == 'image') {
       Navigator.of(context).push(
@@ -700,19 +701,195 @@ class _MediaVaultScreenState extends State<MediaVaultScreen> {
       return;
     }
 
-    // Videos y documentos: necesitamos URL lista.
+    // Videos y documentos: hoja de detalle in-app.
+    _showMediaDetailSheet(d);
+  }
+
+  // Bottom sheet para videos/documentos: identifica de quién es el archivo
+  // (contacto, fecha, dirección) y ofrece "Ver en chat" + "Abrir archivo".
+  // La guarda de "aún descargando" solo aplica a "Abrir archivo"; "Ver en
+  // chat" funciona aunque el archivo todavía no haya terminado de bajar.
+  void _showMediaDetailSheet(Map<String, dynamic> d) {
+    final type = d['mediaType'] as String?;
+    final contactName = (d['contactName'] as String? ?? '').trim();
+    final chatId = d['chatId'] as String? ?? '';
+    final fromMe = d['fromMe'] == true;
+    final ts = d['timestamp'];
+    final dateLabel = ts is Timestamp ? _formatFull(ts.toDate()) : '';
+    final isDocument = type == 'document';
+    final icon = isDocument
+        ? _iconForDoc(d['mediaFileName'] as String?)
+        : Icons.videocam;
+    final title = isDocument ? _shortFileName(d) : 'Video';
+
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: darkBg,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (sheetCtx) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // Tirador.
+                Center(
+                  child: Container(
+                    width: 40,
+                    height: 4,
+                    margin: const EdgeInsets.only(bottom: 16),
+                    decoration: BoxDecoration(
+                      color: surfaceDark,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                ),
+                // Cabecera: ícono + nombre del archivo.
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: primaryAqua.withValues(alpha: 0.15),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Icon(icon, color: primaryAqua, size: 26),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        title,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: white,
+                          fontSize: 15,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                // Metadatos: contacto, dirección y fecha.
+                _detailRow(
+                  Icons.person_outline,
+                  contactName.isNotEmpty ? contactName : chatId,
+                ),
+                const SizedBox(height: 8),
+                _detailRow(
+                  fromMe ? Icons.call_made : Icons.call_received,
+                  fromMe ? 'Enviado' : 'Recibido',
+                ),
+                if (dateLabel.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  _detailRow(Icons.schedule, dateLabel),
+                ],
+                const SizedBox(height: 20),
+                // Acción primaria: saltar al chat.
+                ElevatedButton.icon(
+                  onPressed: () {
+                    Navigator.of(sheetCtx).pop();
+                    if (chatId.isEmpty) return;
+                    // Cerrar vault + delegar a ChatsScreen.
+                    Navigator.of(context).pop();
+                    widget.onJumpToChat?.call(chatId);
+                  },
+                  icon: const Icon(Icons.forum_outlined),
+                  label: const Text('Ver en chat'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: primaryAqua,
+                    foregroundColor: darkBg,
+                    minimumSize: const Size.fromHeight(48),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    textStyle: const TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                // Acción secundaria: abrir el archivo externamente.
+                OutlinedButton.icon(
+                  onPressed: () {
+                    Navigator.of(sheetCtx).pop();
+                    _launchExternal(d);
+                  },
+                  icon: Icon(isDocument
+                      ? Icons.open_in_new
+                      : Icons.play_circle_outline),
+                  label: Text(isDocument ? 'Abrir archivo' : 'Reproducir'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: primaryAqua,
+                    minimumSize: const Size.fromHeight(48),
+                    side: BorderSide(
+                      color: primaryAqua.withValues(alpha: 0.5),
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    textStyle: const TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _detailRow(IconData icon, String text) {
+    return Row(
+      children: [
+        Icon(icon, size: 16, color: lightText),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            text,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(color: lightText, fontSize: 13),
+          ),
+        ),
+      ],
+    );
+  }
+
+  // Abre el archivo en app externa (navegador). Requiere URL lista.
+  Future<void> _launchExternal(Map<String, dynamic> d) async {
+    final url = d['mediaUrl'] as String?;
+    final status = d['mediaStatus'] as String?;
     if (url == null || url.isEmpty || status != 'ready') {
       _toast('Aún no se terminó de descargar. Probá de nuevo en un segundo.');
       return;
     }
-
-    final uri = Uri.parse(url);
     try {
-      final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+      final ok =
+          await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
       if (!ok) _toast('No se pudo abrir el archivo');
     } catch (e) {
       _toast('Error al abrir: $e');
     }
+  }
+
+  String _formatFull(DateTime d) {
+    const months = [
+      'ene', 'feb', 'mar', 'abr', 'may', 'jun',
+      'jul', 'ago', 'sep', 'oct', 'nov', 'dic',
+    ];
+    final h = d.hour.toString().padLeft(2, '0');
+    final m = d.minute.toString().padLeft(2, '0');
+    return '${d.day} ${months[d.month - 1]} ${d.year} · $h:$m';
   }
 
   void _toast(String msg) {
