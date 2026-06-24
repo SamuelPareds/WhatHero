@@ -3,6 +3,9 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_storage/firebase_storage.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:http/http.dart' as http;
 import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/services/api_client.dart';
@@ -244,6 +247,243 @@ class _MessagesViewState extends State<MessagesView> {
         });
       }
     }
+  }
+
+  // ─── Adjuntos: imagen / video / documento ──────────────────────────────
+  // Flujo: elegir archivo (local, instantáneo) → preview + caption opcional →
+  // subir a Storage en la carpeta temporal `outgoing/` → mandar la URL al
+  // backend, que la descarga, la reenvía por WhatsApp y borra el temporal.
+  // La burbuja final la pinta el eco de `messages.upsert` por el mismo
+  // pipeline que los mensajes entrantes — no construimos render local.
+
+  // Límites por tipo, alineados con lo que WhatsApp acepta.
+  static const int _maxImageBytes = 16 * 1024 * 1024;
+  static const int _maxVideoBytes = 64 * 1024 * 1024;
+  static const int _maxDocBytes = 100 * 1024 * 1024;
+
+  void _showAttachmentMenu() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: surfaceDark,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (sheetCtx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(height: 8),
+            ListTile(
+              leading: const Icon(Icons.photo_library_outlined, color: primaryAqua),
+              title: const Text('Galería (foto o video)', style: TextStyle(color: white)),
+              onTap: () {
+                Navigator.pop(sheetCtx);
+                _pickFromGallery();
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.insert_drive_file_outlined, color: primaryAqua),
+              title: const Text('Documento', style: TextStyle(color: white)),
+              onTap: () {
+                Navigator.pop(sheetCtx);
+                _pickDocument();
+              },
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _pickFromGallery() async {
+    try {
+      final XFile? file = await ImagePicker().pickMedia();
+      if (file == null) return;
+      final bytes = await file.readAsBytes();
+      final ext = _extOf(file.name);
+      // pickMedia sólo devuelve imagen o video; si no lo reconocemos por
+      // extensión, lo enviamos como documento para no fallar.
+      await _confirmAndSendAttachment(
+        bytes: bytes,
+        fileName: file.name,
+        ext: ext,
+        kind: _kindForExt(ext),
+      );
+    } catch (e) {
+      _showAttachmentError(e);
+    }
+  }
+
+  Future<void> _pickDocument() async {
+    try {
+      // withData: necesitamos los bytes en memoria (también en Web, donde no
+      // hay path de filesystem accesible).
+      final result = await FilePicker.platform.pickFiles(withData: true);
+      if (result == null || result.files.isEmpty) return;
+      final f = result.files.first;
+      final bytes = f.bytes;
+      if (bytes == null) {
+        _showAttachmentError('No se pudo leer el archivo');
+        return;
+      }
+      // Desde "Documento" siempre enviamos como archivo descargable, aunque
+      // sea una imagen: el usuario quiere el original sin recomprimir.
+      await _confirmAndSendAttachment(
+        bytes: bytes,
+        fileName: f.name,
+        ext: (f.extension ?? _extOf(f.name)).toLowerCase(),
+        kind: 'document',
+      );
+    } catch (e) {
+      _showAttachmentError(e);
+    }
+  }
+
+  // Valida tamaño, muestra preview + caption y, si el usuario confirma, sube
+  // y envía. El diálogo devuelve null al cancelar, o el caption (posiblemente
+  // vacío) al enviar.
+  Future<void> _confirmAndSendAttachment({
+    required Uint8List bytes,
+    required String fileName,
+    required String ext,
+    required String kind,
+  }) async {
+    final limit = kind == 'image'
+        ? _maxImageBytes
+        : kind == 'video'
+            ? _maxVideoBytes
+            : _maxDocBytes;
+    if (bytes.length > limit) {
+      _showAttachmentError('El archivo supera el límite de ${(limit / (1024 * 1024)).round()} MB');
+      return;
+    }
+
+    final caption = await showDialog<String>(
+      context: context,
+      builder: (_) => _AttachmentPreviewDialog(bytes: bytes, fileName: fileName, kind: kind),
+    );
+    if (caption == null) return; // cancelado
+
+    await _uploadAndSendAttachment(
+      bytes: bytes,
+      fileName: fileName,
+      ext: ext,
+      kind: kind,
+      caption: caption,
+    );
+  }
+
+  Future<void> _uploadAndSendAttachment({
+    required Uint8List bytes,
+    required String fileName,
+    required String ext,
+    required String kind,
+    required String caption,
+  }) async {
+    setState(() => _isSending = true);
+    try {
+      final mime = _mimeFor(ext, kind);
+      // Path temporal único en `outgoing/`. El backend lo borra tras enviar
+      // (cleanupAfterSend); la copia canónica la re-guarda el eco en `media/`.
+      final unique = '${DateTime.now().millisecondsSinceEpoch}_${bytes.length}';
+      final path =
+          '$accountsCollection/${widget.accountId}/whatsapp_sessions/${widget.sessionId}/outgoing/$unique${ext.isNotEmpty ? '.$ext' : ''}';
+      final ref = FirebaseStorage.instance.ref(path);
+      await ref.putData(bytes, SettableMetadata(contentType: mime));
+      final url = await ref.getDownloadURL();
+
+      final messageData = <String, dynamic>{
+        'to': widget.phoneNumber,
+        'text': caption,
+        'sessionKey': widget.sessionKey,
+        'accountId': widget.accountId,
+        'mimetype': mime,
+        'cleanupAfterSend': true,
+      };
+      if (kind == 'image') {
+        messageData['imageUrl'] = url;
+      } else if (kind == 'video') {
+        messageData['videoUrl'] = url;
+      } else {
+        messageData['documentUrl'] = url;
+        messageData['documentName'] = fileName;
+      }
+
+      if (SocketService().isConnected) {
+        SocketService().sendMessage(messageData);
+      } else {
+        final response = await http
+            .post(
+              Uri.parse('$backendUrl/send-message'),
+              headers: await authHeaders(),
+              body: jsonEncode(messageData),
+            )
+            .timeout(const Duration(seconds: 30));
+        if (response.statusCode != 200) throw Exception(response.body);
+      }
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('✓ Archivo enviado'),
+            duration: Duration(seconds: 2),
+            backgroundColor: Color(0xFF06B6D4),
+          ),
+        );
+      }
+    } catch (e) {
+      _showAttachmentError(e);
+    } finally {
+      if (mounted) setState(() => _isSending = false);
+    }
+  }
+
+  String _extOf(String name) {
+    final i = name.lastIndexOf('.');
+    return (i > 0 && i < name.length - 1) ? name.substring(i + 1).toLowerCase() : '';
+  }
+
+  String _kindForExt(String ext) {
+    const images = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'heif', 'bmp'};
+    const videos = {'mp4', 'mov', '3gp', 'webm', 'mkv', 'avi', 'm4v'};
+    if (images.contains(ext)) return 'image';
+    if (videos.contains(ext)) return 'video';
+    return 'document';
+  }
+
+  String _mimeFor(String ext, String kind) {
+    const map = {
+      'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
+      'gif': 'image/gif', 'webp': 'image/webp', 'heic': 'image/heic',
+      'heif': 'image/heif', 'bmp': 'image/bmp',
+      'mp4': 'video/mp4', 'mov': 'video/quicktime', '3gp': 'video/3gpp',
+      'webm': 'video/webm', 'mkv': 'video/x-matroska', 'm4v': 'video/x-m4v',
+      'pdf': 'application/pdf',
+      'doc': 'application/msword',
+      'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'xls': 'application/vnd.ms-excel',
+      'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'ppt': 'application/vnd.ms-powerpoint',
+      'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      'txt': 'text/plain', 'csv': 'text/csv', 'zip': 'application/zip',
+      'rar': 'application/vnd.rar', '7z': 'application/x-7z-compressed',
+      'mp3': 'audio/mpeg', 'ogg': 'audio/ogg', 'm4a': 'audio/mp4',
+      'wav': 'audio/wav', 'aac': 'audio/aac',
+    };
+    return map[ext] ??
+        (kind == 'image'
+            ? 'image/jpeg'
+            : kind == 'video'
+                ? 'video/mp4'
+                : 'application/octet-stream');
+  }
+
+  void _showAttachmentError(Object e) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red.shade600),
+    );
   }
 
   // Abre el panel de configuración de sesión como bottom sheet. Se usa cuando
@@ -923,6 +1163,12 @@ class _MessagesViewState extends State<MessagesView> {
                     ),
                     Row(
                   children: [
+                    IconButton(
+                      icon: const Icon(Icons.attach_file_rounded, size: 22),
+                      color: lightText,
+                      tooltip: 'Adjuntar archivo',
+                      onPressed: _isSending ? null : _showAttachmentMenu,
+                    ),
                     Expanded(
                       child: Focus(
                         onKeyEvent: (node, event) {
@@ -1149,6 +1395,143 @@ class _ImageCaptionDialogState extends State<_ImageCaptionDialog> {
             Navigator.pop(context);
             widget.onSend(edited);
           },
+          child: const Text('Enviar', style: TextStyle(color: darkBg, fontWeight: FontWeight.w600)),
+        ),
+      ],
+    );
+  }
+}
+
+// Preview de un adjunto recién elegido (imagen / video / documento) con caption
+// opcional, antes de subirlo. Devuelve el caption al enviar (pop con String) o
+// null al cancelar. Trabaja con los bytes en memoria — sin red hasta confirmar.
+class _AttachmentPreviewDialog extends StatefulWidget {
+  final Uint8List bytes;
+  final String fileName;
+  final String kind; // image | video | document
+
+  const _AttachmentPreviewDialog({
+    required this.bytes,
+    required this.fileName,
+    required this.kind,
+  });
+
+  @override
+  State<_AttachmentPreviewDialog> createState() => _AttachmentPreviewDialogState();
+}
+
+class _AttachmentPreviewDialogState extends State<_AttachmentPreviewDialog> {
+  final TextEditingController _captionController = TextEditingController();
+
+  @override
+  void dispose() {
+    _captionController.dispose();
+    super.dispose();
+  }
+
+  String get _title => switch (widget.kind) {
+        'image' => 'Enviar imagen',
+        'video' => 'Enviar video',
+        _ => 'Enviar documento',
+      };
+
+  String _humanSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(0)} KB';
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+
+  Widget _preview() {
+    if (widget.kind == 'image') {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(8),
+        child: Image.memory(widget.bytes, height: 160, fit: BoxFit.cover),
+      );
+    }
+    // Video y documento: tarjeta con icono + nombre + tamaño (no decodificamos
+    // el video acá; el render real lo hace la burbuja tras enviar).
+    final icon = widget.kind == 'video'
+        ? Icons.videocam_rounded
+        : Icons.insert_drive_file_rounded;
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: darkBg.withValues(alpha: 0.5),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: primaryAqua.withValues(alpha: 0.2)),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: primaryAqua, size: 32),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  widget.fileName,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: white, fontSize: 13, fontWeight: FontWeight.w500),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  _humanSize(widget.bytes.length),
+                  style: TextStyle(color: lightText.withValues(alpha: 0.7), fontSize: 11),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: surfaceDark,
+      title: Text(_title, style: const TextStyle(color: white, fontWeight: FontWeight.w600)),
+      content: SizedBox(
+        width: double.maxFinite,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _preview(),
+            const SizedBox(height: 16),
+            TextField(
+              controller: _captionController,
+              maxLines: 4,
+              minLines: 1,
+              textCapitalization: TextCapitalization.sentences,
+              style: const TextStyle(color: white, fontSize: 13),
+              decoration: InputDecoration(
+                hintText: 'Añade un texto (opcional)',
+                hintStyle: TextStyle(color: lightText.withValues(alpha: 0.5)),
+                filled: true,
+                fillColor: darkBg.withValues(alpha: 0.5),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: BorderSide(color: primaryAqua.withValues(alpha: 0.2)),
+                ),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: BorderSide(color: primaryAqua.withValues(alpha: 0.2)),
+                ),
+                contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: Text('Cancelar', style: TextStyle(color: lightText.withValues(alpha: 0.6))),
+        ),
+        ElevatedButton(
+          style: ElevatedButton.styleFrom(backgroundColor: primaryAqua),
+          onPressed: () => Navigator.pop(context, _captionController.text.trim()),
           child: const Text('Enviar', style: TextStyle(color: darkBg, fontWeight: FontWeight.w600)),
         ),
       ],

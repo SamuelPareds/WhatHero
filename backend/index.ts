@@ -129,6 +129,31 @@ async function fetchToBuffer(url: string, label: string): Promise<Buffer> {
   return Buffer.from(await res.arrayBuffer());
 }
 
+// Borra (best-effort) el objeto temporal que el composer subió a nuestro bucket
+// para transportar un adjunto. Sólo actúa sobre URLs de firebasestorage de
+// NUESTRO bucket: el path lo derivamos de la propia URL, nunca lo pasa el
+// cliente (evita que se pueda pedir el borrado de rutas arbitrarias). El eco
+// de `messages.upsert` ya re-guarda la copia canónica en la carpeta `media/`,
+// así que este temporal es desechable una vez enviado. No bloquea el envío.
+async function deleteTempStorageObject(url: string): Promise<void> {
+  try {
+    const prefix = 'https://firebasestorage.googleapis.com/v0/b/';
+    if (!url.startsWith(prefix)) return;
+    // .../o/<encodedPath>?alt=media&token=...  →  extraemos <encodedPath>.
+    const afterO = url.split('/o/')[1];
+    if (!afterO) return;
+    const encodedPath = afterO.split('?')[0];
+    const path = decodeURIComponent(encodedPath);
+    // Sólo limpiamos lo que sube el composer (carpeta `outgoing/`); nunca la
+    // copia canónica `media/` ni las plantillas de quick responses.
+    if (!path.includes('/outgoing/')) return;
+    await admin.storage().bucket().file(path).delete();
+    console.log(`[deleteTempStorageObject] Temporal eliminado: ${path}`);
+  } catch (error) {
+    console.warn(`[deleteTempStorageObject] No se pudo borrar temporal:`, (error as any)?.message);
+  }
+}
+
 // Construye el contenido Baileys de una respuesta automática (keyword rule).
 // Prioridad de adjunto: documento > imagen > solo texto. La regla lleva como
 // máximo un adjunto (lo garantiza el editor del cliente). El `response` viaja
@@ -907,7 +932,7 @@ async function cancelSession(sessionKey: string) {
  * que respondió (etiqueta visible en cada mensaje saliente).
  */
 async function performSendMessage(
-  { to, text, imageUrl, sessionKey, accountId, quotedMessageId, quotedText, quotedFromMe }: any,
+  { to, text, imageUrl, documentUrl, documentName, videoUrl, audioUrl, mimetype, isPtt, cleanupAfterSend, sessionKey, accountId, quotedMessageId, quotedText, quotedFromMe }: any,
   senderUid: string,
 ) {
   const session = sessions.get(sessionKey);
@@ -952,21 +977,54 @@ async function performSendMessage(
     };
   }
 
-  let message;
-  if (imageUrl) {
-    console.log(`[performSendMessage] Downloading image from URL: ${imageUrl}`);
-    const imageResponse = await fetch(imageUrl).then(res => {
-      if (!res.ok) throw new Error(`Failed to fetch image: ${res.statusText}`);
-      return res.arrayBuffer();
-    });
-    const imageBuffer = Buffer.from(imageResponse);
+  // Armamos el contenido Baileys según qué adjunto llegó. Prioridad:
+  // documento > video > audio > imagen > texto (un mensaje lleva un solo
+  // adjunto; el composer lo garantiza). El `text` viaja como caption del
+  // adjunto (excepto audio, que en WhatsApp no lleva caption). `tempMediaUrl`
+  // guarda la URL del temporal subido por el composer para limpiarla al final.
+  const caption = text || undefined;
+  let content: any;
+  let tempMediaUrl: string | null = null;
 
-    message = await session.sock.sendMessage(jid, {
-      image: imageBuffer,
-      caption: text || undefined,
-    }, sendOptions);
+  if (documentUrl) {
+    content = {
+      document: await fetchToBuffer(documentUrl, 'document'),
+      mimetype: mimetype || 'application/octet-stream',
+      fileName: documentName || 'documento',
+      caption,
+    };
+    tempMediaUrl = documentUrl;
+  } else if (videoUrl) {
+    content = {
+      video: await fetchToBuffer(videoUrl, 'video'),
+      mimetype: mimetype || 'video/mp4',
+      caption,
+    };
+    tempMediaUrl = videoUrl;
+  } else if (audioUrl) {
+    content = {
+      audio: await fetchToBuffer(audioUrl, 'audio'),
+      mimetype: mimetype || 'audio/mp4',
+      ptt: !!isPtt,
+    };
+    tempMediaUrl = audioUrl;
+  } else if (imageUrl) {
+    content = {
+      image: await fetchToBuffer(imageUrl, 'image'),
+      caption,
+    };
+    tempMediaUrl = imageUrl;
   } else {
-    message = await session.sock.sendMessage(jid, { text }, sendOptions);
+    content = { text };
+  }
+
+  const message = await session.sock.sendMessage(jid, content, sendOptions);
+
+  // Limpieza del temporal sólo si el cliente lo pidió (envíos one-off del
+  // composer). Las quick responses NO pasan el flag: sus imágenes son
+  // plantillas reutilizables que deben persistir. Best-effort, no bloquea.
+  if (cleanupAfterSend && tempMediaUrl) {
+    void deleteTempStorageObject(tempMediaUrl);
   }
 
   // Etiquetamos al humano que envió este mensaje. El handler de
