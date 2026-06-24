@@ -1,5 +1,8 @@
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_storage/firebase_storage.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:crm_whatsapp/core.dart';
 import '../chat/widgets/label_editor_dialog.dart';
 
@@ -137,6 +140,9 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
           final rawRules = data['bot_keyword_rules'] ?? data['ai_keyword_rules'];
           if (rawRules is List) {
             _botKeywordRules = List<Map<String, dynamic>>.from(rawRules.map((rule) => {
+              // `ruleId` ancla el archivo en Storage (path determinista).
+              // Reglas legacy no lo tienen → se genera al editarlas en el sheet.
+              'ruleId': rule['ruleId'] as String? ?? '',
               'keyword': rule['keyword'] as String? ?? '',
               'response': rule['response'] as String? ?? '',
               'imageUrl': rule['imageUrl'] as String? ?? '',
@@ -640,6 +646,9 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
       builder: (_) => _KeywordRuleEditorSheet(
+        accountId: widget.accountId,
+        sessionId: widget.sessionId,
+        ruleId: existing?['ruleId'] as String? ?? '',
         keyword: existing?['keyword'] as String? ?? '',
         response: existing?['response'] as String? ?? '',
         imageUrl: existing?['imageUrl'] as String? ?? '',
@@ -651,8 +660,16 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
 
     if (result == null) return; // canceló
 
+    final deleted = result['_delete'] == true;
+    if (deleted) {
+      // Limpieza best-effort: borra el archivo en Storage antes de quitar la
+      // regla del array. El sheet ya borró su imagen al editar, pero aquí
+      // cubrimos el borrado directo de la regla completa.
+      await _deleteRuleImage(result['ruleId'] as String?);
+    }
+
     setState(() {
-      if (result['_delete'] == true) {
+      if (deleted) {
         if (index != null) _botKeywordRules.removeAt(index);
       } else if (index != null) {
         _botKeywordRules[index] = result;
@@ -661,7 +678,21 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
       }
     });
 
-    await _persistRules(deleted: result['_delete'] == true);
+    await _persistRules(deleted: deleted);
+  }
+
+  // Borra el objeto de imagen de una regla en Storage; ignora si no existe
+  // (reglas sin imagen o con URL externa legacy no tienen archivo nuestro).
+  Future<void> _deleteRuleImage(String? ruleId) async {
+    if (ruleId == null || ruleId.isEmpty) return;
+    try {
+      await FirebaseStorage.instance
+          .ref('$accountsCollection/${widget.accountId}/whatsapp_sessions/'
+              '${widget.sessionId}/bot_rules/$ruleId.jpg')
+          .delete();
+    } catch (_) {
+      // Sin archivo o sin permiso → no es crítico.
+    }
   }
 
   // Persiste solo el campo de reglas de inmediato (independiente del footer),
@@ -1346,6 +1377,9 @@ class _LabelsTabBodyState extends State<_LabelsTabBody> {
 // header Cancelar/Guardar). Devuelve el Map de la regla vía Navigator.pop, o
 // null si se cancela. Es StatefulWidget para manejar sus propios controllers.
 class _KeywordRuleEditorSheet extends StatefulWidget {
+  final String accountId;
+  final String sessionId;
+  final String ruleId; // '' para reglas nuevas o legacy sin id
   final String keyword;
   final String response;
   final String imageUrl;
@@ -1353,6 +1387,9 @@ class _KeywordRuleEditorSheet extends StatefulWidget {
   final bool isEditing;
 
   const _KeywordRuleEditorSheet({
+    required this.accountId,
+    required this.sessionId,
+    required this.ruleId,
     required this.keyword,
     required this.response,
     required this.imageUrl,
@@ -1365,22 +1402,38 @@ class _KeywordRuleEditorSheet extends StatefulWidget {
 }
 
 class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
+  // Tope de seguridad para la imagen subida (image_picker ya recomprime).
+  static const int _maxImageBytes = 10 * 1024 * 1024;
+
+  final ImagePicker _picker = ImagePicker();
+
   late final TextEditingController _keywordController;
   late final TextEditingController _responseController;
-  late final TextEditingController _imageUrlController;
   late String _trigger;
+  late final String _ruleId;
+
+  // Estado de la imagen (mismo patrón que quick_responses_panel):
+  // - _pickedBytes: imagen recién elegida, aún sin subir.
+  // - _imageUrl: URL ya persistida (Storage o externa legacy).
+  Uint8List? _pickedBytes;
+  late String _imageUrl;
+  bool _isSaving = false;
 
   @override
   void initState() {
     super.initState();
     _keywordController = TextEditingController(text: widget.keyword);
     _responseController = TextEditingController(text: widget.response);
-    _imageUrlController = TextEditingController(text: widget.imageUrl);
     _trigger = widget.trigger;
+    _imageUrl = widget.imageUrl;
+    // Reglas legacy/nuevas sin id reciben uno estable (push-id de Firestore)
+    // para anclar su archivo en Storage.
+    _ruleId = widget.ruleId.isNotEmpty
+        ? widget.ruleId
+        : FirebaseFirestore.instance.collection('_ids').doc().id;
     // Recalcular el estado de "Guardar" al escribir
     _keywordController.addListener(_onChanged);
     _responseController.addListener(_onChanged);
-    _imageUrlController.addListener(_onChanged);
   }
 
   void _onChanged() => setState(() {});
@@ -1389,8 +1442,53 @@ class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
   void dispose() {
     _keywordController.dispose();
     _responseController.dispose();
-    _imageUrlController.dispose();
     super.dispose();
+  }
+
+  bool get _hasImage => _pickedBytes != null || _imageUrl.isNotEmpty;
+
+  // Path determinista: un archivo por regla → reemplazar sobrescribe, sin
+  // huérfanos. Respeta storage.rules (accounts/... prod, accounts_dev/... dev).
+  Reference _imageRef() => FirebaseStorage.instance.ref(
+        '$accountsCollection/${widget.accountId}/whatsapp_sessions/'
+        '${widget.sessionId}/bot_rules/$_ruleId.jpg',
+      );
+
+  // Elige una imagen de la galería. image_picker ya redimensiona y recomprime.
+  Future<void> _pickImage() async {
+    try {
+      final picked = await _picker.pickImage(
+        source: ImageSource.gallery,
+        maxWidth: 1600,
+        imageQuality: 80,
+      );
+      if (picked == null) return;
+
+      final bytes = await picked.readAsBytes();
+      if (bytes.length > _maxImageBytes) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('La imagen supera el límite de 10 MB')),
+          );
+        }
+        return;
+      }
+      if (mounted) setState(() => _pickedBytes = bytes);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('No se pudo cargar la imagen: $e')),
+        );
+      }
+    }
+  }
+
+  // Quita la imagen del editor (se aplica al guardar)
+  void _removeImage() {
+    setState(() {
+      _pickedBytes = null;
+      _imageUrl = '';
+    });
   }
 
   // Guardar habilitado si hay palabra clave + (respuesta o imagen) y, al editar,
@@ -1398,23 +1496,110 @@ class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
   bool get _canSave {
     final keyword = _keywordController.text.trim();
     final response = _responseController.text.trim();
-    final imageUrl = _imageUrlController.text.trim();
-    final isValid = keyword.isNotEmpty && (response.isNotEmpty || imageUrl.isNotEmpty);
+    final isValid = keyword.isNotEmpty && (response.isNotEmpty || _hasImage);
     if (!isValid) return false;
     if (!widget.isEditing) return true;
+    final imageChanged = _pickedBytes != null || _imageUrl != widget.imageUrl;
     return keyword != widget.keyword ||
         response != widget.response ||
-        imageUrl != widget.imageUrl ||
+        imageChanged ||
         _trigger != widget.trigger;
   }
 
-  void _save() {
-    Navigator.pop(context, {
-      'keyword': _keywordController.text.trim(),
-      'response': _responseController.text.trim(),
-      'imageUrl': _imageUrlController.text.trim(),
-      'trigger': _trigger,
-    });
+  Future<void> _save() async {
+    setState(() => _isSaving = true);
+    try {
+      // Resolver la URL final de la imagen.
+      String imageUrl = _imageUrl;
+      if (_pickedBytes != null) {
+        final ref = _imageRef();
+        await ref.putData(
+          _pickedBytes!,
+          SettableMetadata(contentType: 'image/jpeg'),
+        );
+        imageUrl = await ref.getDownloadURL();
+      } else if (imageUrl.isEmpty && widget.imageUrl.isNotEmpty) {
+        // El usuario quitó la imagen → borrar el objeto en Storage si era nuestro.
+        try {
+          await _imageRef().delete();
+        } catch (_) {/* sin archivo o URL externa legacy → ignorar */}
+      }
+
+      if (!mounted) return;
+      Navigator.pop(context, {
+        'ruleId': _ruleId,
+        'keyword': _keywordController.text.trim(),
+        'response': _responseController.text.trim(),
+        'imageUrl': imageUrl,
+        'trigger': _trigger,
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() => _isSaving = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error al subir la imagen: $e')),
+        );
+      }
+    }
+  }
+
+  // Bloque de imagen: preview con botón de quitar, o caja para agregar.
+  Widget _imagePickerBlock() {
+    if (_hasImage) {
+      final Widget preview = _pickedBytes != null
+          ? Image.memory(_pickedBytes!, height: 160, width: double.infinity, fit: BoxFit.cover)
+          : Image.network(_imageUrl, height: 160, width: double.infinity, fit: BoxFit.cover,
+              errorBuilder: (_, __, ___) => Container(
+                    height: 160,
+                    color: darkBg.withValues(alpha: 0.3),
+                    child: const Icon(Icons.broken_image, color: lightText),
+                  ));
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: Stack(
+          children: [
+            preview,
+            Positioned(
+              top: 8,
+              right: 8,
+              child: InkWell(
+                onTap: _isSaving ? null : _removeImage,
+                child: Container(
+                  padding: const EdgeInsets.all(4),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.6),
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(Icons.close, color: white, size: 20),
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return InkWell(
+      onTap: _isSaving ? null : _pickImage,
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        height: 96,
+        decoration: BoxDecoration(
+          color: darkBg.withValues(alpha: 0.3),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: primaryAqua.withValues(alpha: 0.2)),
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.add_photo_alternate_outlined, color: primaryAqua, size: 28),
+            const SizedBox(height: 6),
+            Text('Agregar imagen',
+                style: TextStyle(color: lightText.withValues(alpha: 0.8), fontSize: 13)),
+          ],
+        ),
+      ),
+    );
   }
 
   @override
@@ -1450,7 +1635,7 @@ class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
             child: Row(
               children: [
                 TextButton(
-                  onPressed: () => Navigator.pop(context),
+                  onPressed: _isSaving ? null : () => Navigator.pop(context),
                   child: const Text('Cancelar', style: TextStyle(color: lightText)),
                 ),
                 Expanded(
@@ -1464,16 +1649,25 @@ class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
                     ),
                   ),
                 ),
-                TextButton(
-                  onPressed: _canSave ? _save : null,
-                  child: Text(
-                    'Guardar',
-                    style: TextStyle(
-                      color: _canSave ? primaryAqua : lightText.withValues(alpha: 0.4),
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ),
+                _isSaving
+                    ? const Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 16),
+                        child: SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2, color: primaryAqua),
+                        ),
+                      )
+                    : TextButton(
+                        onPressed: _canSave ? _save : null,
+                        child: Text(
+                          'Guardar',
+                          style: TextStyle(
+                            color: _canSave ? primaryAqua : lightText.withValues(alpha: 0.4),
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
               ],
             ),
           ),
@@ -1492,8 +1686,8 @@ class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
                   _label('Respuesta del bot'),
                   _field(_responseController, 'Mensaje que enviará el bot…', maxLines: 5),
                   const SizedBox(height: 20),
-                  _label('URL de imagen (opcional)'),
-                  _field(_imageUrlController, 'https://example.com/image.jpg'),
+                  _label('Imagen (opcional)'),
+                  _imagePickerBlock(),
                   const SizedBox(height: 20),
                   _label('Disparar cuando…'),
                   SegmentedButton<String>(
@@ -1563,7 +1757,7 @@ class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
       ),
     );
     if (confirmed == true && mounted) {
-      Navigator.pop(context, {'_delete': true});
+      Navigator.pop(context, {'_delete': true, 'ruleId': _ruleId});
     }
   }
 
