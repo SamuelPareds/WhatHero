@@ -122,6 +122,36 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000);
 
+// Descarga una URL (Storage o externa) a Buffer para enviarla por Baileys.
+async function fetchToBuffer(url: string, label: string): Promise<Buffer> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch ${label}: ${res.statusText}`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
+// Construye el contenido Baileys de una respuesta automática (keyword rule).
+// Prioridad de adjunto: documento > imagen > solo texto. La regla lleva como
+// máximo un adjunto (lo garantiza el editor del cliente). El `response` viaja
+// como caption del adjunto o como texto suelto. Devuelve null si no hay nada
+// que enviar. Las descargas pueden lanzar; el caller decide el fallback.
+async function buildRuleMessageContent(rule: any): Promise<any | null> {
+  if (rule.documentUrl) {
+    const buffer = await fetchToBuffer(rule.documentUrl, 'document');
+    return {
+      document: buffer,
+      mimetype: 'application/pdf',
+      fileName: rule.documentName || 'documento.pdf',
+      caption: rule.response || undefined,
+    };
+  }
+  if (rule.imageUrl) {
+    const buffer = await fetchToBuffer(rule.imageUrl, 'image');
+    return { image: buffer, caption: rule.response || undefined };
+  }
+  if (rule.response) return { text: rule.response };
+  return null;
+}
+
 // Make io available to aiService via global variable for lazy evaluation
 (global as any).__WhatHeroIO = io;
 
@@ -488,23 +518,13 @@ async function startSession(sessionKey: string, accountId: string) {
                 await new Promise(r => setTimeout(r, delayMs));
 
                 try {
-                  let sentBotMsg: any;
-                  if (rule.imageUrl) {
-                    const imageResponse = await fetch(rule.imageUrl).then(res => {
-                      if (!res.ok) throw new Error(`Failed to fetch image: ${res.statusText}`);
-                      return res.arrayBuffer();
-                    });
-                    const imageBuffer = Buffer.from(imageResponse);
-                    sentBotMsg = await sessionForReset.sock.sendMessage(remoteJidForCancel, {
-                      image: imageBuffer,
-                      caption: rule.response || undefined,
-                    });
-                  } else if (rule.response) {
-                    sentBotMsg = await sessionForReset.sock.sendMessage(remoteJidForCancel, { text: rule.response });
-                  }
-                  // Etiqueta 'bot': es una respuesta automática por keyword rule.
-                  if (sentBotMsg?.key?.id) {
-                    sessionForReset.pendingSenders.set(sentBotMsg.key.id, BOT_SENDER);
+                  const content = await buildRuleMessageContent(rule);
+                  if (content) {
+                    const sentBotMsg = await sessionForReset.sock.sendMessage(remoteJidForCancel, content);
+                    // Etiqueta 'bot': es una respuesta automática por keyword rule.
+                    if (sentBotMsg?.key?.id) {
+                      sessionForReset.pendingSenders.set(sentBotMsg.key.id, BOT_SENDER);
+                    }
                   }
                 } catch (sendErr) {
                   console.error('[BotRule] Error enviando canned outgoing:', sendErr);
@@ -683,27 +703,17 @@ async function startSession(sessionKey: string, accountId: string) {
           await new Promise(r => setTimeout(r, aiConfig.responseDelayMs > 2000 ? 2000 : aiConfig.responseDelayMs));
 
           let sentBotMsg: any;
-          if (rule.imageUrl) {
-            try {
-              console.log(`[AI] Downloading image for keyword rule: ${rule.imageUrl}`);
-              const imageResponse = await fetch(rule.imageUrl).then(res => {
-                if (!res.ok) throw new Error(`Failed to fetch image: ${res.statusText}`);
-                return res.arrayBuffer();
-              });
-              const imageBuffer = Buffer.from(imageResponse);
-              sentBotMsg = await session.sock.sendMessage(remoteJid, {
-                image: imageBuffer,
-                caption: rule.response || undefined
-              });
-            } catch (error) {
-              console.error(`[AI] Error sending image for keyword rule:`, error);
-              // Fallback to text only if image fails
-              if (rule.response) {
-                sentBotMsg = await session.sock.sendMessage(remoteJid, { text: rule.response });
-              }
+          try {
+            const content = await buildRuleMessageContent(rule);
+            if (content) {
+              sentBotMsg = await session.sock.sendMessage(remoteJid, content);
             }
-          } else {
-            sentBotMsg = await session.sock.sendMessage(remoteJid, { text: rule.response });
+          } catch (error) {
+            console.error(`[AI] Error sending media for keyword rule:`, error);
+            // Fallback a solo-texto si la descarga del adjunto falló.
+            if (rule.response) {
+              sentBotMsg = await session.sock.sendMessage(remoteJid, { text: rule.response });
+            }
           }
 
           // Etiqueta 'bot': respuesta automática disparada por keyword del cliente.

@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:crm_whatsapp/core.dart';
 import '../chat/widgets/label_editor_dialog.dart';
 
@@ -146,6 +147,9 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
               'keyword': rule['keyword'] as String? ?? '',
               'response': rule['response'] as String? ?? '',
               'imageUrl': rule['imageUrl'] as String? ?? '',
+              // Adjunto documento (PDF). Una regla lleva imagen O documento.
+              'documentUrl': rule['documentUrl'] as String? ?? '',
+              'documentName': rule['documentName'] as String? ?? '',
               'trigger': (rule['trigger'] as String?) ?? 'incoming',
             }));
           }
@@ -612,6 +616,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
                   e.value['keyword'] as String? ?? '',
                   e.value['response'] as String? ?? '',
                   e.value['imageUrl'] as String?,
+                  e.value['documentUrl'] as String?,
                   e.value['trigger'] as String? ?? 'incoming',
                 )),
           const SizedBox(height: 12),
@@ -652,6 +657,8 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
         keyword: existing?['keyword'] as String? ?? '',
         response: existing?['response'] as String? ?? '',
         imageUrl: existing?['imageUrl'] as String? ?? '',
+        documentUrl: existing?['documentUrl'] as String? ?? '',
+        documentName: existing?['documentName'] as String? ?? '',
         // Reglas nuevas arrancan en 'both'; las existentes conservan su trigger
         trigger: existing?['trigger'] as String? ?? (index == null ? 'both' : 'incoming'),
         isEditing: index != null,
@@ -662,10 +669,9 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
 
     final deleted = result['_delete'] == true;
     if (deleted) {
-      // Limpieza best-effort: borra el archivo en Storage antes de quitar la
-      // regla del array. El sheet ya borró su imagen al editar, pero aquí
-      // cubrimos el borrado directo de la regla completa.
-      await _deleteRuleImage(result['ruleId'] as String?);
+      // Limpieza best-effort: borra los archivos en Storage antes de quitar la
+      // regla del array. Cubre el borrado directo de la regla completa.
+      await _deleteRuleAttachments(result['ruleId'] as String?);
     }
 
     setState(() {
@@ -681,17 +687,18 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
     await _persistRules(deleted: deleted);
   }
 
-  // Borra el objeto de imagen de una regla en Storage; ignora si no existe
-  // (reglas sin imagen o con URL externa legacy no tienen archivo nuestro).
-  Future<void> _deleteRuleImage(String? ruleId) async {
+  // Borra los objetos (imagen y/o documento) de una regla en Storage; ignora
+  // los que no existan (reglas sin adjunto o con URL externa legacy).
+  Future<void> _deleteRuleAttachments(String? ruleId) async {
     if (ruleId == null || ruleId.isEmpty) return;
-    try {
-      await FirebaseStorage.instance
-          .ref('$accountsCollection/${widget.accountId}/whatsapp_sessions/'
-              '${widget.sessionId}/bot_rules/$ruleId.jpg')
-          .delete();
-    } catch (_) {
-      // Sin archivo o sin permiso → no es crítico.
+    final base = '$accountsCollection/${widget.accountId}/whatsapp_sessions/'
+        '${widget.sessionId}/bot_rules/$ruleId';
+    for (final ext in ['jpg', 'pdf']) {
+      try {
+        await FirebaseStorage.instance.ref('$base.$ext').delete();
+      } catch (_) {
+        // Sin archivo o sin permiso → no es crítico.
+      }
     }
   }
 
@@ -1069,7 +1076,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
     );
   }
 
-  Widget _keywordTile(int index, String key, String resp, String? imageUrl, String trigger) {
+  Widget _keywordTile(int index, String key, String resp, String? imageUrl, String? documentUrl, String trigger) {
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
       decoration: BoxDecoration(color: darkBg.withValues(alpha: 0.2), borderRadius: BorderRadius.circular(12)),
@@ -1097,6 +1104,10 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
                         if (imageUrl != null && imageUrl.isNotEmpty) ...[
                           const SizedBox(width: 8),
                           const Icon(Icons.image, color: primaryAqua, size: 14),
+                        ],
+                        if (documentUrl != null && documentUrl.isNotEmpty) ...[
+                          const SizedBox(width: 8),
+                          const Icon(Icons.picture_as_pdf, color: Color(0xFFEF4444), size: 14),
                         ],
                       ],
                     ),
@@ -1383,6 +1394,8 @@ class _KeywordRuleEditorSheet extends StatefulWidget {
   final String keyword;
   final String response;
   final String imageUrl;
+  final String documentUrl;
+  final String documentName;
   final String trigger;
   final bool isEditing;
 
@@ -1393,6 +1406,8 @@ class _KeywordRuleEditorSheet extends StatefulWidget {
     required this.keyword,
     required this.response,
     required this.imageUrl,
+    required this.documentUrl,
+    required this.documentName,
     required this.trigger,
     required this.isEditing,
   });
@@ -1404,6 +1419,8 @@ class _KeywordRuleEditorSheet extends StatefulWidget {
 class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
   // Tope de seguridad para la imagen subida (image_picker ya recomprime).
   static const int _maxImageBytes = 10 * 1024 * 1024;
+  // Tope para documentos PDF (WhatsApp acepta hasta ~100 MB; somos conservadores).
+  static const int _maxDocBytes = 20 * 1024 * 1024;
 
   final ImagePicker _picker = ImagePicker();
 
@@ -1412,11 +1429,15 @@ class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
   late String _trigger;
   late final String _ruleId;
 
-  // Estado de la imagen (mismo patrón que quick_responses_panel):
-  // - _pickedBytes: imagen recién elegida, aún sin subir.
-  // - _imageUrl: URL ya persistida (Storage o externa legacy).
+  // Estado del adjunto. Una regla lleva como máximo UNO: imagen O documento.
+  // - _pickedBytes / _pickedDocBytes: archivo recién elegido, aún sin subir.
+  // - _imageUrl / _documentUrl: URL ya persistida (Storage o externa legacy).
   Uint8List? _pickedBytes;
   late String _imageUrl;
+  Uint8List? _pickedDocBytes;
+  String? _pickedDocName;
+  late String _documentUrl;
+  late String _documentName;
   bool _isSaving = false;
 
   @override
@@ -1426,6 +1447,8 @@ class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
     _responseController = TextEditingController(text: widget.response);
     _trigger = widget.trigger;
     _imageUrl = widget.imageUrl;
+    _documentUrl = widget.documentUrl;
+    _documentName = widget.documentName;
     // Reglas legacy/nuevas sin id reciben uno estable (push-id de Firestore)
     // para anclar su archivo en Storage.
     _ruleId = widget.ruleId.isNotEmpty
@@ -1446,15 +1469,29 @@ class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
   }
 
   bool get _hasImage => _pickedBytes != null || _imageUrl.isNotEmpty;
+  bool get _hasDocument => _pickedDocBytes != null || _documentUrl.isNotEmpty;
+  bool get _hasAttachment => _hasImage || _hasDocument;
 
-  // Path determinista: un archivo por regla → reemplazar sobrescribe, sin
-  // huérfanos. Respeta storage.rules (accounts/... prod, accounts_dev/... dev).
-  Reference _imageRef() => FirebaseStorage.instance.ref(
+  // Nombre a mostrar del documento (recién elegido o ya persistido).
+  String get _documentLabel =>
+      _pickedDocName ?? (_documentName.isNotEmpty ? _documentName : 'documento.pdf');
+
+  // Path determinista: un archivo por regla y extensión → reemplazar
+  // sobrescribe, sin huérfanos. Respeta storage.rules (accounts/... prod,
+  // accounts_dev/... dev).
+  Reference _ref(String ext) => FirebaseStorage.instance.ref(
         '$accountsCollection/${widget.accountId}/whatsapp_sessions/'
-        '${widget.sessionId}/bot_rules/$_ruleId.jpg',
+        '${widget.sessionId}/bot_rules/$_ruleId.$ext',
       );
 
+  Future<void> _deleteObject(String ext) async {
+    try {
+      await _ref(ext).delete();
+    } catch (_) {/* sin archivo o URL externa legacy → ignorar */}
+  }
+
   // Elige una imagen de la galería. image_picker ya redimensiona y recomprime.
+  // Limpia el documento: el adjunto es mutuamente excluyente.
   Future<void> _pickImage() async {
     try {
       final picked = await _picker.pickImage(
@@ -1473,7 +1510,15 @@ class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
         }
         return;
       }
-      if (mounted) setState(() => _pickedBytes = bytes);
+      if (mounted) {
+        setState(() {
+          _pickedBytes = bytes;
+          _pickedDocBytes = null;
+          _pickedDocName = null;
+          _documentUrl = '';
+          _documentName = '';
+        });
+      }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -1483,47 +1528,101 @@ class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
     }
   }
 
-  // Quita la imagen del editor (se aplica al guardar)
-  void _removeImage() {
+  // Elige un documento PDF. Limpia la imagen (adjunto mutuamente excluyente).
+  Future<void> _pickDocument() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: ['pdf'],
+        withData: true, // necesitamos los bytes para subirlos a Storage
+      );
+      if (result == null || result.files.isEmpty) return;
+      final file = result.files.single;
+      final bytes = file.bytes;
+      if (bytes == null) return;
+
+      if (bytes.length > _maxDocBytes) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('El documento supera el límite de 20 MB')),
+          );
+        }
+        return;
+      }
+      if (mounted) {
+        setState(() {
+          _pickedDocBytes = bytes;
+          _pickedDocName = file.name;
+          _pickedBytes = null;
+          _imageUrl = '';
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('No se pudo cargar el documento: $e')),
+        );
+      }
+    }
+  }
+
+  // Quita el adjunto del editor (se aplica al guardar)
+  void _removeAttachment() {
     setState(() {
       _pickedBytes = null;
       _imageUrl = '';
+      _pickedDocBytes = null;
+      _pickedDocName = null;
+      _documentUrl = '';
+      _documentName = '';
     });
   }
 
-  // Guardar habilitado si hay palabra clave + (respuesta o imagen) y, al editar,
-  // si hay algún cambio respecto al original.
+  // Guardar habilitado si hay palabra clave + (respuesta o adjunto) y, al
+  // editar, si hay algún cambio respecto al original.
   bool get _canSave {
     final keyword = _keywordController.text.trim();
     final response = _responseController.text.trim();
-    final isValid = keyword.isNotEmpty && (response.isNotEmpty || _hasImage);
+    final isValid = keyword.isNotEmpty && (response.isNotEmpty || _hasAttachment);
     if (!isValid) return false;
     if (!widget.isEditing) return true;
-    final imageChanged = _pickedBytes != null || _imageUrl != widget.imageUrl;
+    final attachmentChanged = _pickedBytes != null ||
+        _pickedDocBytes != null ||
+        _imageUrl != widget.imageUrl ||
+        _documentUrl != widget.documentUrl;
     return keyword != widget.keyword ||
         response != widget.response ||
-        imageChanged ||
+        attachmentChanged ||
         _trigger != widget.trigger;
   }
 
   Future<void> _save() async {
     setState(() => _isSaving = true);
     try {
-      // Resolver la URL final de la imagen.
-      String imageUrl = _imageUrl;
+      // Resolver el adjunto final. Mutuamente excluyente: imagen o documento.
+      String imageUrl = '';
+      String documentUrl = '';
+      String documentName = '';
+
       if (_pickedBytes != null) {
-        final ref = _imageRef();
-        await ref.putData(
-          _pickedBytes!,
-          SettableMetadata(contentType: 'image/jpeg'),
-        );
+        final ref = _ref('jpg');
+        await ref.putData(_pickedBytes!, SettableMetadata(contentType: 'image/jpeg'));
         imageUrl = await ref.getDownloadURL();
-      } else if (imageUrl.isEmpty && widget.imageUrl.isNotEmpty) {
-        // El usuario quitó la imagen → borrar el objeto en Storage si era nuestro.
-        try {
-          await _imageRef().delete();
-        } catch (_) {/* sin archivo o URL externa legacy → ignorar */}
+      } else if (_imageUrl.isNotEmpty) {
+        imageUrl = _imageUrl; // imagen existente sin cambios
+      } else if (_pickedDocBytes != null) {
+        final ref = _ref('pdf');
+        await ref.putData(_pickedDocBytes!, SettableMetadata(contentType: 'application/pdf'));
+        documentUrl = await ref.getDownloadURL();
+        documentName = _pickedDocName ?? 'documento.pdf';
+      } else if (_documentUrl.isNotEmpty) {
+        documentUrl = _documentUrl; // documento existente sin cambios
+        documentName = _documentName;
       }
+
+      // Limpieza de huérfanos: borra el objeto del tipo que ya no se usa.
+      if (imageUrl.isEmpty) await _deleteObject('jpg');
+      if (documentUrl.isEmpty) await _deleteObject('pdf');
 
       if (!mounted) return;
       Navigator.pop(context, {
@@ -1531,56 +1630,38 @@ class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
         'keyword': _keywordController.text.trim(),
         'response': _responseController.text.trim(),
         'imageUrl': imageUrl,
+        'documentUrl': documentUrl,
+        'documentName': documentName,
         'trigger': _trigger,
       });
     } catch (e) {
       if (mounted) {
         setState(() => _isSaving = false);
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error al subir la imagen: $e')),
+          SnackBar(content: Text('Error al subir el adjunto: $e')),
         );
       }
     }
   }
 
-  // Bloque de imagen: preview con botón de quitar, o caja para agregar.
-  Widget _imagePickerBlock() {
-    if (_hasImage) {
-      final Widget preview = _pickedBytes != null
-          ? Image.memory(_pickedBytes!, height: 160, width: double.infinity, fit: BoxFit.cover)
-          : Image.network(_imageUrl, height: 160, width: double.infinity, fit: BoxFit.cover,
-              errorBuilder: (_, __, ___) => Container(
-                    height: 160,
-                    color: darkBg.withValues(alpha: 0.3),
-                    child: const Icon(Icons.broken_image, color: lightText),
-                  ));
-      return ClipRRect(
-        borderRadius: BorderRadius.circular(12),
-        child: Stack(
-          children: [
-            preview,
-            Positioned(
-              top: 8,
-              right: 8,
-              child: InkWell(
-                onTap: _isSaving ? null : _removeImage,
-                child: Container(
-                  padding: const EdgeInsets.all(4),
-                  decoration: BoxDecoration(
-                    color: Colors.black.withValues(alpha: 0.6),
-                    shape: BoxShape.circle,
-                  ),
-                  child: const Icon(Icons.close, color: white, size: 20),
-                ),
-              ),
-            ),
-          ],
-        ),
-      );
-    }
+  // Bloque de adjunto: preview de imagen, tile de documento, o las dos cajas
+  // para agregar uno. La regla lleva como máximo un adjunto.
+  Widget _attachmentBlock() {
+    if (_hasImage) return _imagePreview();
+    if (_hasDocument) return _documentTile();
+    return Row(
+      children: [
+        Expanded(child: _addBox(Icons.add_photo_alternate_outlined, 'Imagen', _pickImage)),
+        const SizedBox(width: 12),
+        Expanded(child: _addBox(Icons.picture_as_pdf_outlined, 'Documento', _pickDocument)),
+      ],
+    );
+  }
 
+  // Caja "agregar" reutilizable para imagen / documento.
+  Widget _addBox(IconData icon, String label, VoidCallback onTap) {
     return InkWell(
-      onTap: _isSaving ? null : _pickImage,
+      onTap: _isSaving ? null : onTap,
       borderRadius: BorderRadius.circular(12),
       child: Container(
         height: 96,
@@ -1592,13 +1673,74 @@ class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            const Icon(Icons.add_photo_alternate_outlined, color: primaryAqua, size: 28),
+            Icon(icon, color: primaryAqua, size: 28),
             const SizedBox(height: 6),
-            Text('Agregar imagen',
-                style: TextStyle(color: lightText.withValues(alpha: 0.8), fontSize: 13)),
+            Text(label, style: TextStyle(color: lightText.withValues(alpha: 0.8), fontSize: 13)),
           ],
         ),
       ),
+    );
+  }
+
+  // Botón flotante de quitar adjunto (esquina superior derecha).
+  Widget _removeBadge() => Positioned(
+        top: 8,
+        right: 8,
+        child: InkWell(
+          onTap: _isSaving ? null : _removeAttachment,
+          child: Container(
+            padding: const EdgeInsets.all(4),
+            decoration: BoxDecoration(
+              color: Colors.black.withValues(alpha: 0.6),
+              shape: BoxShape.circle,
+            ),
+            child: const Icon(Icons.close, color: white, size: 20),
+          ),
+        ),
+      );
+
+  Widget _imagePreview() {
+    final Widget preview = _pickedBytes != null
+        ? Image.memory(_pickedBytes!, height: 160, width: double.infinity, fit: BoxFit.cover)
+        : Image.network(_imageUrl, height: 160, width: double.infinity, fit: BoxFit.cover,
+            errorBuilder: (_, __, ___) => Container(
+                  height: 160,
+                  color: darkBg.withValues(alpha: 0.3),
+                  child: const Icon(Icons.broken_image, color: lightText),
+                ));
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(12),
+      child: Stack(children: [preview, _removeBadge()]),
+    );
+  }
+
+  Widget _documentTile() {
+    return Stack(
+      children: [
+        Container(
+          padding: const EdgeInsets.fromLTRB(16, 16, 44, 16),
+          decoration: BoxDecoration(
+            color: darkBg.withValues(alpha: 0.3),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: primaryAqua.withValues(alpha: 0.2)),
+          ),
+          child: Row(
+            children: [
+              const Icon(Icons.picture_as_pdf, color: Color(0xFFEF4444), size: 32),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  _documentLabel,
+                  style: const TextStyle(color: white, fontWeight: FontWeight.w500),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+        ),
+        _removeBadge(),
+      ],
     );
   }
 
@@ -1686,8 +1828,8 @@ class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
                   _label('Respuesta del bot'),
                   _field(_responseController, 'Mensaje que enviará el bot…', maxLines: 5),
                   const SizedBox(height: 20),
-                  _label('Imagen (opcional)'),
-                  _imagePickerBlock(),
+                  _label('Adjunto (opcional)'),
+                  _attachmentBlock(),
                   const SizedBox(height: 20),
                   _label('Disparar cuando…'),
                   SegmentedButton<String>(

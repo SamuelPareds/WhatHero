@@ -50,7 +50,12 @@ export interface SessionData {
     keywordRules: {
       keyword: string;
       response: string;
+      // Adjunto opcional: la regla lleva como máximo uno (imagen O documento),
+      // garantizado por el editor del cliente. Prioridad de envío: documento >
+      // imagen > solo texto (ver buildRuleMessageContent en index.ts).
       imageUrl?: string;
+      documentUrl?: string;
+      documentName?: string;
       // Cuándo se dispara la regla:
       //   'incoming' → solo cuando el cliente escribe la keyword (comportamiento histórico).
       //   'outgoing' → solo cuando nosotros (operador o WA Web) enviamos un mensaje con la keyword.
