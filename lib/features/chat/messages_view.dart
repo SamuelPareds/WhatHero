@@ -1181,7 +1181,12 @@ class _MessagesViewState extends State<MessagesView> {
                         child: TextField(
                           controller: _messageController,
                           focusNode: _inputFocusNode,
-                          maxLines: null,
+                          // Auto-crece de 1 a 6 líneas y, a partir de ahí,
+                          // scrollea internamente en vez de crecer sin tope.
+                          // Así una respuesta de IA larga nunca queda detrás
+                          // del teclado: el final siempre es alcanzable.
+                          minLines: 1,
+                          maxLines: 6,
                           textCapitalization: TextCapitalization.sentences,
                           style: const TextStyle(color: white, fontSize: 15),
                           onChanged: _handleQuickResponseInput,
