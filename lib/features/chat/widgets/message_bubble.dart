@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
@@ -1433,14 +1434,15 @@ class _MessageBubbleState extends State<MessageBubble> {
                             if (hasCaption)
                               Padding(
                                 padding: const EdgeInsets.fromLTRB(10, 8, 10, 4),
-                                child: Text(
-                                  widget.text,
+                                child: _LinkifiedText(
+                                  text: widget.text,
                                   style: TextStyle(
                                     color: widget.fromMe ? darkBg : white,
                                     fontSize: 15,
                                     fontWeight: FontWeight.w400,
                                     height: 1.4,
                                   ),
+                                  linkColor: widget.fromMe ? darkBg : primaryAqua,
                                 ),
                               ),
                           ],
@@ -1454,14 +1456,15 @@ class _MessageBubbleState extends State<MessageBubble> {
                             if (hasCaption)
                               Padding(
                                 padding: const EdgeInsets.fromLTRB(10, 8, 10, 4),
-                                child: Text(
-                                  widget.text,
+                                child: _LinkifiedText(
+                                  text: widget.text,
                                   style: TextStyle(
                                     color: widget.fromMe ? darkBg : white,
                                     fontSize: 15,
                                     fontWeight: FontWeight.w400,
                                     height: 1.4,
                                   ),
+                                  linkColor: widget.fromMe ? darkBg : primaryAqua,
                                 ),
                               ),
                           ],
@@ -1475,26 +1478,28 @@ class _MessageBubbleState extends State<MessageBubble> {
                                 if (hasCaption)
                                   Padding(
                                     padding: const EdgeInsets.fromLTRB(10, 4, 10, 6),
-                                    child: Text(
-                                      widget.text,
+                                    child: _LinkifiedText(
+                                      text: widget.text,
                                       style: TextStyle(
                                         color: widget.fromMe ? darkBg : white,
                                         fontSize: 15,
                                         fontWeight: FontWeight.w400,
                                         height: 1.4,
                                       ),
+                                      linkColor: widget.fromMe ? darkBg : primaryAqua,
                                     ),
                                   ),
                               ],
                             )
-                          : Text(
-                              widget.text,
+                          : _LinkifiedText(
+                              text: widget.text,
                               style: TextStyle(
                                 color: widget.fromMe ? darkBg : white,
                                 fontSize: 15,
                                 fontWeight: FontWeight.w400,
                                 height: 1.4,
                               ),
+                              linkColor: widget.fromMe ? darkBg : primaryAqua,
                             );
 
                   if (quotedPreview == null) return mainContent;
@@ -1588,6 +1593,138 @@ class _MessageBubbleState extends State<MessageBubble> {
       ),
     );
   }
+}
+
+// Renderiza texto detectando URLs y volviéndolas tappables. Hecho a mano
+// (sin flutter_linkify): el caso es acotado y necesitamos controlar el color
+// del link según el lado de la burbuja. Es StatefulWidget para administrar el
+// ciclo de vida de los TapGestureRecognizer (uno por link) y liberarlos.
+class _LinkifiedText extends StatefulWidget {
+  final String text;
+  final TextStyle style;
+  final Color linkColor;
+
+  const _LinkifiedText({
+    required this.text,
+    required this.style,
+    required this.linkColor,
+  });
+
+  @override
+  State<_LinkifiedText> createState() => _LinkifiedTextState();
+}
+
+class _LinkifiedTextState extends State<_LinkifiedText> {
+  // http(s):// o www. seguido de no-espacios. La puntuación final se recorta
+  // aparte (ver _buildSpans) para no tragarse el punto de "mirá: https://x.com."
+  static final RegExp _urlRegex = RegExp(
+    r'(https?:\/\/|www\.)[^\s]+',
+    caseSensitive: false,
+  );
+
+  // Caracteres que, si cierran el match, no son parte real del enlace.
+  static const String _trailingPunctuation = '.,;:!?)]}';
+
+  final List<TapGestureRecognizer> _recognizers = [];
+  late TextSpan _rootSpan;
+
+  @override
+  void initState() {
+    super.initState();
+    _buildSpans();
+  }
+
+  @override
+  void didUpdateWidget(_LinkifiedText oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.text != widget.text ||
+        oldWidget.style != widget.style ||
+        oldWidget.linkColor != widget.linkColor) {
+      _buildSpans();
+    }
+  }
+
+  @override
+  void dispose() {
+    _disposeRecognizers();
+    super.dispose();
+  }
+
+  void _disposeRecognizers() {
+    for (final r in _recognizers) {
+      r.dispose();
+    }
+    _recognizers.clear();
+  }
+
+  void _buildSpans() {
+    _disposeRecognizers();
+
+    final text = widget.text;
+    final spans = <InlineSpan>[];
+    final linkStyle = widget.style.copyWith(
+      color: widget.linkColor,
+      decoration: TextDecoration.underline,
+      decorationColor: widget.linkColor,
+    );
+
+    int last = 0;
+    for (final match in _urlRegex.allMatches(text)) {
+      if (match.start > last) {
+        spans.add(TextSpan(text: text.substring(last, match.start)));
+      }
+
+      var url = match.group(0)!;
+      // Recortar puntuación que cierra el match pero no pertenece al enlace.
+      var trailing = '';
+      while (url.isNotEmpty &&
+          _trailingPunctuation.contains(url[url.length - 1])) {
+        trailing = url[url.length - 1] + trailing;
+        url = url.substring(0, url.length - 1);
+      }
+
+      final recognizer = TapGestureRecognizer()..onTap = () => _open(url);
+      _recognizers.add(recognizer);
+      spans.add(TextSpan(text: url, style: linkStyle, recognizer: recognizer));
+
+      if (trailing.isNotEmpty) spans.add(TextSpan(text: trailing));
+      last = match.end;
+    }
+    if (last < text.length) {
+      spans.add(TextSpan(text: text.substring(last)));
+    }
+
+    _rootSpan = TextSpan(style: widget.style, children: spans);
+  }
+
+  Future<void> _open(String raw) async {
+    // www.x.com → https://www.x.com para que el SO sepa abrir el navegador.
+    final normalized = raw.toLowerCase().startsWith('www.') ? 'https://$raw' : raw;
+    final uri = Uri.tryParse(normalized);
+    if (uri == null) {
+      _notifyError();
+      return;
+    }
+    try {
+      final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+      if (!ok) _notifyError();
+    } catch (_) {
+      _notifyError();
+    }
+  }
+
+  void _notifyError() {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: const Text('No se pudo abrir el enlace'),
+        backgroundColor: Colors.red.shade600,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => Text.rich(_rootSpan);
 }
 
 // Visor fullscreen de video con controles propios (sin chewie).
