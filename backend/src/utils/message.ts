@@ -45,3 +45,53 @@ export function unwrapMessageContent(message: any): any {
   // `.message` por el contenido desempaquetado.
   return { ...message, message: content };
 }
+
+// ============================================
+// Tokenización para búsqueda de texto en mensajes.
+//
+// Firestore no soporta búsqueda full-text ni "contains" de substrings: solo
+// igualdad, rangos y `array-contains`. Para poder buscar palabras dentro de los
+// mensajes guardamos, junto a cada mensaje indexable, un array `searchTokens`
+// con sus palabras normalizadas. La búsqueda se resuelve con
+// `where('searchTokens', 'array-contains', palabra)`.
+//
+// Normalización (clave en español):
+//   - minúsculas
+//   - sin acentos: "está" → "esta", "ñ" → "n" (NFD + strip de diacríticos)
+//   - split por todo lo que no sea letra/número
+//   - dedupe y límite de seguridad (mensajes enormes no inflan el índice)
+//
+// Coincidencia por PALABRA COMPLETA: "factura" encuentra el mensaje, "fact" no.
+// Las frases se resuelven en el cliente refinando sobre el campo `text`.
+// ============================================
+
+// Normaliza un texto a minúsculas sin acentos. Reutilizable para comparar el
+// query del usuario contra `searchTokens` con el mismo criterio.
+export function normalizeForSearch(text: string): string {
+  return text
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, ''); // quita diacríticos combinantes
+}
+
+// Máximo de tokens por mensaje. Cubre mensajes normales de sobra; trunca
+// pastes gigantes para no inflar el doc del índice ni el costo de escritura.
+const MAX_SEARCH_TOKENS = 80;
+
+// Convierte el texto de un mensaje en un array de palabras únicas para indexar.
+// Devuelve [] si el texto no tiene palabras indexables (media sin caption, etc).
+export function buildSearchTokens(text: string | undefined | null): string[] {
+  if (!text) return [];
+  const normalized = normalizeForSearch(text);
+  const seen = new Set<string>();
+  for (const raw of normalized.split(/[^a-z0-9]+/)) {
+    if (!raw) continue;
+    // Tokens de 1 char (a, y, o) son ruido y disparan reads masivos; los
+    // ignoramos. Números cortos sí pueden importar (ej. "10"), así que el
+    // filtro es solo por longitud, no por tipo.
+    if (raw.length < 2) continue;
+    seen.add(raw);
+    if (seen.size >= MAX_SEARCH_TOKENS) break;
+  }
+  return [...seen];
+}

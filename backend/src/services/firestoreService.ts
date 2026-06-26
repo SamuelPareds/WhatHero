@@ -2,7 +2,7 @@ import admin from 'firebase-admin';
 import { toNumber } from '@whiskeysockets/baileys';
 import { SessionData, SenderInfo } from '../types';
 import { extractPhoneNumber, isConversationalJid } from '../utils/phone';
-import { unwrapMessageContent } from '../utils/message';
+import { unwrapMessageContent, buildSearchTokens } from '../utils/message';
 import { ACCOUNTS_COLLECTION } from '../config/env';
 import { extractMediaInfo, processMediaAsync } from './mediaService';
 import { WHATSAPP_SENDER } from './senderResolver';
@@ -232,6 +232,88 @@ export async function updateMediaIndexEntry(params: {
     await ref.set(params.patch, { merge: true });
   } catch (err) {
     console.warn(`[MediaIndex] No se pudo actualizar ${params.messageId}:`, err);
+  }
+}
+
+// ============================================
+// Índice de búsqueda de texto (`message_index`).
+//
+// Gemelo conceptual de `media_index`: una colección plana a nivel de sesión
+// (`whatsapp_sessions/{sid}/message_index/{messageId}`) que permite buscar
+// palabras dentro de los mensajes SIN barrer chat por chat ni usar
+// collectionGroup. Cada doc trae `searchTokens` (palabras normalizadas) para
+// resolver la búsqueda con `array-contains`, más `text` para que el cliente
+// pinte el snippet y refine frases.
+//
+// Solo se indexan mensajes CON texto (conversación o caption). Media sin
+// caption no genera tokens → no se indexa (se busca en el media_vault).
+// Idempotente (merge) y fail-safe: un error aquí no tumba el guardado.
+//
+// Requiere índice compuesto en Firestore: searchTokens (array-contains) +
+// timestamp (desc). Ver firestore.indexes.json.
+// ============================================
+
+// Máximo de chars del texto guardado en el índice. Suficiente para snippet +
+// refinamiento de frase en cliente; evita duplicar pastes enormes.
+const MESSAGE_INDEX_TEXT_MAX = 500;
+
+export async function writeMessageIndexEntry(params: {
+  accountId: string;
+  sessionId: string;
+  messageId: string;
+  chatId: string;
+  text: string;
+  contactName?: string | null;
+  timestamp: admin.firestore.Timestamp;
+  fromMe: boolean;
+  senderName?: string;
+}): Promise<void> {
+  const tokens = buildSearchTokens(params.text);
+  if (tokens.length === 0) return; // nada indexable (media sin caption, etc.)
+  try {
+    const payload: Record<string, any> = {
+      messageId: params.messageId,
+      chatId: params.chatId,
+      text: params.text.substring(0, MESSAGE_INDEX_TEXT_MAX),
+      searchTokens: tokens,
+      timestamp: params.timestamp,
+      fromMe: params.fromMe,
+    };
+    if (params.contactName) payload.contactName = params.contactName;
+    if (params.senderName) payload.senderName = params.senderName;
+
+    await getDb()
+      .collection(ACCOUNTS_COLLECTION)
+      .doc(params.accountId)
+      .collection('whatsapp_sessions')
+      .doc(params.sessionId)
+      .collection('message_index')
+      .doc(params.messageId)
+      .set(payload, { merge: true });
+  } catch (err) {
+    console.warn(`[MessageIndex] No se pudo indexar ${params.messageId}:`, err);
+  }
+}
+
+// Borra la entrada del índice de un mensaje (hard-delete / revoke 'me').
+// Fail-safe: un mensaje huérfano en el índice solo aparecería como resultado
+// fantasma, no rompe nada — pero conviene mantenerlo limpio.
+export async function deleteMessageIndexEntry(
+  accountId: string,
+  sessionId: string,
+  messageId: string,
+): Promise<void> {
+  try {
+    await getDb()
+      .collection(ACCOUNTS_COLLECTION)
+      .doc(accountId)
+      .collection('whatsapp_sessions')
+      .doc(sessionId)
+      .collection('message_index')
+      .doc(messageId)
+      .delete();
+  } catch (err) {
+    console.warn(`[MessageIndex] No se pudo borrar ${messageId}:`, err);
   }
 }
 
@@ -530,6 +612,22 @@ export async function saveMessageToFirestore(
           editedAt: admin.firestore.Timestamp.fromDate(new Date(protocolTs)),
         }, { merge: true });
 
+        // Reindexar el texto editado. El doc de message_index ya existe (creado
+        // al guardar el original) con su timestamp correcto, así que solo
+        // refrescamos text + searchTokens vía merge. Fire-and-forget.
+        getDb()
+          .collection(ACCOUNTS_COLLECTION)
+          .doc(accountId)
+          .collection('whatsapp_sessions')
+          .doc(sessionId)
+          .collection('message_index')
+          .doc(targetMessageId)
+          .set({
+            text: newText.substring(0, MESSAGE_INDEX_TEXT_MAX),
+            searchTokens: buildSearchTokens(newText),
+          }, { merge: true })
+          .catch((e) => console.warn(`[MessageIndex] reindex edit ${targetMessageId}:`, e));
+
         console.log(`[Edit] ${actor} editó ${targetMessageId} en chat ${phoneNumber}: "${newText}"`);
         return;
       }
@@ -543,6 +641,8 @@ export async function saveMessageToFirestore(
       if (actor === 'me') {
         await targetMessageRef.delete();
         await recalcChatLastMessage(accountId, sessionId, phoneNumber, targetMessageId);
+        deleteMessageIndexEntry(accountId, sessionId, targetMessageId)
+          .catch(() => { /* ya logueado en el helper */ });
         console.log(`[Revoke] me eliminó ${targetMessageId} en chat ${phoneNumber} → hard-delete`);
       } else {
         await targetMessageRef.set({
@@ -680,6 +780,20 @@ export async function saveMessageToFirestore(
       senderType: senderFields.senderType,
       senderName: senderFields.senderName,
       mediaFields,
+    }).catch(() => { /* ya logueado en el helper */ });
+
+    // Indexar al message_index para búsqueda de texto (solo si hay texto/caption).
+    // Mismo patrón fire-and-forget que media_index.
+    writeMessageIndexEntry({
+      accountId,
+      sessionId,
+      messageId,
+      chatId: phoneNumber,
+      text: messageText,
+      contactName: cachedNameForIndex ?? null,
+      timestamp: msgTimestamp,
+      fromMe: !!message.key.fromMe,
+      senderName: senderFields.senderName,
     }).catch(() => { /* ya logueado en el helper */ });
 
     // Update the chat document with lastMessage (for efficient list display)

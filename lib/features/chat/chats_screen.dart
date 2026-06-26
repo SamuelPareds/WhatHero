@@ -18,6 +18,7 @@ import 'package:crm_whatsapp/features/accounts.dart';
 import 'messages_view.dart';
 import 'media_vault_screen.dart';
 import 'widgets/ai_state_indicator.dart';
+import 'widgets/message_search_results.dart';
 import 'widgets/unread_badge.dart';
 import 'widgets/label_chip.dart';
 import 'widgets/labels_selector_sheet.dart';
@@ -537,7 +538,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
             : [
                 IconButton(
                   icon: const Icon(Icons.search, size: 20),
-                  tooltip: 'Buscar contacto',
+                  tooltip: 'Buscar contacto o mensaje',
                   onPressed: _toggleSearch,
                 ),
                 IconButton(
@@ -650,17 +651,16 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 note.toLowerCase().contains(searchQuery);
           }).toList();
 
-          if (filteredChats.isEmpty) {
-            // Empty state contextual: prioridad búsqueda > filtro activo >
-            // bandeja vacía. Así el copy explica por qué no hay nada a la vista.
+          // El empty-state grande solo aplica SIN búsqueda. Al buscar, aunque
+          // ningún chat coincida por nombre, _buildSearchBody igual muestra la
+          // sección "Mensajes" (el caso más valioso de la búsqueda de texto).
+          if (filteredChats.isEmpty && searchQuery.isEmpty) {
+            // Empty state contextual: filtro activo > bandeja vacía. Así el
+            // copy explica por qué no hay nada a la vista.
             final IconData emptyIcon;
             final String emptyTitle;
             final String emptySubtitle;
-            if (searchQuery.isNotEmpty) {
-              emptyIcon = Icons.search_off;
-              emptyTitle = 'No se encontraron resultados';
-              emptySubtitle = 'Intenta con otro contacto o número';
-            } else if (_activeFilter == ChatFilter.noRespondidos) {
+            if (_activeFilter == ChatFilter.noRespondidos) {
               emptyIcon = Icons.mark_chat_read_outlined;
               emptyTitle = 'Todo respondido';
               emptySubtitle = 'No tienes mensajes pendientes por responder';
@@ -682,9 +682,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
                   'Los chats aparecerán aquí cuando recibas mensajes';
             }
             // El botón "Ir a Mis Cuentas" solo tiene sentido en la bandeja
-            // realmente vacía, no cuando un filtro/búsqueda no arroja nada.
-            final showAccountsCta =
-                searchQuery.isEmpty && _activeFilter == ChatFilter.todos;
+            // realmente vacía, no cuando un filtro no arroja nada.
+            final showAccountsCta = _activeFilter == ChatFilter.todos;
             return Center(
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
@@ -730,6 +729,13 @@ class _ChatsScreenState extends State<ChatsScreen> {
             );
           }
 
+          // Al buscar mostramos dos secciones (estilo WhatsApp): "Chats"
+          // (match en memoria por nombre/teléfono/nota) y "Mensajes" (hits del
+          // message_index por contenido). Sin búsqueda, lista normal.
+          if (searchQuery.isNotEmpty) {
+            return _buildSearchBody(filteredChats);
+          }
+
           return ListView.separated(
             itemCount: filteredChats.length,
             // Divisor sutil entre chats, indentado para arrancar tras el avatar.
@@ -741,78 +747,125 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 color: white.withValues(alpha: 0.06),
               ),
             ),
-            itemBuilder: (context, index) {
-              final chatDoc = filteredChats[index];
-              final chatData = chatDoc.data() as Map<String, dynamic>?;
-
-              final phoneNumber = chatData?['phoneNumber'] as String? ?? '';
-              final contactName = chatData?['contactName'] as String? ?? '';
-              final lastMessage = chatData?['lastMessage'] ?? 'Sin mensajes';
-              final timestamp = (chatData?['lastMessageTimestamp'] as Timestamp?)?.toDate();
-              final unrespondedCount = (chatData?['unresponded_count'] as num?)?.toInt() ?? 0;
-              final markedPending = chatData?['marked_pending'] as bool? ?? false;
-              // Un chat está "pendiente" por la señal automática o por la marca
-              // manual de seguimiento. Ambas pintan naranja y abren el swipe.
-              final isPending = unrespondedCount > 0 || markedPending;
-              final labelIds = ((chatData?['labelIds'] as List?) ?? const [])
-                  .whereType<String>()
-                  .toList();
-              final note = chatData?['note'] as String? ?? '';
-
-              final tile = _ChatTile(
-                phoneNumber: phoneNumber,
-                contactName: contactName,
-                lastMessage: lastMessage,
-                timestamp: timestamp,
-                isSelected: selectedChatPhone == phoneNumber,
-                unrespondedCount: unrespondedCount,
-                markedPending: markedPending,
-                sessionKey: widget.sessionKey,
-                labelIds: labelIds,
-                labelsCatalog: _labelsCatalog,
-                note: note,
-                onTap: () {
-                  setState(() {
-                    selectedChatPhone = phoneNumber;
-                  });
-                },
-                onLongPress: () => _showChatOptions(
-                    phoneNumber, contactName, labelIds, note, isPending),
-              );
-
-              // Swipe simétrico estilo WhatsApp: si el chat está pendiente,
-              // la acción lo cierra ("Listo"); si no, lo marca a mano
-              // ("Pendiente") para darle seguimiento aunque no haya pendientes.
-              return Slidable(
-                key: ValueKey('chat_$phoneNumber'),
-                groupTag: 'chats',
-                endActionPane: ActionPane(
-                  motion: const DrawerMotion(),
-                  extentRatio: 0.25,
-                  children: [
-                    if (isPending)
-                      SlidableAction(
-                        onPressed: (_) => _markAsResponded(phoneNumber),
-                        backgroundColor: const Color(0xFFF97316),
-                        foregroundColor: Colors.white,
-                        icon: Icons.mark_chat_read,
-                        label: 'Listo',
-                      )
-                    else
-                      SlidableAction(
-                        onPressed: (_) => _markAsPending(phoneNumber),
-                        backgroundColor: const Color(0xFFF97316),
-                        foregroundColor: Colors.white,
-                        icon: Icons.mark_chat_unread,
-                        label: 'Pendiente',
-                      ),
-                  ],
-                ),
-                child: tile,
-              );
-            },
+            itemBuilder: (context, index) => _buildChatTile(filteredChats[index]),
           );
         },
+      ),
+    );
+  }
+
+  // Construye el tile de un chat (con su swipe). Reutilizado por la lista normal
+  // y por la sección "Chats" del buscador.
+  Widget _buildChatTile(QueryDocumentSnapshot chatDoc) {
+    final chatData = chatDoc.data() as Map<String, dynamic>?;
+
+    final phoneNumber = chatData?['phoneNumber'] as String? ?? '';
+    final contactName = chatData?['contactName'] as String? ?? '';
+    final lastMessage = chatData?['lastMessage'] ?? 'Sin mensajes';
+    final timestamp = (chatData?['lastMessageTimestamp'] as Timestamp?)?.toDate();
+    final unrespondedCount = (chatData?['unresponded_count'] as num?)?.toInt() ?? 0;
+    final markedPending = chatData?['marked_pending'] as bool? ?? false;
+    // Un chat está "pendiente" por la señal automática o por la marca
+    // manual de seguimiento. Ambas pintan naranja y abren el swipe.
+    final isPending = unrespondedCount > 0 || markedPending;
+    final labelIds = ((chatData?['labelIds'] as List?) ?? const [])
+        .whereType<String>()
+        .toList();
+    final note = chatData?['note'] as String? ?? '';
+
+    final tile = _ChatTile(
+      phoneNumber: phoneNumber,
+      contactName: contactName,
+      lastMessage: lastMessage,
+      timestamp: timestamp,
+      isSelected: selectedChatPhone == phoneNumber,
+      unrespondedCount: unrespondedCount,
+      markedPending: markedPending,
+      sessionKey: widget.sessionKey,
+      labelIds: labelIds,
+      labelsCatalog: _labelsCatalog,
+      note: note,
+      onTap: () {
+        setState(() {
+          selectedChatPhone = phoneNumber;
+        });
+      },
+      onLongPress: () => _showChatOptions(
+          phoneNumber, contactName, labelIds, note, isPending),
+    );
+
+    // Swipe simétrico estilo WhatsApp: si el chat está pendiente,
+    // la acción lo cierra ("Listo"); si no, lo marca a mano
+    // ("Pendiente") para darle seguimiento aunque no haya pendientes.
+    return Slidable(
+      key: ValueKey('chat_$phoneNumber'),
+      groupTag: 'chats',
+      endActionPane: ActionPane(
+        motion: const DrawerMotion(),
+        extentRatio: 0.25,
+        children: [
+          if (isPending)
+            SlidableAction(
+              onPressed: (_) => _markAsResponded(phoneNumber),
+              backgroundColor: const Color(0xFFF97316),
+              foregroundColor: Colors.white,
+              icon: Icons.mark_chat_read,
+              label: 'Listo',
+            )
+          else
+            SlidableAction(
+              onPressed: (_) => _markAsPending(phoneNumber),
+              backgroundColor: const Color(0xFFF97316),
+              foregroundColor: Colors.white,
+              icon: Icons.mark_chat_unread,
+              label: 'Pendiente',
+            ),
+        ],
+      ),
+      child: tile,
+    );
+  }
+
+  // Cuerpo del buscador: sección "Chats" (en memoria) + sección "Mensajes"
+  // (asíncrona, contra message_index). La sección Mensajes ignora el chip de
+  // filtro activo: busca contenido en toda la sesión.
+  Widget _buildSearchBody(List<QueryDocumentSnapshot> filteredChats) {
+    return ListView(
+      children: [
+        if (filteredChats.isNotEmpty) ...[
+          _searchSectionHeader('Chats'),
+          ...filteredChats.map(_buildChatTile),
+        ],
+        _searchSectionHeader('Mensajes'),
+        MessageSearchResults(
+          accountId: widget.accountId,
+          sessionId: widget.sessionId!,
+          query: searchQuery,
+          onOpenChat: (chatId) {
+            setState(() {
+              selectedChatPhone = chatId;
+              // Colapsar el buscador al saltar al chat, como WhatsApp.
+              _searchExpanded = false;
+              searchController.clear();
+              searchQuery = '';
+            });
+          },
+        ),
+      ],
+    );
+  }
+
+  Widget _searchSectionHeader(String label) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 6),
+      child: Text(
+        label.toUpperCase(),
+        style: TextStyle(
+          color: primaryAqua.withValues(alpha: 0.8),
+          fontSize: 12,
+          fontWeight: FontWeight.w700,
+          letterSpacing: 0.5,
+        ),
       ),
     );
   }
@@ -839,7 +892,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
       style: const TextStyle(color: white, fontSize: 18),
       cursorColor: primaryAqua,
       decoration: const InputDecoration(
-        hintText: 'Buscar contacto...',
+        hintText: 'Buscar contacto o mensaje...',
         hintStyle: TextStyle(color: lightText, fontSize: 18),
         border: InputBorder.none,
         isCollapsed: true,

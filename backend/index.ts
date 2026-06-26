@@ -17,7 +17,7 @@ import cron from 'node-cron';
 import { SessionData, MessageBuffer } from './src/types';
 import { extractPhoneNumber, storeLIDMapping, resolveLIDViaSock, isConversationalJid } from './src/utils/phone';
 import { unwrapMessageContent } from './src/utils/message';
-import { initializeSession, saveMessageToFirestore, getAIConfig, cacheContactName, applyContactUpdate, reconcileContactNames, consolidateLIDChat, incrementUnrespondedCount, resetUnrespondedCount, writeMediaIndexEntry, isIndexableMedia } from './src/services/firestoreService';
+import { initializeSession, saveMessageToFirestore, getAIConfig, cacheContactName, applyContactUpdate, reconcileContactNames, consolidateLIDChat, incrementUnrespondedCount, resetUnrespondedCount, writeMediaIndexEntry, isIndexableMedia, writeMessageIndexEntry } from './src/services/firestoreService';
 import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer, emitAiState, getSessionTimezone, AiError } from './src/services/aiService';
 
 // Mapeo de códigos de AiError → HTTP para el endpoint manual (copiloto). El
@@ -1796,6 +1796,97 @@ app.post('/backfill-media-index', express.json(), verifyHttpAuth(), async (req, 
     console.error('[Backfill] Error:', error);
     res.status(500).json({
       error: 'Failed to backfill media_index',
+      details: (error as any).message,
+    });
+  }
+});
+
+// Backfill del message_index para una sesión: recorre todos los chats y crea la
+// entrada de búsqueda de cada mensaje con texto. Necesario una vez para indexar
+// el histórico previo a esta feature (los mensajes nuevos se indexan al vuelo).
+// Idempotente: re-ejecutarlo solo sobreescribe con merge. Mismo patrón paginado
+// que /backfill-media-index.
+app.post('/backfill-message-index', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const { accountId, sessionId } = req.body as {
+      accountId?: string;
+      sessionId?: string;
+    };
+    if (!accountId || !sessionId) {
+      return res.status(400).json({ error: 'Missing accountId or sessionId' });
+    }
+    // verifyHttpAuth ya validó que el requester es miembro de accountId.
+
+    const db = admin.firestore();
+    const sessionRef = db
+      .collection(ACCOUNTS_COLLECTION)
+      .doc(accountId)
+      .collection('whatsapp_sessions')
+      .doc(sessionId);
+
+    const chatsSnap = await sessionRef.collection('chats').get();
+    let scannedChats = 0;
+    let indexedCount = 0;
+    let skippedCount = 0;
+
+    for (const chatDoc of chatsSnap.docs) {
+      scannedChats++;
+      const chatId = chatDoc.id;
+      const chatData = chatDoc.data();
+      const contactName: string | null = chatData?.contactName ?? null;
+
+      let cursor: FirebaseFirestore.QueryDocumentSnapshot | null = null;
+      while (true) {
+        let q: FirebaseFirestore.Query = chatDoc.ref
+          .collection('messages')
+          .orderBy('timestamp', 'desc')
+          .limit(500);
+        if (cursor) q = q.startAfter(cursor);
+        const page = await q.get();
+        if (page.empty) break;
+
+        for (const msgDoc of page.docs) {
+          const m = msgDoc.data();
+          const text: string = m.text ?? '';
+          // writeMessageIndexEntry hace no-op si el texto no tiene tokens
+          // (media sin caption), pero contamos el skip para reportar.
+          if (!text.trim()) {
+            skippedCount++;
+            continue;
+          }
+          await writeMessageIndexEntry({
+            accountId,
+            sessionId,
+            messageId: msgDoc.id,
+            chatId,
+            text,
+            contactName,
+            timestamp: m.timestamp,
+            fromMe: !!m.fromMe,
+            senderName: m.senderName,
+          });
+          indexedCount++;
+        }
+
+        cursor = page.docs[page.docs.length - 1];
+        if (page.size < 500) break;
+      }
+    }
+
+    // Marcamos la sesión como ya indexada: a partir de aquí los mensajes nuevos
+    // se indexan solos al guardarse, así que el frontend puede ocultar el botón
+    // de backfill (no tiene sentido re-correrlo el histórico completo).
+    await sessionRef.set(
+      { message_index_backfilled_at: admin.firestore.FieldValue.serverTimestamp() },
+      { merge: true },
+    );
+
+    console.log(`[Backfill] message_index para ${accountId}/${sessionId}: chats=${scannedChats}, indexed=${indexedCount}, skipped=${skippedCount}`);
+    res.json({ success: true, scannedChats, indexedCount, skippedCount });
+  } catch (error) {
+    console.error('[Backfill] Error:', error);
+    res.status(500).json({
+      error: 'Failed to backfill message_index',
       details: (error as any).message,
     });
   }
