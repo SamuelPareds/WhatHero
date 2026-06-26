@@ -82,6 +82,11 @@ class _SessionDispatcherState extends State<SessionDispatcher> {
   // SESIÓN; la apertura del chat la hace ChatsScreen.
   ValueNotifier<HumanAttentionPush?>? _pendingTap;
 
+  // Sesión sobre la que ya avisamos "desconectada" en este episodio de
+  // deep-link. Evita repetir el aviso en cada rebuild del StreamBuilder. Se
+  // resetea con cada tap nuevo (_applyDeepLink) para poder volver a avisar.
+  String? _disconnectedNoticeFor;
+
   @override
   void initState() {
     super.initState();
@@ -133,10 +138,38 @@ class _SessionDispatcherState extends State<SessionDispatcher> {
   void _applyDeepLink(HumanAttentionPush push) {
     if (!mounted || !push.isValid) return;
     Navigator.of(context).popUntil((route) => route.isFirst);
+    // Tap nuevo: permitimos volver a avisar si la sesión sigue desconectada.
+    _disconnectedNoticeFor = null;
     if (push.sessionPhone.isNotEmpty &&
         push.sessionPhone != _overrideSessionId) {
       setState(() => _overrideSessionId = push.sessionPhone);
     }
+  }
+
+  // Deep-link a una sesión que no está entre las conectadas (p. ej. se
+  // desvinculó). En vez de fallar callado cayendo a otra sesión, avisamos qué
+  // pasó y limpiamos override + intención para no quedarnos reintentando.
+  // Se llama desde build cuando el override no aparece en los docs conectados;
+  // por eso el efecto (snackbar + setState) va en un post-frame callback.
+  void _noticeDisconnectedSession(String sessionId) {
+    if (_disconnectedNoticeFor == sessionId) return;
+    _disconnectedNoticeFor = sessionId;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      NotificationService().pendingTap.value = null;
+      setState(() => _overrideSessionId = null);
+      ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+        SnackBar(
+          content: Text(
+            'La sesión $sessionId está desconectada. '
+            'Vuelve a vincularla para abrir ese chat.',
+          ),
+          backgroundColor: Colors.orange.shade800,
+          behavior: SnackBarBehavior.floating,
+          duration: const Duration(seconds: 5),
+        ),
+      );
+    });
   }
 
   @override
@@ -188,7 +221,8 @@ class _SessionDispatcherState extends State<SessionDispatcher> {
               // sobre la última sesión usada. Si ninguna coincide entre las
               // conectadas (p. ej. el push apunta a una sesión desvinculada),
               // caemos a la primera disponible.
-              final preferredSessionId = _overrideSessionId ?? lastSessionId;
+              final overrideId = _overrideSessionId;
+              final preferredSessionId = overrideId ?? lastSessionId;
               DocumentSnapshot? targetDoc;
               if (preferredSessionId != null) {
                 for (final doc in docs) {
@@ -197,6 +231,13 @@ class _SessionDispatcherState extends State<SessionDispatcher> {
                     break;
                   }
                 }
+              }
+
+              // Deep-link a una sesión desconectada: no está entre los docs
+              // conectados → avisamos (Fase 3, opción "solo avisar") y caemos a
+              // la primera disponible para no dejar al usuario en pantalla vacía.
+              if (overrideId != null && targetDoc == null) {
+                _noticeDisconnectedSession(overrideId);
               }
               targetDoc ??= docs.first;
 
