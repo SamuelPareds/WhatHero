@@ -72,6 +72,9 @@ class _MessagesViewState extends State<MessagesView> {
   int _messageLimit = 30;
   bool _isLoadingMore = false;
   bool _hasMore = true;
+  // Flecha flotante para volver al mensaje más reciente; visible solo cuando el
+  // usuario se aleja del fondo revisando el historial.
+  bool _showScrollToBottom = false;
 
   // 🎯 Salto a un mensaje (deep-link desde el buscador).
   // _pendingJumpId: objetivo aún no localizado en la lista cargada.
@@ -315,15 +318,68 @@ class _MessagesViewState extends State<MessagesView> {
   }
 
   void _scrollListener() {
+    if (!_scrollController.hasClients) return;
+    final pixels = _scrollController.position.pixels;
+
+    // Flecha "bajar a lo más reciente": en reverse:true, el fondo (mensajes
+    // nuevos) es pixels≈0; al alejarnos del fondo la mostramos.
+    final shouldShow = pixels > 300;
+    if (shouldShow != _showScrollToBottom) {
+      setState(() => _showScrollToBottom = shouldShow);
+    }
+
     // Durante un salto programático no paginamos: el jumpTo puede aterrizar
     // cerca del tope y se confundiría con scroll manual del usuario.
     if (_jumpScrolling) return;
     // En una lista 'reverse: true', el final (maxScrollExtent) es la parte SUPERIOR (mensajes viejos)
-    if (_scrollController.position.pixels >= _scrollController.position.maxScrollExtent - 200) {
+    if (pixels >= _scrollController.position.maxScrollExtent - 200) {
       if (!_isLoadingMore && _hasMore) {
         _loadMoreMessages();
       }
     }
+  }
+
+  // Baja al mensaje más reciente (fondo de la lista reverse → offset 0).
+  void _scrollToBottom() {
+    if (!_scrollController.hasClients) return;
+    _scrollController.animateTo(
+      0,
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.easeOut,
+    );
+  }
+
+  // Flecha flotante, sutil, abajo-derecha. Aparece/desaparece con un fade+scale
+  // y queda inerte (IgnorePointer) cuando está oculta para no robar taps.
+  Widget _scrollToBottomButton() {
+    return IgnorePointer(
+      ignoring: !_showScrollToBottom,
+      child: AnimatedOpacity(
+        opacity: _showScrollToBottom ? 1 : 0,
+        duration: const Duration(milliseconds: 180),
+        child: AnimatedScale(
+          scale: _showScrollToBottom ? 1 : 0.8,
+          duration: const Duration(milliseconds: 180),
+          curve: Curves.easeOut,
+          child: Material(
+            color: surfaceDark.withValues(alpha: 0.95),
+            elevation: 4,
+            shape: CircleBorder(
+              side: BorderSide(color: primaryAqua.withValues(alpha: 0.3)),
+            ),
+            child: InkWell(
+              customBorder: const CircleBorder(),
+              onTap: _scrollToBottom,
+              child: const Padding(
+                padding: EdgeInsets.all(7),
+                child: Icon(Icons.keyboard_arrow_down,
+                    color: primaryAqua, size: 24),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   void _loadMoreMessages() {
@@ -1113,7 +1169,9 @@ class _MessagesViewState extends State<MessagesView> {
       children: [
         // Messages
         Expanded(
-          child: StreamBuilder<QuerySnapshot>(
+          child: Stack(
+            children: [
+              StreamBuilder<QuerySnapshot>(
             stream: FirebaseFirestore.instance
                 .collection(accountsCollection)
                 .doc(widget.accountId)
@@ -1249,11 +1307,18 @@ class _MessagesViewState extends State<MessagesView> {
               );
             },
           ),
+              Positioned(
+                right: 16,
+                bottom: 16,
+                child: _scrollToBottomButton(),
+              ),
+            ],
+          ),
         ),
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
           decoration: BoxDecoration(
-            color: surfaceDark, 
+            color: surfaceDark,
             border: Border(top: BorderSide(color: primaryAqua.withValues(alpha: 0.1), width: 1))
           ),
           child: SafeArea(
