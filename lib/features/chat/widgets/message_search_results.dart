@@ -283,14 +283,35 @@ class _MessageSearchResultsState extends State<MessageSearchResults> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        ..._hits.map((h) => _MessageHitTile(
-              hit: h,
+        ..._groupHits().map((g) => _ChatHitGroup(
+              group: g,
               query: widget.query,
-              onTap: () => widget.onOpenChat(h.chatId),
+              onOpenChat: widget.onOpenChat,
             )),
         _backfillButton(),
       ],
     );
+  }
+
+  // Agrupa los hits por chat preservando el orden. Como `_hits` ya viene
+  // ordenado por fecha desc, el primer hit que vemos de cada chat fija su
+  // posición → los chats quedan ordenados por su coincidencia más reciente, y
+  // dentro de cada uno los mensajes mantienen el orden desc. Así un mismo
+  // contacto que repitió una palabra aparece una sola vez, con sus mensajes
+  // listados debajo (en vez de una fila por mensaje).
+  List<_ChatGroup> _groupHits() {
+    final groups = <String, _ChatGroup>{};
+    for (final h in _hits) {
+      groups.putIfAbsent(
+        h.chatId,
+        () => _ChatGroup(
+          chatId: h.chatId,
+          contactName: h.contactName,
+          hits: [],
+        ),
+      ).hits.add(h);
+    }
+    return groups.values.toList();
   }
 
   Widget _hint(String text) => Padding(
@@ -346,12 +367,112 @@ class _MessageHit {
   });
 }
 
-class _MessageHitTile extends StatelessWidget {
+// Todos los hits de un mismo chat, en el orden desc en que llegaron de `_hits`.
+class _ChatGroup {
+  final String chatId;
+  final String? contactName;
+  final List<_MessageHit> hits;
+
+  _ChatGroup({
+    required this.chatId,
+    required this.contactName,
+    required this.hits,
+  });
+}
+
+// Un contacto con sus mensajes coincidentes anidados: header (avatar + nombre)
+// una sola vez, y debajo cada match con su fecha tras una guía vertical aqua.
+// Tanto el header como cada fila abren el chat.
+class _ChatHitGroup extends StatelessWidget {
+  final _ChatGroup group;
+  final String query;
+  final void Function(String chatId) onOpenChat;
+
+  const _ChatHitGroup({
+    required this.group,
+    required this.query,
+    required this.onOpenChat,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final title = (group.contactName?.trim().isNotEmpty ?? false)
+        ? group.contactName!.trim()
+        : group.chatId;
+    final initial = title.isNotEmpty ? title[0].toUpperCase() : '?';
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        InkWell(
+          onTap: () => onOpenChat(group.chatId),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 10, 16, 6),
+            child: Row(
+              children: [
+                CircleAvatar(
+                  radius: 20,
+                  backgroundColor: primaryAqua.withValues(alpha: 0.2),
+                  child: Text(initial,
+                      style: const TextStyle(
+                          color: primaryAqua, fontWeight: FontWeight.bold)),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                          color: white,
+                          fontWeight: FontWeight.w600,
+                          fontSize: 15)),
+                ),
+              ],
+            ),
+          ),
+        ),
+        // Guía vertical aqua alineada bajo el avatar para comunicar la jerarquía
+        // de los mensajes respecto al contacto.
+        Padding(
+          padding: const EdgeInsets.only(left: 35, bottom: 4),
+          // IntrinsicHeight acota la guía vertical a la altura de la columna de
+          // mensajes; sin esto, el `stretch` pide altura infinita dentro del
+          // ListView (no acotado verticalmente) y revienta el layout.
+          child: IntrinsicHeight(
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Container(
+                  width: 2,
+                  margin: const EdgeInsets.only(top: 4, bottom: 4),
+                  color: primaryAqua.withValues(alpha: 0.25),
+                ),
+                Expanded(
+                  child: Column(
+                    children: group.hits
+                        .map((h) => _MessageHitRow(
+                              hit: h,
+                              query: query,
+                              onTap: () => onOpenChat(h.chatId),
+                            ))
+                        .toList(),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _MessageHitRow extends StatelessWidget {
   final _MessageHit hit;
   final String query;
   final VoidCallback onTap;
 
-  const _MessageHitTile({
+  const _MessageHitRow({
     required this.hit,
     required this.query,
     required this.onTap,
@@ -359,52 +480,19 @@ class _MessageHitTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final title = (hit.contactName?.trim().isNotEmpty ?? false)
-        ? hit.contactName!.trim()
-        : hit.chatId;
-    final initial = title.isNotEmpty ? title[0].toUpperCase() : '?';
-
     return InkWell(
       onTap: onTap,
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+        padding: const EdgeInsets.fromLTRB(12, 8, 16, 8),
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            CircleAvatar(
-              radius: 20,
-              backgroundColor: primaryAqua.withValues(alpha: 0.2),
-              child: Text(initial,
-                  style: const TextStyle(
-                      color: primaryAqua, fontWeight: FontWeight.bold)),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Expanded(
-                        child: Text(title,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                                color: white,
-                                fontWeight: FontWeight.w600,
-                                fontSize: 15)),
-                      ),
-                      if (hit.timestamp != null)
-                        Text(_formatDate(hit.timestamp!),
-                            style: const TextStyle(
-                                color: lightText, fontSize: 11)),
-                    ],
-                  ),
-                  const SizedBox(height: 2),
-                  _snippet(),
-                ],
-              ),
-            ),
+            Expanded(child: _snippet()),
+            if (hit.timestamp != null) ...[
+              const SizedBox(width: 8),
+              Text(_formatDate(hit.timestamp!),
+                  style: const TextStyle(color: lightText, fontSize: 11)),
+            ],
           ],
         ),
       ),
