@@ -68,6 +68,20 @@ class SessionDispatcher extends StatefulWidget {
 }
 
 class _SessionDispatcherState extends State<SessionDispatcher> {
+  // Sesión elegida por un deep-link de notificación. Tiene prioridad sobre la
+  // "última sesión usada": cuando el operador toca un push de otra sesión,
+  // saltamos a ESA. Persiste para que se quede ahí donde lo llevó la notif.
+  String? _overrideSessionId;
+
+  // Cacheada para no re-pedir SharedPreferences en cada rebuild (un setState
+  // por deep-link reconstruiría el FutureBuilder y parpadearía el spinner).
+  late final Future<String?> _lastSessionFuture =
+      StorageService().getLastSessionId();
+
+  // Intención de deep-link compartida con ChatsScreen. Aquí solo decidimos la
+  // SESIÓN; la apertura del chat la hace ChatsScreen.
+  ValueNotifier<HumanAttentionPush?>? _pendingTap;
+
   @override
   void initState() {
     super.initState();
@@ -90,6 +104,45 @@ class _SessionDispatcherState extends State<SessionDispatcher> {
     // registraría hasta que el usuario navegara manualmente.
     // Es async pero no esperamos: la UI no debe bloquearse por permisos/red.
     unawaited(NotificationService().init(widget.accountId));
+
+    // Deep-link de cold-start (app abierta DESDE un tap a la notificación):
+    // elegimos la sesión del push para el primer render, en vez de la última
+    // sesión usada. El chat lo abre ChatsScreen vía initialTapReady.
+    NotificationService().initialTapReady.then((push) {
+      if (push != null && mounted) _applyDeepLink(push);
+    });
+
+    // Deep-link con la app viva (tap en background/foreground): mismo notifier
+    // que consume ChatsScreen. Aquí solo cambiamos de sesión si hace falta.
+    _pendingTap = NotificationService().pendingTap;
+    _pendingTap!.addListener(_onPendingTap);
+  }
+
+  void _onPendingTap() {
+    final push = _pendingTap?.value;
+    if (push != null) _applyDeepLink(push);
+  }
+
+  // Lleva al usuario a la sesión del push. Dos cosas:
+  //  1. Descarta rutas apiladas (AccountsScreen, o una ChatsScreen de otra
+  //     sesión abierta a mano) para que la ChatsScreen raíz vuelva a ser la
+  //     visible.
+  //  2. Si el push apunta a otra sesión, la fija como override → el build
+  //     resuelve esa sesión y, gracias al ValueKey, remonta la ChatsScreen
+  //     correcta, cuya initState lee la intención y abre el chat.
+  void _applyDeepLink(HumanAttentionPush push) {
+    if (!mounted || !push.isValid) return;
+    Navigator.of(context).popUntil((route) => route.isFirst);
+    if (push.sessionPhone.isNotEmpty &&
+        push.sessionPhone != _overrideSessionId) {
+      setState(() => _overrideSessionId = push.sessionPhone);
+    }
+  }
+
+  @override
+  void dispose() {
+    _pendingTap?.removeListener(_onPendingTap);
+    super.dispose();
   }
 
   @override
@@ -100,7 +153,7 @@ class _SessionDispatcherState extends State<SessionDispatcher> {
     // único ancestro garantizado post-login que conoce el accountId.
     return ForegroundPushHost(
       child: FutureBuilder<String?>(
-        future: StorageService().getLastSessionId(),
+        future: _lastSessionFuture,
       builder: (context, lastSessionSnapshot) {
         if (lastSessionSnapshot.connectionState == ConnectionState.waiting) {
           return const Scaffold(
@@ -131,17 +184,20 @@ class _SessionDispatcherState extends State<SessionDispatcher> {
             final docs = snapshot.data?.docs ?? [];
 
             if (docs.isNotEmpty) {
-              // 1. Intentar encontrar la última sesión guardada que esté conectada
+              // Preferencia de sesión: el deep-link de una notificación manda
+              // sobre la última sesión usada. Si ninguna coincide entre las
+              // conectadas (p. ej. el push apunta a una sesión desvinculada),
+              // caemos a la primera disponible.
+              final preferredSessionId = _overrideSessionId ?? lastSessionId;
               DocumentSnapshot? targetDoc;
-              if (lastSessionId != null) {
-                try {
-                  targetDoc = docs.firstWhere((doc) => doc.id == lastSessionId);
-                } catch (_) {
-                  // Si no se encuentra, targetDoc sigue siendo null
+              if (preferredSessionId != null) {
+                for (final doc in docs) {
+                  if (doc.id == preferredSessionId) {
+                    targetDoc = doc;
+                    break;
+                  }
                 }
               }
-
-              // 2. Si no hay guardada o ya no está conectada, usar la primera disponible
               targetDoc ??= docs.first;
 
               final sessionId = targetDoc.id;
@@ -150,6 +206,10 @@ class _SessionDispatcherState extends State<SessionDispatcher> {
 
               if (sessionKey != null) {
                 return ChatsScreen(
+                  // El ValueKey por sesión fuerza el remonte al cambiar de
+                  // sesión (deep-link): la nueva ChatsScreen corre initState y
+                  // ahí lee la intención pendiente para abrir el chat.
+                  key: ValueKey(sessionId),
                   sessionId: sessionId,
                   sessionKey: sessionKey,
                   accountId: widget.accountId,

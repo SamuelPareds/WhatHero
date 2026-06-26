@@ -20,8 +20,9 @@ import '../services/notification_sound.dart';
 /// Es aditivo y multiplataforma: en Android foreground también mejora, sin
 /// tocar la bandeja del SO ni el flujo de background.
 ///
-/// Tap en el banner → reenvía al `tapStream` vía `forwardTap`, reutilizando el
-/// deep-link que ya maneja `ChatsScreen`.
+/// Tap en el banner → publica la intención de deep-link vía `forwardTap`,
+/// reutilizando el mismo canal que el tap nativo (SessionDispatcher cambia de
+/// sesión si hace falta y ChatsScreen abre el chat).
 class ForegroundPushHost extends StatefulWidget {
   final Widget child;
 

@@ -73,7 +73,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
   StreamSubscription? _statusSubscription;
   StreamSubscription? _humanAttentionSubscription;
   StreamSubscription? _labelsSubscription;
-  StreamSubscription? _pushTapSubscription;
+  // Intención de deep-link compartida con SessionDispatcher. Esta pantalla solo
+  // abre chats de SU sesión; el cambio de sesión lo orquesta el dispatcher.
+  ValueNotifier<HumanAttentionPush?>? _pendingTap;
 
   // Cache del catálogo de etiquetas de la sesión actual. Se mantiene en
   // memoria para que cada `_ChatTile` resuelva sus chips sin abrir su propio
@@ -107,37 +109,43 @@ class _ChatsScreenState extends State<ChatsScreen> {
       if (push != null) _handlePushTap(push);
     });
 
-    // Tap a notif con app en background (ya estaba viva): navegar al chat.
-    _pushTapSubscription = NotificationService().tapStream.listen((push) {
-      _handlePushTap(push);
-    });
+    // Tap a notif con app viva (background/foreground): intención compartida.
+    // La leemos al montar (clave: si el dispatcher acaba de remontar esta
+    // pantalla por un cambio de sesión, el valor ya está puesto y debemos
+    // consumirlo aquí) y también escuchamos cambios en vivo.
+    _pendingTap = NotificationService().pendingTap;
+    _pendingTap!.addListener(_onPendingTap);
+    if (_pendingTap!.value != null) _handlePushTap(_pendingTap!.value!);
+  }
+
+  void _onPendingTap() {
+    final push = _pendingTap?.value;
+    if (push != null) _handlePushTap(push);
   }
 
   // Abre el chat indicado por el push. Validaciones:
   // - widget aún montado
   // - payload válido (accountId + chatId)
-  // - sesión activa coincide con la del push
   // - existe sessionId actual (sin él, _buildMessageDetail renderiza vacío y
   //   el usuario vería pantalla en negro; mejor no navegar)
+  // - el push apunta a ESTA sesión. Si apunta a otra, NO es nuestro trabajo:
+  //   SessionDispatcher remonta la ChatsScreen de la sesión correcta y esa
+  //   instancia entra aquí con la sesión ya coincidente. Por eso NO consumimos
+  //   la intención cuando no es nuestra — la deja viva para esa otra pantalla.
   void _handlePushTap(HumanAttentionPush push) {
     if (!mounted) return;
     if (!push.isValid) return;
-    if (widget.sessionId == null) {
-      debugPrint(
-        '[ChatsScreen] Push recibido pero no hay sessionId activa, skip deep-link',
-      );
-      return;
-    }
+    if (widget.sessionId == null) return;
     if (push.sessionPhone.isNotEmpty &&
         push.sessionPhone != widget.sessionId) {
-      debugPrint(
-        '[ChatsScreen] Push para sesión ${push.sessionPhone}, '
-        'pero la activa es ${widget.sessionId}. Skip deep-link por ahora.',
-      );
       return;
     }
     debugPrint('[ChatsScreen] Deep-link a chat ${push.chatId}');
     setState(() => selectedChatPhone = push.chatId);
+    // Consumimos la intención (si vino del notifier compartido) para que no se
+    // re-dispare en rebuilds. El cold-start llega por initialTapReady, donde
+    // pendingTap es null, así que el guard `== push` evita limpiar de más.
+    if (_pendingTap?.value == push) _pendingTap!.value = null;
   }
 
   void _subscribeToLabels() {
@@ -191,7 +199,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
     _statusSubscription?.cancel();
     _humanAttentionSubscription?.cancel();
     _labelsSubscription?.cancel();
-    _pushTapSubscription?.cancel();
+    _pendingTap?.removeListener(_onPendingTap);
     _cancelledTimer?.cancel();
     _filterCounts.dispose();
     ActiveChatTracker.instance.clear();

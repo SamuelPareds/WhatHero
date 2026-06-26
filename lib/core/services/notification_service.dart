@@ -72,15 +72,22 @@ class NotificationService {
   Stream<HumanAttentionPush> get foregroundStream =>
       _foregroundController.stream;
 
-  // Tap en notificación: la UI navega al chat.
-  final _tapController = StreamController<HumanAttentionPush>.broadcast();
-  Stream<HumanAttentionPush> get tapStream => _tapController.stream;
+  // Tap en notificación (app viva): intención de deep-link PENDIENTE.
+  // Es un ValueNotifier, no un Stream de un disparo, a propósito: el push puede
+  // apuntar a una sesión distinta de la activa. En ese caso `SessionDispatcher`
+  // remonta la `ChatsScreen` de la sesión correcta, y esa instancia recién
+  // nacida necesita LEER la intención al montar (un evento de stream ya habría
+  // pasado). Dos consumidores con responsabilidades separadas:
+  //   - SessionDispatcher → cambia de sesión si el push apunta a otra.
+  //   - ChatsScreen        → abre el chat dentro de SU sesión y limpia el valor.
+  // Quien consume pone el valor en null para que no se re-dispare en rebuilds.
+  final ValueNotifier<HumanAttentionPush?> pendingTap =
+      ValueNotifier<HumanAttentionPush?>(null);
 
-  /// Reenvía un push al canal de tap. Lo usa el banner in-app (foreground web):
-  /// cuando el operador toca el banner, reutilizamos el MISMO deep-link que ya
-  /// maneja `ChatsScreen._handlePushTap` (suscrito a `tapStream`), sin duplicar
-  /// la lógica de navegación al chat.
-  void forwardTap(HumanAttentionPush push) => _tapController.add(push);
+  /// Publica una intención de deep-link. Lo usa el banner in-app (foreground
+  /// web): cuando el operador toca el banner, reutilizamos el MISMO canal que el
+  /// tap nativo (`onMessageOpenedApp`), sin duplicar la lógica de navegación.
+  void forwardTap(HumanAttentionPush push) => pendingTap.value = push;
 
   // Cold-start tap: completer que resuelve cuando init() determinó si la app
   // abrió desde un tap (con la data del push) o no (null). Usamos Future en
@@ -232,7 +239,7 @@ class NotificationService {
       _onOpenSub?.cancel();
       _onOpenSub = FirebaseMessaging.onMessageOpenedApp.listen((m) {
         if (_isHumanAttentionMessage(m)) {
-          _tapController.add(HumanAttentionPush.fromMessage(m));
+          pendingTap.value = HumanAttentionPush.fromMessage(m);
         }
       });
 
