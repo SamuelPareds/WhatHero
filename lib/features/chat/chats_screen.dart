@@ -48,6 +48,11 @@ class ChatsScreen extends StatefulWidget {
 
 class _ChatsScreenState extends State<ChatsScreen> {
   String? selectedChatPhone;
+  // Salto a un mensaje concreto al abrir un chat desde el buscador. Lo consume
+  // MessagesView (carga hasta él + scroll + resalte) y avisa con onJumpConsumed
+  // para limpiarlo, de modo que volver a tocar el mismo resultado re-dispare.
+  String? _jumpToMessageId;
+  DateTime? _jumpToTimestamp;
   String searchQuery = '';
   // Búsqueda expandible: colapsada muestra solo el icono 🔍 junto al nombre de
   // la sesión; al expandir, el campo tapa nombre+número para escribir cómodo.
@@ -841,9 +846,14 @@ class _ChatsScreenState extends State<ChatsScreen> {
           accountId: widget.accountId,
           sessionId: widget.sessionId!,
           query: searchQuery,
-          onOpenChat: (chatId) {
+          onOpenChat: (chatId, {messageId, timestamp}) {
             setState(() {
               selectedChatPhone = chatId;
+              // Objetivo de salto: si se tocó una fila de mensaje, MessagesView
+              // cargará hasta él y lo resaltará. El header del grupo no manda
+              // messageId → abre el chat normal (abajo).
+              _jumpToMessageId = messageId;
+              _jumpToTimestamp = timestamp;
               // Colapsar el buscador al saltar al chat, como WhatsApp.
               _searchExpanded = false;
               searchController.clear();
@@ -1321,12 +1331,26 @@ class _ChatsScreenState extends State<ChatsScreen> {
                     ),
                   Expanded(
                     child: MessagesView(
+                      // Key por chat: cada conversación arranca con su propio
+                      // estado (límite de paginación, scroll) en vez de heredar
+                      // el del chat previo.
+                      key: ValueKey('msgview_$selectedChatPhone'),
                       phoneNumber: selectedChatPhone!,
                       sessionId: widget.sessionId!,
                       sessionKey: widget.sessionKey,
                       accountId: widget.accountId,
                       sessionAiEnabled: sessionAiEnabled,
                       sessionAiHasCredentials: sessionAiHasCredentials,
+                      jumpToMessageId: _jumpToMessageId,
+                      jumpToTimestamp: _jumpToTimestamp,
+                      onJumpConsumed: () {
+                        if (_jumpToMessageId != null) {
+                          setState(() {
+                            _jumpToMessageId = null;
+                            _jumpToTimestamp = null;
+                          });
+                        }
+                      },
                     ),
                   ),
                 ],

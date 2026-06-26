@@ -44,8 +44,11 @@ class MessageSearchResults extends StatefulWidget {
   final String query;
 
   /// Abre el chat del resultado tocado (lo resuelve el padre: setea
-  /// selectedChatPhone y colapsa el buscador).
-  final void Function(String chatId) onOpenChat;
+  /// selectedChatPhone y colapsa el buscador). Si se toca una fila de mensaje
+  /// concreta, pasa `messageId`+`timestamp` para que el chat salte a esa burbuja
+  /// y la resalte; el header del grupo abre el chat sin objetivo.
+  final void Function(String chatId, {String? messageId, DateTime? timestamp})
+      onOpenChat;
 
   const MessageSearchResults({
     required this.accountId,
@@ -159,6 +162,9 @@ class _MessageSearchResultsState extends State<MessageSearchResults> {
         if (!normalizeForSearch(text).contains(phrase)) continue;
         hits.add(_MessageHit(
           chatId: (d['chatId'] as String?) ?? doc.id,
+          // El doc del índice usa el messageId como id (y lo duplica en el
+          // campo); con él el chat puede saltar a la burbuja exacta.
+          messageId: (d['messageId'] as String?) ?? doc.id,
           text: text,
           contactName: d['contactName'] as String?,
           fromMe: d['fromMe'] as bool? ?? false,
@@ -353,6 +359,7 @@ class _MessageSearchResultsState extends State<MessageSearchResults> {
 
 class _MessageHit {
   final String chatId;
+  final String messageId;
   final String text;
   final String? contactName;
   final bool fromMe;
@@ -360,6 +367,7 @@ class _MessageHit {
 
   const _MessageHit({
     required this.chatId,
+    required this.messageId,
     required this.text,
     required this.contactName,
     required this.fromMe,
@@ -386,7 +394,8 @@ class _ChatGroup {
 class _ChatHitGroup extends StatelessWidget {
   final _ChatGroup group;
   final String query;
-  final void Function(String chatId) onOpenChat;
+  final void Function(String chatId, {String? messageId, DateTime? timestamp})
+      onOpenChat;
 
   const _ChatHitGroup({
     required this.group,
@@ -453,7 +462,9 @@ class _ChatHitGroup extends StatelessWidget {
                         .map((h) => _MessageHitRow(
                               hit: h,
                               query: query,
-                              onTap: () => onOpenChat(h.chatId),
+                              onTap: () => onOpenChat(h.chatId,
+                                  messageId: h.messageId,
+                                  timestamp: h.timestamp),
                             ))
                         .toList(),
                   ),

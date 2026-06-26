@@ -39,6 +39,14 @@ class MessagesView extends StatefulWidget {
   // al usuario a SessionSettingsPanel.
   final bool sessionAiHasCredentials;
 
+  // Salto a un mensaje concreto (deep-link desde el buscador). Con el timestamp
+  // se calcula cuánto historial cargar para incluirlo; null = abrir normal.
+  final String? jumpToMessageId;
+  final DateTime? jumpToTimestamp;
+  // Aviso al padre de que el salto ya se resolvió (encontrado o no) para que
+  // limpie su estado y un re-toque del mismo resultado vuelva a disparar.
+  final VoidCallback? onJumpConsumed;
+
   const MessagesView({
     required this.phoneNumber,
     required this.sessionId,
@@ -46,6 +54,9 @@ class MessagesView extends StatefulWidget {
     required this.accountId,
     required this.sessionAiEnabled,
     required this.sessionAiHasCredentials,
+    this.jumpToMessageId,
+    this.jumpToTimestamp,
+    this.onJumpConsumed,
     super.key,
   });
 
@@ -61,6 +72,21 @@ class _MessagesViewState extends State<MessagesView> {
   int _messageLimit = 30;
   bool _isLoadingMore = false;
   bool _hasMore = true;
+
+  // 🎯 Salto a un mensaje (deep-link desde el buscador).
+  // _pendingJumpId: objetivo aún no localizado en la lista cargada.
+  // _highlightId: burbuja resaltándose ahora (tinte aqua que se desvanece).
+  // _jumpKey: ancla para Scrollable.ensureVisible sobre la burbuja objetivo.
+  // _jumpPreparing: evita relanzar el count() mientras una preparación corre.
+  String? _pendingJumpId;
+  String? _highlightId;
+  final GlobalKey _jumpKey = GlobalKey();
+  bool _jumpPreparing = false;
+  // Verdadero mientras hacemos el scroll programático hacia el objetivo, para
+  // que _scrollListener no confunda el salto con "el usuario llegó arriba" y
+  // dispare paginación de más.
+  bool _jumpScrolling = false;
+  Timer? _highlightTimer;
 
   bool _isSending = false;
   bool _isGenerating = false;
@@ -146,11 +172,30 @@ class _MessagesViewState extends State<MessagesView> {
     super.initState();
     // Escuchar el scroll para cargar más mensajes
     _scrollController.addListener(_scrollListener);
+    // Si entramos directo a un mensaje (deep-link del buscador), preparamos el
+    // salto: cargar suficiente historial para incluirlo.
+    if (widget.jumpToMessageId != null) {
+      _pendingJumpId = widget.jumpToMessageId;
+      _prepareJump(widget.jumpToMessageId!, widget.jumpToTimestamp);
+    }
+  }
+
+  @override
+  void didUpdateWidget(MessagesView old) {
+    super.didUpdateWidget(old);
+    // Nuevo objetivo de salto mientras el chat ya está abierto (p. ej. tocar
+    // otro resultado del buscador en el mismo contacto).
+    if (widget.jumpToMessageId != null &&
+        widget.jumpToMessageId != old.jumpToMessageId) {
+      _pendingJumpId = widget.jumpToMessageId;
+      _prepareJump(widget.jumpToMessageId!, widget.jumpToTimestamp);
+    }
   }
 
   @override
   void dispose() {
     _scrollController.removeListener(_scrollListener);
+    _highlightTimer?.cancel();
     _messageController.dispose();
     _scrollController.dispose();
     _quickResponseOverlay?.remove();
@@ -159,7 +204,120 @@ class _MessagesViewState extends State<MessagesView> {
     super.dispose();
   }
 
+  // Prepara el salto en dos pasos, ambos independientes del stream paginado
+  // (que reentrega caché vieja al cambiar el límite y daría falsos negativos):
+  //   1. `.get()` directo al doc → autoridad sobre si el mensaje existe. Si no,
+  //      avisamos aquí y soltamos el salto (única fuente del "no encontrado").
+  //   2. `count()` de cuántos mensajes hay MÁS NUEVOS que él → su posición desde
+  //      arriba (orden desc); subimos el límite a ese número + buffer para que
+  //      entre en la ventana cargada de una sola vez.
+  Future<void> _prepareJump(String messageId, DateTime? ts) async {
+    if (_jumpPreparing) return;
+    _jumpPreparing = true;
+    final messagesRef = FirebaseFirestore.instance
+        .collection(accountsCollection)
+        .doc(widget.accountId)
+        .collection('whatsapp_sessions')
+        .doc(widget.sessionId)
+        .collection('chats')
+        .doc(widget.phoneNumber)
+        .collection('messages');
+    try {
+      // 1. ¿Existe? (resuelve el "no encontrado" sin depender del stream).
+      final doc = await messagesRef.doc(messageId).get();
+      if (!mounted) return;
+      if (!doc.exists) {
+        _pendingJumpId = null;
+        widget.onJumpConsumed?.call();
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('No se encontró el mensaje en este chat'),
+        ));
+        return;
+      }
+      // 2. ¿Cuánto historial cargar para incluirlo?
+      if (ts != null) {
+        final agg = await messagesRef
+            .where('timestamp', isGreaterThan: Timestamp.fromDate(ts))
+            .count()
+            .get();
+        final needed = (agg.count ?? 0) + 5; // buffer por timestamps empatados
+        if (mounted && needed > _messageLimit) {
+          setState(() {
+            _messageLimit = needed;
+            _hasMore = true;
+          });
+        }
+      }
+    } catch (_) {
+      // Si falla el count, no abortamos: _resolveJump aún puede localizar el
+      // mensaje en lo cargado y, si falta, crecer por paginación.
+    } finally {
+      _jumpPreparing = false;
+    }
+  }
+
+  // Llamado tras cada snapshot mientras hay un salto pendiente. El mensaje YA se
+  // confirmó existente en _prepareJump, así que aquí solo: si está cargado →
+  // scroll + resalte; si la página está llena (falta cargarlo) → crece; si no,
+  // esperamos el siguiente snapshot. Nunca declara "no encontrado" (eso lo
+  // resolvió el .get() directo, inmune a la caché vieja del StreamBuilder).
+  void _resolveJump(List<QueryDocumentSnapshot> messages) {
+    final id = _pendingJumpId;
+    if (id == null) return;
+    final idx = messages.indexWhere((d) => d.id == id);
+    if (idx >= 0) {
+      _jumpScrolling = true;
+      setState(() {
+        _highlightId = id;
+        _pendingJumpId = null;
+      });
+      widget.onJumpConsumed?.call();
+      // Tras pintar la burbuja resaltada, llevamos el scroll hasta ella. Como
+      // los ítems fuera del viewport no se construyen, primero saltamos a la
+      // región del objetivo (offset proporcional a su índice en la lista
+      // reverse) para forzar su build, y luego ensureVisible lo centra.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_scrollController.hasClients) {
+          _jumpScrolling = false;
+          return;
+        }
+        final max = _scrollController.position.maxScrollExtent;
+        final frac = messages.length <= 1 ? 0.0 : idx / (messages.length - 1);
+        _scrollController.jumpTo((frac * max).clamp(0.0, max));
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          final ctx = _jumpKey.currentContext;
+          if (ctx != null) {
+            Scrollable.ensureVisible(ctx,
+                alignment: 0.4,
+                duration: const Duration(milliseconds: 400),
+                curve: Curves.easeInOut);
+          }
+          // Libera el guard tras la animación de ensureVisible (~400ms).
+          Future.delayed(const Duration(milliseconds: 500), () {
+            if (mounted) _jumpScrolling = false;
+          });
+          _highlightTimer?.cancel();
+          _highlightTimer = Timer(const Duration(milliseconds: 2500), () {
+            if (mounted) setState(() => _highlightId = null);
+          });
+        });
+      });
+    } else if (messages.length >= _messageLimit && !_jumpPreparing) {
+      // Página llena y el objetivo no está aún → hay más historial arriba:
+      // crece y reintenta en el próximo snapshot. (Un snapshot viejo nunca está
+      // "lleno" respecto al límite recién ampliado, así que no entra basura.)
+      setState(() => _messageLimit += 60);
+    }
+    // else: página incompleta → es el snapshot viejo aún sin reflejar el límite
+    // nuevo, o el fin del historial. En ambos casos esperamos: como el mensaje
+    // existe (confirmado en _prepareJump), un snapshot mayor terminará por
+    // traerlo. No avisamos aquí para no producir falsos "no encontrado".
+  }
+
   void _scrollListener() {
+    // Durante un salto programático no paginamos: el jumpTo puede aterrizar
+    // cerca del tope y se confundiría con scroll manual del usuario.
+    if (_jumpScrolling) return;
     // En una lista 'reverse: true', el final (maxScrollExtent) es la parte SUPERIOR (mensajes viejos)
     if (_scrollController.position.pixels >= _scrollController.position.maxScrollExtent - 200) {
       if (!_isLoadingMore && _hasMore) {
@@ -977,6 +1135,14 @@ class _MessagesViewState extends State<MessagesView> {
                 _hasMore = false;
               }
 
+              // Salto pendiente: tras pintar este set intentamos localizar el
+              // mensaje objetivo (post-frame para no llamar setState en build).
+              if (_pendingJumpId != null) {
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (mounted) _resolveJump(messages);
+                });
+              }
+
               if (messages.isEmpty) return const Center(child: Text('Sin mensajes', style: TextStyle(color: lightText, fontSize: 16)));
 
               return ListView.builder(
@@ -1059,18 +1225,26 @@ class _MessagesViewState extends State<MessagesView> {
                     )),
                   );
 
-                  if (!showSeparator) return bubble;
                   // El Column NO se reversea internamente — el listview sólo
                   // invierte el orden de items, no su contenido. Por eso el
                   // separador va como PRIMER hijo: queda visualmente arriba
                   // del primer mensaje del día (igual que en WhatsApp).
-                  return Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      _DateSeparator(_formatDaySeparator(msgDate)),
-                      bubble,
-                    ],
-                  );
+                  final Widget item = showSeparator
+                      ? Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            _DateSeparator(_formatDaySeparator(msgDate)),
+                            bubble,
+                          ],
+                        )
+                      : bubble;
+
+                  // Burbuja objetivo del salto: ancla para ensureVisible + tinte
+                  // aqua que se desvanece (~2.5s) para señalar el resultado.
+                  if (msg.id == _highlightId) {
+                    return _JumpHighlight(key: _jumpKey, child: item);
+                  }
+                  return item;
                 },
               );
             },
@@ -1282,6 +1456,32 @@ class _MessagesViewState extends State<MessagesView> {
 
 // Chip centrado de cabecera de día, estilo WhatsApp/Apple dark. Translúcido
 // sobre el fondo del chat con borde aqua sutil para que respire sin gritar.
+// Resalte temporal de la burbuja a la que saltó el buscador: un tinte aqua que
+// aparece y se desvanece en ~2.5s (TweenAnimationBuilder de 1→0). El padre
+// retira el wrapper al terminar limpiando `_highlightId`. La GlobalKey vive en
+// el wrapper externo para que Scrollable.ensureVisible tenga el ancla.
+class _JumpHighlight extends StatelessWidget {
+  final Widget child;
+  const _JumpHighlight({required this.child, super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 1.0, end: 0.0),
+      duration: const Duration(milliseconds: 2500),
+      curve: Curves.easeOut,
+      builder: (_, t, inner) => Container(
+        decoration: BoxDecoration(
+          color: primaryAqua.withValues(alpha: 0.22 * t),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: inner,
+      ),
+      child: child,
+    );
+  }
+}
+
 class _DateSeparator extends StatelessWidget {
   final String label;
   const _DateSeparator(this.label);
