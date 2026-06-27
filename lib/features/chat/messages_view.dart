@@ -100,6 +100,14 @@ class _MessagesViewState extends State<MessagesView> {
   // porque al tocar el overlay el TextField puede perder el foco/selección.
   TextRange? _activeTokenRange;
 
+  // Seguimiento de ventas: si este chat fue encolado por el agente, al abrirlo
+  // pre-llenamos el composer con el borrador y mostramos un cintillo. true
+  // mientras el borrador sigue "vivo" (no enviado ni descartado). ValueNotifier
+  // para rebuildar solo el cintillo, no todo el composer.
+  final ValueNotifier<bool> _isFollowupChat = ValueNotifier(false);
+  // Guard para pre-llenar el borrador una sola vez por apertura del chat.
+  bool _followupChecked = false;
+
   // Draft de cita activo. null = no estamos respondiendo a nada → composer
   // normal. ValueNotifier (en lugar de setState) para que solo se rebuilden
   // las partes que escuchan: la franja del composer y el TextField.
@@ -181,6 +189,8 @@ class _MessagesViewState extends State<MessagesView> {
       _pendingJumpId = widget.jumpToMessageId;
       _prepareJump(widget.jumpToMessageId!, widget.jumpToTimestamp);
     }
+    // Si el agente de seguimiento dejó un borrador para este chat, lo cargamos.
+    _loadFollowupDraft();
   }
 
   @override
@@ -203,6 +213,7 @@ class _MessagesViewState extends State<MessagesView> {
     _scrollController.dispose();
     _quickResponseOverlay?.remove();
     _replyDraft.dispose();
+    _isFollowupChat.dispose();
     _inputFocusNode.dispose();
     super.dispose();
   }
@@ -399,6 +410,82 @@ class _MessagesViewState extends State<MessagesView> {
     });
   }
 
+  // Referencia al doc del chat (donde viven los campos followup_*).
+  DocumentReference<Map<String, dynamic>> get _chatDocRef =>
+      FirebaseFirestore.instance
+          .collection(accountsCollection)
+          .doc(widget.accountId)
+          .collection('whatsapp_sessions')
+          .doc(widget.sessionId)
+          .collection('chats')
+          .doc(widget.phoneNumber);
+
+  // Doc de la cola de seguimiento de este chat (id = phoneNumber del contacto).
+  DocumentReference<Map<String, dynamic>> get _followupQueueRef =>
+      FirebaseFirestore.instance
+          .collection(accountsCollection)
+          .doc(widget.accountId)
+          .collection('whatsapp_sessions')
+          .doc(widget.sessionId)
+          .collection('followup_queue')
+          .doc(widget.phoneNumber);
+
+  // Al abrir el chat: si el agente dejó un borrador encolado, lo pre-cargamos
+  // en el composer (editable) y encendemos el cintillo. Una sola vez por
+  // apertura. No pisa lo que el usuario ya haya escrito.
+  Future<void> _loadFollowupDraft() async {
+    if (_followupChecked) return;
+    _followupChecked = true;
+    // Si entramos por un deep-link a un mensaje, no secuestramos el composer.
+    if (widget.jumpToMessageId != null) return;
+    try {
+      final snap = await _followupQueueRef.get();
+      final data = snap.data();
+      if (!mounted || data == null) return;
+      if ((data['status'] as String?) != 'pending') return;
+      final draft = (data['draftMessage'] as String?)?.trim() ?? '';
+      if (draft.isEmpty) return;
+      if (_messageController.text.trim().isNotEmpty) return; // respeta lo ya escrito
+      _messageController.text = draft;
+      _isFollowupChat.value = true;
+    } catch (e) {
+      // Silencioso: el seguimiento es una ayuda, su fallo no debe romper el chat.
+      print('[Followup] No se pudo cargar el borrador: $e');
+    }
+  }
+
+  // El operador envió el seguimiento: lo marcamos como enviado para que salga
+  // del filtro "Seguimiento" y no se vuelva a elegir mañana.
+  Future<void> _markFollowupSent() async {
+    _isFollowupChat.value = false;
+    try {
+      await _chatDocRef.set({
+        'followup_status': 'sent',
+        'followup_count': FieldValue.increment(1),
+        'followup_last_at': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+      await _followupQueueRef.set({'status': 'sent'}, SetOptions(merge: true));
+    } catch (e) {
+      print('[Followup] No se pudo marcar como enviado: $e');
+    }
+  }
+
+  // El operador descarta el borrador sin enviarlo: limpia el composer y saca el
+  // chat del filtro (lo dejamos en paz, como un "no dar seguimiento" puntual).
+  Future<void> _dismissFollowupDraft() async {
+    _isFollowupChat.value = false;
+    _messageController.clear();
+    try {
+      await _chatDocRef.set({
+        'followup_status': 'dismissed',
+        'followup_last_reason': 'Descartado por el operador',
+      }, SetOptions(merge: true));
+      await _followupQueueRef.set({'status': 'cancelled'}, SetOptions(merge: true));
+    } catch (e) {
+      print('[Followup] No se pudo descartar: $e');
+    }
+  }
+
   Future<void> _sendMessage() async {
     final text = _messageController.text.trim();
     if (text.isEmpty || _isSending) return;
@@ -411,6 +498,9 @@ class _MessagesViewState extends State<MessagesView> {
       // Snapshot del draft al momento del envío. Si el usuario cancela durante
       // el await, queremos enviar lo que estaba activo cuando tocó "enviar".
       final draft = _replyDraft.value;
+      // ¿Este envío cierra un seguimiento del agente? Lo capturamos antes de
+      // limpiar para marcarlo como enviado tras el éxito.
+      final wasFollowup = _isFollowupChat.value;
 
       final messageData = {
         'to': widget.phoneNumber,
@@ -432,6 +522,7 @@ class _MessagesViewState extends State<MessagesView> {
         SocketService().sendMessage(messageData);
         _messageController.clear();
         _clearReplyDraft();
+        if (wasFollowup) _markFollowupSent();
       } else {
         // FALLBACK: Si no hay socket, usar HTTP (Seguridad)
         print('[MessagesView] Socket desconectado, usando fallback HTTP...');
@@ -444,6 +535,7 @@ class _MessagesViewState extends State<MessagesView> {
         if (response.statusCode == 200) {
           _messageController.clear();
           _clearReplyDraft();
+          if (wasFollowup) _markFollowupSent();
         } else {
           throw Exception('Fallback HTTP falló: ${response.body}');
         }
@@ -1342,6 +1434,46 @@ class _MessagesViewState extends State<MessagesView> {
                 return Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
+                    // Cintillo del agente de seguimiento: aparece cuando el chat
+                    // trae un borrador encolado. Comunica que el texto del
+                    // composer es una propuesta editable, y ofrece descartarla.
+                    ValueListenableBuilder<bool>(
+                      valueListenable: _isFollowupChat,
+                      builder: (context, isFollowup, _) {
+                        if (!isFollowup) return const SizedBox.shrink();
+                        return Container(
+                          margin: const EdgeInsets.only(bottom: 8),
+                          padding: const EdgeInsets.fromLTRB(10, 8, 4, 8),
+                          decoration: BoxDecoration(
+                            color: primaryAqua.withValues(alpha: 0.1),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border(left: BorderSide(color: primaryAqua, width: 3)),
+                          ),
+                          child: Row(
+                            children: [
+                              const Icon(Icons.auto_awesome, size: 16, color: primaryAqua),
+                              const SizedBox(width: 8),
+                              const Expanded(
+                                child: Text(
+                                  'Borrador del agente · edítalo y envía',
+                                  style: TextStyle(color: primaryAqua, fontSize: 12, fontWeight: FontWeight.w600),
+                                ),
+                              ),
+                              TextButton(
+                                onPressed: _dismissFollowupDraft,
+                                style: TextButton.styleFrom(
+                                  foregroundColor: lightText,
+                                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                                  minimumSize: const Size(0, 32),
+                                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                ),
+                                child: const Text('Descartar', style: TextStyle(fontSize: 12)),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
                     // Franja de "respondiendo a..." arriba del input. Se muestra
                     // sólo cuando hay un draft activo. ValueListenableBuilder
                     // evita rebuilds del Row de input cuando cambia el draft.

@@ -26,7 +26,7 @@ import 'widgets/labels_selector_sheet.dart';
 // Filtros rápidos de la lista de chats (estilo chips de WhatsApp).
 // todos / no respondidos / con notas son fijos; `etiqueta` filtra por una
 // etiqueta concreta del catálogo (su id va en `_activeLabelId`).
-enum ChatFilter { todos, noRespondidos, conNotas, etiqueta }
+enum ChatFilter { todos, seguimiento, noRespondidos, conNotas, etiqueta }
 
 class ChatsScreen extends StatefulWidget {
   final String? sessionId;
@@ -66,8 +66,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
   // Contadores por filtro. Los chips viven en el AppBar (fuera del StreamBuilder
   // del body), así que el body los publica aquí y los chips se suscriben sin
   // rebuildar toda la pantalla.
-  final ValueNotifier<({int unresponded, int notes})> _filterCounts =
-      ValueNotifier((unresponded: 0, notes: 0));
+  final ValueNotifier<({int unresponded, int notes, int followups})> _filterCounts =
+      ValueNotifier((unresponded: 0, notes: 0, followups: 0));
   final TextEditingController searchController = TextEditingController();
 
   StreamSubscription? _statusSubscription;
@@ -613,10 +613,22 @@ class _ChatsScreenState extends State<ChatsScreen> {
             final m = d.data() as Map<String, dynamic>?;
             return ((m?['note'] as String?) ?? '').trim().isNotEmpty;
           }).length;
+          // Chats que el agente de seguimiento dejó encolados (con borrador listo).
+          final followupsTotal = allChats.where((d) {
+            final m = d.data() as Map<String, dynamic>?;
+            return (m?['followup_status'] as String?) == 'queued';
+          }).length;
           WidgetsBinding.instance.addPostFrameCallback((_) {
-            final next = (unresponded: unrespondedTotal, notes: notesTotal);
+            final next = (unresponded: unrespondedTotal, notes: notesTotal, followups: followupsTotal);
             if (mounted && _filterCounts.value != next) {
               _filterCounts.value = next;
+            }
+            // Si vaciaron la cola estando en el filtro "Seguimiento", el chip se
+            // oculta; degradamos a "Todos" para no dejar al usuario mirando vacío.
+            if (mounted &&
+                followupsTotal == 0 &&
+                _activeFilter == ChatFilter.seguimiento) {
+              setState(() => _activeFilter = ChatFilter.todos);
             }
           });
 
@@ -629,6 +641,10 @@ class _ChatsScreenState extends State<ChatsScreen> {
             switch (_activeFilter) {
               case ChatFilter.todos:
                 break;
+              case ChatFilter.seguimiento:
+                if ((chatData?['followup_status'] as String?) != 'queued') {
+                  return false;
+                }
               case ChatFilter.noRespondidos:
                 final count =
                     (chatData?['unresponded_count'] as num?)?.toInt() ?? 0;
@@ -673,7 +689,11 @@ class _ChatsScreenState extends State<ChatsScreen> {
             final IconData emptyIcon;
             final String emptyTitle;
             final String emptySubtitle;
-            if (_activeFilter == ChatFilter.noRespondidos) {
+            if (_activeFilter == ChatFilter.seguimiento) {
+              emptyIcon = Icons.campaign_outlined;
+              emptyTitle = 'Sin seguimientos pendientes';
+              emptySubtitle = 'El agente dejará aquí los chats listos para reactivar';
+            } else if (_activeFilter == ChatFilter.noRespondidos) {
               emptyIcon = Icons.mark_chat_read_outlined;
               emptyTitle = 'Todo respondido';
               emptySubtitle = 'No tienes mensajes pendientes por responder';
@@ -928,7 +948,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
     return SizedBox(
       height: 36,
-      child: ValueListenableBuilder<({int unresponded, int notes})>(
+      child: ValueListenableBuilder<({int unresponded, int notes, int followups})>(
         valueListenable: _filterCounts,
         builder: (context, counts, _) {
           return ListView(
@@ -943,6 +963,20 @@ class _ChatsScreenState extends State<ChatsScreen> {
                   _activeLabelId = null;
                 }),
               ),
+              // Chip del agente de seguimiento: solo aparece cuando hay chats
+              // encolados, justo después de "Todos" para máxima visibilidad.
+              if (counts.followups > 0) ...[
+                const SizedBox(width: 8),
+                _FilterChip(
+                  label: 'Seguimiento',
+                  count: counts.followups,
+                  selected: _activeFilter == ChatFilter.seguimiento,
+                  onTap: () => setState(() {
+                    _activeFilter = ChatFilter.seguimiento;
+                    _activeLabelId = null;
+                  }),
+                ),
+              ],
               const SizedBox(width: 8),
               _FilterChip(
                 label: 'Pendientes',

@@ -670,43 +670,46 @@ export async function classifyFollowupCandidate(
       ? exclusionPrompt.trim()
       : '(El operador no definió reglas extra; usa solo las guías generales.)';
 
-    if (provider === 'openai' || provider === 'deepseek') {
-      const isDeepSeek = provider === 'deepseek';
-      const client = new OpenAI({
-        apiKey: (isDeepSeek ? deepseekApiKey : openaiApiKey) || apiKey,
-        ...(isDeepSeek && { baseURL: DEEPSEEK_BASE_URL }),
-      });
-      const systemContent = `${FOLLOWUP_META_INSTRUCTIONS}
+    // Una sola pasada al proveedor que devuelve el texto crudo. La envolvemos en
+    // un reintento porque DeepSeek (y a veces OpenAI) devuelve contenido vacío de
+    // forma intermitente; sin reintento ese vacío caía en parse fallido → SKIP,
+    // descartando leads válidos.
+    const runOnce = async (): Promise<string> => {
+      if (provider === 'openai' || provider === 'deepseek') {
+        const isDeepSeek = provider === 'deepseek';
+        const client = new OpenAI({
+          apiKey: (isDeepSeek ? deepseekApiKey : openaiApiKey) || apiKey,
+          ...(isDeepSeek && { baseURL: DEEPSEEK_BASE_URL }),
+        });
+        const systemContent = `${FOLLOWUP_META_INSTRUCTIONS}
 
 ### CONTEXTO TEMPORAL
 ${buildTemporalContext(timezone)}
 
 ### REGLAS DE EXCLUSIÓN DEL OPERADOR
 ${operatorRules}`;
-      const userContent = `### HISTORIAL DE LA CONVERSACIÓN
+        const userContent = `### HISTORIAL DE LA CONVERSACIÓN
 ${transcript}
 
 ### TU RESPUESTA (formato obligatorio, sin texto extra)
 Decisión: <FOLLOW_UP | SKIP>
 Razón: <una frase breve explicando por qué>`;
-      const response = await client.chat.completions.create({
-        model: modelName,
-        messages: [
-          { role: 'system', content: systemContent },
-          { role: 'user', content: userContent },
-        ],
-        temperature: 0.1,
-        max_tokens: 200,
-      });
-      const responseText = response.choices[0]?.message.content || '';
-      console.log(`[Followup] ${provider} raw: ${responseText.substring(0, 200)}`);
-      return parseFollowupDecision(responseText);
-    }
+        const response = await client.chat.completions.create({
+          model: modelName,
+          messages: [
+            { role: 'system', content: systemContent },
+            { role: 'user', content: userContent },
+          ],
+          temperature: 0.1,
+          max_tokens: 200,
+        });
+        return response.choices[0]?.message.content || '';
+      }
 
-    // Gemini (sin systemInstruction nativo en v0.3.x): todo en un prompt user.
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: modelName });
-    const prompt = `### REGLAS DE EXCLUSIÓN DEL OPERADOR
+      // Gemini (sin systemInstruction nativo en v0.3.x): todo en un prompt user.
+      const genAI = new GoogleGenerativeAI(apiKey);
+      const model = genAI.getGenerativeModel({ model: modelName });
+      const prompt = `### REGLAS DE EXCLUSIÓN DEL OPERADOR
 ${operatorRules}
 
 ### CONTEXTO TEMPORAL
@@ -721,12 +724,19 @@ ${transcript}
 ### TU RESPUESTA (formato obligatorio, sin texto extra)
 Decisión: <FOLLOW_UP | SKIP>
 Razón: <una frase breve explicando por qué>`;
-    const result = await model.generateContent({
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.1, maxOutputTokens: 200 },
-    });
-    const responseText = result.response.text();
-    console.log(`[Followup] gemini raw: ${responseText.substring(0, 200)}`);
+      const result = await model.generateContent({
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.1, maxOutputTokens: 200 },
+      });
+      return result.response.text();
+    };
+
+    let responseText = await runOnce();
+    if (!responseText.trim()) {
+      console.warn(`[Followup] ${provider} devolvió vacío, reintentando una vez`);
+      responseText = await runOnce();
+    }
+    console.log(`[Followup] ${provider} raw: ${responseText.substring(0, 200)}`);
     return parseFollowupDecision(responseText);
   } catch (error) {
     // Ante cualquier fallo → SKIP (no molestar al cliente).
