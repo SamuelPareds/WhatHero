@@ -33,11 +33,15 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
   late TextEditingController _discriminatorPromptController;
   late TextEditingController _reminderApiUrlController;
   late TextEditingController _reminderTemplateController;
-  
+  late TextEditingController _followupExclusionController;
+  late TextEditingController _followupMessageController;
+
   // FocusNodes for focus management
   late FocusNode _systemPromptFocus;
   late FocusNode _discriminatorFocus;
   late FocusNode _reminderTemplateFocus;
+  late FocusNode _followupExclusionFocus;
+  late FocusNode _followupMessageFocus;
   
   // States
   bool _aiEnabled = false;
@@ -68,6 +72,10 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
   bool _reminderEnabled = false;
   TimeOfDay _reminderScheduledTime = const TimeOfDay(hour: 9, minute: 0);
 
+  // Agente de Seguimiento de Ventas (Re-engagement)
+  bool _followupEnabled = false;
+  TimeOfDay _followupScheduledTime = const TimeOfDay(hour: 9, minute: 0);
+
   bool _isSaving = false;
   bool _isLoading = true;
 
@@ -83,9 +91,13 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
     _discriminatorPromptController = TextEditingController();
     _reminderApiUrlController = TextEditingController();
     _reminderTemplateController = TextEditingController();
+    _followupExclusionController = TextEditingController();
+    _followupMessageController = TextEditingController();
     _systemPromptFocus = FocusNode();
     _discriminatorFocus = FocusNode();
     _reminderTemplateFocus = FocusNode();
+    _followupExclusionFocus = FocusNode();
+    _followupMessageFocus = FocusNode();
     _loadSettings();
   }
 
@@ -118,6 +130,14 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
           if (data['reminder_scheduled_time'] is String) {
             final parts = (data['reminder_scheduled_time'] as String).split(':');
             _reminderScheduledTime = TimeOfDay(hour: int.tryParse(parts[0]) ?? 9, minute: int.tryParse(parts[1]) ?? 0);
+          }
+
+          _followupEnabled = data['followup_enabled'] ?? false;
+          _followupExclusionController.text = data['followup_exclusion_prompt'] ?? '';
+          _followupMessageController.text = data['followup_message_prompt'] ?? '';
+          if (data['followup_scheduled_time'] is String) {
+            final parts = (data['followup_scheduled_time'] as String).split(':');
+            _followupScheduledTime = TimeOfDay(hour: int.tryParse(parts[0]) ?? 9, minute: int.tryParse(parts[1]) ?? 0);
           }
 
           if (data['ai_active_hours'] is Map) {
@@ -214,6 +234,10 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
         'reminder_api_url': _reminderApiUrlController.text.trim(),
         'reminder_template': _reminderTemplateController.text.trim(),
         'reminder_scheduled_time': '${_reminderScheduledTime.hour.toString().padLeft(2, '0')}:${_reminderScheduledTime.minute.toString().padLeft(2, '0')}',
+        'followup_enabled': _followupEnabled,
+        'followup_scheduled_time': '${_followupScheduledTime.hour.toString().padLeft(2, '0')}:${_followupScheduledTime.minute.toString().padLeft(2, '0')}',
+        'followup_exclusion_prompt': _followupExclusionController.text.trim(),
+        'followup_message_prompt': _followupMessageController.text.trim(),
       });
 
       if (mounted) {
@@ -238,9 +262,13 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
     _discriminatorPromptController.dispose();
     _reminderApiUrlController.dispose();
     _reminderTemplateController.dispose();
+    _followupExclusionController.dispose();
+    _followupMessageController.dispose();
     _systemPromptFocus.dispose();
     _discriminatorFocus.dispose();
     _reminderTemplateFocus.dispose();
+    _followupExclusionFocus.dispose();
+    _followupMessageFocus.dispose();
     super.dispose();
   }
 
@@ -446,6 +474,42 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
                   maxLines: 6,
                   canExpand: true,
                   focusNode: _discriminatorFocus,
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+          _expandableSection(
+            'Seguimiento de Ventas',
+            Icons.campaign_outlined,
+            _followupEnabled,
+            (v) => setState(() => _followupEnabled = v),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Cada día revisa las conversaciones que quedaron frías sin cerrar y deja un mensaje de seguimiento en una cola para que lo apruebes antes de enviar.',
+                  style: TextStyle(color: lightText.withValues(alpha: 0.7), fontSize: 12),
+                ),
+                const SizedBox(height: 16),
+                _timeTile('Hora del Barrido Diario', _followupScheduledTime, (t) => setState(() => _followupScheduledTime = t)),
+                const SizedBox(height: 16),
+                _textField(
+                  controller: _followupExclusionController,
+                  label: 'A quién NO dar seguimiento (lenguaje natural)',
+                  hint: 'Ejemplo:\n\nNo des seguimiento si:\n- El cliente ya agendó o se le confirmó la cita\n- Es una conversación personal o no comercial\n- Dijo "luego te aviso" o "yo te escribo"\n- Rechazó la oferta',
+                  maxLines: 6,
+                  canExpand: true,
+                  focusNode: _followupExclusionFocus,
+                ),
+                const SizedBox(height: 16),
+                _textField(
+                  controller: _followupMessageController,
+                  label: 'Tono del mensaje de seguimiento',
+                  hint: 'Ejemplo: Sé cálido y cercano. Retoma con naturalidad el servicio que preguntó e invítalo a agendar, sin presionar.',
+                  maxLines: 4,
+                  canExpand: true,
+                  focusNode: _followupMessageFocus,
                 ),
               ],
             ),
@@ -876,11 +940,14 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            Text(label, style: const TextStyle(color: lightText, fontSize: 13, fontWeight: FontWeight.w600)),
+            Expanded(
+              child: Text(label, style: const TextStyle(color: lightText, fontSize: 13, fontWeight: FontWeight.w600)),
+            ),
             if (canExpand)
               GestureDetector(
                 onTap: () => _showExpandedEditor(label, controller, focusNode),
                 child: const Row(
+                  mainAxisSize: MainAxisSize.min,
                   children: [
                     Icon(Icons.open_in_full_rounded, color: primaryAqua, size: 14),
                     SizedBox(width: 4),

@@ -34,6 +34,7 @@ const AI_ERROR_HTTP: Record<string, number> = {
 };
 import { extractMediaInfo, classifyIncomingMedia } from './src/services/mediaService';
 import { ReminderService } from './src/services/reminderService';
+import { FollowupService } from './src/services/followupService';
 import { sendHumanAttentionNotification } from './src/services/notificationService';
 import { ACCOUNTS_COLLECTION, IS_PRODUCTION } from './src/config/env';
 import { verifyHttpAuth, verifySocketAuth, invalidateMembershipCache } from './src/middleware/auth';
@@ -1915,6 +1916,28 @@ app.post('/send-reminders', express.json(), async (req, res) => {
   }
 });
 
+// Disparo manual del agente de seguimiento (Fase 1: arma la cola, NO envía).
+// Mismo patrón que /send-reminders: sin verifyHttpAuth porque lo invoca el cron
+// interno. Útil para probar el clasificador y los borradores a demanda.
+app.post('/run-followups', express.json(), async (req, res) => {
+  try {
+    const { sessionKey, accountId, sessionId } = req.body;
+
+    if (!sessionKey || !accountId || !sessionId) {
+      return res.status(400).json({ error: 'Missing sessionKey, accountId, or sessionId' });
+    }
+
+    const result = await FollowupService.buildFollowupQueue(accountId, sessionId, sessionKey, sessions);
+    res.json(result);
+  } catch (error) {
+    console.error('Error running followups (HTTP):', error);
+    res.status(500).json({
+      error: 'Failed to run followups',
+      details: (error as any).message,
+    });
+  }
+});
+
 // Handshake auth: rechazamos sockets sin idToken válido o sin membresía
 // en el accountId solicitado. Esto cierra el hueco previo donde cualquier
 // cliente podía unirse a la sala de cualquier cuenta tipeando un accountId.
@@ -2112,5 +2135,7 @@ httpServer.listen(PORT, async () => {
   // Setup cron for reminders (checks every minute)
   cron.schedule('* * * * *', () => {
     ReminderService.checkAndRunScheduledReminders(sessions);
+    // Agente de seguimiento: mismo tick. Cada uno arma su cola a su hora configurada.
+    FollowupService.checkAndRunScheduledFollowups(sessions);
   });
 });

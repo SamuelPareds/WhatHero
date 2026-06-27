@@ -602,6 +602,183 @@ Razón: <una frase breve explicando por qué>`;
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Agente de Seguimiento de Ventas (Re-engagement)
+// ─────────────────────────────────────────────────────────────────────────
+// Gemelo del Discriminador, pero en vez de "¿IA o humano?" responde
+// "¿vale la pena reactivar este lead frío?". El operador escribe las reglas de
+// exclusión en lenguaje natural (chats personales, ya cerrados, "luego te aviso",
+// etc.) y el modelo lee la conversación completa para decidir FOLLOW_UP | SKIP.
+
+// Parser tolerante para la decisión de seguimiento. Default SEGURO = SKIP:
+// inverso al discriminador. Ante la duda NO molestamos al cliente (mejor perder
+// un seguimiento que mandar un mensaje no deseado a alguien que ya cerró o es
+// una conversación personal).
+function parseFollowupDecision(
+  raw: string
+): { decision: 'FOLLOW_UP' | 'SKIP'; reason: string } {
+  const text = (raw || '').trim();
+  const upper = text.toUpperCase();
+
+  const decisionMatch = upper.match(/DECISI[ÓO]N\s*:\s*(FOLLOW[_\s-]?UP|SEGUIR|S[IÍ]|SKIP|OMITIR|NO)/);
+  const reasonMatch = text.match(/Raz[óo]n\s*:\s*(.+?)(?:\n|$)/i);
+  const reason = reasonMatch?.[1]?.trim() || '(sin razón)';
+
+  if (decisionMatch) {
+    const token = decisionMatch[1].replace(/[_\s-]/g, '');
+    if (token === 'FOLLOWUP' || token === 'SEGUIR' || token === 'SI' || token === 'SÍ') {
+      return { decision: 'FOLLOW_UP', reason };
+    }
+    return { decision: 'SKIP', reason };
+  }
+
+  // Sin parseo claro → SKIP (no molestar). Guardamos un recorte para auditar.
+  return { decision: 'SKIP', reason: `(parse fallido) ${text.substring(0, 120)}` };
+}
+
+// Criterios comunes que ayudan al modelo a no reactivar leads que no debe.
+// Se inyectan junto con las reglas del operador.
+const FOLLOWUP_META_INSTRUCTIONS = `Eres un analista de ventas que revisa una conversación de WhatsApp YA FRÍA (el cliente dejó de responder hace ~1 día). Tu única tarea es decidir si vale la pena enviar UN mensaje de seguimiento para intentar cerrar la venta, o si hay que dejar la conversación en paz.
+
+GUÍAS GENERALES (clasifica como SKIP cuando):
+- La venta YA se cerró (hay confirmación de cita/compra, agradecimiento de cierre, o el negocio ya envió un mensaje de confirmación).
+- Es una conversación PERSONAL o no comercial (familiar, amistad, proveedor, spam, número equivocado).
+- El cliente pidió explícitamente NO ser contactado, dijo "luego te aviso", "yo te escribo", "lo pienso y te digo", o rechazó la oferta.
+- El cliente ya está siendo atendido activamente por un humano y la conversación sigue viva.
+- No hay ninguna intención de compra real (solo saludó, se equivocó, o preguntó algo no relacionado con servicios).
+
+Clasifica como FOLLOW_UP SÓLO cuando: el cliente mostró interés en un servicio o producto (preguntó precios, disponibilidad, detalles) pero la conversación se enfrió SIN cerrar y SIN una negativa ni un "yo te aviso". Ese es el lead recuperable.
+
+Ante la duda, responde SKIP. Es mejor no molestar a un cliente que mandar un mensaje inoportuno.`;
+
+// Clasifica un chat frío como FOLLOW_UP | SKIP. Misma forma que
+// classifyMessageIntent (routing por provider). Default SKIP ante error.
+export async function classifyFollowupCandidate(
+  apiKey: string,
+  exclusionPrompt: string,
+  history: { role: 'user' | 'model'; parts: { text: string }[] }[],
+  modelName: string = 'gemini-2.5-flash',
+  provider: AiProvider = 'gemini',
+  openaiApiKey?: string,
+  deepseekApiKey?: string,
+  timezone: string = DEFAULT_TIMEZONE
+): Promise<{ decision: 'FOLLOW_UP' | 'SKIP'; reason: string }> {
+  try {
+    const transcript = buildTranscript(history);
+
+    const operatorRules = exclusionPrompt?.trim()
+      ? exclusionPrompt.trim()
+      : '(El operador no definió reglas extra; usa solo las guías generales.)';
+
+    if (provider === 'openai' || provider === 'deepseek') {
+      const isDeepSeek = provider === 'deepseek';
+      const client = new OpenAI({
+        apiKey: (isDeepSeek ? deepseekApiKey : openaiApiKey) || apiKey,
+        ...(isDeepSeek && { baseURL: DEEPSEEK_BASE_URL }),
+      });
+      const systemContent = `${FOLLOWUP_META_INSTRUCTIONS}
+
+### CONTEXTO TEMPORAL
+${buildTemporalContext(timezone)}
+
+### REGLAS DE EXCLUSIÓN DEL OPERADOR
+${operatorRules}`;
+      const userContent = `### HISTORIAL DE LA CONVERSACIÓN
+${transcript}
+
+### TU RESPUESTA (formato obligatorio, sin texto extra)
+Decisión: <FOLLOW_UP | SKIP>
+Razón: <una frase breve explicando por qué>`;
+      const response = await client.chat.completions.create({
+        model: modelName,
+        messages: [
+          { role: 'system', content: systemContent },
+          { role: 'user', content: userContent },
+        ],
+        temperature: 0.1,
+        max_tokens: 200,
+      });
+      const responseText = response.choices[0]?.message.content || '';
+      console.log(`[Followup] ${provider} raw: ${responseText.substring(0, 200)}`);
+      return parseFollowupDecision(responseText);
+    }
+
+    // Gemini (sin systemInstruction nativo en v0.3.x): todo en un prompt user.
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({ model: modelName });
+    const prompt = `### REGLAS DE EXCLUSIÓN DEL OPERADOR
+${operatorRules}
+
+### CONTEXTO TEMPORAL
+${buildTemporalContext(timezone)}
+
+### CONTEXTO Y CRITERIOS
+${FOLLOWUP_META_INSTRUCTIONS}
+
+### HISTORIAL DE LA CONVERSACIÓN
+${transcript}
+
+### TU RESPUESTA (formato obligatorio, sin texto extra)
+Decisión: <FOLLOW_UP | SKIP>
+Razón: <una frase breve explicando por qué>`;
+    const result = await model.generateContent({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.1, maxOutputTokens: 200 },
+    });
+    const responseText = result.response.text();
+    console.log(`[Followup] gemini raw: ${responseText.substring(0, 200)}`);
+    return parseFollowupDecision(responseText);
+  } catch (error) {
+    // Ante cualquier fallo → SKIP (no molestar al cliente).
+    console.error('[Followup] Error clasificando candidato:', error);
+    return { decision: 'SKIP', reason: '(error del clasificador IA)' };
+  }
+}
+
+// Redacta el mensaje de seguimiento reusando generateAIResponse. El history
+// puede terminar en un turn `model` (el último mensaje lo enviamos nosotros) y
+// Gemini exige cerrar en `user`; por eso anexamos una instrucción `user`
+// sintética. Vale para los 3 providers. Devuelve null si la IA falla (el caller
+// no encola nada en ese caso).
+export async function draftFollowupMessage(
+  apiKey: string,
+  messagePrompt: string,
+  history: { role: 'user' | 'model'; parts: { text: string }[] }[],
+  modelName: string = 'gemini-2.5-flash',
+  provider: AiProvider = 'gemini',
+  openaiApiKey?: string,
+  deepseekApiKey?: string,
+  timezone: string = DEFAULT_TIMEZONE
+): Promise<string | null> {
+  const systemPrompt = `Eres un asistente de ventas redactando UN mensaje de seguimiento por WhatsApp para retomar una conversación que quedó fría sin cerrar la venta.
+
+INDICACIONES DEL OPERADOR (tono y contenido):
+${messagePrompt?.trim() || 'Sé cálido, cercano y breve. Retoma con naturalidad lo que el cliente preguntó e invítalo a continuar, sin presionar.'}
+
+REGLAS DE REDACCIÓN:
+- Escribe UN solo mensaje, breve (1-3 frases), cálido y natural, como lo haría una persona del negocio.
+- Haz referencia a lo que el cliente mostró interés (el servicio/producto que preguntó) para que se sienta personal, no genérico.
+- No suenes insistente ni desesperado. Una invitación amable, no una venta agresiva.
+- No inventes datos (precios, fechas, promociones) que no aparezcan en la conversación.
+- Responde SOLO con el texto del mensaje, sin comillas, sin firmar, sin explicaciones.`;
+
+  const syntheticTurn = {
+    role: 'user' as const,
+    parts: [{ text: '[Instrucción interna: redacta ahora el mensaje de seguimiento según las indicaciones. Responde solo con el mensaje.]' }],
+  };
+
+  return generateAIResponse(
+    apiKey,
+    systemPrompt,
+    [...history, syntheticTurn],
+    modelName,
+    provider,
+    openaiApiKey,
+    deepseekApiKey,
+    timezone
+  );
+}
+
 // Divide la respuesta en grupos de párrafos (alternando 2 y 3) para simular escritura humana.
 // Cada chunk enviado se registra en pendingSenders con AI_SENDER para que el
 // upsert lo guarde con senderType='ai'.
