@@ -1261,7 +1261,14 @@ class _MessagesViewState extends State<MessagesView> {
       children: [
         // Messages
         Expanded(
-          child: Stack(
+          // Tap en cualquier parte vacía de la conversación → cierra el
+          // teclado. El ListView no tiene reconocedor de tap (solo arrastre),
+          // así que un tap limpio lo gana este detector; los taps sobre
+          // burbujas los gana su GestureDetector interno (el más anidado).
+          child: GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onTap: () => FocusManager.instance.primaryFocus?.unfocus(),
+            child: Stack(
             children: [
               StreamBuilder<QuerySnapshot>(
             stream: FirebaseFirestore.instance
@@ -1297,6 +1304,10 @@ class _MessagesViewState extends State<MessagesView> {
 
               return ListView.builder(
                 controller: _scrollController,
+                // Al empezar a deslizar para revisar el historial, baja el
+                // teclado solo (gesto estándar WhatsApp/iMessage).
+                keyboardDismissBehavior:
+                    ScrollViewKeyboardDismissBehavior.onDrag,
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
                 itemCount: messages.length + (_hasMore ? 1 : 0),
                 reverse: true, // Importante: el índice 0 es el mensaje más nuevo (abajo)
@@ -1405,6 +1416,7 @@ class _MessagesViewState extends State<MessagesView> {
                 child: _scrollToBottomButton(),
               ),
             ],
+          ),
           ),
         ),
         Container(
