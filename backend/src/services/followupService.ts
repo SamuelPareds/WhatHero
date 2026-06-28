@@ -7,6 +7,7 @@ import {
   classifyFollowupCandidate,
   draftFollowupMessage,
   DEFAULT_TIMEZONE,
+  type AiProvider,
 } from './aiService';
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -28,8 +29,6 @@ interface FollowupConfig {
   enabled: boolean;
   scheduledTime: string;   // "09:00"
   timezone: string;
-  minHours: number;        // antigüedad mínima del último mensaje (ventana "ya frío")
-  maxHours: number;        // antigüedad máxima (no reactivar conversaciones muy viejas)
   exclusionPrompt: string; // reglas naturales de a quién excluir
   messagePrompt: string;   // tono/instrucciones del mensaje a redactar
   autoSend: boolean;       // Fase 3: saltarse la cola de revisión
@@ -57,8 +56,6 @@ export class FollowupService {
         enabled: data.followup_enabled ?? false,
         scheduledTime: data.followup_scheduled_time ?? '09:00',
         timezone: data.followup_timezone ?? DEFAULT_TIMEZONE,
-        minHours: data.followup_min_hours ?? 20,
-        maxHours: data.followup_max_hours ?? 48,
         exclusionPrompt: data.followup_exclusion_prompt ?? '',
         messagePrompt: data.followup_message_prompt ?? '',
         autoSend: data.followup_auto_send ?? false,
@@ -70,26 +67,74 @@ export class FollowupService {
   }
 
   /**
-   * Candidatos estructurales: chats cuyo último mensaje cayó en la ventana
-   * [now-maxHours, now-minHours], que no estén excluidos manualmente ni hayan
-   * recibido ya un seguimiento. Filtro de rango sobre un campo único
-   * (lastMessageTimestamp) → índice automático en Firestore.
+   * Offset (tz − UTC) en ms para un instante dado, consciente de DST. Usa
+   * Intl para leer cómo se ve `instant` en la zona y restar contra UTC.
+   */
+  private static tzOffsetMs(instant: Date, timezone: string): number {
+    const dtf = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone, hour12: false,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
+    const p: Record<string, string> = {};
+    for (const part of dtf.formatToParts(instant)) p[part.type] = part.value;
+    // 'en-US' h24 a veces emite '24' a medianoche; lo normalizamos a 0.
+    const hour = p.hour === '24' ? 0 : Number(p.hour);
+    const asUTC = Date.UTC(+p.year, +p.month - 1, +p.day, hour, +p.minute, +p.second);
+    return asUTC - instant.getTime();
+  }
+
+  /**
+   * Instante UTC de las 00:00:00 del día `dateStr` ('YYYY-MM-DD') en `timezone`.
+   */
+  private static zonedMidnightUtc(dateStr: string, timezone: string): Date {
+    const [y, m, d] = dateStr.split('-').map(Number);
+    const wallAsUtc = Date.UTC(y, m - 1, d); // como si la pared fuera UTC
+    const offset = this.tzOffsetMs(new Date(wallAsUtc), timezone);
+    return new Date(wallAsUtc - offset);
+  }
+
+  /**
+   * Límites [inicio, fin) del día calendario "ayer" en la zona del negocio,
+   * como instantes UTC. inicio = ayer 00:00, fin = hoy 00:00 (exclusivo).
+   */
+  private static yesterdayBoundsUtc(timezone: string): { start: Date; end: Date } {
+    const now = new Date();
+    const todayStr = new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(now); // 'YYYY-MM-DD'
+    // Ayer = hoy − 1 día, calculado sobre los componentes de fecha (sin DST).
+    const [y, m, d] = todayStr.split('-').map(Number);
+    const yest = new Date(Date.UTC(y, m - 1, d) - 86_400_000);
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const yesterdayStr = `${yest.getUTCFullYear()}-${pad(yest.getUTCMonth() + 1)}-${pad(yest.getUTCDate())}`;
+    return {
+      start: this.zonedMidnightUtc(yesterdayStr, timezone),
+      end: this.zonedMidnightUtc(todayStr, timezone),
+    };
+  }
+
+  /**
+   * Candidatos estructurales: chats cuyo último mensaje cayó DENTRO del día
+   * calendario "ayer" (en la zona del negocio), que no estén excluidos
+   * manualmente ni hayan recibido ya un seguimiento. Filtro de rango sobre un
+   * campo único (lastMessageTimestamp) → índice automático en Firestore.
    */
   static async findColdChats(
     accountId: string,
     sessionId: string,
     config: FollowupConfig
   ): Promise<{ chatId: string; data: FirebaseFirestore.DocumentData }[]> {
-    const now = Date.now();
-    const oldest = admin.firestore.Timestamp.fromMillis(now - config.maxHours * 3_600_000);
-    const newest = admin.firestore.Timestamp.fromMillis(now - config.minHours * 3_600_000);
+    const { start, end } = this.yesterdayBoundsUtc(config.timezone);
+    const oldest = admin.firestore.Timestamp.fromDate(start);
+    const newest = admin.firestore.Timestamp.fromDate(end);
 
     const snap = await this.db
       .collection(ACCOUNTS_COLLECTION).doc(accountId)
       .collection('whatsapp_sessions').doc(sessionId)
       .collection('chats')
       .where('lastMessageTimestamp', '>=', oldest)
-      .where('lastMessageTimestamp', '<=', newest)
+      .where('lastMessageTimestamp', '<', newest)
       .orderBy('lastMessageTimestamp', 'desc')
       .limit(MAX_CANDIDATES_PER_RUN)
       .get();
@@ -161,7 +206,7 @@ export class FollowupService {
     }
 
     const candidates = await this.findColdChats(accountId, sessionId, config);
-    console.log(`[FollowupService] ${sessionId}: ${candidates.length} chats fríos en ventana ${config.minHours}-${config.maxHours}h`);
+    console.log(`[FollowupService] ${sessionId}: ${candidates.length} chats con último mensaje de ayer (${config.timezone})`);
 
     let queued = 0;
     let skipped = 0;
@@ -180,7 +225,7 @@ export class FollowupService {
         config.exclusionPrompt,
         history,
         aiConfig.model,
-        aiConfig.provider || 'gemini',
+        (aiConfig.provider || 'gemini') as AiProvider,
         aiConfig.openaiApiKey,
         aiConfig.deepseekApiKey,
         config.timezone
@@ -207,7 +252,7 @@ export class FollowupService {
         config.messagePrompt,
         history,
         aiConfig.model,
-        aiConfig.provider || 'gemini',
+        (aiConfig.provider || 'gemini') as AiProvider,
         aiConfig.openaiApiKey,
         aiConfig.deepseekApiKey,
         config.timezone
