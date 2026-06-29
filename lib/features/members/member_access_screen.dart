@@ -7,6 +7,8 @@ import 'package:http/http.dart' as http;
 import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/services/api_client.dart';
 
+import 'edit_member_name_dialog.dart';
+
 /// Panel de permisos por sesión de un miembro (Fase 1).
 ///
 /// El owner decide a qué sesiones de WhatsApp tiene acceso un sub-user:
@@ -40,6 +42,10 @@ class _MemberAccessScreenState extends State<MemberAccessScreen> {
   bool _allSessions = false;
   final Set<String> _granted = {};
 
+  // Datos del miembro para el header (editables desde esta misma pantalla).
+  String? _displayName;
+  String _email = '';
+
   /// Sesiones de la cuenta: [phone, alias].
   List<MapEntry<String, String>> _sessions = [];
 
@@ -70,10 +76,11 @@ class _MemberAccessScreenState extends State<MemberAccessScreen> {
       }).toList()
         ..sort((a, b) => a.value.toLowerCase().compareTo(b.value.toLowerCase()));
 
-      final access = memberSnap.data() is Map
-          ? (memberSnap.data() as Map<String, dynamic>)['access']
-              as Map<String, dynamic>?
-          : null;
+      final memberData = memberSnap.data() as Map<String, dynamic>?;
+      _displayName = memberData?['displayName'] as String?;
+      _email = memberData?['email'] as String? ?? '';
+
+      final access = memberData?['access'] as Map<String, dynamic>?;
       if (access != null) {
         _allSessions = access['allSessions'] == true;
         final sessions = access['sessions'] as Map<String, dynamic>?;
@@ -136,6 +143,18 @@ class _MemberAccessScreenState extends State<MemberAccessScreen> {
       if (!mounted) return;
       _showError('Error de red: $e');
       setState(() => _saving = false);
+    }
+  }
+
+  Future<void> _editName() async {
+    final newName = await showEditMemberNameDialog(
+      context,
+      accountId: widget.accountId,
+      uid: widget.memberUid,
+      currentName: _displayName ?? '',
+    );
+    if (newName != null && mounted) {
+      setState(() => _displayName = newName);
     }
   }
 
@@ -206,9 +225,63 @@ class _MemberAccessScreenState extends State<MemberAccessScreen> {
   }
 
   Widget _buildBody() {
+    final hasName = _displayName != null && _displayName!.isNotEmpty;
     return ListView(
       padding: const EdgeInsets.symmetric(vertical: 8),
       children: [
+        // Identidad del miembro + edición de nombre (integrada aquí para que
+        // la pantalla de "Miembros" tenga un solo gesto por fila).
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
+          child: Row(
+            children: [
+              CircleAvatar(
+                radius: 24,
+                backgroundColor: surfaceDark,
+                child: Text(
+                  (hasName ? _displayName! : _email).characters.first
+                      .toUpperCase(),
+                  style: const TextStyle(
+                    color: primaryAqua,
+                    fontWeight: FontWeight.w700,
+                    fontSize: 18,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      hasName ? _displayName! : 'Sin nombre',
+                      style: const TextStyle(
+                        color: white,
+                        fontWeight: FontWeight.w700,
+                        fontSize: 16,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      _email,
+                      style: const TextStyle(color: lightText, fontSize: 12.5),
+                    ),
+                  ],
+                ),
+              ),
+              TextButton.icon(
+                onPressed: _saving ? null : _editName,
+                icon: const Icon(Icons.edit_outlined, size: 18, color: primaryAqua),
+                label: const Text(
+                  'Nombre',
+                  style: TextStyle(color: primaryAqua, fontWeight: FontWeight.w600),
+                ),
+              ),
+            ],
+          ),
+        ),
+        const Divider(color: surfaceDark, height: 1),
+        const SizedBox(height: 8),
         SwitchListTile(
           value: _allSessions,
           activeColor: primaryAqua,
