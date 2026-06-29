@@ -554,11 +554,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
                   tooltip: 'Buscar contacto o mensaje',
                   onPressed: _toggleSearch,
                 ),
-                IconButton(
-                  icon: const Icon(Icons.photo_library_outlined, size: 20),
-                  tooltip: 'Galería de medios',
-                  onPressed: () => _openMediaVault(),
-                ),
+                // La galería de medios ya no vive aquí: al abrir la búsqueda
+                // surge como atajo dentro del cuerpo (estilo WhatsApp), así
+                // este slot del AppBar queda libre. Ver _buildMediaGalleryEntry.
                 IconButton(
                   icon: const Icon(Icons.flash_on, size: 20),
                   tooltip: 'Respuestas rápidas',
@@ -717,7 +715,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
             // El botón "Ir a Mis Cuentas" solo tiene sentido en la bandeja
             // realmente vacía, no cuando un filtro no arroja nada.
             final showAccountsCta = _activeFilter == ChatFilter.todos;
-            return Center(
+            return _withMediaShortcut(Center(
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
@@ -759,7 +757,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                   ],
                 ],
               ),
-            );
+            ));
           }
 
           // Al buscar mostramos dos secciones (estilo WhatsApp): "Chats"
@@ -769,7 +767,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
             return _buildSearchBody(filteredChats);
           }
 
-          return ListView.separated(
+          return _withMediaShortcut(ListView.separated(
             itemCount: filteredChats.length,
             // Divisor sutil entre chats, indentado para arrancar tras el avatar.
             separatorBuilder: (_, __) => Padding(
@@ -781,7 +779,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
               ),
             ),
             itemBuilder: (context, index) => _buildChatTile(filteredChats[index]),
-          );
+          ));
         },
       ),
     );
@@ -856,6 +854,66 @@ class _ChatsScreenState extends State<ChatsScreen> {
         ],
       ),
       child: tile,
+    );
+  }
+
+  // Antepone el atajo a la galería de medios cuando la búsqueda está abierta
+  // pero aún no escribes nada (campo vacío). Es el reemplazo del icono que vivía
+  // en el AppBar: estilo WhatsApp, los medios surgen dentro de la vista de
+  // búsqueda. Mientras escribes (searchQuery con texto) no aparece, para no
+  // ensuciar los resultados de "Chats" y "Mensajes".
+  Widget _withMediaShortcut(Widget child) {
+    if (!_searchExpanded || searchQuery.isNotEmpty) return child;
+    return Column(
+      children: [
+        _buildMediaGalleryEntry(),
+        Divider(
+          height: 1,
+          thickness: 0.5,
+          color: white.withValues(alpha: 0.06),
+        ),
+        Expanded(child: child),
+      ],
+    );
+  }
+
+  // Fila tappable que abre la galería de medios de la sesión. Mismo lenguaje
+  // visual que un avatar de chat (cuadro aqua al 20%) para que se sienta nativa.
+  Widget _buildMediaGalleryEntry() {
+    return InkWell(
+      onTap: _openMediaVault,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        child: Row(
+          children: [
+            Container(
+              width: 44,
+              height: 44,
+              decoration: BoxDecoration(
+                color: primaryAqua.withValues(alpha: 0.2),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: const Icon(
+                Icons.photo_library_outlined,
+                color: primaryAqua,
+                size: 22,
+              ),
+            ),
+            const SizedBox(width: 14),
+            const Expanded(
+              child: Text(
+                'Galería de medios',
+                style: TextStyle(
+                  color: white,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ),
+            const Icon(Icons.chevron_right, color: lightText, size: 20),
+          ],
+        ),
+      ),
     );
   }
 
