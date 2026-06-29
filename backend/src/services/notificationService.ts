@@ -93,9 +93,56 @@ async function fetchTitleParts(
   return { sessionAlias, contactName };
 }
 
+// Calcula el conjunto de uids con acceso a una sesión concreta.
+// Owner (uid == accountId) siempre. Cada miembro según su `access`:
+//   - sin campo access → legacy "ve todo" (incluido).
+//   - allSessions:true → incluido.
+//   - sessions[sessionPhone] presente → incluido.
+// Devuelve null si no se pudo leer members (→ caller hace fail-open por
+// seguridad operativa: mejor una notif de más que perder el aviso del owner).
+async function computeAllowedUids(
+  accountId: string,
+  sessionPhone: string,
+): Promise<Set<string> | null> {
+  try {
+    const allowed = new Set<string>([accountId]); // owner
+    const membersSnap = await getDb()
+      .collection(ACCOUNTS_COLLECTION)
+      .doc(accountId)
+      .collection('members')
+      .get();
+
+    membersSnap.forEach((doc) => {
+      const access = doc.data()?.access as
+        | { allSessions?: boolean; sessions?: Record<string, unknown> }
+        | undefined;
+      // Sin access → miembro legacy con acceso total.
+      if (!access) {
+        allowed.add(doc.id);
+        return;
+      }
+      if (access.allSessions === true) {
+        allowed.add(doc.id);
+        return;
+      }
+      if (access.sessions && sessionPhone in access.sessions) {
+        allowed.add(doc.id);
+      }
+    });
+    return allowed;
+  } catch (error) {
+    console.error('[Notify] Error computando uids con acceso:', error);
+    return null;
+  }
+}
+
 // Lee tokens FCM activos del usuario. Devuelve también el deviceId para limpieza posterior.
+// Filtra por `allowedUids`: solo notifica a dispositivos de usuarios con acceso
+// a la sesión. Un device sin campo `uid` (legacy) se incluye (fail-open) para
+// no perder avisos de dispositivos viejos sin re-registrar.
 async function fetchDeviceTokens(
   accountId: string,
+  allowedUids: Set<string> | null,
 ): Promise<{ deviceId: string; token: string; platform: string }[]> {
   try {
     const snap = await getDb()
@@ -106,14 +153,17 @@ async function fetchDeviceTokens(
 
     const result: { deviceId: string; token: string; platform: string }[] = [];
     snap.forEach((doc) => {
-      const data = doc.data() as DeviceDoc;
-      if (data?.fcm_token && typeof data.fcm_token === 'string') {
-        result.push({
-          deviceId: doc.id,
-          token: data.fcm_token,
-          platform: data.platform ?? 'unknown',
-        });
+      const data = doc.data() as DeviceDoc & { uid?: string };
+      if (!data?.fcm_token || typeof data.fcm_token !== 'string') return;
+      // Si tenemos lista de permitidos y el device tiene uid, filtramos.
+      if (allowedUids && data.uid && !allowedUids.has(data.uid)) {
+        return;
       }
+      result.push({
+        deviceId: doc.id,
+        token: data.fcm_token,
+        platform: data.platform ?? 'unknown',
+      });
     });
     return result;
   } catch (error) {
@@ -161,9 +211,16 @@ async function pruneDeadTokens(
 export async function sendHumanAttentionNotification(
   payload: HumanAttentionPayload,
 ): Promise<void> {
-  const devices = await fetchDeviceTokens(payload.accountId);
+  // Solo notificamos a quienes tienen acceso a esta sesión (permisos por
+  // sesión). El owner siempre incluido.
+  const allowedUids = await computeAllowedUids(
+    payload.accountId,
+    payload.sessionPhone,
+  );
+
+  const devices = await fetchDeviceTokens(payload.accountId, allowedUids);
   if (devices.length === 0) {
-    console.log(`[Notify] Sin dispositivos registrados para ${payload.accountId}, skip push`);
+    console.log(`[Notify] Sin dispositivos con acceso para ${payload.accountId}/${payload.sessionPhone}, skip push`);
     return;
   }
 

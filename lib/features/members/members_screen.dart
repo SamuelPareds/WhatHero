@@ -9,6 +9,7 @@ import 'package:crm_whatsapp/core/services/account_context_service.dart';
 import 'package:crm_whatsapp/core/services/api_client.dart';
 
 import 'add_member_modal.dart';
+import 'member_access_screen.dart';
 
 /// Pantalla "Miembros del equipo".
 ///
@@ -56,6 +57,7 @@ class MembersScreen extends StatelessWidget {
                 displayName: data?['displayName'] as String?,
                 isOwnerTile: true,
                 canEdit: true, // siempre puedes editar tu propio nombre
+                canManageAccess: false, // el owner siempre tiene acceso total
               );
             },
           ),
@@ -105,6 +107,8 @@ class MembersScreen extends StatelessWidget {
                     displayName: data['displayName'] as String?,
                     isOwnerTile: false,
                     canEdit: canEdit,
+                    // Solo el owner administra permisos de sus sub-users.
+                    canManageAccess: ctx.isOwner,
                   );
                 }).toList(),
               );
@@ -137,6 +141,8 @@ class _PersonTile extends StatelessWidget {
   final String? displayName;
   final bool isOwnerTile;
   final bool canEdit;
+  // El owner puede administrar permisos por sesión de un sub-user.
+  final bool canManageAccess;
 
   const _PersonTile({
     required this.accountId,
@@ -145,6 +151,7 @@ class _PersonTile extends StatelessWidget {
     required this.displayName,
     required this.isOwnerTile,
     required this.canEdit,
+    required this.canManageAccess,
   });
 
   String _initial() {
@@ -152,18 +159,35 @@ class _PersonTile extends StatelessWidget {
     return src.isEmpty ? '?' : src.characters.first.toUpperCase();
   }
 
+  void _openAccess(BuildContext context) {
+    final label = (displayName?.isNotEmpty ?? false) ? displayName! : email;
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => MemberAccessScreen(
+          accountId: accountId,
+          memberUid: uid,
+          memberLabel: label,
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final hasName = displayName != null && displayName!.isNotEmpty;
     return ListTile(
-      onTap: canEdit
-          ? () => _showEditDialog(
-                context,
-                accountId: accountId,
-                uid: uid,
-                currentName: displayName ?? '',
-              )
-          : null,
+      // Tap principal: si el owner administra a un sub-user, abre permisos;
+      // si no, abre la edición de nombre (caso self / owner sobre sí mismo).
+      onTap: canManageAccess
+          ? () => _openAccess(context)
+          : canEdit
+              ? () => _showEditDialog(
+                    context,
+                    accountId: accountId,
+                    uid: uid,
+                    currentName: displayName ?? '',
+                  )
+              : null,
       leading: CircleAvatar(
         backgroundColor: isOwnerTile
             ? primaryAqua.withValues(alpha: 0.2)
@@ -183,28 +207,52 @@ class _PersonTile extends StatelessWidget {
       subtitle: Text(
         isOwnerTile
             ? (hasName ? 'Owner • Tú' : 'Owner • Tú · toca para ponerte nombre')
-            : email,
+            : canManageAccess
+                ? '$email · toca para gestionar permisos'
+                : email,
         style: const TextStyle(color: lightText, fontSize: 12),
       ),
-      trailing: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-        decoration: BoxDecoration(
-          color: isOwnerTile
-              ? primaryAqua.withValues(alpha: 0.15)
-              : surfaceDark,
-          borderRadius: BorderRadius.circular(12),
-          border: isOwnerTile
-              ? null
-              : Border.all(color: lightText.withValues(alpha: 0.2)),
-        ),
-        child: Text(
-          isOwnerTile ? 'Owner' : 'Miembro',
-          style: TextStyle(
-            color: isOwnerTile ? primaryAqua : lightText,
-            fontSize: 12,
-            fontWeight: FontWeight.w600,
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Cuando el tap abre permisos, el lápiz da acceso a editar el nombre.
+          if (canManageAccess)
+            IconButton(
+              icon: const Icon(Icons.edit_outlined, color: lightText, size: 20),
+              tooltip: 'Editar nombre',
+              onPressed: () => _showEditDialog(
+                context,
+                accountId: accountId,
+                uid: uid,
+                currentName: displayName ?? '',
+              ),
+            ),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            decoration: BoxDecoration(
+              color: isOwnerTile
+                  ? primaryAqua.withValues(alpha: 0.15)
+                  : surfaceDark,
+              borderRadius: BorderRadius.circular(12),
+              border: isOwnerTile
+                  ? null
+                  : Border.all(color: lightText.withValues(alpha: 0.2)),
+            ),
+            child: Text(
+              isOwnerTile ? 'Owner' : 'Miembro',
+              style: TextStyle(
+                color: isOwnerTile ? primaryAqua : lightText,
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
           ),
-        ),
+          if (canManageAccess)
+            const Padding(
+              padding: EdgeInsets.only(left: 4),
+              child: Icon(Icons.chevron_right, color: lightText, size: 20),
+            ),
+        ],
       ),
     );
   }

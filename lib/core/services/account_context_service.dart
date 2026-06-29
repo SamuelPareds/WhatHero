@@ -33,12 +33,26 @@ class AccountContextService extends ChangeNotifier {
   bool _mustChangePassword = false;
   bool _isReady = false;
 
+  // Permisos por sesión del usuario actual (sub-user). El owner siempre tiene
+  // acceso total. Default true para preservar el comportamiento legacy de
+  // miembros sin campo `access`.
+  bool _allSessionsAccess = true;
+  Set<String> _grantedSessions = {};
+
   String? get currentUid => _currentUid;
   String? get activeAccountId => _activeAccountId;
   String get role => _role;
   bool get mustChangePassword => _mustChangePassword;
   bool get isOwner => _role == 'owner';
   bool get isReady => _isReady;
+
+  /// ¿El usuario actual ve TODAS las sesiones de la cuenta? (owner o miembro
+  /// con allSessions / legacy). Si es false, solo ve [grantedSessions].
+  bool get hasAllSessionsAccess => isOwner || _allSessionsAccess;
+
+  /// Teléfonos de sesión a los que el sub-user tiene acceso explícito.
+  /// Solo relevante cuando [hasAllSessionsAccess] es false.
+  Set<String> get grantedSessions => _grantedSessions;
 
   /// Resuelve el contexto para un usuario Firebase recién logueado.
   /// Idempotente: si ya estamos resueltos para este uid, no hace nada.
@@ -89,6 +103,15 @@ class AccountContextService extends ChangeNotifier {
             (data['mustChangePassword'] as bool?) ?? false;
       }
 
+      // Permisos por sesión. El owner siempre tiene acceso total; para
+      // sub-users leemos su doc de miembro. Default (sin campo access o si
+      // falla la lectura) = acceso total, para no bloquear miembros legacy.
+      _allSessionsAccess = true;
+      _grantedSessions = {};
+      if (_role != 'owner' && _activeAccountId != null) {
+        await _loadMemberAccess(_activeAccountId!, user.uid);
+      }
+
       _isReady = true;
       notifyListeners();
       debugPrint(
@@ -106,6 +129,36 @@ class AccountContextService extends ChangeNotifier {
       _activeAccountId = null;
       _isReady = false;
       return false;
+    }
+  }
+
+  /// Lee accounts/{accountId}/members/{uid}.access para resolver los permisos
+  /// por sesión del sub-user. Si el doc no tiene `access` (miembro legacy) o
+  /// la lectura falla, dejamos el default de acceso total ya seteado por el
+  /// caller — fallamos abierto para no dejar a un miembro sin ver nada.
+  Future<void> _loadMemberAccess(String accountId, String uid) async {
+    try {
+      final snap = await FirebaseFirestore.instance
+          .collection(accountsCollection)
+          .doc(accountId)
+          .collection('members')
+          .doc(uid)
+          .get();
+      final access = snap.data()?['access'] as Map<String, dynamic>?;
+      if (access == null) {
+        // Miembro legacy sin permisos configurados → acceso total.
+        return;
+      }
+      _allSessionsAccess = access['allSessions'] == true;
+      final sessions = access['sessions'] as Map<String, dynamic>?;
+      _grantedSessions = sessions?.keys.toSet() ?? {};
+      debugPrint(
+        '[AccountContext] Permisos: allSessions=$_allSessionsAccess, '
+        'sesiones=$_grantedSessions',
+      );
+    } catch (e) {
+      debugPrint('[AccountContext] No se pudo leer member access: $e');
+      // Mantener default de acceso total.
     }
   }
 
@@ -148,6 +201,8 @@ class AccountContextService extends ChangeNotifier {
     _role = 'owner';
     _mustChangePassword = false;
     _isReady = false;
+    _allSessionsAccess = true;
+    _grantedSessions = {};
     notifyListeners();
   }
 }

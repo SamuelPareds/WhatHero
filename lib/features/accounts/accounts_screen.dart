@@ -39,6 +39,25 @@ class _AccountsScreenState extends State<AccountsScreen> {
     _loadVersion();
   }
 
+  /// Stream de sesiones segun los permisos del usuario.
+  /// - Owner / acceso total: todas las sesiones de la cuenta.
+  /// - Sub-user restringido: solo las sesiones cuyo `allowedUids` lo incluye
+  ///   (query filtrable que las rules aprueban; sin orderBy para no exigir
+  ///   índice compuesto — el orden se aplica en memoria en el builder).
+  Stream<QuerySnapshot> _sessionsStream() {
+    final col = FirebaseFirestore.instance
+        .collection(accountsCollection)
+        .doc(widget.accountId)
+        .collection('whatsapp_sessions');
+
+    final ctx = AccountContextService();
+    if (ctx.hasAllSessionsAccess) {
+      return col.orderBy('connected_at', descending: true).snapshots();
+    }
+    final uid = ctx.currentUid ?? FirebaseAuth.instance.currentUser?.uid ?? '';
+    return col.where('allowedUids', arrayContains: uid).snapshots();
+  }
+
   Future<void> _loadVersion() async {
     final version = await VersionService.getVersion();
     if (mounted) {
@@ -172,18 +191,27 @@ class _AccountsScreenState extends State<AccountsScreen> {
         ),
       ),
       body: StreamBuilder<QuerySnapshot>(
-        stream: FirebaseFirestore.instance
-            .collection(accountsCollection)
-            .doc(widget.accountId)
-            .collection('whatsapp_sessions')
-            .orderBy('connected_at', descending: true)
-            .snapshots(),
+        stream: _sessionsStream(),
         builder: (context, snapshot) {
           if (!snapshot.hasData) {
             return const Center(child: CircularProgressIndicator());
           }
 
-          final sessions = snapshot.data!.docs;
+          // Ordenamos en memoria por connected_at desc: el branch restringido
+          // (arrayContains) no puede usar orderBy sin un índice compuesto, y
+          // la lista de sesiones es pequeña. Owners y restringidos comparten
+          // el mismo orden visual.
+          final sessions = snapshot.data!.docs.toList()
+            ..sort((a, b) {
+              final ta = (a.data() as Map<String, dynamic>?)?['connected_at'];
+              final tb = (b.data() as Map<String, dynamic>?)?['connected_at'];
+              if (ta is Timestamp && tb is Timestamp) {
+                return tb.compareTo(ta);
+              }
+              if (ta is Timestamp) return -1;
+              if (tb is Timestamp) return 1;
+              return 0;
+            });
 
           if (sessions.isEmpty) {
             return Center(

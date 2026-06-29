@@ -28,6 +28,49 @@ service cloud.firestore {
              accountId in get(/databases/$(database)/documents/users/$(request.auth.uid)).data.memberOfAccounts;
     }
 
+    // ---------------------------------------------------------------------
+    // PERMISOS POR SESIÓN
+    // ---------------------------------------------------------------------
+    // El owner de una cuenta tiene uid == accountId (ver Multi-Usuario Fase 1),
+    // así que es un check directo y sin lecturas extra.
+    function isOwner(accountId) {
+      return request.auth != null && request.auth.uid == accountId;
+    }
+
+    // Doc del miembro (sub-user) dentro de la cuenta. El owner NO tiene mirror,
+    // por eso estas funciones solo se invocan tras descartar isOwner() (los `||`
+    // hacen short-circuit y nunca pegan el get() para el owner).
+    // `root` parametriza la colección raíz: 'accounts' (prod) o 'accounts_dev'.
+    function memberData(root, accountId) {
+      return get(/databases/$(database)/documents/$(root)/$(accountId)/members/$(request.auth.uid)).data;
+    }
+
+    // access del miembro, con default de migración: si el doc no tiene campo
+    // `access` (miembros creados antes de la feature de permisos), se asume
+    // acceso total — preserva el comportamiento legacy de "ve todo".
+    function memberAccess(root, accountId) {
+      return memberData(root, accountId).get('access', {'allSessions': true, 'sessions': {}});
+    }
+
+    function memberAllSessions(root, accountId) {
+      return memberAccess(root, accountId).get('allSessions', false) == true;
+    }
+
+    function sessionGranted(root, accountId, sessionId) {
+      return sessionId in memberAccess(root, accountId).get('sessions', {});
+    }
+
+    // ¿Puede este uid ver/operar la sesión `sessionId` de la cuenta?
+    // Usada en el subárbol de una sesión concreta (sessionId fijo en el path):
+    // owner, miembro con acceso total, o miembro con grant a esa sesión.
+    function canAccessSession(root, accountId, sessionId) {
+      return isMember(accountId) && (
+        isOwner(accountId) ||
+        memberAllSessions(root, accountId) ||
+        sessionGranted(root, accountId, sessionId)
+      );
+    }
+
     // users/{uid}: cada quien lee solo el suyo. Auto-bootstrap controlado.
     match /users/{uid} {
       allow read: if request.auth != null && request.auth.uid == uid;
@@ -51,11 +94,47 @@ service cloud.firestore {
       allow update, delete: if false;
     }
 
-    // accounts/{accountId} (producción) — lectura/escritura para miembros.
+    // -------------------------------------------------------------------
+    // Reglas de accounts/ (prod) y accounts_dev/ (dev).
+    // No usamos un catch-all `{document=**}` porque Firestore EVALÚA TODAS
+    // las reglas que matchean y concede si ALGUNA permite (OR). Un catch-all
+    // permisivo anularía la restricción por sesión. Por eso enumeramos cada
+    // subcolección directa de la cuenta: whatsapp_sessions, members, devices.
+    // -------------------------------------------------------------------
+
+    // accounts/{accountId} (producción)
     match /accounts/{accountId} {
+      // El doc de la cuenta en sí: cualquier miembro lo lee/escribe.
       allow read, write: if isMember(accountId);
 
-      match /{document=**} {
+      // Sesiones de WhatsApp: gated por permiso de sesión.
+      // El doc de la sesión soporta además el branch denormalizado
+      // `allowedUids` para que un miembro restringido pueda LISTAR solo sus
+      // sesiones (query `where('allowedUids', arrayContains: uid)`).
+      match /whatsapp_sessions/{sessionId} {
+        allow read: if isMember(accountId) && (
+          isOwner(accountId) ||
+          memberAllSessions('accounts', accountId) ||
+          request.auth.uid in resource.data.allowedUids
+        );
+        allow write: if canAccessSession('accounts', accountId, sessionId);
+
+        // Subárbol de la sesión (chats, messages, labels, quick_responses,
+        // media_index, message_index, followup_queue, ...): sessionId fijo en
+        // el path → usamos el check por get() del member doc.
+        match /{document=**} {
+          allow read, write: if canAccessSession('accounts', accountId, sessionId);
+        }
+      }
+
+      // Miembros: cualquier miembro lee la lista; solo el backend escribe.
+      match /members/{memberId} {
+        allow read: if isMember(accountId);
+        allow write: if false;
+      }
+
+      // Dispositivos (FCM tokens): cualquier miembro registra/borra el suyo.
+      match /devices/{deviceId} {
         allow read, write: if isMember(accountId);
       }
     }
@@ -64,7 +143,25 @@ service cloud.firestore {
     match /accounts_dev/{accountId} {
       allow read, write: if isMember(accountId);
 
-      match /{document=**} {
+      match /whatsapp_sessions/{sessionId} {
+        allow read: if isMember(accountId) && (
+          isOwner(accountId) ||
+          memberAllSessions('accounts_dev', accountId) ||
+          request.auth.uid in resource.data.allowedUids
+        );
+        allow write: if canAccessSession('accounts_dev', accountId, sessionId);
+
+        match /{document=**} {
+          allow read, write: if canAccessSession('accounts_dev', accountId, sessionId);
+        }
+      }
+
+      match /members/{memberId} {
+        allow read: if isMember(accountId);
+        allow write: if false;
+      }
+
+      match /devices/{deviceId} {
         allow read, write: if isMember(accountId);
       }
     }

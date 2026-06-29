@@ -1572,7 +1572,23 @@ app.post('/accounts/members', express.json(), verifyHttpAuth(), async (req, res)
       createdBy: requesterUid,
     });
 
-    // 4. Mirror en subcollection accounts/{accountId}/members.
+    // 4. Permisos por defecto (least-privilege). Si la cuenta tiene UNA sola
+    //    sesión, el miembro arranca con acceso a esa sesión (caso común: un
+    //    negocio = un WhatsApp). Con 0 o varias sesiones arranca sin acceso y
+    //    el owner asigna explícitamente en el panel de permisos.
+    const sessionsSnap = await db
+      .collection(ACCOUNTS_COLLECTION)
+      .doc(accountId)
+      .collection('whatsapp_sessions')
+      .get();
+
+    const defaultSessions: Record<string, { allChats: boolean }> = {};
+    if (sessionsSnap.size === 1) {
+      defaultSessions[sessionsSnap.docs[0].id] = { allChats: true };
+    }
+    const defaultAccess = { allSessions: false, sessions: defaultSessions };
+
+    // 5. Mirror en subcollection accounts/{accountId}/members.
     await db
       .collection(ACCOUNTS_COLLECTION)
       .doc(accountId)
@@ -1582,11 +1598,20 @@ app.post('/accounts/members', express.json(), verifyHttpAuth(), async (req, res)
         email: cleanEmail,
         displayName: cleanDisplayName,
         role: 'member',
+        access: defaultAccess,
         addedAt: admin.firestore.FieldValue.serverTimestamp(),
         addedBy: requesterUid,
       });
 
-    // 5. Cache: si hubiera un cache stale para el owner, da igual; lo del
+    // 6. Denormalizar allowedUids en las sesiones con grant inicial.
+    if (sessionsSnap.size === 1) {
+      await sessionsSnap.docs[0].ref.set(
+        { allowedUids: admin.firestore.FieldValue.arrayUnion(newUser.uid) },
+        { merge: true },
+      );
+    }
+
+    // 7. Cache: si hubiera un cache stale para el owner, da igual; lo del
     //    sub-user ya quedó listo en Firestore + claims.
     invalidateMembershipCache(newUser.uid);
 
@@ -1697,6 +1722,133 @@ app.patch('/accounts/members/:uid', express.json(), verifyHttpAuth(), async (req
     console.error('[PATCH /accounts/members] Error:', error);
     res.status(500).json({
       error: 'Failed to update member',
+      details: (error as any).message,
+    });
+  }
+});
+
+// ===========================================================================
+// PERMISOS POR SESIÓN — PATCH /accounts/members/:uid/access
+// ===========================================================================
+//
+// Define a qué sesiones (y en Fase 2, a qué chats) tiene acceso un sub-user.
+//
+// Modelo `access` (en accounts/{accountId}/members/{uid}):
+//   { allSessions: bool, sessions: { "<phone>": { allChats: true } } }
+//
+// - allSessions:true  → acceso total (preset "manager full"). Consulta sin filtro.
+// - allSessions:false → solo las sesiones listadas en `sessions`.
+//
+// Denormalización: para que el cliente pueda LISTAR solo sus sesiones de forma
+// segura (Firestore exige que la query sea filtrable por las rules), cada
+// session doc mantiene `allowedUids: string[]` con los uids que tienen grant
+// explícito a ESA sesión. Owners y allSessions NO van en el array (consultan
+// sin filtro). Aquí recomputamos esos arrays para el uid afectado.
+//
+// IMPORTANTE migración: un miembro SIN campo `access` se interpreta como
+// allSessions:true (mismo comportamiento legacy de "ve todo"). La restricción
+// solo aplica cuando el owner la configura explícitamente vía este endpoint.
+
+/// Valida y normaliza el objeto access del body. Retorna null si es inválido.
+function normalizeAccess(raw: any): {
+  allSessions: boolean;
+  sessions: Record<string, { allChats: boolean }>;
+} | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const allSessions = raw.allSessions === true;
+  const sessions: Record<string, { allChats: boolean }> = {};
+  if (raw.sessions && typeof raw.sessions === 'object') {
+    for (const [phone, grant] of Object.entries(raw.sessions)) {
+      if (!phone || typeof phone !== 'string') return null;
+      // Fase 1: allChats siempre true (acceso por sesión = todos sus chats).
+      // El flag queda persistido para que Fase 2 lo pueda poner en false.
+      const allChats = (grant as any)?.allChats !== false;
+      sessions[phone] = { allChats };
+    }
+  }
+  return { allSessions, sessions };
+}
+
+app.patch('/accounts/members/:uid/access', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const requesterUid = req.auth!.uid;
+    const targetUid = req.params.uid;
+    const { accountId } = req.body as { accountId: string };
+
+    const access = normalizeAccess((req.body as any).access);
+    if (!access) {
+      return res.status(400).json({ error: 'access inválido' });
+    }
+
+    // Solo el owner de la cuenta puede modificar permisos de sus miembros.
+    const requesterDoc = await db.collection('users').doc(requesterUid).get();
+    if (!requesterDoc.exists) {
+      return res.status(403).json({ error: 'Requester sin doc users/' });
+    }
+    const requesterData = requesterDoc.data()!;
+    if (requesterData.role !== 'owner' || requesterData.ownedAccountId !== accountId) {
+      return res.status(403).json({ error: 'Solo el owner puede cambiar permisos' });
+    }
+
+    // El owner no tiene mirror en members/ y siempre tiene acceso total: no
+    // tiene sentido configurarle permisos.
+    if (targetUid === accountId) {
+      return res.status(400).json({ error: 'El owner siempre tiene acceso total' });
+    }
+
+    const memberRef = db
+      .collection(ACCOUNTS_COLLECTION)
+      .doc(accountId)
+      .collection('members')
+      .doc(targetUid);
+    const memberSnap = await memberRef.get();
+    if (!memberSnap.exists) {
+      return res.status(404).json({ error: 'El miembro no pertenece a esta cuenta' });
+    }
+
+    // Conjunto de sesiones a las que el miembro tiene grant explícito.
+    // Si allSessions, no necesita estar en ningún allowedUids (consulta libre).
+    const grantedPhones = access.allSessions
+      ? new Set<string>()
+      : new Set<string>(Object.keys(access.sessions));
+
+    // 1. Persistir access en el member doc.
+    const batch = db.batch();
+    batch.set(memberRef, { access }, { merge: true });
+
+    // 2. Recomputar allowedUids en TODAS las sesiones de la cuenta para este uid.
+    const sessionsSnap = await db
+      .collection(ACCOUNTS_COLLECTION)
+      .doc(accountId)
+      .collection('whatsapp_sessions')
+      .get();
+
+    for (const sessionDoc of sessionsSnap.docs) {
+      const phone = sessionDoc.id;
+      const shouldHaveAccess = grantedPhones.has(phone);
+      batch.set(
+        sessionDoc.ref,
+        {
+          allowedUids: shouldHaveAccess
+            ? admin.firestore.FieldValue.arrayUnion(targetUid)
+            : admin.firestore.FieldValue.arrayRemove(targetUid),
+        },
+        { merge: true },
+      );
+    }
+
+    await batch.commit();
+
+    console.log(
+      `[PATCH access] owner=${requesterUid} actualizó permisos de ${targetUid} ` +
+      `(allSessions=${access.allSessions}, sesiones=[${[...grantedPhones].join(',')}])`,
+    );
+
+    res.json({ success: true, uid: targetUid, access });
+  } catch (error) {
+    console.error('[PATCH /accounts/members/:uid/access] Error:', error);
+    res.status(500).json({
+      error: 'Failed to update access',
       details: (error as any).message,
     });
   }
