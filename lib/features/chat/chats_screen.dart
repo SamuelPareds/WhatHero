@@ -361,9 +361,21 @@ class _ChatsScreenState extends State<ChatsScreen> {
     final isMobile = MediaQuery.of(context).size.width < 600;
 
     if (isMobile) {
-      return selectedChatPhone == null
-          ? _buildChatsList()
-          : _buildMessageDetail();
+      // Mantenemos la lista SIEMPRE montada (Offstage cuando hay un chat
+      // abierto) en vez de reemplazarla por el detalle. Así el journey
+      // búsqueda→chat→back es instantáneo: al volver, MessageSearchResults
+      // conserva sus hits (cero re-lecturas, sin spinner) y la lista su scroll.
+      // El detalle se dibuja encima solo cuando hace falta, así MessagesView
+      // (pesada) no se construye mientras estás en la lista.
+      return Stack(
+        children: [
+          Offstage(
+            offstage: selectedChatPhone != null,
+            child: _buildChatsList(),
+          ),
+          if (selectedChatPhone != null) _buildMessageDetail(),
+        ],
+      );
     }
 
     return Scaffold(
@@ -817,6 +829,11 @@ class _ChatsScreenState extends State<ChatsScreen> {
       labelsCatalog: _labelsCatalog,
       note: note,
       onTap: () {
+        // La lista ahora sobrevive Offstage al abrir el chat; si el campo de
+        // búsqueda estaba enfocado, su teclado quedaría montado sobre el
+        // detalle. Soltamos el foco explícitamente (antes lo resolvía el
+        // desmontaje de la lista).
+        FocusScope.of(context).unfocus();
         setState(() {
           selectedChatPhone = phoneNumber;
         });
@@ -933,6 +950,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
           sessionId: widget.sessionId!,
           query: searchQuery,
           onOpenChat: (chatId, {messageId, timestamp}) {
+            // Soltamos el foco del campo de búsqueda: con la lista viva Offstage,
+            // su teclado quedaría montado sobre el detalle si no lo cerramos.
+            FocusScope.of(context).unfocus();
             setState(() {
               selectedChatPhone = chatId;
               // Objetivo de salto: si se tocó una fila de mensaje, MessagesView
@@ -940,10 +960,14 @@ class _ChatsScreenState extends State<ChatsScreen> {
               // messageId → abre el chat normal (abajo).
               _jumpToMessageId = messageId;
               _jumpToTimestamp = timestamp;
-              // Colapsar el buscador al saltar al chat, como WhatsApp.
-              _searchExpanded = false;
-              searchController.clear();
-              searchQuery = '';
+              // A diferencia de WhatsApp, NO colapsamos ni limpiamos la búsqueda
+              // al saltar al chat: el estado (searchQuery/controller/expanded)
+              // vive en el State, así que al volver con back reaparece la misma
+              // búsqueda con sus resultados. Journey clave: evaluar cómo responde
+              // el asistente a varios clientes que escribieron lo mismo, sin
+              // retipear entre chat y chat. La sección "Chats" ya se comportaba
+              // así; esto la alinea. Para salir de la búsqueda queda la ✕ del
+              // campo (_toggleSearch).
             });
           },
         ),
