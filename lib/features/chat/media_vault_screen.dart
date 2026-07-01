@@ -28,14 +28,23 @@ class MediaVaultScreen extends StatefulWidget {
   final String sessionAlias;
 
   // Callback: el operador eligió "Ver en chat" desde el viewer.
-  // ChatsScreen lo usa para cerrar este vault y seleccionar el contacto.
+  // ChatsScreen lo usa para seleccionar el contacto. La galería NO se cierra a
+  // sí misma: en móvil queda viva (Offstage) debajo del chat para poder volver
+  // a ella con el back; en desktop, ChatsScreen decide cerrarla.
   final void Function(String chatId)? onJumpToChat;
+
+  // Callback: cierre de la galería (botón back del AppBar). Como ahora la
+  // galería se monta como capa dentro de ChatsScreen (no como ruta), el cierre
+  // lo maneja el padre vía setState. Fallback a Navigator.pop por si algún día
+  // se empuja como ruta.
+  final VoidCallback? onClose;
 
   const MediaVaultScreen({
     required this.accountId,
     required this.sessionId,
     required this.sessionAlias,
     this.onJumpToChat,
+    this.onClose,
     super.key,
   });
 
@@ -177,7 +186,7 @@ class _MediaVaultScreenState extends State<MediaVaultScreen> {
       appBar: AppBar(
         leading: IconButton(
           icon: const Icon(Icons.arrow_back, color: primaryAqua),
-          onPressed: () => Navigator.of(context).pop(),
+          onPressed: widget.onClose ?? () => Navigator.of(context).pop(),
         ),
         title: Column(
           mainAxisSize: MainAxisSize.min,
@@ -690,8 +699,8 @@ class _MediaVaultScreenState extends State<MediaVaultScreen> {
             onJumpToChat: () {
               final chatId = d['chatId'] as String?;
               if (chatId == null) return;
-              // Cerrar viewer + cerrar vault + delegar a ChatsScreen.
-              Navigator.of(context).pop();
+              // Cerrar solo el visor (ruta transitoria) y delegar a ChatsScreen.
+              // La galería NO se cierra: queda viva debajo para volver con back.
               Navigator.of(context).pop();
               widget.onJumpToChat?.call(chatId);
             },
@@ -795,8 +804,8 @@ class _MediaVaultScreenState extends State<MediaVaultScreen> {
                   onPressed: () {
                     Navigator.of(sheetCtx).pop();
                     if (chatId.isEmpty) return;
-                    // Cerrar vault + delegar a ChatsScreen.
-                    Navigator.of(context).pop();
+                    // Cerrar solo la hoja (transitoria) y delegar a ChatsScreen.
+                    // La galería queda viva debajo para volver con back.
                     widget.onJumpToChat?.call(chatId);
                   },
                   icon: const Icon(Icons.forum_outlined),

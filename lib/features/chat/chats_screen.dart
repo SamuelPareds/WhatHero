@@ -89,6 +89,11 @@ class _ChatsScreenState extends State<ChatsScreen> {
   String? _cancelledChatPhone;
   Timer? _cancelledTimer;
 
+  // Galería de medios como capa (no como ruta): así queda viva Offstage debajo
+  // de un chat abierto desde ella, y el back regresa a la galería con su scroll
+  // y filtros intactos — mismo patrón que la persistencia del buscador.
+  bool _showMediaVault = false;
+
   @override
   void initState() {
     super.initState();
@@ -328,24 +333,27 @@ class _ChatsScreenState extends State<ChatsScreen> {
     });
   }
 
-  // Abre la galería de medios de la sesión actual. Cuando el operador toca
-  // "Ver en chat" desde el visor, MediaVaultScreen ya hizo pop de sí misma
-  // y solo nos pide saltar a ese contacto.
+  // Abre la galería de medios de la sesión actual. En vez de empujar una ruta,
+  // levantamos una capa dentro de esta pantalla (ver build): así, al saltar a un
+  // chat desde la galería, ésta sobrevive Offstage y el back vuelve a ella.
   void _openMediaVault() {
     if (widget.sessionId == null) return;
-    Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => MediaVaultScreen(
-          accountId: widget.accountId,
-          sessionId: widget.sessionId!,
-          sessionAlias: widget.initialAlias ?? widget.sessionId!,
-          onJumpToChat: (chatId) {
-            if (!mounted) return;
-            setState(() => selectedChatPhone = chatId);
-          },
-        ),
-      ),
-    );
+    setState(() => _showMediaVault = true);
+  }
+
+  // "Ver en chat" desde la galería. Móvil: dejamos la galería viva (Offstage)
+  // debajo del chat para volver a ella con el back. Desktop: la cerramos y el
+  // chat aparece en el split view (comportamiento previo de la ruta).
+  void _onMediaJumpToChat(String chatId) {
+    if (!mounted) return;
+    // La galería sobrevive montada al saltar; soltamos el foco de su buscador
+    // para que su teclado no quede sobre el detalle del chat.
+    FocusScope.of(context).unfocus();
+    final isMobile = MediaQuery.of(context).size.width < 600;
+    setState(() {
+      selectedChatPhone = chatId;
+      if (!isMobile) _showMediaVault = false;
+    });
   }
 
   @override
@@ -360,47 +368,67 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
     final isMobile = MediaQuery.of(context).size.width < 600;
 
-    if (isMobile) {
-      // Mantenemos la lista SIEMPRE montada (Offstage cuando hay un chat
-      // abierto) en vez de reemplazarla por el detalle. Así el journey
-      // búsqueda→chat→back es instantáneo: al volver, MessageSearchResults
-      // conserva sus hits (cero re-lecturas, sin spinner) y la lista su scroll.
-      // El detalle se dibuja encima solo cuando hace falta, así MessagesView
-      // (pesada) no se construye mientras estás en la lista.
-      return Stack(
-        children: [
-          Offstage(
-            offstage: selectedChatPhone != null,
-            child: _buildChatsList(),
-          ),
-          if (selectedChatPhone != null) _buildMessageDetail(),
-        ],
-      );
-    }
-
-    return Scaffold(
-      body: Row(
-        children: [
-          SizedBox(width: 400, child: _buildChatsList()),
-          Expanded(
-            child: selectedChatPhone != null
-                ? _buildMessageDetail()
-                : Container(
-                    color: darkBg,
-                    child: const Center(
-                      child: Text(
-                        'Selecciona un chat para empezar',
-                        style: TextStyle(
-                          fontSize: 18,
-                          color: lightText,
-                          fontWeight: FontWeight.w500,
+    final Widget content = isMobile
+        // Mantenemos la lista SIEMPRE montada (Offstage cuando hay un chat
+        // abierto) en vez de reemplazarla por el detalle. Así el journey
+        // búsqueda→chat→back es instantáneo: al volver, MessageSearchResults
+        // conserva sus hits (cero re-lecturas, sin spinner) y la lista su scroll.
+        // El detalle se dibuja encima solo cuando hace falta, así MessagesView
+        // (pesada) no se construye mientras estás en la lista.
+        ? Stack(
+            children: [
+              Offstage(
+                offstage: selectedChatPhone != null,
+                child: _buildChatsList(),
+              ),
+              if (selectedChatPhone != null) _buildMessageDetail(),
+            ],
+          )
+        : Scaffold(
+            body: Row(
+              children: [
+                SizedBox(width: 400, child: _buildChatsList()),
+                Expanded(
+                  child: selectedChatPhone != null
+                      ? _buildMessageDetail()
+                      : Container(
+                          color: darkBg,
+                          child: const Center(
+                            child: Text(
+                              'Selecciona un chat para empezar',
+                              style: TextStyle(
+                                fontSize: 18,
+                                color: lightText,
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                          ),
                         ),
-                      ),
-                    ),
-                  ),
+                ),
+              ],
+            ),
+          );
+
+    if (!_showMediaVault) return content;
+
+    // Galería de medios como capa superior. En móvil queda viva Offstage cuando
+    // hay un chat abierto desde ella, para que el back regrese a la galería con
+    // su estado intacto (mismo patrón que el buscador). En desktop se muestra
+    // full-screen y se cierra al saltar a un chat (ver _onMediaJumpToChat).
+    return Stack(
+      children: [
+        content,
+        Offstage(
+          offstage: isMobile && selectedChatPhone != null,
+          child: MediaVaultScreen(
+            accountId: widget.accountId,
+            sessionId: widget.sessionId!,
+            sessionAlias: widget.initialAlias ?? widget.sessionId!,
+            onClose: () => setState(() => _showMediaVault = false),
+            onJumpToChat: _onMediaJumpToChat,
           ),
-        ],
-      ),
+        ),
+      ],
     );
   }
 
