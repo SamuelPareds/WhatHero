@@ -342,7 +342,7 @@ async function generateAIResponseOpenAI(
   apiKey: string,
   systemPrompt: string,
   history: { role: 'user' | 'model'; parts: { text: string }[] }[],
-  modelName: string = 'gpt-4o-mini',
+  modelName: string = 'gpt-4.1-mini',
   baseURL?: string
 ): Promise<string | null> {
   try {
@@ -557,7 +557,7 @@ async function classifyMessageIntentOpenAI(
   apiKey: string,
   discriminatorPrompt: string,
   history: { role: 'user' | 'model'; parts: { text: string }[] }[],
-  modelName: string = 'gpt-4o-mini',
+  modelName: string = 'gpt-4.1-mini',
   baseURL?: string,
   timezone: string = DEFAULT_TIMEZONE
 ): Promise<'TalkToAiAssistant' | 'TalkToHuman'> {

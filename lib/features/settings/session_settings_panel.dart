@@ -1009,7 +1009,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
   String _defaultModelFor(String? provider) {
     switch (provider) {
       case 'openai':
-        return 'gpt-4o-mini';
+        return 'gpt-4.1-mini';
       case 'deepseek':
         return 'deepseek-v4-flash';
       default:
@@ -1020,9 +1020,9 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
   Widget _modelDropdownTile() {
     final List<Map<String, String>> models = _selectedProvider == 'openai'
       ? [
-          {'id': 'gpt-4o-mini', 'name': 'GPT-4o Mini', 'desc': 'Recomendado'},
-          {'id': 'gpt-4o', 'name': 'GPT-4o', 'desc': 'Más potente'},
-          {'id': 'gpt-4-turbo', 'name': 'GPT-4 Turbo', 'desc': 'Más rápido'},
+          {'id': 'gpt-4.1-mini', 'name': 'GPT-4.1 Mini', 'desc': 'Recomendado'},
+          {'id': 'gpt-4o-mini', 'name': 'GPT-4o Mini', 'desc': 'Más barato'},
+          {'id': 'gpt-5-mini', 'name': 'GPT-5 Mini', 'desc': 'A prueba'},
         ]
       : _selectedProvider == 'deepseek'
       ? [
