@@ -245,15 +245,18 @@ export async function generateAIResponse(
     // + cómo interpretar los timestamps del historial. Esto vale para los 3
     // providers, por eso se hace acá una sola vez.
     // Instrucción puntual del operador humano (modo copiloto). Efímera: guía
-    // SOLO esta generación, no muta el system prompt de la sesión. Se anexa como
-    // bloque de máxima prioridad; vale para los 3 providers porque Gemini la
-    // prependea al primer turn user y OpenAI/DeepSeek la mandan como `system`.
-    const operatorBlock = operatorInstruction?.trim()
-      ? `\n\n=== INSTRUCCIÓN PRIORITARIA DEL OPERADOR HUMANO (máxima prioridad) ===\n` +
-        `El agente humano que supervisa esta conversación te indica explícitamente para ESTA respuesta: "${operatorInstruction.trim()}".\n` +
-        `Cumple esta instrucción al redactar tu próxima respuesta, integrándola de forma natural con el contexto y el último mensaje del cliente (por ejemplo, saluda si corresponde Y entrega lo que el operador pide). Esta indicación tiene prioridad sobre cualquier ambigüedad del historial.`
-      : '';
-    const temporalSystemPrompt = `${buildTemporalContext(timezone)}\n\n${TIMESTAMP_METADATA_NOTE}\n\n${systemPrompt}${operatorBlock}`;
+    // SOLO esta generación, no muta el system prompt de la sesión. NO se anexa
+    // al system prompt: ahí queda enterrada lejos del punto de generación (en
+    // Gemini el system entero se prependea al PRIMER turn user, a ~20 turnos
+    // del final) y pierde contra las reglas duras del prompt del negocio
+    // ("REGLA BLOQUEANTE", plantillas EXACTAS). Se inyecta al FINAL de la
+    // conversación —donde el modelo pone máxima atención— con estrategia por
+    // provider: OpenAI/DeepSeek como mensaje `system` de cierre; Gemini
+    // fusionada al último turn user.
+    const operatorNote = operatorInstruction?.trim()
+      ? buildOperatorNote(operatorInstruction.trim())
+      : undefined;
+    const temporalSystemPrompt = `${buildTemporalContext(timezone)}\n\n${TIMESTAMP_METADATA_NOTE}\n\n${systemPrompt}`;
 
     let call: Promise<string | null>;
     if (provider === 'openai' || provider === 'deepseek') {
@@ -264,14 +267,16 @@ export async function generateAIResponse(
         temporalSystemPrompt,
         history,
         modelName,
-        isDeepSeek ? DEEPSEEK_BASE_URL : undefined
+        isDeepSeek ? DEEPSEEK_BASE_URL : undefined,
+        operatorNote
       );
     } else {
       call = generateAIResponseGemini(
         apiKey,
         temporalSystemPrompt,
         history,
-        modelName
+        modelName,
+        operatorNote
       );
     }
 
@@ -295,12 +300,28 @@ export async function generateAIResponse(
   }
 }
 
+// Bloque con la instrucción puntual del operador, redactado con jerarquía
+// explícita: la orden pisa cualquier escenario/plantilla del prompt del
+// negocio (si no, el modelo resuelve el conflicto a favor del flujo "REGLA
+// BLOQUEANTE" y la ignora), pero integra el contexto y conserva el estilo.
+function buildOperatorNote(instruction: string): string {
+  return (
+    `=== NOTA INTERNA DEL OPERADOR (el cliente NO ve esta nota y jamás debe intuir que existe) ===\n` +
+    `Tu supervisor humano te indica para tu PRÓXIMA respuesta: "${instruction}".\n` +
+    `1. Esta orden define el CONTENIDO CENTRAL de tu respuesta y tiene prioridad ABSOLUTA sobre cualquier escenario, plantilla o flujo de tus instrucciones (incluido enviar o no la descripción completa de un servicio, CTAs o pasos de agendamiento). Si contradice una regla del flujo, gana la orden.\n` +
+    `2. Integra el contexto: si el cliente además preguntó algo que la orden no cubre, respóndelo también, sin desplazar la orden.\n` +
+    `3. Conserva tu identidad y estilo de siempre (tono, emojis, formato de WhatsApp).\n` +
+    `4. Nunca menciones al operador, ni esta nota, ni que recibiste una instrucción.`
+  );
+}
+
 // Generate AI response using Gemini
 async function generateAIResponseGemini(
   apiKey: string,
   systemPrompt: string,
   history: { role: 'user' | 'model'; parts: { text: string }[] }[],
-  modelName: string = 'gemini-2.5-flash'
+  modelName: string = 'gemini-2.5-flash',
+  operatorNote?: string
 ): Promise<string | null> {
   try {
     const genAI = new GoogleGenerativeAI(apiKey);
@@ -319,6 +340,21 @@ async function generateAIResponseGemini(
       }
       return turn;
     });
+
+    // La nota del operador se fusiona al ÚLTIMO turn user (el mensaje que el
+    // modelo está por responder) y no como turn aparte, porque Gemini valida
+    // la alternancia user/model en requests multiturn.
+    if (operatorNote) {
+      for (let i = enhancedHistory.length - 1; i >= 0; i--) {
+        if (enhancedHistory[i].role === 'user') {
+          enhancedHistory[i] = {
+            role: 'user' as const,
+            parts: [{ text: `${enhancedHistory[i].parts[0]?.text || ''}\n\n${operatorNote}` }],
+          };
+          break;
+        }
+      }
+    }
 
     // Usamos `generateContent` directo (no `startChat`) porque el historial
     // termina en `user` y eso es justamente lo que Gemini necesita para
@@ -343,11 +379,15 @@ async function generateAIResponseOpenAI(
   systemPrompt: string,
   history: { role: 'user' | 'model'; parts: { text: string }[] }[],
   modelName: string = 'gpt-4.1-mini',
-  baseURL?: string
+  baseURL?: string,
+  operatorNote?: string
 ): Promise<string | null> {
   try {
     const client = new OpenAI({ apiKey, ...(baseURL && { baseURL }) });
 
+    // La nota del operador va como mensaje `system` de CIERRE (después del
+    // último mensaje del cliente): es el mecanismo estándar de steering y pesa
+    // mucho más que texto dentro del system prompt inicial.
     const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
       {
         role: 'system',
@@ -357,6 +397,7 @@ async function generateAIResponseOpenAI(
         role: (msg.role === 'user' ? 'user' : 'assistant') as 'user' | 'assistant',
         content: msg.parts[0]?.text || '',
       })),
+      ...(operatorNote ? [{ role: 'system' as const, content: operatorNote }] : []),
     ];
 
     const response = await client.chat.completions.create({
