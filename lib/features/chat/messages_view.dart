@@ -112,6 +112,11 @@ class _MessagesViewState extends State<MessagesView> {
   // normal. ValueNotifier (en lugar de setState) para que solo se rebuilden
   // las partes que escuchan: la franja del composer y el TextField.
   final ValueNotifier<ReplyDraft?> _replyDraft = ValueNotifier(null);
+  // ¿Hay texto en el composer? Al escribir ocultamos el botón de adjuntar para
+  // devolverle ancho al TextField; al vaciarse reaparece. ValueNotifier para
+  // rebuildar solo ese botón, no todo el composer. El listener del controlador
+  // también capta rellenados programáticos (IA, respuestas rápidas, drafts).
+  final ValueNotifier<bool> _hasText = ValueNotifier(false);
   // FocusNode del input → al activar un draft hacemos focus para que el
   // teclado salte automáticamente, sin requerir tap extra.
   final FocusNode _inputFocusNode = FocusNode();
@@ -178,11 +183,18 @@ class _MessagesViewState extends State<MessagesView> {
     return text.isEmpty ? '$icon $label' : '$icon $text';
   }
 
+  void _updateHasText() {
+    final hasText = _messageController.text.isNotEmpty;
+    if (hasText != _hasText.value) _hasText.value = hasText;
+  }
+
   @override
   void initState() {
     super.initState();
     // Escuchar el scroll para cargar más mensajes
     _scrollController.addListener(_scrollListener);
+    // Rastrea si hay texto para ocultar/mostrar el botón de adjuntar.
+    _messageController.addListener(_updateHasText);
     // Si entramos directo a un mensaje (deep-link del buscador), preparamos el
     // salto: cargar suficiente historial para incluirlo.
     if (widget.jumpToMessageId != null) {
@@ -209,7 +221,9 @@ class _MessagesViewState extends State<MessagesView> {
   void dispose() {
     _scrollController.removeListener(_scrollListener);
     _highlightTimer?.cancel();
+    _messageController.removeListener(_updateHasText);
     _messageController.dispose();
+    _hasText.dispose();
     _scrollController.dispose();
     _quickResponseOverlay?.remove();
     _replyDraft.dispose();
@@ -1546,11 +1560,33 @@ class _MessagesViewState extends State<MessagesView> {
                     ),
                     Row(
                   children: [
-                    IconButton(
-                      icon: const Icon(Icons.attach_file_rounded, size: 22),
-                      color: lightText,
-                      tooltip: 'Adjuntar archivo',
-                      onPressed: _isSending ? null : _showAttachmentMenu,
+                    // El botón de adjuntar se retira mientras hay texto para
+                    // darle todo el ancho al TextField. Colapsa su ancho + fade
+                    // (SizeTransition horizontal) y reaparece igual al vaciarse.
+                    ValueListenableBuilder<bool>(
+                      valueListenable: _hasText,
+                      builder: (context, hasText, _) {
+                        return AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 200),
+                          switchInCurve: Curves.easeOut,
+                          switchOutCurve: Curves.easeIn,
+                          transitionBuilder: (child, animation) => SizeTransition(
+                            sizeFactor: animation,
+                            axis: Axis.horizontal,
+                            axisAlignment: -1,
+                            child: FadeTransition(opacity: animation, child: child),
+                          ),
+                          child: hasText
+                              ? const SizedBox(key: ValueKey('attach-hidden'))
+                              : IconButton(
+                                  key: const ValueKey('attach-btn'),
+                                  icon: const Icon(Icons.attach_file_rounded, size: 22),
+                                  color: lightText,
+                                  tooltip: 'Adjuntar archivo',
+                                  onPressed: _isSending ? null : _showAttachmentMenu,
+                                ),
+                        );
+                      },
                     ),
                     Expanded(
                       child: Focus(
