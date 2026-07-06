@@ -16,9 +16,17 @@ import 'package:crm_whatsapp/core/services/api_client.dart';
 class _AudioPlaybackController {
   static final _AudioPlaybackController instance = _AudioPlaybackController._();
   _AudioPlaybackController._() {
-    // Autoloop: cuando el audio termina vuelve a empezar. Se rompe sólo
-    // cuando el operador pausa o le da play a otra burbuja (que llama stop).
-    player.setLoopMode(LoopMode.one);
+    // Sin bucle: el audio se reproduce una vez y se detiene (estilo WhatsApp).
+    player.setLoopMode(LoopMode.off);
+    // Al completar, just_audio deja `playing == true` con la posición al final,
+    // lo que dejaría el botón en "pausa". Rebobinamos y pausamos para volver al
+    // estado "play" en el inicio, listo para reproducir de nuevo.
+    player.processingStateStream.listen((state) {
+      if (state == ProcessingState.completed) {
+        player.pause();
+        player.seek(Duration.zero);
+      }
+    });
   }
 
   final AudioPlayer player = AudioPlayer();

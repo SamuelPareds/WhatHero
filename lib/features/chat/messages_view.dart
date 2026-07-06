@@ -1796,6 +1796,10 @@ class _ImageCaptionDialogState extends State<_ImageCaptionDialog> {
   Widget build(BuildContext context) {
     return AlertDialog(
       backgroundColor: surfaceDark,
+      // scrollable: con el teclado abierto en mobile el contenido (imagen +
+      // caption) se scrollea en vez de comprimirse, así el final del texto
+      // largo siempre es alcanzable.
+      scrollable: true,
       title: Text(widget.title, style: const TextStyle(color: white, fontWeight: FontWeight.w600)),
       content: SizedBox(
         width: double.maxFinite,
@@ -1809,8 +1813,12 @@ class _ImageCaptionDialogState extends State<_ImageCaptionDialog> {
             const SizedBox(height: 16),
             TextField(
               controller: _captionController,
-              maxLines: 4,
+              // maxLines null: el campo crece con el texto y, junto con el
+              // AlertDialog scrollable, el final siempre queda alcanzable
+              // (sin conflicto entre scroll interno del campo y el del diálogo).
               minLines: 1,
+              maxLines: null,
+              keyboardType: TextInputType.multiline,
               textCapitalization: TextCapitalization.sentences,
               style: const TextStyle(color: white, fontSize: 13),
               decoration: InputDecoration(
@@ -1941,6 +1949,10 @@ class _AttachmentPreviewDialogState extends State<_AttachmentPreviewDialog> {
   Widget build(BuildContext context) {
     return AlertDialog(
       backgroundColor: surfaceDark,
+      // scrollable: con el teclado abierto en mobile el contenido (preview +
+      // caption) se scrollea en vez de comprimirse, así el final del texto
+      // largo siempre es alcanzable.
+      scrollable: true,
       title: Text(_title, style: const TextStyle(color: white, fontWeight: FontWeight.w600)),
       content: SizedBox(
         width: double.maxFinite,
@@ -1951,8 +1963,12 @@ class _AttachmentPreviewDialogState extends State<_AttachmentPreviewDialog> {
             const SizedBox(height: 16),
             TextField(
               controller: _captionController,
-              maxLines: 4,
+              // maxLines null: el campo crece con el texto y, junto con el
+              // AlertDialog scrollable, el final siempre queda alcanzable
+              // (sin conflicto entre scroll interno del campo y el del diálogo).
               minLines: 1,
+              maxLines: null,
+              keyboardType: TextInputType.multiline,
               textCapitalization: TextCapitalization.sentences,
               style: const TextStyle(color: white, fontSize: 13),
               decoration: InputDecoration(
