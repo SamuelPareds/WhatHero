@@ -4,14 +4,16 @@
 const lidToPhoneMap = new Map<string, string>();
 
 // Determina si un JID corresponde a una conversación 1:1 con un humano.
-// Excluye Estados/Stories (status@broadcast), listas de difusión (*@broadcast)
-// y canales de WhatsApp (*@newsletter). Los grupos (@g.us) NO se filtran aquí
-// porque su manejo es responsabilidad de cada caller (algunos sí los procesan).
+// Excluye Estados/Stories (status@broadcast), listas de difusión (*@broadcast),
+// canales de WhatsApp (*@newsletter) y grupos (@g.us). Los grupos se descartan
+// aquí para que no generen chats en Firestore ni disparen descarga/subida de su
+// media a Storage (control de costos): el CRM sólo gestiona conversaciones 1:1.
 export function isConversationalJid(jid: string | null | undefined): boolean {
   if (!jid) return false;
   if (jid === 'status@broadcast') return false;
   if (jid.endsWith('@broadcast')) return false;
   if (jid.endsWith('@newsletter')) return false;
+  if (jid.endsWith('@g.us')) return false;
   return true;
 }
 
