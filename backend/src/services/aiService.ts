@@ -5,6 +5,7 @@ import { SessionData } from '../types';
 import { ACCOUNTS_COLLECTION } from '../config/env';
 import { incrementUnrespondedCount, resetUnrespondedCount } from './firestoreService';
 import { sendHumanAttentionNotification } from './notificationService';
+import { isBlockedMediaDoc } from './mediaService';
 import { AI_SENDER } from './senderResolver';
 
 // Lazy evaluation: getDb() is called only after Firebase is initialized
@@ -416,23 +417,56 @@ async function generateAIResponseOpenAI(
   }
 }
 
+// Etiquetas para representar adjuntos en el historial que ve el modelo.
+const MEDIA_HISTORY_LABEL: Record<string, string> = {
+  image: 'una imagen',
+  audio: 'un audio',
+  video: 'un video',
+  document: 'un documento',
+};
+
+// Placeholder textual del adjunto de un mensaje, o null si no aplica (sin
+// media, sticker o GIF decorativo). Antes la media sin caption era invisible
+// para el modelo: el asistente respondía como si el cliente no hubiera
+// enviado nada (ej. repetía instrucciones de pago tras recibir el
+// comprobante). El placeholder le da la existencia del adjunto sin fingir
+// que puede abrirlo.
+function mediaPlaceholder(d: any): string | null {
+  const type = d?.mediaType as string | undefined;
+  if (!type || type === 'sticker') return null;
+  if (type === 'video' && d?.mediaIsGif) return null;
+  const label = MEDIA_HISTORY_LABEL[type];
+  if (!label) return null;
+  return d.fromMe
+    ? `[Adjuntaste ${label} en este mensaje]`
+    : `[El cliente adjuntó ${label}; no puedes ver ni escuchar su contenido]`;
+}
+
 // Normalize message history to preserve all messages for better context.
 // Cada turn se prefija con su fecha/hora ([dom 8 jun, 1:49 p. m.]) como
 // metadata para que el modelo perciba el tiempo transcurrido entre mensajes.
+// Los mensajes con adjunto no decorativo entran como placeholder (+ caption
+// si traía) en vez de descartarse.
 export function normalizeHistory(
   rawDocs: any[],
   timezone: string = DEFAULT_TIMEZONE
 ): { role: 'user' | 'model'; parts: { text: string }[] }[] {
   return rawDocs
-    .filter(d => d.text && d.text.trim().length > 0)
     .map(d => {
+      const rawText = typeof d.text === 'string' ? d.text.trim() : '';
+      const placeholder = mediaPlaceholder(d);
+      if (!rawText && !placeholder) return null;
+      const body = placeholder
+        ? (rawText ? `${placeholder} ${rawText}` : placeholder)
+        : rawText;
       const stamp = formatMessageTimestamp(d.timestamp, timezone);
-      const text = stamp ? `[${stamp}] ${d.text}` : (d.text as string);
+      const text = stamp ? `[${stamp}] ${body}` : body;
       return {
         role: d.fromMe ? ('model' as const) : ('user' as const),
         parts: [{ text }],
       };
-    });
+    })
+    .filter((t): t is { role: 'user' | 'model'; parts: { text: string }[] } => t !== null);
 }
 
 // Construye el transcripto de la conversación en texto plano para que el
@@ -889,6 +923,7 @@ export async function processMessageBuffer(
 
     // Fetch last 10 messages for conversation history
     let history: { role: 'user' | 'model'; parts: { text: string }[] }[] = [];
+    let rawDocs: any[] = [];
 
     try {
       const historyDocs = await getDb()
@@ -900,10 +935,79 @@ export async function processMessageBuffer(
         .limit(20)
         .get();
 
-      const rawDocs = historyDocs.docs.reverse().map(d => d.data());
+      rawDocs = historyDocs.docs.reverse().map(d => d.data());
       history = normalizeHistory(rawDocs, timezone);
     } catch (error) {
       console.log('[Buffer] Could not fetch message history, continuing without context:', error);
+    }
+
+    // ============================================
+    // MEDIA HOLD: complemento con memoria del media gate de index.ts.
+    // El gate corta el ciclo cuando LLEGA la media bloqueada; este hold cubre
+    // los textos que el cliente manda DESPUÉS ("listo", "¿ya lo viste?"):
+    // mientras en el historial reciente haya media entrante que la IA no puede
+    // leer sin una respuesta nuestra posterior, la conversación es del humano
+    // (ni discriminador ni asistente). Se levanta solo: cualquier mensaje
+    // fromMe posterior a la media (CRM, celular físico, WA Web o sugerencia IA
+    // enviada) reactiva el flujo normal. Sin estado nuevo en Firestore — se
+    // deriva del historial que ya bajamos arriba.
+    // ============================================
+    let heldByMedia = false;
+    for (const doc of rawDocs) {
+      if (doc.fromMe) heldByMedia = false;
+      else if (isBlockedMediaDoc(doc, aiConfig.mediaAllowlist)) heldByMedia = true;
+    }
+
+    if (heldByMedia) {
+      await incrementUnrespondedCount(
+        accountId,
+        session.phoneNumber!,
+        contactPhone,
+        bufferedMessages.length
+      );
+
+      try {
+        await getDb()
+          .collection(ACCOUNTS_COLLECTION)
+          .doc(accountId)
+          .collection('whatsapp_sessions')
+          .doc(session.phoneNumber!)
+          .collection('chats')
+          .doc(contactPhone)
+          .set(
+            { human_attention_at: admin.firestore.FieldValue.serverTimestamp() },
+            { merge: true }
+          );
+      } catch (error) {
+        console.error('[MediaHold] Error stamping human_attention_at:', error);
+      }
+
+      getIO().to(accountId).emit('human_attention_required', {
+        sessionKey,
+        chatId: contactPhone,
+        phoneNumber: session.phoneNumber,
+        timestamp: new Date().toISOString(),
+        reason: 'unanswered_media',
+      });
+
+      // Push en CADA ráfaga a propósito: si el operador olvidó responder la
+      // media, cada nuevo mensaje del cliente re-alerta. El collapse tag por
+      // chat evita que se apilen en el notification shade.
+      sendHumanAttentionNotification({
+        accountId,
+        sessionPhone: session.phoneNumber!,
+        sessionKey,
+        chatId: contactPhone,
+        reason: 'unanswered_media',
+        messagePreview: combinedMessage,
+      }).catch((err) => console.error('[Notify] unanswered_media push falló:', err));
+
+      console.log(
+        `[MediaHold] ${contactPhone}: media sin responder en el historial, IA en espera ` +
+        `(+${bufferedMessages.length} pendientes)`
+      );
+      // El finally emite 'idle' y libera el spinner del frontend.
+      return;
     }
 
     // DISCRIMINATOR: Check if message should be handled by AI or human

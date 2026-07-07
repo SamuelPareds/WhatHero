@@ -51,6 +51,23 @@ export function classifyIncomingMedia(
   return 'none';
 }
 
+// Espejo de classifyIncomingMedia pero para mensajes YA persistidos en
+// Firestore: lee mediaType/mediaIsGif del doc en vez del mensaje crudo de
+// Baileys. Lo usa el media hold de aiService para detectar, en el historial
+// reciente, media entrante que la IA no puede leer.
+export function isBlockedMediaDoc(
+  doc: any,
+  allowlist: MediaAllowlist
+): boolean {
+  const type = doc?.mediaType as string | undefined;
+  if (!type || type === 'sticker') return false;
+  if (type === 'video' && doc?.mediaIsGif) return false;
+  if (type === 'image' || type === 'audio' || type === 'video' || type === 'document') {
+    return !allowlist[type];
+  }
+  return false;
+}
+
 export interface MediaInfo {
   type: MediaType;
   mime: string;

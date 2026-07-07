@@ -6,7 +6,7 @@ function getDb() {
   return admin.firestore();
 }
 
-export type HumanAttentionReason = 'discriminator' | 'blocked_media' | 'ai_off';
+export type HumanAttentionReason = 'discriminator' | 'blocked_media' | 'unanswered_media' | 'ai_off';
 
 export interface HumanAttentionPayload {
   accountId: string;          // UID del usuario dueño de la sesión
