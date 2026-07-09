@@ -685,6 +685,29 @@ export async function saveMessageToFirestore(
           }, { merge: true })
           .catch((e) => console.warn(`[MessageIndex] reindex edit ${targetMessageId}:`, e));
 
+        // Si el mensaje editado era el ÚLTIMO del chat, refrescar el preview de
+        // la lista (WhatsApp real también lo hace). El timestamp NO se toca:
+        // una edición no re-ordena los chats. Para captions de media se
+        // conserva el icono del preview original (📷/🎥/📄 + caption nuevo).
+        try {
+          const chatRef = targetMessageRef.parent.parent;
+          if (chatRef) {
+            const chatSnap = await chatRef.get();
+            if (chatSnap.exists && chatSnap.get('lastMessageId') === targetMessageId) {
+              const mediaType = (await targetMessageRef.get()).get('mediaType') as string | undefined;
+              const icons: Record<string, string> = { image: '📷', video: '🎥', document: '📄' };
+              const icon = mediaType ? icons[mediaType] : undefined;
+              const preview = icon ? `${icon} ${newText}` : newText;
+              await chatRef.update({ lastMessage: preview.substring(0, 100) });
+              console.log(`[Edit] Preview de chat ${phoneNumber} actualizado (el editado era el último mensaje)`);
+            }
+          }
+        } catch (previewErr) {
+          // El merge del mensaje ya quedó: un preview desactualizado no
+          // justifica romper el flujo del edit.
+          console.warn(`[Edit] No se pudo refrescar el preview del chat ${phoneNumber}:`, previewErr);
+        }
+
         console.log(`[Edit] ${actor} editó ${targetMessageId} en chat ${phoneNumber}: "${newText}"`);
         return;
       }
