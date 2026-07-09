@@ -469,6 +469,8 @@ async function startSession(sessionKey: string, accountId: string) {
     // disparen IA, buffers, keyword rules ni contadores de pendientes:
     //   - reactionMessage           → emoji sobre un mensaje existente
     //   - protocolMessage type 0/14 → revoke / edit (se mergean en el target)
+    //   - secretEncryptedMessage    → edición E2E de clientes nuevos; se
+    //     descifra dentro de saveMessageToFirestore y se mergea en el target
     //   - cualquier otro protocolMessage (3=ephemeral setting, 4=sync, etc.) →
     //     metadata de configuración del chat; saveMessageToFirestore lo descarta
     //     sin escribir. Sin este corte, en chats con mensajes temporales el
@@ -476,7 +478,8 @@ async function startSession(sessionKey: string, accountId: string) {
     //     contador "tu turno" con un mensaje fantasma.
     const isMetadataEvent =
       !!message.message?.reactionMessage ||
-      !!message.message?.protocolMessage;
+      !!message.message?.protocolMessage ||
+      !!message.message?.secretEncryptedMessage;
     if (isMetadataEvent) {
       await saveMessageToFirestore(message, sessionKey, accountId, sessions, sock.user?.id, sock);
       return;

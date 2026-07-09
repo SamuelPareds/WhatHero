@@ -3,6 +3,7 @@ import { toNumber } from '@whiskeysockets/baileys';
 import { SessionData, SenderInfo } from '../types';
 import { extractPhoneNumber, isConversationalJid } from '../utils/phone';
 import { unwrapMessageContent, buildSearchTokens } from '../utils/message';
+import { decryptSecretMessageEdit, SECRET_ENC_TYPE_MESSAGE_EDIT } from '../utils/messageEdit';
 import { ACCOUNTS_COLLECTION } from '../config/env';
 import { extractMediaInfo, processMediaAsync } from './mediaService';
 import { WHATSAPP_SENDER } from './senderResolver';
@@ -552,6 +553,59 @@ export async function saveMessageToFirestore(
     }
 
     // ============================================
+    // secretEncryptedMessage: ediciones E2E de clientes nuevos de WhatsApp.
+    // El contenido editado viene cifrado con el messageSecret del mensaje
+    // ORIGINAL (que persistimos al guardarlo). Si logramos descifrar,
+    // re-armamos el protocolMessage type 14 en memoria y dejamos que el
+    // bloque de abajo haga el merge como si hubiera llegado en texto plano.
+    // Si no se puede (mensaje anterior al soporte, llave que no autentica),
+    // logueamos y descartamos — nunca burbuja fantasma.
+    // ============================================
+    const secretEnc = message.message?.secretEncryptedMessage;
+    if (secretEnc) {
+      if (secretEnc.secretEncType !== SECRET_ENC_TYPE_MESSAGE_EDIT) {
+        console.log(`[SecretEdit] type=${secretEnc.secretEncType} no soportado (solo MESSAGE_EDIT) en chat ${phoneNumber}, ignorando`);
+        return;
+      }
+      const targetMessageId = secretEnc.targetMessageKey?.id;
+      if (!targetMessageId) {
+        console.warn(`[SecretEdit] Sobre sin targetMessageKey.id en chat ${phoneNumber}, ignorando`);
+        return;
+      }
+
+      const origSnap = await getDb()
+        .collection(ACCOUNTS_COLLECTION)
+        .doc(accountId)
+        .collection('whatsapp_sessions')
+        .doc(sessionId)
+        .collection('chats')
+        .doc(phoneNumber)
+        .collection('messages')
+        .doc(targetMessageId)
+        .get();
+      const msgEncKeyB64 = origSnap.exists ? (origSnap.get('messageSecret') as string | undefined) : undefined;
+      if (!msgEncKeyB64) {
+        console.warn(`[SecretEdit] Mensaje original ${targetMessageId} sin messageSecret persistido (anterior al soporte de ediciones), no se puede descifrar`);
+        return;
+      }
+
+      const protocolContent = decryptSecretMessageEdit({
+        secretEnc,
+        messageKey: message.key,
+        msgEncKeyB64,
+        meId: sock?.user?.id,
+        meLid: sock?.user?.lid,
+      });
+      if (!protocolContent) {
+        console.warn(`[SecretEdit] No se pudo descifrar la edición de ${targetMessageId} en chat ${phoneNumber} (ninguna identidad autenticó)`);
+        return;
+      }
+
+      console.log(`[SecretEdit] Edición descifrada para ${targetMessageId} en chat ${phoneNumber}`);
+      message = { ...message, message: protocolContent };
+    }
+
+    // ============================================
     // protocolMessage: metadata sobre un mensaje existente.
     // Tipos relevantes (proto.Message.ProtocolMessage.Type):
     //   0  = REVOKE         (eliminar para todos)
@@ -599,6 +653,9 @@ export async function saveMessageToFirestore(
         const editedMessage = protocolMessage.editedMessage;
         const newText = editedMessage?.conversation
           ?? editedMessage?.extendedTextMessage?.text
+          ?? editedMessage?.imageMessage?.caption
+          ?? editedMessage?.videoMessage?.caption
+          ?? editedMessage?.documentMessage?.caption
           ?? '';
 
         if (!newText) {
@@ -752,6 +809,14 @@ export async function saveMessageToFirestore(
         }
       : {};
 
+    // messageSecret (base64, 32 bytes): llave con la que el autor sellará una
+    // eventual edición E2E de ESTE mensaje (secretEncryptedMessage). Sin
+    // persistirla, la edición sería indescifrable. Solo la traen clientes nuevos.
+    const rawMessageSecret = message.message?.messageContextInfo?.messageSecret;
+    const secretFields = rawMessageSecret?.length
+      ? { messageSecret: Buffer.from(rawMessageSecret).toString('base64') }
+      : {};
+
     // Save message to messages subcollection
     const msgTimestamp = admin.firestore.Timestamp.fromDate(new Date(messageTimestamp));
     await messagesSubCollectionRef.doc(messageId).set({
@@ -764,6 +829,7 @@ export async function saveMessageToFirestore(
       ...senderFields,
       ...mediaFields,
       ...quoteFields,
+      ...secretFields,
     }, { merge: true });
 
     // Indexar al media_index si aplica (imágenes/videos/docs; no audios ni stickers ni gifs).

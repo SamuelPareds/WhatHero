@@ -9,6 +9,9 @@
 //                         protocolMessage…) queda un nivel más adentro.
 //   - viewOnceMessage / viewOnceMessageV2 / viewOnceMessageV2Extension →
 //                         "ver una vez". Mismo patrón de anidamiento.
+//   - editedMessage     → ediciones. El protocolMessage type 14 (MESSAGE_EDIT)
+//                         viene DENTRO de este sobre; sin desempaquetar, la
+//                         edición no se detecta como metadata y se descarta.
 //
 // Si no desempaquetamos, el parser lee `message.message.conversation` como
 // undefined y se persiste un mensaje vacío (burbuja fantasma). Este helper
@@ -22,6 +25,7 @@ const WRAPPER_KEYS = [
   'viewOnceMessage',
   'viewOnceMessageV2',
   'viewOnceMessageV2Extension',
+  'editedMessage',
 ] as const;
 
 // Desempaqueta recursivamente los sobres conocidos. El límite de profundidad
