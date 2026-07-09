@@ -101,6 +101,14 @@ class MessageBubble extends StatefulWidget {
   // Callback que dispara el item "Responder" del long-press menu. Lo provee
   // MessagesView (que mantiene el ReplyDraft) — el bubble solo notifica.
   final VoidCallback? onReplyTap;
+  // Burbujas optimistas (envío en vuelo). null = mensaje real de Firestore.
+  //   'pending' → relojito 🕓 (esperando ack del backend)
+  //   'sent'    → ✓✓ (ack ok, esperando el doc real por el stream)
+  //   'failed'  → icono rojo; tap dispara onRetryTap (Reintentar/Descartar)
+  // Con sendStatus != null el long-press menu se desactiva: el mensaje aún no
+  // existe en WhatsApp, no hay nada que responder/editar/eliminar.
+  final String? sendStatus;
+  final VoidCallback? onRetryTap;
 
   const MessageBubble({
     super.key,
@@ -132,6 +140,8 @@ class MessageBubble extends StatefulWidget {
     this.quotedText,
     this.quotedFromMe,
     this.onReplyTap,
+    this.sendStatus,
+    this.onRetryTap,
   });
 
   @override
@@ -585,6 +595,8 @@ class _MessageBubbleState extends State<MessageBubble> {
 
     return GestureDetector(
       onLongPress: _showMessageOptions,
+      // Burbuja fallida: tap abre Reintentar/Descartar (provisto por la vista).
+      onTap: widget.sendStatus == 'failed' ? widget.onRetryTap : null,
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
         child: content,
@@ -858,6 +870,9 @@ class _MessageBubbleState extends State<MessageBubble> {
   }
 
   void _showMessageOptions() {
+    // Burbuja optimista: el mensaje aún no existe en WhatsApp — no hay nada
+    // que responder/editar/eliminar. El fallo se maneja con tap (onRetryTap).
+    if (widget.sendStatus != null) return;
     // En mensajes con media no tiene sentido editar texto; copiar solo si hay caption.
     final hasMedia = widget.mediaType != null;
     final canCopy = widget.text.isNotEmpty;
@@ -1592,6 +1607,23 @@ class _MessageBubbleState extends State<MessageBubble> {
                         fontStyle: FontStyle.italic,
                       ),
                     ),
+                  ],
+                  // Estado de envío al estilo WhatsApp, solo en salientes:
+                  //   🕓 relojito  → en vuelo (burbuja optimista 'pending')
+                  //   ✕ rojo      → falló; el tap en la burbuja abre reintentar
+                  //   ✓✓ gris     → confirmado ('sent' o mensaje real de Firestore:
+                  //                 si está en la DB es que WhatsApp lo aceptó)
+                  if (widget.fromMe) ...[
+                    const SizedBox(width: 4),
+                    if (widget.sendStatus == 'pending')
+                      Icon(Icons.schedule,
+                          size: 13, color: lightText.withValues(alpha: 0.7))
+                    else if (widget.sendStatus == 'failed')
+                      const Icon(Icons.error_outline,
+                          size: 14, color: Color(0xFFF87171))
+                    else
+                      Icon(Icons.done_all,
+                          size: 14, color: lightText.withValues(alpha: 0.7)),
                   ],
                 ],
               ),

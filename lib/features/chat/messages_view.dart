@@ -9,6 +9,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:http/http.dart' as http;
 import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/services/api_client.dart';
+import 'package:crm_whatsapp/core/services/pending_messages_service.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/features/settings.dart';
 import 'widgets/message_bubble.dart';
@@ -500,73 +501,137 @@ class _MessagesViewState extends State<MessagesView> {
     }
   }
 
+  // Envío optimista (estilo WhatsApp): la burbuja aparece YA con relojito y
+  // el composer se limpia YA. El texto nunca se pierde: si el backend falla
+  // (o no responde en 25s), la burbuja pasa a "fallida" con Reintentar.
+  // Ciclo: 🕓 sending → ack ok → ✓✓ sent → llega el doc real por el stream →
+  // la burbuja local se purga sola (misma posición, cero flicker).
   Future<void> _sendMessage() async {
     final text = _messageController.text.trim();
-    if (text.isEmpty || _isSending) return;
+    if (text.isEmpty) return;
 
-    setState(() {
-      _isSending = true;
-    });
+    // Snapshot del draft al momento del envío. Si el usuario cancela durante
+    // el vuelo, queremos enviar lo que estaba activo cuando tocó "enviar".
+    final draft = _replyDraft.value;
+    // ¿Este envío cierra un seguimiento del agente? Lo capturamos antes de
+    // limpiar. Se marca optimista igual que la burbuja (un fallo se resuelve
+    // con Reintentar, no revirtiendo el seguimiento).
+    final wasFollowup = _isFollowupChat.value;
+
+    final service = PendingMessagesService();
+    final tempId = service.newTempId();
+    final messageData = {
+      'to': widget.phoneNumber,
+      'text': text,
+      'sessionKey': widget.sessionKey,
+      'accountId': widget.accountId,
+      'tempId': tempId,
+      if (draft != null) ...{
+        'quotedMessageId': draft.messageId,
+        'quotedText': draft.text,
+        'quotedFromMe': draft.fromMe,
+      },
+    };
+
+    service.add(
+      PendingMessagesService.chatKey(widget.sessionKey, widget.phoneNumber),
+      PendingMessage(
+        tempId: tempId,
+        text: text,
+        timestamp: DateTime.now(),
+        payload: messageData,
+      ),
+    );
+    _messageController.clear();
+    _clearReplyDraft();
+    if (wasFollowup) _markFollowupSent();
+    _scrollToNewest();
+
+    await _transmitPending(messageData);
+  }
+
+  // Transmite el payload de una burbuja optimista (envío inicial o reintento).
+  // Socket conectado → emit y los acks message_sent_success/error resuelven
+  // el estado (SocketService los enruta al PendingMessagesService). Sin
+  // socket → HTTP, cuyo response ES el ack.
+  Future<void> _transmitPending(Map<String, dynamic> messageData) async {
+    final tempId = messageData['tempId'] as String;
+    final service = PendingMessagesService();
+
+    if (SocketService().isConnected) {
+      SocketService().sendMessage(messageData);
+      return;
+    }
 
     try {
-      // Snapshot del draft al momento del envío. Si el usuario cancela durante
-      // el await, queremos enviar lo que estaba activo cuando tocó "enviar".
-      final draft = _replyDraft.value;
-      // ¿Este envío cierra un seguimiento del agente? Lo capturamos antes de
-      // limpiar para marcarlo como enviado tras el éxito.
-      final wasFollowup = _isFollowupChat.value;
+      final response = await http.post(
+        Uri.parse('$backendUrl/send-message'),
+        headers: await authHeaders(),
+        body: jsonEncode(messageData),
+      ).timeout(const Duration(seconds: 10));
 
-      final messageData = {
-        'to': widget.phoneNumber,
-        'text': text,
-        'sessionKey': widget.sessionKey,
-        'accountId': widget.accountId,
-        'tempId': DateTime.now().millisecondsSinceEpoch.toString(),
-        if (draft != null) ...{
-          'quotedMessageId': draft.messageId,
-          'quotedText': draft.text,
-          'quotedFromMe': draft.fromMe,
-        },
-      };
-
-      // INTELIGENTE: Si el socket está conectado, enviar por ahí (Velocidad Rayo)
-      // (El backend resetea unresponded_count al detectar fromMe en messages.upsert)
-      if (SocketService().isConnected) {
-        print('[MessagesView] Enviando vía WebSocket...');
-        SocketService().sendMessage(messageData);
-        _messageController.clear();
-        _clearReplyDraft();
-        if (wasFollowup) _markFollowupSent();
+      if (response.statusCode == 200) {
+        final body = jsonDecode(response.body) as Map<String, dynamic>;
+        service.onSendSuccess(tempId, body['messageId'] as String?);
       } else {
-        // FALLBACK: Si no hay socket, usar HTTP (Seguridad)
-        print('[MessagesView] Socket desconectado, usando fallback HTTP...');
-        final response = await http.post(
-          Uri.parse('$backendUrl/send-message'),
-          headers: await authHeaders(),
-          body: jsonEncode(messageData),
-        ).timeout(const Duration(seconds: 10));
-
-        if (response.statusCode == 200) {
-          _messageController.clear();
-          _clearReplyDraft();
-          if (wasFollowup) _markFollowupSent();
-        } else {
-          throw Exception('Fallback HTTP falló: ${response.body}');
-        }
+        service.onSendError(tempId, 'HTTP ${response.statusCode}');
       }
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error: ${e.toString()}'), backgroundColor: Colors.red.shade600),
-        );
-      }
-    } finally {
-      if (mounted) {
-        setState(() {
-          _isSending = false;
-        });
-      }
+      service.onSendError(tempId, e.toString());
     }
+  }
+
+  // Con reverse:true el offset 0 es el fondo (mensaje más nuevo).
+  void _scrollToNewest() {
+    if (!_scrollController.hasClients) return;
+    _scrollController.animateTo(
+      0,
+      duration: const Duration(milliseconds: 250),
+      curve: Curves.easeOut,
+    );
+  }
+
+  // Tap en una burbuja fallida → Reintentar (mismo tempId y payload, la
+  // burbuja vuelve al relojito en su lugar) o Descartar.
+  void _showRetrySheet(PendingMessage p) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: surfaceDark,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(24, 16, 24, 4),
+              child: Text(
+                'No se pudo enviar${p.error != null ? ': ${p.error}' : ''}',
+                style: TextStyle(color: lightText.withValues(alpha: 0.8), fontSize: 13),
+              ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.refresh, color: primaryAqua),
+              title: const Text('Reintentar', style: TextStyle(color: white)),
+              onTap: () {
+                Navigator.pop(sheetContext);
+                PendingMessagesService().markRetrying(p.tempId);
+                _transmitPending(p.payload);
+              },
+            ),
+            ListTile(
+              leading: Icon(Icons.delete_outline, color: Colors.red.shade400),
+              title: Text('Descartar mensaje', style: TextStyle(color: Colors.red.shade400)),
+              onTap: () {
+                Navigator.pop(sheetContext);
+                PendingMessagesService().discard(p.tempId);
+              },
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   // ─── Adjuntos: imagen / video / documento ──────────────────────────────
@@ -1314,20 +1379,67 @@ class _MessagesViewState extends State<MessagesView> {
                 });
               }
 
-              if (messages.isEmpty) return const Center(child: Text('Sin mensajes', style: TextStyle(color: lightText, fontSize: 16)));
+              // Capa optimista: burbujas locales en vuelo (relojito/fallidas)
+              // por encima del stream de Firestore. ListenableBuilder para que
+              // los acks (✓✓ / fallo) rebuildeen sin tocar el StreamBuilder.
+              final pendingChatKey = PendingMessagesService.chatKey(
+                  widget.sessionKey, widget.phoneNumber);
+              return ListenableBuilder(
+                listenable: PendingMessagesService(),
+                builder: (context, _) {
+                  final docIds = <String>{for (final d in messages) d.id};
+                  final pendings = PendingMessagesService()
+                      .visibleForChat(pendingChatKey, docIds);
+                  // Purga post-frame de burbujas cuyo doc real ya llegó
+                  // (mutar el service durante build está prohibido).
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    PendingMessagesService()
+                        .purgeReconciled(pendingChatKey, docIds);
+                  });
 
-              return ListView.builder(
+                  if (messages.isEmpty && pendings.isEmpty) {
+                    return const Center(child: Text('Sin mensajes', style: TextStyle(color: lightText, fontSize: 16)));
+                  }
+
+                  return ListView.builder(
                 controller: _scrollController,
                 // Al empezar a deslizar para revisar el historial, baja el
                 // teclado solo (gesto estándar WhatsApp/iMessage).
                 keyboardDismissBehavior:
                     ScrollViewKeyboardDismissBehavior.onDrag,
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
-                itemCount: messages.length + (_hasMore ? 1 : 0),
+                itemCount: pendings.length + messages.length + (_hasMore ? 1 : 0),
                 reverse: true, // Importante: el índice 0 es el mensaje más nuevo (abajo)
                 itemBuilder: (context, index) {
+                  // Burbujas optimistas primero: con reverse:true el índice 0
+                  // queda abajo, y lo pendiente es siempre lo más nuevo.
+                  if (index < pendings.length) {
+                    final p = pendings[pendings.length - 1 - index];
+                    return MessageBubble(
+                      key: ValueKey(p.tempId),
+                      text: p.text,
+                      fromMe: true,
+                      timestamp: p.timestamp,
+                      messageId: p.tempId,
+                      chatPhone: widget.phoneNumber,
+                      sessionKey: widget.sessionKey,
+                      accountId: widget.accountId,
+                      sessionPhone: widget.sessionId,
+                      quotedMessageId: p.payload['quotedMessageId'] as String?,
+                      quotedText: p.payload['quotedText'] as String?,
+                      quotedFromMe: p.payload['quotedFromMe'] as bool?,
+                      sendStatus: switch (p.status) {
+                        PendingStatus.sending => 'pending',
+                        PendingStatus.sent => 'sent',
+                        PendingStatus.failed => 'failed',
+                      },
+                      onRetryTap: () => _showRetrySheet(p),
+                    );
+                  }
+
+                  final msgIndex = index - pendings.length;
                   // Si es el último elemento y hay más, mostrar spinner de carga
-                  if (index == messages.length) {
+                  if (msgIndex == messages.length) {
                     return const Center(
                       child: Padding(
                         padding: EdgeInsets.symmetric(vertical: 20),
@@ -1340,7 +1452,7 @@ class _MessagesViewState extends State<MessagesView> {
                     );
                   }
 
-                  final msg = messages[index];
+                  final msg = messages[msgIndex];
                   final data = msg.data() as Map<String, dynamic>;
                   // Snapshot para el draft: el preview en la franja del composer
                   // muestra el texto del mensaje (o un fallback si era media sin
@@ -1354,7 +1466,7 @@ class _MessagesViewState extends State<MessagesView> {
                   // viejo. Mostramos cabecera arriba de este bubble si es el
                   // mensaje más viejo de su día en el set cargado (older==null)
                   // o si el mensaje inmediatamente más viejo es de otro día.
-                  final olderDoc = (index + 1 < messages.length) ? messages[index + 1] : null;
+                  final olderDoc = (msgIndex + 1 < messages.length) ? messages[msgIndex + 1] : null;
                   bool showSeparator = false;
                   if (olderDoc == null) {
                     showSeparator = true;
@@ -1420,6 +1532,8 @@ class _MessagesViewState extends State<MessagesView> {
                     return _JumpHighlight(key: _jumpKey, child: item);
                   }
                   return item;
+                },
+              );
                 },
               );
             },

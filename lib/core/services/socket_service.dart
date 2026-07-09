@@ -4,6 +4,7 @@ import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'package:flutter/foundation.dart';
 import '../config.dart';
 import 'ai_state_service.dart';
+import 'pending_messages_service.dart';
 
 /// Evento de QR recibido
 class QREvent {
@@ -140,6 +141,23 @@ class SocketService {
     // widgets se suscriben directamente con ListenableBuilder.
     _socket?.on('ai_state', (data) {
       AiStateService().applySocketPayload(Map<String, dynamic>.from(data));
+    });
+
+    // Acks de envío para las burbujas optimistas (relojito → ✓✓ / reintentar).
+    // Mismo patrón que ai_state: directo al singleton, sin Stream intermedio.
+    _socket?.on('message_sent_success', (data) {
+      PendingMessagesService().onSendSuccess(
+        data['tempId'] as String?,
+        data['messageId'] as String?,
+      );
+    });
+
+    _socket?.on('message_sent_error', (data) {
+      debugPrint('[SocketService] Envío falló: ${data['error']}');
+      PendingMessagesService().onSendError(
+        data['tempId'] as String?,
+        data['error'] as String?,
+      );
     });
   }
 

@@ -2165,9 +2165,10 @@ io.on('connection', (socket) => {
       });
     } catch (error) {
       console.error('[Socket.io] Error enviando mensaje:', error);
-      socket.emit('message_sent_error', { 
-        to, 
-        error: (error as any).message 
+      socket.emit('message_sent_error', {
+        to,
+        error: (error as any).message,
+        tempId: data.tempId, // correlaciona el fallo con la burbuja optimista
       });
     }
   });
