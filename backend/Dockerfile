@@ -10,6 +10,11 @@ RUN mkdir -p auth_info && chmod 755 auth_info
 COPY package*.json ./
 COPY tsconfig.json ./
 
+# Parches a node_modules (patch-package via postinstall). Hoy: preservar el
+# messageContextInfo exterior de deviceSentMessage en Baileys para poder
+# descifrar ediciones de mensajes enviados desde el teléfono conectado.
+COPY patches ./patches
+
 # Install dependencies
 RUN npm ci
 

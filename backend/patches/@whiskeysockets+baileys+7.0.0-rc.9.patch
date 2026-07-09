@@ -1,0 +1,24 @@
+diff --git a/node_modules/@whiskeysockets/baileys/lib/Utils/decode-wa-message.js b/node_modules/@whiskeysockets/baileys/lib/Utils/decode-wa-message.js
+index 794be80..783ddc6 100644
+--- a/node_modules/@whiskeysockets/baileys/lib/Utils/decode-wa-message.js
++++ b/node_modules/@whiskeysockets/baileys/lib/Utils/decode-wa-message.js
+@@ -230,7 +230,18 @@ export const decryptMessageNode = (stanza, meId, meLid, repository, logger) => {
+                                 throw new Error(`Unknown e2e type: ${e2eType}`);
+                         }
+                         let msg = proto.Message.decode(e2eType !== 'plaintext' ? unpadRandomMax16(msgBuffer) : msgBuffer);
+-                        msg = msg.deviceSentMessage?.message || msg;
++                        if (msg.deviceSentMessage?.message) {
++                            // [WhatHero patch] own-device messages carry messageContextInfo
++                            // (messageSecret) on the OUTER envelope; preserve it when
++                            // unwrapping, like whatsmeow does (message.go: storeMessageSecret
++                            // runs before the DeviceSentMessage unwrap). Without this, edits
++                            // of phone-sent messages are undecryptable downstream.
++                            const outerMessageContextInfo = msg.messageContextInfo;
++                            msg = msg.deviceSentMessage.message;
++                            if (outerMessageContextInfo && !msg.messageContextInfo) {
++                                msg.messageContextInfo = outerMessageContextInfo;
++                            }
++                        }
+                         if (msg.senderKeyDistributionMessage) {
+                             //eslint-disable-next-line max-depth
+                             try {
