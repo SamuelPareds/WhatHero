@@ -645,7 +645,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
           ),
           Switch(
             value: value,
-            activeColor: primaryAqua,
+            activeThumbColor: primaryAqua,
             onChanged: comingSoon ? null : (v) {},
           ),
         ],
@@ -813,7 +813,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
                       Text('AgendaCool', style: TextStyle(color: white, fontSize: 18, fontWeight: FontWeight.bold)),
                       Text('Recordatorios de Citas', style: TextStyle(color: lightText, fontSize: 12)),
                     ])),
-                    Switch(value: _reminderEnabled, activeColor: primaryAqua, onChanged: (v) => setState(() => _reminderEnabled = v)),
+                    Switch(value: _reminderEnabled, activeThumbColor: primaryAqua, onChanged: (v) => setState(() => _reminderEnabled = v)),
                   ],
                 ),
                 if (_reminderEnabled) ...[
@@ -986,7 +986,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
           Text(title, style: const TextStyle(color: white, fontWeight: FontWeight.bold)),
-          Switch(value: value, activeColor: primaryAqua, onChanged: onChanged),
+          Switch(value: value, activeThumbColor: primaryAqua, onChanged: onChanged),
         ],
       ),
     );
@@ -1136,7 +1136,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
         ListTile(
           leading: Icon(icon, color: enabled ? primaryAqua : lightText),
           title: Text(title, style: TextStyle(color: white, fontWeight: enabled ? FontWeight.bold : FontWeight.normal)),
-          trailing: Switch(value: enabled, activeColor: primaryAqua, onChanged: onToggle),
+          trailing: Switch(value: enabled, activeThumbColor: primaryAqua, onChanged: onToggle),
         ),
         if (enabled) Padding(padding: const EdgeInsets.fromLTRB(16, 0, 16, 16), child: child),
       ]),

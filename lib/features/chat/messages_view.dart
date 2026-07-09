@@ -1573,7 +1573,7 @@ class _MessagesViewState extends State<MessagesView> {
                           transitionBuilder: (child, animation) => SizeTransition(
                             sizeFactor: animation,
                             axis: Axis.horizontal,
-                            axisAlignment: -1,
+                            alignment: Alignment.centerLeft,
                             child: FadeTransition(opacity: animation, child: child),
                           ),
                           child: hasText

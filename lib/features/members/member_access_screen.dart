@@ -284,7 +284,7 @@ class _MemberAccessScreenState extends State<MemberAccessScreen> {
         const SizedBox(height: 8),
         SwitchListTile(
           value: _allSessions,
-          activeColor: primaryAqua,
+          activeThumbColor: primaryAqua,
           onChanged: _saving
               ? null
               : (v) => setState(() => _allSessions = v),
@@ -325,7 +325,7 @@ class _MemberAccessScreenState extends State<MemberAccessScreen> {
             final selected = _allSessions || _granted.contains(phone);
             return SwitchListTile(
               value: selected,
-              activeColor: primaryAqua,
+              activeThumbColor: primaryAqua,
               // Cuando hay acceso total, las sesiones individuales se ven
               // activas pero no editables (el master switch manda).
               onChanged: (_allSessions || _saving)
