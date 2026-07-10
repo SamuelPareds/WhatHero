@@ -1194,6 +1194,7 @@ class _MessagesViewState extends State<MessagesView> {
                   final title = qr['title'] as String? ?? '';
                   final text = qr['text'] as String? ?? '';
                   final imageUrl = qr['imageUrl'] as String? ?? '';
+                  final documentName = qr['documentName'] as String? ?? '';
 
                   return InkWell(
                     onTap: () => _selectQuickResponse(qr),
@@ -1218,6 +1219,10 @@ class _MessagesViewState extends State<MessagesView> {
                             const SizedBox(width: 4),
                             Icon(Icons.image, size: 14, color: primaryAqua.withValues(alpha: 0.6)),
                           ],
+                          if (documentName.isNotEmpty) ...[
+                            const SizedBox(width: 4),
+                            Icon(Icons.description, size: 14, color: primaryAqua.withValues(alpha: 0.6)),
+                          ],
                         ],
                       ),
                     ),
@@ -1238,12 +1243,16 @@ class _MessagesViewState extends State<MessagesView> {
   void _selectQuickResponse(Map<String, dynamic> template) {
     final text = template['text'] as String? ?? '';
     final imageUrl = template['imageUrl'] as String? ?? '';
+    final documentUrl = template['documentUrl'] as String? ?? '';
+    final documentName = template['documentName'] as String? ?? '';
     final title = template['title'] as String? ?? '';
 
     _quickResponseOverlay?.remove();
     _quickResponseOverlay = null;
 
-    if (imageUrl.isNotEmpty) {
+    if (documentUrl.isNotEmpty) {
+      _showDocumentConfirmationDialog(title, text, documentUrl, documentName);
+    } else if (imageUrl.isNotEmpty) {
       _showImageConfirmationDialog(title, text, imageUrl);
     } else {
       _insertAtToken(text);
@@ -1288,6 +1297,21 @@ class _MessagesViewState extends State<MessagesView> {
     );
   }
 
+  void _showDocumentConfirmationDialog(String title, String caption, String documentUrl, String documentName) {
+    showDialog(
+      context: context,
+      builder: (_) => _DocumentCaptionDialog(
+        title: title,
+        caption: caption,
+        documentUrl: documentUrl,
+        documentName: documentName,
+        onSend: (editedCaption) => _sendQuickResponseWithDocument(
+          {'text': editedCaption, 'documentUrl': documentUrl, 'documentName': documentName},
+        ),
+      ),
+    );
+  }
+
   Future<void> _sendQuickResponse(Map<String, dynamic> template) async {
     final text = template['text'] as String? ?? '';
     final imageUrl = template['imageUrl'] as String? ?? '';
@@ -1306,7 +1330,6 @@ class _MessagesViewState extends State<MessagesView> {
       };
 
       if (SocketService().isConnected) {
-        print('[MessagesView] Enviando respuesta rápida vía WebSocket...');
         SocketService().sendMessage(messageData);
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -1314,7 +1337,52 @@ class _MessagesViewState extends State<MessagesView> {
           );
         }
       } else {
-        print('[MessagesView] Socket desconectado, usando fallback HTTP para respuesta rápida...');
+        final response = await http.post(
+          Uri.parse('$backendUrl/send-message'),
+          headers: await authHeaders(),
+          body: jsonEncode(messageData),
+        ).timeout(const Duration(seconds: 10));
+
+        if (response.statusCode != 200) throw Exception(response.body);
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error al enviar: ${e.toString()}'), backgroundColor: Colors.red.shade600),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isSending = false);
+    }
+  }
+
+  Future<void> _sendQuickResponseWithDocument(Map<String, dynamic> template) async {
+    final text = template['text'] as String? ?? '';
+    final documentUrl = template['documentUrl'] as String? ?? '';
+    final documentName = template['documentName'] as String? ?? '';
+
+    if (documentUrl.isEmpty) return;
+
+    setState(() => _isSending = true);
+
+    try {
+      final messageData = {
+        'to': widget.phoneNumber,
+        'text': text,
+        'documentUrl': documentUrl,
+        'documentName': documentName,
+        'sessionKey': widget.sessionKey,
+        'accountId': widget.accountId,
+      };
+
+      if (SocketService().isConnected) {
+        SocketService().sendMessage(messageData);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('✓ Documento enviado'), duration: Duration(seconds: 2), backgroundColor: Color(0xFF06B6D4)),
+          );
+        }
+      } else {
         final response = await http.post(
           Uri.parse('$backendUrl/send-message'),
           headers: await authHeaders(),
@@ -1874,6 +1942,124 @@ class _DateSeparator extends StatelessWidget {
 // Diálogo de confirmación para respuestas con imagen, con caption editable.
 // Es StatefulWidget para que el controller se libere en dispose() de forma
 // segura (sin "used after dispose" al cerrar el diálogo).
+class _DocumentCaptionDialog extends StatefulWidget {
+  final String title;
+  final String caption;
+  final String documentUrl;
+  final String documentName;
+  final void Function(String editedCaption) onSend;
+
+  const _DocumentCaptionDialog({
+    required this.title,
+    required this.caption,
+    required this.documentUrl,
+    required this.documentName,
+    required this.onSend,
+  });
+
+  @override
+  State<_DocumentCaptionDialog> createState() => _DocumentCaptionDialogState();
+}
+
+class _DocumentCaptionDialogState extends State<_DocumentCaptionDialog> {
+  late final TextEditingController _captionController;
+
+  @override
+  void initState() {
+    super.initState();
+    _captionController = TextEditingController(text: widget.caption);
+  }
+
+  @override
+  void dispose() {
+    _captionController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: surfaceDark,
+      scrollable: true,
+      title: Text(widget.title, style: const TextStyle(color: white, fontWeight: FontWeight.w600)),
+      content: SizedBox(
+        width: double.maxFinite,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
+              decoration: BoxDecoration(
+                color: darkBg.withValues(alpha: 0.5),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: primaryAqua.withValues(alpha: 0.2)),
+              ),
+              child: Column(
+                children: [
+                  Icon(Icons.description, size: 40, color: primaryAqua.withValues(alpha: 0.7)),
+                  const SizedBox(height: 12),
+                  Text(
+                    widget.documentName,
+                    style: const TextStyle(color: white, fontWeight: FontWeight.w600, fontSize: 14),
+                    textAlign: TextAlign.center,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Documento listo para enviar',
+                    style: TextStyle(color: lightText.withValues(alpha: 0.6), fontSize: 12),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: _captionController,
+              minLines: 1,
+              maxLines: null,
+              keyboardType: TextInputType.multiline,
+              textCapitalization: TextCapitalization.sentences,
+              style: const TextStyle(color: white, fontSize: 13),
+              decoration: InputDecoration(
+                hintText: 'Añade un texto (opcional)',
+                hintStyle: TextStyle(color: lightText.withValues(alpha: 0.5)),
+                filled: true,
+                fillColor: darkBg.withValues(alpha: 0.5),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: BorderSide(color: primaryAqua.withValues(alpha: 0.2)),
+                ),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: BorderSide(color: primaryAqua.withValues(alpha: 0.2)),
+                ),
+                contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: Text('Cancelar', style: TextStyle(color: lightText.withValues(alpha: 0.6))),
+        ),
+        ElevatedButton(
+          style: ElevatedButton.styleFrom(backgroundColor: primaryAqua),
+          onPressed: () {
+            final edited = _captionController.text.trim();
+            Navigator.pop(context);
+            widget.onSend(edited);
+          },
+          child: const Text('Enviar', style: TextStyle(color: darkBg, fontWeight: FontWeight.w600)),
+        ),
+      ],
+    );
+  }
+}
+
 class _ImageCaptionDialog extends StatefulWidget {
   final String title;
   final String caption;

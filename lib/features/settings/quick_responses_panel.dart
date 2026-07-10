@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:crm_whatsapp/core.dart';
 
 class QuickResponsesPanel extends StatefulWidget {
@@ -22,6 +23,7 @@ class QuickResponsesPanel extends StatefulWidget {
 class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
   late TextEditingController _titleController;
   late TextEditingController _textController;
+  late TextEditingController _searchController;
   List<Map<String, dynamic>> _quickResponses = [];
   bool _isSaving = false;
   bool _isLoading = true;
@@ -34,6 +36,8 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
   String _origTitle = '';
   String _origText = '';
   String _origImageUrl = '';
+  String _origDocumentUrl = '';
+  String _origDocumentName = '';
 
   // Estado de imagen del editor:
   // - _imageUrl: URL ya persistida (Storage o externa legacy)
@@ -43,14 +47,31 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
   final ImagePicker _picker = ImagePicker();
   static const int _maxImageBytes = 10 * 1024 * 1024; // tope de seguridad: 10 MB
 
+  // Estado de documento del editor:
+  // - _documentUrl: URL ya persistida
+  // - _pickedDocumentBytes: documento recién elegido pendiente de subir
+  String _documentUrl = '';
+  String _documentName = '';
+  String _documentMimeType = '';
+  Uint8List? _pickedDocumentBytes;
+  String _pickedDocumentName = '';
+  static const int _maxDocumentBytes = 10 * 1024 * 1024; // 10 MB
+
+  // Búsqueda en la lista
+  String _searchQuery = '';
+
   @override
   void initState() {
     super.initState();
     _titleController = TextEditingController();
     _textController = TextEditingController();
+    _searchController = TextEditingController();
     // Recalcular el estado de "Guardar" mientras se edita
     _titleController.addListener(_onFieldChanged);
     _textController.addListener(_onFieldChanged);
+    _searchController.addListener(() {
+      setState(() => _searchQuery = _searchController.text.toLowerCase());
+    });
     _loadQuickResponses();
   }
 
@@ -98,16 +119,25 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
         _origTitle = '';
         _origText = '';
         _origImageUrl = '';
+        _origDocumentUrl = '';
+        _origDocumentName = '';
       } else {
         _editingId = qr['id'] as String;
         _origTitle = qr['title'] as String? ?? '';
         _origText = qr['text'] as String? ?? '';
         _origImageUrl = qr['imageUrl'] as String? ?? '';
+        _origDocumentUrl = qr['documentUrl'] as String? ?? '';
+        _origDocumentName = qr['documentName'] as String? ?? '';
       }
       _titleController.text = _origTitle;
       _textController.text = _origText;
       _imageUrl = _origImageUrl;
       _pickedBytes = null;
+      _documentUrl = _origDocumentUrl;
+      _documentName = _origDocumentName;
+      _documentMimeType = qr?['documentMimeType'] as String? ?? '';
+      _pickedDocumentBytes = null;
+      _pickedDocumentName = '';
       _showEditor = true;
     });
   }
@@ -121,23 +151,32 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
       _textController.clear();
       _imageUrl = '';
       _pickedBytes = null;
+      _documentUrl = '';
+      _documentName = '';
+      _documentMimeType = '';
+      _pickedDocumentBytes = null;
+      _pickedDocumentName = '';
     });
   }
 
   // Hay imagen si hay una recién elegida (en memoria) o una URL ya persistida
   bool get _hasImage => _pickedBytes != null || _imageUrl.isNotEmpty;
 
+  // Hay documento si hay uno recién elegido o una URL ya persistida
+  bool get _hasDocument => _pickedDocumentBytes != null || _documentUrl.isNotEmpty;
+
   // Guardar habilitado solo si es válido y (al editar) hay cambios reales.
   // Así "si no hay cambios, no pasa nada" → el botón queda inactivo.
   bool get _canSave {
     final title = _titleController.text.trim();
     final text = _textController.text.trim();
-    final isValid = title.isNotEmpty && (text.isNotEmpty || _hasImage);
+    final isValid = title.isNotEmpty && (text.isNotEmpty || _hasImage || _hasDocument);
     if (!isValid) return false;
     if (_editingId == null) return true; // crear: cualquier contenido válido
-    // editar: exige al menos un cambio (texto o imagen) respecto al original
+    // editar: exige al menos un cambio (texto, imagen o documento) respecto al original
     final imageChanged = _pickedBytes != null || _imageUrl != _origImageUrl;
-    return title != _origTitle || text != _origText || imageChanged;
+    final documentChanged = _pickedDocumentBytes != null || _documentUrl != _origDocumentUrl;
+    return title != _origTitle || text != _origText || imageChanged || documentChanged;
   }
 
   // Path determinista en Storage: un archivo por respuesta (reemplazar =
@@ -146,6 +185,12 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
   Reference _imageRef(String docId) => FirebaseStorage.instance.ref(
         '$accountsCollection/${widget.accountId}/whatsapp_sessions/'
         '${widget.sessionId}/quick_responses/$docId.jpg',
+      );
+
+  // Document reference: preserva extensión original para integridad
+  Reference _documentRef(String docId, String ext) => FirebaseStorage.instance.ref(
+        '$accountsCollection/${widget.accountId}/whatsapp_sessions/'
+        '${widget.sessionId}/quick_responses/$docId.${ext.isNotEmpty ? ext.replaceFirst(RegExp(r'^\.'), '') : 'bin'}',
       );
 
   // Elige una imagen de la galería. image_picker ya redimensiona y recomprime
@@ -188,6 +233,75 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
     });
   }
 
+  // Validación de seguridad: rechazar tipos peligrosos
+  bool _isSafeFileType(String ext) {
+    final dangerous = {'exe', 'bat', 'cmd', 'com', 'scr', 'vbs', 'js', 'jar', 'app', 'deb', 'rpm'};
+    return !dangerous.contains(ext.toLowerCase());
+  }
+
+  Future<void> _pickDocument() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        withData: true,
+        allowMultiple: false,
+      );
+      if (result == null || result.files.isEmpty) return;
+
+      final f = result.files.first;
+      final bytes = f.bytes;
+      if (bytes == null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('No se pudo leer el archivo')),
+          );
+        }
+        return;
+      }
+
+      if (bytes.length > _maxDocumentBytes) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('El documento supera el límite de 10 MB')),
+          );
+        }
+        return;
+      }
+
+      final ext = (f.extension ?? '').toLowerCase();
+      if (!_isSafeFileType(ext)) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Tipo de archivo no permitido: .$ext')),
+          );
+        }
+        return;
+      }
+
+      if (mounted) {
+        setState(() {
+          _pickedDocumentBytes = bytes;
+          _pickedDocumentName = f.name;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error al cargar documento: $e')),
+        );
+      }
+    }
+  }
+
+  void _removeDocument() {
+    setState(() {
+      _pickedDocumentBytes = null;
+      _pickedDocumentName = '';
+      _documentUrl = '';
+      _documentName = '';
+      _documentMimeType = '';
+    });
+  }
+
   Future<void> _saveQuickResponse() async {
     final title = _titleController.text.trim();
     final text = _textController.text.trim();
@@ -196,14 +310,13 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
 
     try {
       final isEditing = _editingId != null;
-      // Para crear necesitamos el id antes de subir la imagen (path determinista)
+      // Para crear necesitamos el id antes de subir archivos (path determinista)
       final docRef = isEditing ? _collectionRef.doc(_editingId) : _collectionRef.doc();
       final docId = docRef.id;
 
-      // Resolver la URL final de la imagen
+      // Resolver URL final de la imagen
       String imageUrl = _imageUrl;
       if (_pickedBytes != null) {
-        // Subir la imagen recién elegida y obtener su URL de descarga
         final ref = _imageRef(docId);
         await ref.putData(
           _pickedBytes!,
@@ -211,24 +324,47 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
         );
         imageUrl = await ref.getDownloadURL();
       } else if (imageUrl.isEmpty && _origImageUrl.isNotEmpty) {
-        // El usuario quitó la imagen → borrar el objeto en Storage si era nuestro
         await _deleteImageObject(docId);
       }
 
+      // Resolver URL final del documento
+      String documentUrl = _documentUrl;
+      String documentName = _documentName;
+      String documentMimeType = _documentMimeType;
+      if (_pickedDocumentBytes != null) {
+        final ext = _pickedDocumentName.contains('.')
+            ? _pickedDocumentName.split('.').last
+            : 'bin';
+        final ref = _documentRef(docId, ext);
+        await ref.putData(
+          _pickedDocumentBytes!,
+          SettableMetadata(contentType: 'application/octet-stream'),
+        );
+        documentUrl = await ref.getDownloadURL();
+        documentName = _pickedDocumentName;
+        documentMimeType = _getMimeType(ext);
+      } else if (documentUrl.isEmpty && _origDocumentUrl.isNotEmpty) {
+        await _deleteDocumentObject(docId);
+      }
+
       if (isEditing) {
-        // Editar: solo campos editables, preservando 'order' y 'createdAt'
         await docRef.update({
           'title': title,
           'text': text,
           'imageUrl': imageUrl,
+          'documentUrl': documentUrl,
+          'documentName': documentName,
+          'documentMimeType': documentMimeType,
         });
       } else {
-        // Crear: doc nuevo con order al final y timestamp del servidor
         await docRef.set({
           'id': docId,
           'title': title,
           'text': text,
           'imageUrl': imageUrl,
+          'documentUrl': documentUrl,
+          'documentName': documentName,
+          'documentMimeType': documentMimeType,
           'order': _quickResponses.length,
           'createdAt': FieldValue.serverTimestamp(),
         });
@@ -265,6 +401,41 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
     } catch (_) {
       // Sin archivo o sin permiso → no es crítico, seguimos
     }
+  }
+
+  // Borra el documento en Storage; ignora si no existe
+  Future<void> _deleteDocumentObject(String docId) async {
+    try {
+      // Intentar con extensiones comunes
+      final exts = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'zip', 'bin'];
+      for (final ext in exts) {
+        try {
+          await _documentRef(docId, ext).delete();
+          return;
+        } catch (_) {
+          // Continuar con la siguiente
+        }
+      }
+    } catch (_) {
+      // Sin archivo o sin permiso → no es crítico
+    }
+  }
+
+  // Detectar MIME type basado en extensión
+  String _getMimeType(String ext) {
+    final mimeMap = {
+      'pdf': 'application/pdf',
+      'doc': 'application/msword',
+      'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'xls': 'application/vnd.ms-excel',
+      'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'ppt': 'application/vnd.ms-powerpoint',
+      'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      'txt': 'text/plain',
+      'csv': 'text/csv',
+      'zip': 'application/zip',
+    };
+    return mimeMap[ext.toLowerCase()] ?? 'application/octet-stream';
   }
 
   // Confirma antes de borrar (acción destructiva, estilo WhatsApp)
@@ -320,6 +491,7 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
   void dispose() {
     _titleController.dispose();
     _textController.dispose();
+    _searchController.dispose();
     super.dispose();
   }
 
@@ -388,11 +560,47 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
                       padding: const EdgeInsets.symmetric(vertical: 8),
                       children: [
                         _instructions(),
+                        _searchBar(),
                         ..._buildResponseTiles(),
                       ],
                     ),
         ),
       ],
+    );
+  }
+
+  Widget _searchBar() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+      child: TextField(
+        controller: _searchController,
+        style: const TextStyle(color: white),
+        decoration: InputDecoration(
+          hintText: 'Buscar respuestas...',
+          hintStyle: TextStyle(color: lightText.withValues(alpha: 0.5)),
+          prefixIcon: Icon(Icons.search, color: lightText.withValues(alpha: 0.5)),
+          suffixIcon: _searchQuery.isNotEmpty
+              ? IconButton(
+                  icon: Icon(Icons.clear, color: lightText.withValues(alpha: 0.5)),
+                  onPressed: () {
+                    _searchController.clear();
+                    setState(() => _searchQuery = '');
+                  },
+                )
+              : null,
+          filled: true,
+          fillColor: surfaceDark.withValues(alpha: 0.5),
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(12),
+            borderSide: BorderSide(color: primaryAqua.withValues(alpha: 0.1)),
+          ),
+          enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(12),
+            borderSide: BorderSide(color: primaryAqua.withValues(alpha: 0.1)),
+          ),
+          contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        ),
+      ),
     );
   }
 
@@ -443,10 +651,37 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
     );
   }
 
-  // Construye las filas con separadores entre ellas
+  // Construye las filas con separadores entre ellas, filtrando por búsqueda
   List<Widget> _buildResponseTiles() {
+    final filtered = _quickResponses.where((qr) {
+      final title = (qr['title'] as String? ?? '').toLowerCase();
+      final text = (qr['text'] as String? ?? '').toLowerCase();
+      final docName = (qr['documentName'] as String? ?? '').toLowerCase();
+      return title.contains(_searchQuery) ||
+          text.contains(_searchQuery) ||
+          docName.contains(_searchQuery);
+    }).toList();
+
+    if (filtered.isEmpty && _searchQuery.isNotEmpty) {
+      return [
+        Padding(
+          padding: const EdgeInsets.all(40),
+          child: Column(
+            children: [
+              Icon(Icons.search_off, size: 40, color: primaryAqua.withValues(alpha: 0.3)),
+              const SizedBox(height: 12),
+              Text(
+                'No se encontraron respuestas',
+                style: TextStyle(color: lightText.withValues(alpha: 0.6)),
+              ),
+            ],
+          ),
+        ),
+      ];
+    }
+
     final tiles = <Widget>[];
-    for (var i = 0; i < _quickResponses.length; i++) {
+    for (var i = 0; i < filtered.length; i++) {
       if (i > 0) {
         tiles.add(Divider(
           color: primaryAqua.withValues(alpha: 0.08),
@@ -455,7 +690,7 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
           endIndent: 20,
         ));
       }
-      tiles.add(_responseTile(_quickResponses[i]));
+      tiles.add(_responseTile(filtered[i]));
     }
     return tiles;
   }
@@ -464,8 +699,11 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
     final title = qr['title'] as String? ?? '';
     final text = qr['text'] as String? ?? '';
     final hasImage = (qr['imageUrl'] as String?)?.isNotEmpty ?? false;
-    // Preview: el texto si existe, si no un indicio de imagen
-    final preview = text.isNotEmpty ? text : (hasImage ? 'Imagen' : '');
+    final documentName = qr['documentName'] as String? ?? '';
+    final hasDocument = documentName.isNotEmpty;
+
+    // Preview: el texto si existe, si no un indicio de imagen/documento
+    final preview = text.isNotEmpty ? text : (hasImage ? 'Imagen' : (hasDocument ? 'Documento' : ''));
 
     return InkWell(
       onTap: () => _openEditor(qr),
@@ -487,14 +725,18 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                   ),
-                  if (preview.isNotEmpty)
+                  if (preview.isNotEmpty || hasImage || hasDocument)
                     Padding(
                       padding: const EdgeInsets.only(top: 3),
                       child: Row(
                         children: [
-                          // Mini-glifo de imagen: único indicador que sí informa
                           if (hasImage) ...[
                             Icon(Icons.image_outlined,
+                                size: 13, color: lightText.withValues(alpha: 0.6)),
+                            const SizedBox(width: 4),
+                          ],
+                          if (hasDocument) ...[
+                            Icon(Icons.description_outlined,
                                 size: 13, color: lightText.withValues(alpha: 0.6)),
                             const SizedBox(width: 4),
                           ],
@@ -626,12 +868,15 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
                 _fieldLabel('Mensaje'),
                 _textField(
                   controller: _textController,
-                  hint: 'Mensaje o caption para la imagen',
+                  hint: 'Mensaje o caption para la imagen/documento',
                   maxLines: 4,
                 ),
                 const SizedBox(height: 20),
                 _fieldLabel('Imagen (opcional)'),
                 _imagePickerField(),
+                const SizedBox(height: 20),
+                _fieldLabel('Documento (opcional)'),
+                _documentPickerField(),
                 // Eliminar solo tiene sentido al editar una existente
                 if (isEditing) ...[
                   const SizedBox(height: 32),
@@ -726,6 +971,97 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
             const SizedBox(height: 4),
             Text(
               'Se optimiza automáticamente (máx. 10 MB)',
+              style: TextStyle(color: lightText.withValues(alpha: 0.5), fontSize: 11),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // Selector de documento: muestra nombre y tamaño si está cargado, o área para agregar
+  Widget _documentPickerField() {
+    if (_hasDocument) {
+      final displayName = _pickedDocumentName.isNotEmpty ? _pickedDocumentName : _documentName;
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+            decoration: BoxDecoration(
+              color: surfaceDark.withValues(alpha: 0.6),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: primaryAqua.withValues(alpha: 0.2)),
+            ),
+            child: Row(
+              children: [
+                Icon(Icons.description, size: 24, color: primaryAqua.withValues(alpha: 0.7)),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        displayName,
+                        style: const TextStyle(color: white, fontWeight: FontWeight.w600, fontSize: 13),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        (_pickedDocumentBytes?.length ?? 0) > 0
+                            ? '${((_pickedDocumentBytes!.length) / (1024 * 1024)).toStringAsFixed(2)} MB'
+                            : 'Documento',
+                        style: TextStyle(color: lightText.withValues(alpha: 0.6), fontSize: 11),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              TextButton.icon(
+                onPressed: _pickDocument,
+                icon: const Icon(Icons.swap_horiz, size: 18, color: primaryAqua),
+                label: const Text('Cambiar', style: TextStyle(color: primaryAqua)),
+              ),
+              TextButton.icon(
+                onPressed: _removeDocument,
+                icon: const Icon(Icons.delete_outline, size: 18, color: Colors.red),
+                label: const Text('Quitar', style: TextStyle(color: Colors.red)),
+              ),
+            ],
+          ),
+        ],
+      );
+    }
+
+    // Sin documento: área tappable para agregar
+    return InkWell(
+      onTap: _pickDocument,
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(vertical: 28),
+        decoration: BoxDecoration(
+          color: darkBg.withValues(alpha: 0.3),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: primaryAqua.withValues(alpha: 0.2)),
+        ),
+        child: Column(
+          children: [
+            Icon(Icons.upload_file_outlined,
+                size: 32, color: primaryAqua.withValues(alpha: 0.7)),
+            const SizedBox(height: 8),
+            const Text('Agregar documento',
+                style: TextStyle(color: primaryAqua, fontWeight: FontWeight.w600)),
+            const SizedBox(height: 4),
+            Text(
+              'PDF, Word, Excel, etc. (máx. 10 MB)',
               style: TextStyle(color: lightText.withValues(alpha: 0.5), fontSize: 11),
             ),
           ],
