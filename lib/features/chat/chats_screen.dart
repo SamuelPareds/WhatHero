@@ -2243,19 +2243,26 @@ class _ChatTile extends StatelessWidget {
   String _formatTimestamp(DateTime? dateTime) {
     if (dateTime == null) return '';
 
+    // El corte de día se hace por calendario (year/month/day), no por
+    // duración: 'Ayer' debe significar "el día calendario anterior", no
+    // "hace 24-48h". Ver mismo patrón en messages_view._formatDaySeparator.
     final now = DateTime.now();
-    final difference = now.difference(dateTime);
+    final today = DateTime(now.year, now.month, now.day);
+    final messageDay = DateTime(dateTime.year, dateTime.month, dateTime.day);
+    final diffDays = today.difference(messageDay).inDays;
 
-    if (difference.inMinutes < 1) {
-      return 'Ahora';
-    } else if (difference.inHours < 1) {
-      return 'Hace ${difference.inMinutes}m';
-    } else if (difference.inHours < 24) {
+    if (diffDays <= 0) {
+      // Mismo día: tiempo relativo reciente.
+      final difference = now.difference(dateTime);
+      if (difference.inMinutes < 1) return 'Ahora';
+      if (difference.inHours < 1) return 'Hace ${difference.inMinutes}m';
       return 'Hace ${difference.inHours}h';
-    } else if (difference.inDays == 1) {
+    } else if (diffDays == 1) {
       return 'Ayer';
-    } else if (difference.inDays < 7) {
-      return 'Hace ${difference.inDays}d';
+    } else if (diffDays == 2) {
+      return 'Antier';
+    } else if (diffDays < 7) {
+      return 'Hace ${diffDays}d';
     } else {
       return '${dateTime.day}/${dateTime.month}';
     }

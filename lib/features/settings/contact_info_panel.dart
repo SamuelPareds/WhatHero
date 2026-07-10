@@ -241,17 +241,20 @@ class ContactInfoPanel extends StatelessWidget {
   }
 
   String _formatLastMessageTime(DateTime dateTime) {
+    // 'Hace Xd' se calcula por días de calendario, no por bloques de 24h,
+    // para no marcar como "Hace 1d" algo que en calendario fue anteayer.
     final now = DateTime.now();
-    final difference = now.difference(dateTime);
+    final today = DateTime(now.year, now.month, now.day);
+    final messageDay = DateTime(dateTime.year, dateTime.month, dateTime.day);
+    final diffDays = today.difference(messageDay).inDays;
 
-    if (difference.inMinutes < 1) {
-      return 'Hace unos segundos';
-    } else if (difference.inHours < 1) {
-      return 'Hace ${difference.inMinutes}m';
-    } else if (difference.inHours < 24) {
+    if (diffDays <= 0) {
+      final difference = now.difference(dateTime);
+      if (difference.inMinutes < 1) return 'Hace unos segundos';
+      if (difference.inHours < 1) return 'Hace ${difference.inMinutes}m';
       return 'Hace ${difference.inHours}h';
-    } else if (difference.inDays < 7) {
-      return 'Hace ${difference.inDays}d';
+    } else if (diffDays < 7) {
+      return 'Hace ${diffDays}d';
     } else {
       return '${dateTime.day}/${dateTime.month}/${dateTime.year}';
     }
