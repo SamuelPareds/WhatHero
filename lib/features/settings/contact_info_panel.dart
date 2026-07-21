@@ -101,8 +101,14 @@ class ContactInfoPanel extends StatelessWidget {
                       // Phone Number
                       Center(
                         child: GestureDetector(
-                          onLongPress: () {
-                            Clipboard.setData(ClipboardData(text: phoneNumber));
+                          onTap: () {
+                            // Copia solo los últimos 10 dígitos (número local sin
+                            // lada de país ni sufijos de WhatsApp).
+                            final digits = phoneNumber.replaceAll(RegExp(r'\D'), '');
+                            final last10 = digits.length > 10
+                                ? digits.substring(digits.length - 10)
+                                : digits;
+                            Clipboard.setData(ClipboardData(text: last10));
                             ScaffoldMessenger.of(context).showSnackBar(
                               SnackBar(
                                 content: const Text(
