@@ -132,6 +132,20 @@ Transiciones entre modos: `AnimatedSwitcher` 220ms para no saltar.
 
 ---
 
+## 📱 Versión de WhatsApp Web (defensa anti-405)
+
+El backend se declara ante WhatsApp como una versión concreta de WhatsApp Web (`2.3000.<revisión>`). WhatsApp **corta las versiones viejas cada pocas semanas**, y cuando lo hace caen todas las sesiones a la vez con `405 Connection Failure` — sin poder siquiera generar un QR para revincular. Pasó el 28-jul-2026 con las 3 cuentas de producción.
+
+- **Nunca usar `fetchLatestBaileysVersion()` directo.** Esa función parsea un `.ts` de GitHub por número de línea y, si falla, devuelve un valor viejo con `isLatest: false` sin avisar. Fue la causa raíz de la caída.
+- **Siempre usar `resolveWaVersion()`** de `backend/src/config/waVersion.ts`. Cadena: `WA_VERSION` (env) → `web.whatsapp.com/sw.js` → pin de Baileys → `WA_VERSION_FLOOR`. Descarta cualquier fuente que devuelva algo más viejo que el piso, y trata `isLatest: false` como fallo.
+- **Diagnóstico y emergencias:** `cd backend && npm run check:wa` (agrega una versión como argumento para probarla antes de usarla).
+- **Ver runbook completo:** `backend/WA_VERSION_GUIDE.md`.
+
+### Logs de Baileys
+El logger raíz (`index.ts`) aplica `redact` sobre los campos base64 gigantes de `histNotification` (el bootstrap del history sync pesa ~50 KB por línea). Se redactan campos puntuales en vez de subir el nivel a `warn` a propósito: durante la caída del 405 el dato que reveló la causa (`appVersion`) venía en una línea `info`. Para silenciar sólo a Baileys sin tocar los logs propios: `BAILEYS_LOG_LEVEL=warn` en Railway.
+
+---
+
 ## 🤖 Reglas de Oro para el Desarrollo
 - **Objetivo real:** Optimiza para que el código sea *fácil de entender y mantener* por una persona nueva en el proyecto. Menos líneas y menos dependencias son medios para eso, no el objetivo: si una abstracción, estructura o cache hace el proyecto más entendible o más rápido donde importa, la inversión es válida aunque agregue código.
 - **Desafío técnico (con umbral):** Si mi propuesta tiene una alternativa significativamente más simple, robusta o rápida, dímelo ANTES de codear ("Existe una forma más sencilla...") y espera mi decisión. Si la diferencia es menor (estilo, micro-detalles, ±pocas líneas), decide tú por la opción simple y menciónalo brevemente al final — no me interrumpas por eso.

@@ -6,7 +6,6 @@ import { Server } from 'socket.io';
 import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
-  fetchLatestBaileysVersion,
   type ConnectionState
 } from '@whiskeysockets/baileys';
 import { pino } from 'pino';
@@ -37,6 +36,7 @@ import { ReminderService } from './src/services/reminderService';
 import { FollowupService } from './src/services/followupService';
 import { sendHumanAttentionNotification } from './src/services/notificationService';
 import { ACCOUNTS_COLLECTION, IS_PRODUCTION } from './src/config/env';
+import { resolveWaVersion } from './src/config/waVersion';
 import { verifyHttpAuth, verifySocketAuth, invalidateMembershipCache } from './src/middleware/auth';
 import { generateTempPassword } from './src/utils/password';
 import { resolveHumanSender, BOT_SENDER, invalidateHumanNameCache } from './src/services/senderResolver';
@@ -99,7 +99,31 @@ const io = new Server(httpServer, {
 });
 
 const db = admin.firestore();
-const logger = pino({ level: 'info' }, pino.destination({ sync: false }));
+
+// Baileys loguea el history sync a nivel info, y un solo `histNotification`
+// puede arrastrar ~50 KB de base64 (el payload del bootstrap inicial y los
+// handles de media cifrada). En Railway eso ahoga todo lo demás.
+//
+// Los quitamos por path en vez de subir el nivel a 'warn': la línea sobrevive
+// con lo que sirve (syncType, progress, chunkOrder) y pesa ~99% menos. Bajar
+// el nivel nos habría costado diagnóstica — durante la caída del 405 de
+// jul-2026 el dato que reveló la causa (appVersion) venía en una línea info.
+const BAILEYS_NOISY_FIELDS = [
+  'histNotification.initialHistBootstrapInlinePayload',
+  'histNotification.encHandle',
+  'histNotification.directPath',
+  'histNotification.mediaKey',
+  'histNotification.fileSha256',
+  'histNotification.fileEncSha256',
+];
+
+const logger = pino(
+  {
+    level: process.env.LOG_LEVEL || 'info',
+    redact: { paths: BAILEYS_NOISY_FIELDS, remove: true },
+  },
+  pino.destination({ sync: false }),
+);
 
 const sessions = new Map<string, SessionData>();
 
@@ -183,7 +207,8 @@ async function buildRuleMessageContent(rule: any): Promise<any | null> {
 
 async function startSession(sessionKey: string, accountId: string) {
   const { state, saveCreds } = await useMultiFileAuthState(`auth_info/${sessionKey}`);
-  const { version } = await fetchLatestBaileysVersion();
+  const version = await resolveWaVersion();
+  console.log(`[startSession] ${sessionKey} → handshake con WA Web ${version.join('.')}`);
 
   // Write metadata file so startExistingSessions() can recover this session on reboot
   writeFileSync(`auth_info/${sessionKey}/meta.json`, JSON.stringify({ accountId }));
@@ -209,7 +234,9 @@ async function startSession(sessionKey: string, accountId: string) {
   const sock = makeWASocket({
     version,
     auth: state,
-    logger: logger.child({ class: 'baileys' }),
+    // BAILEYS_LOG_LEVEL permite silenciar sólo a Baileys desde Railway (p.ej.
+    // 'warn') sin tocar los logs propios de WhatHero ni redesplegar código.
+    logger: logger.child({ class: 'baileys' }, { level: process.env.BAILEYS_LOG_LEVEL || logger.level }),
     browser: ['WhatHero', 'Chrome', '121.0.0'],
     generateHighQualityLinkPreview: true,
     syncFullHistory: false,
