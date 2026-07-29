@@ -6,7 +6,16 @@ function getDb() {
   return admin.firestore();
 }
 
-export type HumanAttentionReason = 'discriminator' | 'blocked_media' | 'unanswered_media' | 'ai_off';
+// `ai_truncated`: el modelo cortó su respuesta por límite de tokens y preferimos
+// no enviar media frase. `send_failed`: un chunk no salió ni con reintento, así
+// que la respuesta quedó incompleta en el chat del cliente.
+export type HumanAttentionReason =
+  | 'discriminator'
+  | 'blocked_media'
+  | 'unanswered_media'
+  | 'ai_off'
+  | 'ai_truncated'
+  | 'send_failed';
 
 export interface HumanAttentionPayload {
   accountId: string;          // UID del usuario dueño de la sesión

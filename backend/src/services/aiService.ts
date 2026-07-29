@@ -4,7 +4,7 @@ import OpenAI from 'openai';
 import { SessionData } from '../types';
 import { ACCOUNTS_COLLECTION } from '../config/env';
 import { incrementUnrespondedCount, resetUnrespondedCount } from './firestoreService';
-import { sendHumanAttentionNotification } from './notificationService';
+import { sendHumanAttentionNotification, HumanAttentionReason } from './notificationService';
 import { isBlockedMediaDoc } from './mediaService';
 import { AI_SENDER } from './senderResolver';
 
@@ -30,6 +30,31 @@ export type AiLifecycleState = 'buffering' | 'thinking' | 'responding' | 'idle';
 const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
 
 export type AiProvider = 'gemini' | 'openai' | 'deepseek';
+
+// Techo de tokens de salida para la ruta OpenAI-compatible. Estaba en 1000 y
+// era la causa de las respuestas cortadas a media frase: al agotarse, la API
+// devuelve 200 con el texto mutilado y `finish_reason: 'length'`. La ruta
+// Gemini nunca mandó `maxOutputTokens` en generación (usa el default del
+// modelo, enorme) y por eso jamás truncó. 4000 deja aire de sobra para un
+// mensaje de WhatsApp largo MÁS los tokens de razonamiento, que DeepSeek V4 y
+// la familia GPT-5 descuentan de este mismo presupuesto.
+const AI_MAX_OUTPUT_TOKENS = 4000;
+
+// Los modelos de razonamiento (GPT-5, familia o*) rechazan `max_tokens` —exigen
+// `max_completion_tokens`— y solo aceptan la temperatura por defecto. Sin esta
+// distinción, elegir "GPT-5 Mini" en el panel de sesión hacía fallar la llamada
+// entera con un 400 del proveedor.
+function isReasoningModel(modelName: string): boolean {
+  return /^(gpt-5|o[1-9])/i.test(modelName);
+}
+
+// Resultado de una generación. `truncated` viaja aparte del texto porque un
+// mensaje cortado a media frase NO debe enviarse al cliente: el caller decide
+// (el auto-responder deriva a humano; el copiloto avisa al operador).
+export type AiGenerationResult = {
+  text: string | null;
+  truncated: boolean;
+};
 
 // Error estructurado de IA con un `code` estable que el endpoint manual traduce
 // a HTTP + mensaje claro para el operador. SOLO se usa en el modo copiloto
@@ -78,6 +103,48 @@ function classifyAiError(error: any): AiError {
     return new AiError('safety_block', 'La respuesta fue bloqueada por los filtros de seguridad del modelo.');
   }
   return new AiError('provider_error', msg);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Ciclos de IA cancelables
+// ─────────────────────────────────────────────────────────────────────────
+// Un ciclo va desde que dispara el buffer hasta que sale el último chunk.
+// Si el cliente escribe en medio, la respuesta que estábamos generando (o
+// terminando de enviar) ya nació vieja: la cortamos ahí mismo y dejamos que el
+// buffer nuevo produzca una que sí conteste lo último que dijo. Es lo que haría
+// una persona que ve entrar un mensaje mientras escribe: se detiene y ajusta.
+// Los chunks ya enviados se quedan, igual que en una conversación real.
+type AiCycle = { cancelled: boolean };
+const activeAiCycles = new Map<string, AiCycle>();
+
+function cycleKey(sessionKey: string, contactPhone: string): string {
+  return `${sessionKey}:${contactPhone}`;
+}
+
+// Corta el ciclo de IA en vuelo de ese chat. Devuelve true si había uno activo.
+export function cancelAiCycle(sessionKey: string, contactPhone: string): boolean {
+  const cycle = activeAiCycles.get(cycleKey(sessionKey, contactPhone));
+  if (!cycle || cycle.cancelled) return false;
+  cycle.cancelled = true;
+  return true;
+}
+
+// IDs de los mensajes que envió la propia IA. La rama `fromMe` de
+// `messages.upsert` los consulta para no confundir un chunk del asistente con
+// "el humano tomó el control": esa confusión cancelaba el buffer que el cliente
+// acababa de crear al escribir durante el envío, y se tragaba su mensaje sin
+// responderlo ni marcarlo como pendiente. TTL corto: solo hace falta vivo hasta
+// que llegue el upsert del propio envío.
+const AI_SENT_ID_TTL_MS = 60_000;
+const aiSentMessageIds = new Set<string>();
+
+export function isAiSentMessage(messageId: string): boolean {
+  return aiSentMessageIds.has(messageId);
+}
+
+function rememberAiSentMessage(messageId: string): void {
+  aiSentMessageIds.add(messageId);
+  setTimeout(() => aiSentMessageIds.delete(messageId), AI_SENT_ID_TTL_MS);
 }
 
 export function emitAiState(
@@ -229,9 +296,10 @@ export async function generateAIResponse(
   operatorInstruction?: string,
   // Opciones SOLO usadas por el endpoint manual (copiloto). El auto-responder no
   // las pasa → `throwOnError=false` y sin timeout = comportamiento idéntico al
-  // histórico: ante cualquier fallo devuelve null y el caller NO envía nada.
+  // histórico: ante cualquier fallo devuelve `text: null` y el caller NO envía
+  // nada. El truncamiento sí viaja siempre en el resultado, para los dos modos.
   options?: { throwOnError?: boolean; timeoutMs?: number }
-): Promise<string | null> {
+): Promise<AiGenerationResult> {
   const throwOnError = options?.throwOnError ?? false;
   const timeoutMs = options?.timeoutMs;
   try {
@@ -239,7 +307,7 @@ export async function generateAIResponse(
     if (!history || history.length === 0) {
       if (throwOnError) throw new AiError('empty_history', 'No hay mensajes suficientes para generar una respuesta.');
       console.warn('[AI] generateAIResponse llamado con history vacío, abortando.');
-      return null;
+      return { text: null, truncated: false };
     }
 
     // Enriquecemos el system prompt con conciencia temporal: qué hora es ahora
@@ -259,7 +327,7 @@ export async function generateAIResponse(
       : undefined;
     const temporalSystemPrompt = `${buildTemporalContext(timezone)}\n\n${TIMESTAMP_METADATA_NOTE}\n\n${systemPrompt}`;
 
-    let call: Promise<string | null>;
+    let call: Promise<AiGenerationResult>;
     if (provider === 'openai' || provider === 'deepseek') {
       // Ambos comparten la misma ruta OpenAI-compatible; DeepSeek solo añade baseURL.
       const isDeepSeek = provider === 'deepseek';
@@ -286,18 +354,25 @@ export async function generateAIResponse(
     const raw = timeoutMs ? await withTimeout(call, timeoutMs) : await call;
 
     // Red de seguridad contra fuga de la metadata temporal del historial.
-    const text = raw ? stripTimestampBrackets(raw) : raw;
-    if (throwOnError && (!text || !text.trim())) {
-      throw new AiError('empty_response', 'El modelo no devolvió texto.');
+    const text = raw.text ? stripTimestampBrackets(raw.text) : raw.text;
+    if (throwOnError) {
+      // El copiloto avisa antes de volcar al composer: pegar media frase sin
+      // que el operador lo note es peor que pedirle que reintente.
+      if (raw.truncated) {
+        throw new AiError('truncated', 'La respuesta quedó cortada por el límite de longitud del modelo.');
+      }
+      if (!text || !text.trim()) {
+        throw new AiError('empty_response', 'El modelo no devolvió texto.');
+      }
     }
-    return text;
+    return { text, truncated: raw.truncated };
   } catch (error) {
     // Modo manual (copiloto): propagamos un error tipado para que el endpoint lo
     // traduzca a HTTP + mensaje claro. Modo auto-responder: tragamos el error y
     // devolvemos null → el caller no envía nada (contrato intencional).
     if (throwOnError) throw classifyAiError(error);
     console.error('[AI] Error calling AI service:', error);
-    return null;
+    return { text: null, truncated: false };
   }
 }
 
@@ -323,7 +398,7 @@ async function generateAIResponseGemini(
   history: { role: 'user' | 'model'; parts: { text: string }[] }[],
   modelName: string = 'gemini-2.5-flash',
   operatorNote?: string
-): Promise<string | null> {
+): Promise<AiGenerationResult> {
   try {
     const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({ model: modelName });
@@ -364,7 +439,15 @@ async function generateAIResponseGemini(
     const result = await model.generateContent({
       contents: enhancedHistory,
     });
-    return result.response.text();
+    // Sin `maxOutputTokens` el techo es el default del modelo, así que MAX_TOKENS
+    // aquí es rarísimo; lo miramos igual para que el contrato sea uniforme entre
+    // los tres proveedores y nunca se envíe un texto cortado.
+    const finishReason = result.response.candidates?.[0]?.finishReason;
+    const text = result.response.text();
+    console.log(
+      `[AI] gemini model=${modelName} finish=${finishReason ?? 'n/a'} chars=${text?.length ?? 0}`
+    );
+    return { text, truncated: finishReason === 'MAX_TOKENS' };
   } catch (error) {
     // Logueamos y re-lanzamos: el catch externo de generateAIResponse decide si
     // tragar (auto-responder → null) o clasificar y propagar (manual → throw).
@@ -382,7 +465,7 @@ async function generateAIResponseOpenAI(
   modelName: string = 'gpt-4.1-mini',
   baseURL?: string,
   operatorNote?: string
-): Promise<string | null> {
+): Promise<AiGenerationResult> {
   try {
     const client = new OpenAI({ apiKey, ...(baseURL && { baseURL }) });
 
@@ -401,14 +484,34 @@ async function generateAIResponseOpenAI(
       ...(operatorNote ? [{ role: 'system' as const, content: operatorNote }] : []),
     ];
 
+    const reasoning = isReasoningModel(modelName);
     const response = await client.chat.completions.create({
       model: modelName,
       messages,
-      temperature: 0.7,
-      max_tokens: 1000,
+      ...(reasoning ? {} : { temperature: 0.7 }),
+      ...(reasoning
+        ? { max_completion_tokens: AI_MAX_OUTPUT_TOKENS }
+        : { max_tokens: AI_MAX_OUTPUT_TOKENS }),
     });
 
-    return response.choices[0]?.message.content || null;
+    // `finish_reason: 'length'` = el modelo agotó el presupuesto y cortó a media
+    // frase. Antes se devolvía como si fuera una respuesta sana y salía así al
+    // cliente. Logueamos el consumo para poder ver en producción si algún
+    // prompt de negocio se está acercando al techo.
+    const choice = response.choices[0];
+    const usage = response.usage;
+    const reasoningTokens =
+      (usage?.completion_tokens_details as { reasoning_tokens?: number } | undefined)?.reasoning_tokens ?? 0;
+    console.log(
+      `[AI] ${baseURL ? 'deepseek' : 'openai'} model=${modelName} finish=${choice?.finish_reason ?? 'n/a'} ` +
+      `completion_tokens=${usage?.completion_tokens ?? '?'} reasoning_tokens=${reasoningTokens} ` +
+      `chars=${choice?.message.content?.length ?? 0}`
+    );
+
+    return {
+      text: choice?.message.content || null,
+      truncated: choice?.finish_reason === 'length',
+    };
   } catch (error) {
     // Logueamos y re-lanzamos: el catch externo de generateAIResponse decide si
     // tragar (auto-responder → null) o clasificar y propagar (manual → throw).
@@ -852,7 +955,7 @@ REGLAS DE REDACCIÓN:
     parts: [{ text: '[Instrucción interna: redacta ahora el mensaje de seguimiento según las indicaciones. Responde solo con el mensaje.]' }],
   };
 
-  return generateAIResponse(
+  const result = await generateAIResponse(
     apiKey,
     systemPrompt,
     [...history, syntheticTurn],
@@ -862,40 +965,86 @@ REGLAS DE REDACCIÓN:
     deepseekApiKey,
     timezone
   );
+
+  // Un seguimiento cortado a media frase es peor que no mandar ninguno: el
+  // caller no encola nada cuando devolvemos null.
+  if (result.truncated) {
+    console.warn('[Followup] Mensaje descartado: el modelo lo cortó por límite de longitud.');
+    return null;
+  }
+  return result.text;
 }
 
 // Divide la respuesta en grupos de párrafos (alternando 2 y 3) para simular escritura humana.
 // Cada chunk enviado se registra en pendingSenders con AI_SENDER para que el
 // upsert lo guarde con senderType='ai'.
-async function sendChunkedResponse(session: SessionData, remoteJid: string, response: string): Promise<void> {
+//
+// Entre chunk y chunk pasan hasta 2.5s, así que es la ventana natural para que
+// el cliente interrumpa: antes de cada envío consultamos el ciclo y, si fue
+// cancelado, dejamos de escupir la respuesta vieja.
+async function sendChunkedResponse(
+  session: SessionData,
+  remoteJid: string,
+  response: string,
+  cycle: AiCycle,
+): Promise<{ sent: number; total: number; cancelled: boolean; failed: boolean }> {
   const sock = session.sock;
   const tagAi = (sent: any) => {
-    if (sent?.key?.id) session.pendingSenders.set(sent.key.id, AI_SENDER);
+    if (sent?.key?.id) {
+      session.pendingSenders.set(sent.key.id, AI_SENDER);
+      rememberAiSentMessage(sent.key.id);
+    }
   };
 
-  const chunks = response.split(/\n\n+/);
+  // Un fallo puntual de WhatsApp (blip de conexión, rate limit) no debe dejar la
+  // respuesta a medias sin que nadie se entere: reintentamos una vez y, si no
+  // sale, el caller deriva el chat a un humano.
+  const sendChunk = async (text: string): Promise<boolean> => {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        tagAi(await sock.sendMessage(remoteJid, { text }));
+        return true;
+      } catch (error) {
+        console.error(`[AI] Error enviando chunk (intento ${attempt}/2):`, error);
+        if (attempt === 1) await new Promise(resolve => setTimeout(resolve, 300));
+      }
+    }
+    return false;
+  };
 
-  // Si es texto corto (1 párrafo), enviar directo sin chunking
+  // Armamos los grupos primero para poder razonar sobre "cuántos faltan" al
+  // cancelar o fallar. Texto de 1 párrafo = un solo mensaje, sin chunking.
+  const chunks = response.split(/\n\n+/);
+  const groups: string[] = [];
   if (chunks.length <= 1) {
-    const sent = await sock.sendMessage(remoteJid, { text: response.trim() });
-    tagAi(sent);
-    return;
+    groups.push(response.trim());
+  } else {
+    let i = 0;
+    let groupSize = 2;
+    while (i < chunks.length) {
+      const group = chunks.slice(i, i + groupSize).join('\n\n').trim();
+      if (group) groups.push(group);
+      i += groupSize;
+      groupSize = groupSize === 2 ? 3 : 2;
+    }
   }
 
-  let i = 0;
-  let groupSize = 2;
-  while (i < chunks.length) {
-    const group = chunks.slice(i, i + groupSize).join('\n\n').trim();
-    if (group) {
-      const sent = await sock.sendMessage(remoteJid, { text: group });
-      tagAi(sent);
-      // Delay proporcional a la longitud del chunk (mínimo 800ms, máximo 2500ms)
+  let sent = 0;
+  for (const group of groups) {
+    if (cycle.cancelled) {
+      return { sent, total: groups.length, cancelled: true, failed: false };
+    }
+    if (!(await sendChunk(group))) {
+      return { sent, total: groups.length, cancelled: false, failed: true };
+    }
+    sent++;
+    // Delay proporcional a la longitud del chunk (mínimo 800ms, máximo 2500ms)
+    if (sent < groups.length) {
       const delay = Math.min(2500, Math.max(800, group.length * 10));
       await new Promise(resolve => setTimeout(resolve, delay));
     }
-    i += groupSize;
-    groupSize = groupSize === 2 ? 3 : 2;
   }
+  return { sent, total: groups.length, cancelled: false, failed: false };
 }
 
 // Process buffered messages: fetch history, run discriminator, and send AI response
@@ -912,6 +1061,53 @@ export async function processMessageBuffer(
   // pesado (historial + discriminador + generación). El frontend reemplaza
   // el icono de IA por un spinner mientras dure este bloque.
   emitAiState(accountId, sessionKey, contactPhone, 'thinking');
+
+  // Registramos el ciclo para que un mensaje del cliente pueda cortarlo tanto
+  // durante la generación como entre chunks.
+  const key = cycleKey(sessionKey, contactPhone);
+  const cycle: AiCycle = { cancelled: false };
+  activeAiCycles.set(key, cycle);
+
+  // Deriva el chat a un humano: cuenta los pendientes, sella el chat, avisa al
+  // CRM en vivo y manda el push. Es el mismo camino para las cuatro razones por
+  // las que la IA se abstiene de responder (media que no puede leer,
+  // discriminador, respuesta truncada por el modelo y chunk que no salió).
+  const escalateToHuman = async (reason: HumanAttentionReason, pending: number) => {
+    await incrementUnrespondedCount(accountId, session.phoneNumber!, contactPhone, pending);
+
+    try {
+      await getDb()
+        .collection(ACCOUNTS_COLLECTION)
+        .doc(accountId)
+        .collection('whatsapp_sessions')
+        .doc(session.phoneNumber!)
+        .collection('chats')
+        .doc(contactPhone)
+        .set(
+          { human_attention_at: admin.firestore.FieldValue.serverTimestamp() },
+          { merge: true }
+        );
+    } catch (error) {
+      console.error(`[Buffer] Error stamping human_attention_at (${reason}):`, error);
+    }
+
+    getIO().to(accountId).emit('human_attention_required', {
+      sessionKey,
+      chatId: contactPhone,
+      phoneNumber: session.phoneNumber,
+      timestamp: new Date().toISOString(),
+      reason,
+    });
+
+    sendHumanAttentionNotification({
+      accountId,
+      sessionPhone: session.phoneNumber!,
+      sessionKey,
+      chatId: contactPhone,
+      reason,
+      messagePreview: bufferedMessages.join('\n'),
+    }).catch((err) => console.error(`[Notify] ${reason} push falló:`, err));
+  };
 
   try {
     // Combine all buffered messages into one context
@@ -959,48 +1155,10 @@ export async function processMessageBuffer(
     }
 
     if (heldByMedia) {
-      await incrementUnrespondedCount(
-        accountId,
-        session.phoneNumber!,
-        contactPhone,
-        bufferedMessages.length
-      );
-
-      try {
-        await getDb()
-          .collection(ACCOUNTS_COLLECTION)
-          .doc(accountId)
-          .collection('whatsapp_sessions')
-          .doc(session.phoneNumber!)
-          .collection('chats')
-          .doc(contactPhone)
-          .set(
-            { human_attention_at: admin.firestore.FieldValue.serverTimestamp() },
-            { merge: true }
-          );
-      } catch (error) {
-        console.error('[MediaHold] Error stamping human_attention_at:', error);
-      }
-
-      getIO().to(accountId).emit('human_attention_required', {
-        sessionKey,
-        chatId: contactPhone,
-        phoneNumber: session.phoneNumber,
-        timestamp: new Date().toISOString(),
-        reason: 'unanswered_media',
-      });
-
       // Push en CADA ráfaga a propósito: si el operador olvidó responder la
       // media, cada nuevo mensaje del cliente re-alerta. El collapse tag por
       // chat evita que se apilen en el notification shade.
-      sendHumanAttentionNotification({
-        accountId,
-        sessionPhone: session.phoneNumber!,
-        sessionKey,
-        chatId: contactPhone,
-        reason: 'unanswered_media',
-        messagePreview: combinedMessage,
-      }).catch((err) => console.error('[Notify] unanswered_media push falló:', err));
+      await escalateToHuman('unanswered_media', bufferedMessages.length);
 
       console.log(
         `[MediaHold] ${contactPhone}: media sin responder en el historial, IA en espera ` +
@@ -1031,47 +1189,9 @@ export async function processMessageBuffer(
       );
 
       if (classification === 'TalkToHuman') {
-        // Incrementamos el contador por la ráfaga completa de mensajes que el discriminador clasificó
-        await incrementUnrespondedCount(
-          accountId,
-          session.phoneNumber!,
-          contactPhone,
-          bufferedMessages.length
-        );
-
-        try {
-          await getDb()
-            .collection(ACCOUNTS_COLLECTION)
-            .doc(accountId)
-            .collection('whatsapp_sessions')
-            .doc(session.phoneNumber!)
-            .collection('chats')
-            .doc(contactPhone)
-            .set(
-              { human_attention_at: admin.firestore.FieldValue.serverTimestamp() },
-              { merge: true }
-            );
-        } catch (error) {
-          console.error('[Buffer] Error stamping human_attention_at:', error);
-        }
-
-        getIO().to(accountId).emit('human_attention_required', {
-          sessionKey,
-          chatId: contactPhone,
-          phoneNumber: session.phoneNumber,
-          timestamp: new Date().toISOString(),
-        });
-
-        // Push FCM en paralelo: el flujo de IA no espera al envío de notificación.
-        // Errores de FCM no deben romper el procesamiento del mensaje.
-        sendHumanAttentionNotification({
-          accountId,
-          sessionPhone: session.phoneNumber!,
-          sessionKey,
-          chatId: contactPhone,
-          reason: 'discriminator',
-          messagePreview: combinedMessage,
-        }).catch((err) => console.error('[Notify] discriminator push falló:', err));
+        // Contamos la ráfaga completa que el discriminador clasificó. El push
+        // FCM sale en paralelo: el flujo de IA no espera a la notificación.
+        await escalateToHuman('discriminator', bufferedMessages.length);
 
         console.log(
           `[Buffer] Emitted human_attention_required for ${contactPhone} (+${bufferedMessages.length} unresponded)`
@@ -1089,6 +1209,13 @@ export async function processMessageBuffer(
     // buffer dispare), por eso no pasamos un userMessage separado: estaría
     // duplicado y confunde al modelo (Gemini además rechaza dos turns user
     // consecutivos en el flujo de chat).
+    // Si el cliente escribió mientras corría el discriminador, no gastamos una
+    // llamada al proveedor para una respuesta que igual descartaríamos abajo.
+    if (cycle.cancelled) {
+      console.log(`[Buffer] Ciclo cancelado antes de generar para ${contactPhone}`);
+      return;
+    }
+
     const aiResponse = await generateAIResponse(
       aiConfig.apiKey,
       aiConfig.systemPrompt || 'Eres un asistente útil.',
@@ -1100,20 +1227,63 @@ export async function processMessageBuffer(
       timezone
     );
 
-    if (aiResponse) {
+    // El cliente escribió mientras el modelo pensaba: esta respuesta ya nació
+    // vieja. La descartamos sin enviar nada y dejamos que el buffer nuevo genere
+    // la que sí contesta lo último que dijo.
+    if (cycle.cancelled) {
+      console.log(`[Buffer] Ciclo cancelado durante la generación para ${contactPhone}, respuesta descartada`);
+      return;
+    }
+
+    // Respuesta truncada por el modelo: mandar media frase al cliente es peor
+    // que no mandar nada, así que derivamos el chat al humano.
+    if (aiResponse.truncated) {
+      console.warn(
+        `[Buffer] Respuesta truncada por límite de tokens para ${contactPhone}; no se envía, deriva a humano`
+      );
+      await escalateToHuman('ai_truncated', bufferedMessages.length);
+      return;
+    }
+
+    if (aiResponse.text) {
       // Pasamos a 'responding' justo antes de empezar a mandar chunks: este es
       // el momento crítico donde el usuario puede querer interceptar.
       emitAiState(accountId, sessionKey, contactPhone, 'responding');
-      await sendChunkedResponse(session, remoteJid, aiResponse);
-      console.log(`[Buffer] Auto-responded to ${remoteJid} en chunks`);
+      const result = await sendChunkedResponse(session, remoteJid, aiResponse.text, cycle);
+
+      if (result.cancelled) {
+        // Interrupción deseada, no un error: no reseteamos el contador porque
+        // el mensaje que interrumpió sigue pendiente de respuesta.
+        console.log(
+          `[Buffer] Envío interrumpido por el cliente en ${contactPhone}: ${result.sent}/${result.total} chunks enviados`
+        );
+        return;
+      }
+
+      if (result.failed) {
+        console.error(
+          `[Buffer] Envío incompleto a ${contactPhone}: ${result.sent}/${result.total} chunks; deriva a humano`
+        );
+        await escalateToHuman('send_failed', bufferedMessages.length);
+        return;
+      }
+
+      console.log(`[Buffer] Auto-responded to ${remoteJid} en ${result.total} chunk(s)`);
       // La IA respondió: cualquier pendiente previo queda cubierto
       await resetUnrespondedCount(accountId, session.phoneNumber!, contactPhone);
     }
   } catch (error) {
     console.error('[Buffer] Error processing message buffer:', error);
   } finally {
+    // Solo desregistramos si el ciclo en el mapa sigue siendo el nuestro: si nos
+    // cancelaron y el buffer nuevo ya arrancó su propio ciclo, borrarlo aquí lo
+    // dejaría fuera del alcance de futuras cancelaciones.
+    if (activeAiCycles.get(key) === cycle) activeAiCycles.delete(key);
     // Cierre garantizado del ciclo: tanto en éxito como en error volvemos a idle
-    // para que el frontend libere el spinner y muestre el icono de IA normal.
-    emitAiState(accountId, sessionKey, contactPhone, 'idle');
+    // para que el frontend libere el spinner. Si nos cancelaron, no lo emitimos:
+    // ya hay un ciclo nuevo en marcha y su indicador ('buffering') es el válido.
+    if (!cycle.cancelled) {
+      emitAiState(accountId, sessionKey, contactPhone, 'idle');
+    }
   }
 }

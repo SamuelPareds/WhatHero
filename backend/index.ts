@@ -17,7 +17,7 @@ import { SessionData, MessageBuffer } from './src/types';
 import { extractPhoneNumber, storeLIDMapping, resolveLIDViaSock, isConversationalJid } from './src/utils/phone';
 import { unwrapMessageContent } from './src/utils/message';
 import { initializeSession, saveMessageToFirestore, getAIConfig, cacheContactName, applyContactUpdate, reconcileContactNames, consolidateLIDChat, incrementUnrespondedCount, resetUnrespondedCount, writeMediaIndexEntry, isIndexableMedia, writeMessageIndexEntry } from './src/services/firestoreService';
-import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer, emitAiState, getSessionTimezone, AiError } from './src/services/aiService';
+import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer, emitAiState, getSessionTimezone, AiError, cancelAiCycle, isAiSentMessage } from './src/services/aiService';
 
 // Mapeo de códigos de AiError → HTTP para el endpoint manual (copiloto). El
 // frontend usa el `code` para mostrar un mensaje claro con acción "Reintentar".
@@ -30,6 +30,7 @@ const AI_ERROR_HTTP: Record<string, number> = {
   safety_block: 422,
   empty_response: 502,
   empty_history: 422,
+  truncated: 502,
 };
 import { extractMediaInfo, classifyIncomingMedia } from './src/services/mediaService';
 import { ReminderService } from './src/services/reminderService';
@@ -527,9 +528,17 @@ async function startSession(sessionKey: string, accountId: string) {
             if (resolved) contactPhoneForCancel = resolved;
           }
 
+          // Los chunks que manda la propia IA vuelven por aquí como `fromMe`.
+          // Tratarlos como "el humano tomó el control" cancelaba el buffer que
+          // el cliente acababa de crear al escribir durante el envío: su
+          // mensaje se perdía sin respuesta y sin quedar marcado como
+          // pendiente. Un chunk propio no cancela nada ni resetea contadores;
+          // de eso ya se encarga processMessageBuffer al terminar.
+          const isOwnAiChunk = !!message.key.id && isAiSentMessage(message.key.id);
+
           const bufferKey = `${sessionKey}:${contactPhoneForCancel}`;
           const buffer = messageBuffers.get(bufferKey);
-          if (buffer?.timeout) {
+          if (!isOwnAiChunk && buffer?.timeout) {
             clearTimeout(buffer.timeout);
             messageBuffers.delete(bufferKey);
             console.log(`[Buffer] CANCELLED: Human response detected for ${contactPhoneForCancel}`);
@@ -537,9 +546,15 @@ async function startSession(sessionKey: string, accountId: string) {
             emitAiState(accountId, sessionKey, contactPhoneForCancel, 'idle');
           }
 
+          // El humano escribiendo también corta un envío por chunks en curso:
+          // si ya contestó él, la IA no debe seguir soltando su respuesta.
+          if (!isOwnAiChunk && cancelAiCycle(sessionKey, contactPhoneForCancel)) {
+            console.log(`[AI] Ciclo cancelado por respuesta humana en ${contactPhoneForCancel}`);
+          }
+
           // Reset contador: el humano (o IA via CRM) acaba de responder
           const sessionForReset = sessions.get(sessionKey);
-          if (sessionForReset?.phoneNumber) {
+          if (!isOwnAiChunk && sessionForReset?.phoneNumber) {
             await resetUnrespondedCount(accountId, sessionForReset.phoneNumber, contactPhoneForCancel);
           }
 
@@ -616,6 +631,15 @@ async function startSession(sessionKey: string, accountId: string) {
       } else {
         console.warn(`[AI] Could not resolve LID ${contactPhone}, will use LID as contact identifier`);
       }
+    }
+
+    // El cliente escribió: si hay un ciclo de IA en vuelo (generando o mandando
+    // chunks), lo cortamos. Esa respuesta contestaba lo anterior y ya quedó
+    // vieja; el buffer que se arma abajo generará una que sí atienda esto
+    // último. Simula lo que hace una persona al ver entrar un mensaje mientras
+    // escribe: se detiene y ajusta.
+    if (cancelAiCycle(sessionKey, contactPhone)) {
+      console.log(`[AI] Ciclo cancelado: el cliente ${contactPhone} escribió durante la respuesta`);
     }
 
     // Helper local: marca este mensaje como pendiente de respuesta humana
@@ -1196,8 +1220,10 @@ app.post('/generate-ai-response', express.json(), verifyHttpAuth(), async (req, 
     //
     // throwOnError + timeoutMs: SOLO el modo manual (copiloto). Así el operador
     // recibe un error tipado si algo falla, sin afectar al auto-responder.
+    // `throwOnError` hace que una respuesta truncada llegue como AiError
+    // ('truncated') en vez de volcar media frase al composer del operador.
     const startedAt = Date.now();
-    const suggestedText = await generateAIResponse(
+    const { text: suggestedText } = await generateAIResponse(
       aiConfig.apiKey,
       aiConfig.systemPrompt,
       history,
@@ -2210,6 +2236,12 @@ io.on('connection', (socket) => {
       console.warn('[Socket.io] Unauthorized or session not found for cancel_ai_buffer');
       socket.emit('ai_toggle_result', { success: false, message: 'Unauthorized' });
       return;
+    }
+
+    // Apagar la IA a mitad de un ciclo también corta la generación y los chunks
+    // que falten: si el operador la desactivó, no debe seguir escribiendo.
+    if (cancelAiCycle(sessionKey, contactPhone)) {
+      console.log(`[AI] Ciclo cancelado: IA desactivada para ${contactPhone}`);
     }
 
     const bufferKey = `${sessionKey}:${contactPhone}`;

@@ -132,6 +132,28 @@ Transiciones entre modos: `AnimatedSwitcher` 220ms para no saltar.
 
 ---
 
+## ✂️ Respuestas completas (defensa anti-truncamiento)
+
+Tres caminos distintos hacían que el cliente viera media respuesta. Los tres están cerrados en `aiService.ts`; si tocas esa zona, no los reabras.
+
+### 1. El techo de tokens del proveedor
+`AI_MAX_OUTPUT_TOKENS = 4000` para la ruta OpenAI-compatible. **Estaba en 1000 y era la causa raíz:** al agotarse, la API devuelve HTTP 200 con el texto cortado a media frase y `finish_reason: 'length'`, que nadie miraba. La ruta Gemini nunca mandó `maxOutputTokens` en generación (usa el default del modelo) y por eso jamás truncó — el límite existía solo donde fallaba.
+- Los modelos de razonamiento (GPT-5, familia o*) **descuentan sus tokens de pensamiento de ese mismo presupuesto**, así que un techo bajo los estrangula. Además rechazan `max_tokens` (exigen `max_completion_tokens`) y solo aceptan la temperatura por defecto: lo resuelve `isReasoningModel()`.
+- **Nunca entregar una respuesta con `truncated: true`.** El auto-responder no la envía y deriva a humano (`ai_truncated`); el copiloto lanza `AiError('truncated')` para que el operador no pegue media frase sin darse cuenta.
+
+### 2. El ciclo de IA es cancelable
+Un ciclo va desde que dispara el buffer hasta que sale el último chunk — pueden ser 10s. `activeAiCycles` permite cortarlo **durante la generación y entre chunks**: la respuesta contestaba lo anterior y ya nació vieja, así que se descarta y el buffer nuevo genera una que sí atienda lo último. Es lo que hace una persona al ver entrar un mensaje mientras escribe.
+- Cancelan: el cliente escribiendo, el humano respondiendo (CRM o celular) y `cancel_ai_buffer`.
+- Los chunks ya enviados se quedan; cancelar **no** resetea `unresponded_count` (el mensaje que interrumpió sigue pendiente).
+- El `finally` no emite `idle` si el ciclo fue cancelado: ya hay un ciclo nuevo y su indicador es el válido.
+
+### 3. Los chunks propios no son "el humano tomó el control"
+Cada chunk que manda la IA vuelve por `messages.upsert` como `fromMe`. Esa rama cancelaba el buffer que el cliente acababa de crear al escribir durante el envío: **su mensaje se perdía sin respuesta y sin quedar marcado como pendiente**. `isAiSentMessage(id)` (set con TTL de 60s, poblado al enviar cada chunk) desactiva ahí el cancel y el reset. No sirve `pendingSenders` para esto: `saveMessageToFirestore` lo consume y borra antes de que corra esa rama.
+
+**Chunking:** el envío en grupos de 2-3 párrafos con pausas es intencional y **no se toca** — humaniza la conversación. Un chunk que falla se reintenta una vez; si no sale, el chat se deriva a humano (`send_failed`) en vez de quedar mudo en un `console.error`.
+
+---
+
 ## 📱 Versión de WhatsApp Web (defensa anti-405)
 
 El backend se declara ante WhatsApp como una versión concreta de WhatsApp Web (`2.3000.<revisión>`). WhatsApp **corta las versiones viejas cada pocas semanas**, y cuando lo hace caen todas las sesiones a la vez con `405 Connection Failure` — sin poder siquiera generar un QR para revincular. Pasó el 28-jul-2026 con las 3 cuentas de producción.

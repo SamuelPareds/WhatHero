@@ -967,6 +967,9 @@ class _MessagesViewState extends State<MessagesView> {
         return 'La respuesta fue bloqueada por los filtros del modelo. Reformula con una instrucción.';
       case 'empty_response':
         return 'La IA no devolvió texto. Reintenta.';
+      case 'truncated':
+        // Preferimos no volcar media frase al composer sin que se note.
+        return 'La respuesta quedó cortada por su longitud. Reintenta o pide una más breve.';
       case 'empty_history':
         return 'No hay mensajes suficientes para generar una respuesta.';
       default:
