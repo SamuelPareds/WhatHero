@@ -202,6 +202,19 @@ El logger raíz (`index.ts`) aplica `redact` sobre los campos base64 gigantes de
 
 ---
 
+## 📦 Dependencias iOS: sólo Swift Package Manager
+
+**iOS no tiene CocoaPods.** No hay `ios/Podfile`, ni `Podfile.lock`, ni `Pods/`. Los 14 plugins con código nativo iOS —Firebase completo, `just_audio`, `file_picker`, `image_picker_ios`, `video_player_avfoundation`…— se resuelven por SPM a través de `ios/Flutter/ephemeral/Packages/FlutterGeneratedPluginSwiftPackage`, y hasta el propio engine llega por ahí (`FLUTTER_FRAMEWORK_SWIFT_PACKAGE_PATH`).
+
+- **Nunca correr `pod install` en `ios/`.** Recrea el estado híbrido: vuelve el `Pods/`, vuelven las dos fases `[CP] Check Pods Manifest.lock` —que corren en **cada** compilación sólo para diffear dos archivos— y Flutter re-inyecta el `#include? "Pods/…"` en los xcconfig. Antes de la limpieza el único pod que quedaba era el stub `Flutter (1.0.0)`: puro peaje sin carga.
+- **El centinela son los xcconfig.** `ios/Flutter/Debug.xcconfig` y `Release.xcconfig` deben tener **una sola línea**: `#include "Generated.xcconfig"`. Si reaparece el `#include?` de Pods, alguien dejó un `Podfile` **y** un `Podfile.lock` en `ios/`: con ambos presentes Flutter llama a `addPodsDependencyToFlutterXcconfig` y reescribe esa línea en el siguiente `pub get`. Borrar los dos, no uno.
+- **Al agregar un plugin nuevo, verificar que traiga `ios/<nombre>/Package.swift`.** Si sólo trae `.podspec`, Flutter avisa `do not support Swift Package Manager` y regenera el Podfile para ese plugin — se vuelve al híbrido. Buscar alternativa con SPM o asumir el retorno de CocoaPods a conciencia, no por accidente.
+- **`flutter clean` en iOS cuesta caro.** Los paquetes de Firebase no apuntan al pub cache sino a `build/ios/SourcePackages/`; borrar `build/` obliga a Xcode a re-resolver `firebase-ios-sdk` y ~19 paquetes remotos desde GitHub. Necesita red y el primer build siguiente se va largo. Es esperado, no es síntoma de que algo se rompió.
+- **`Runner.xcworkspace` se conserva** aunque no haya pods: la plantilla oficial de Flutter lo incluye y `flutter build` lo usa si existe. Debe referenciar **sólo** `Runner.xcodeproj`.
+- **macOS todavía usa CocoaPods**, aunque también tiene SPM activo y su `Podfile.lock` sólo trae `FlutterMacOS`. Se puede desintegrar igual el día que se retome esa plataforma.
+
+---
+
 ## 🤖 Reglas de Oro para el Desarrollo
 - **Objetivo real:** Optimiza para que el código sea *fácil de entender y mantener* por una persona nueva en el proyecto. Menos líneas y menos dependencias son medios para eso, no el objetivo: si una abstracción, estructura o cache hace el proyecto más entendible o más rápido donde importa, la inversión es válida aunque agregue código.
 - **Desafío técnico (con umbral):** Si mi propuesta tiene una alternativa significativamente más simple, robusta o rápida, dímelo ANTES de codear ("Existe una forma más sencilla...") y espera mi decisión. Si la diferencia es menor (estilo, micro-detalles, ±pocas líneas), decide tú por la opción simple y menciónalo brevemente al final — no me interrumpas por eso.
