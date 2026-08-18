@@ -57,6 +57,8 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
   // estas respuestas son canned, no generadas por la IA.
   List<Map<String, dynamic>> _botKeywordRules = [];
   bool _discriminatorEnabled = false;
+  // Default true: es el comportamiento que hace útil la bandeja del teléfono.
+  bool _markReadOnReply = true;
 
   // Allowlist de tipos de media que la IA puede leer. Por defecto todo en
   // false: la IA es solo-texto. En Fase 1 los toggles son read-only
@@ -174,6 +176,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
             }));
           }
 
+          _markReadOnReply = data['mark_read_on_reply'] ?? true;
           _discriminatorEnabled = data['ai_discriminator_enabled'] ?? false;
           _discriminatorPromptController.text = data['ai_discriminator_prompt'] ?? '';
 
@@ -222,6 +225,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
         // `bot_keyword_rules` NO se escribe aquí: las respuestas automáticas se
         // persisten al instante desde su editor (ver _persistRules), igual que
         // las etiquetas. Así no dependen del footer ni chocan con otras pestañas.
+        'mark_read_on_reply': _markReadOnReply,
         'ai_discriminator_enabled': _discriminatorEnabled,
         'ai_discriminator_prompt': _discriminatorPromptController.text.trim(),
         'ai_media_allowlist': {
@@ -382,6 +386,17 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
           const SizedBox(height: 16),
           _infoTile('ID de Sesión', widget.sessionId, Icons.fingerprint),
           _infoTile('Número Vinculado', '+${widget.sessionId}', Icons.chat_bubble_outline),
+          const SizedBox(height: 32),
+          _sectionTitle('Sincronización con WhatsApp'),
+          const SizedBox(height: 8),
+          const Text(
+            'Al responder un chat (tú o la IA) se limpia su "no leído" en el WhatsApp de tu teléfono. '
+            'Lo que siga sin leer allá es lo que de verdad falta atender: sin esto, la bandeja crece '
+            'sin techo y deja de servir para encontrar a quien te escribió.',
+            style: TextStyle(color: lightText, fontSize: 13),
+          ),
+          const SizedBox(height: 20),
+          _switchTile('Marcar como leído al responder', _markReadOnReply, (v) => setState(() => _markReadOnReply = v)),
         ],
       ),
     );

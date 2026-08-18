@@ -1763,11 +1763,36 @@ class _ChatsScreenState extends State<ChatsScreen> {
             {'unresponded_count': 0, 'marked_pending': false},
             SetOptions(merge: true),
           );
+
+      // El teléfono también tiene que enterarse. Si no, el chat se queda en
+      // negrita allá para siempre y ensucia justo la bandeja que usamos para
+      // pescar los mensajes que WhatsApp nunca le entregó a WhatHero.
+      unawaited(_markChatReadOnWhatsApp(contactPhone));
     } catch (e) {
       debugPrint('Error marking chat as responded: $e');
       if (mounted) {
         _showEtherealToast(false, 'Error al marcar', isActivating: false);
       }
+    }
+  }
+
+  // Confirma lectura en el WhatsApp del teléfono, sin enviar nada. Best-effort
+  // a propósito: el pendiente ya quedó cerrado en Firestore (que es lo que ve
+  // el operador), así que un fallo de red acá no merece molestarlo con un
+  // error. El backend respeta el switch `mark_read_on_reply` de la sesión.
+  Future<void> _markChatReadOnWhatsApp(String contactPhone) async {
+    try {
+      await http.post(
+        Uri.parse('$backendUrl/mark-chat-read'),
+        headers: await authHeaders(),
+        body: jsonEncode({
+          'phoneNumber': contactPhone,
+          'sessionKey': widget.sessionKey,
+          'accountId': widget.accountId,
+        }),
+      ).timeout(const Duration(seconds: 10));
+    } catch (e) {
+      debugPrint('No se pudo marcar leído en WhatsApp: $e');
     }
   }
 

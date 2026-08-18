@@ -1,3 +1,5 @@
+import type { WAMessageKey } from '@whiskeysockets/baileys';
+
 // Quién originó cada mensaje saliente. El frontend muestra `name` arriba del
 // bubble (ej. "Samuel", "ai", "bot", "WhatsApp"). El `type` es lo único que
 // consume el contexto del asistente/discriminador para decidir routing.
@@ -30,6 +32,10 @@ export interface SessionData {
   // messages.upsert lo consume para etiquetar el doc en Firestore. Si no hay
   // entry → el mensaje fue enviado desde el WhatsApp oficial del teléfono.
   pendingSenders: Map<string, SenderInfo>;
+  // Llaves de los mensajes entrantes que todavía NO confirmamos como leídos
+  // ante WhatsApp (contactPhone -> llaves). Se vacía al responderle al chat.
+  // Ver readReceiptService.ts para la política completa.
+  unreadKeys: Map<string, WAMessageKey[]>;
   aiConfig?: {
     enabled: boolean;
     apiKey: string;
@@ -78,6 +84,9 @@ export interface SessionData {
       video: boolean;
       document: boolean;
     };
+    // Confirmar lectura en WhatsApp al responderle a un chat. Vive acá porque
+    // getAIConfig ya cachea el doc de sesión 60s: leerlo no cuesta un read extra.
+    markReadOnReply: boolean;
     loadedAt: number;
   };
 }

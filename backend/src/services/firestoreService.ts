@@ -1232,6 +1232,9 @@ export async function getAIConfig(session: SessionData, accountId: string) {
         video:    rawAllowlist.video    === true,
         document: rawAllowlist.document === true,
       },
+      // Default true: es el comportamiento que hace útil la bandeja del
+      // teléfono. Quien no lo quiera lo apaga desde Ajustes de Sesión.
+      markReadOnReply: data?.mark_read_on_reply ?? true,
       loadedAt: now,
     };
 
@@ -1258,6 +1261,9 @@ export async function getAIConfig(session: SessionData, accountId: string) {
         video: false,
         document: false,
       },
+      // Fallamos cerrado: si no pudimos leer el doc, no tocamos el estado de
+      // lectura del teléfono. Se reintenta al vencer el TTL.
+      markReadOnReply: false,
       loadedAt: now,
     };
   }

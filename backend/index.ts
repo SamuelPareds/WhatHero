@@ -19,6 +19,7 @@ import { extractPhoneNumber, storeLIDMapping, resolveLIDViaSock, isConversationa
 import { unwrapMessageContent } from './src/utils/message';
 import { initializeSession, saveMessageToFirestore, getAIConfig, cacheContactName, applyContactUpdate, reconcileContactNames, consolidateLIDChat, incrementUnrespondedCount, resetUnrespondedCount, writeMediaIndexEntry, isIndexableMedia, writeMessageIndexEntry } from './src/services/firestoreService';
 import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer, emitAiState, getSessionTimezone, AiError, cancelAiCycle, isAiSentMessage } from './src/services/aiService';
+import { trackUnreadMessage, markChatAsReadIfEnabled, forgetChatUnread } from './src/services/readReceiptService';
 
 // Mapeo de códigos de AiError → HTTP para el endpoint manual (copiloto). El
 // frontend usa el `code` para mostrar un mensaje claro con acción "Reintentar".
@@ -258,6 +259,9 @@ async function startSession(sessionKey: string, accountId: string) {
     // Mismo criterio para el Map de senders pendientes: si la sesión vuelve
     // tras un reconnect, los envíos en vuelo conservan su intención.
     pendingSenders: existingSession?.pendingSenders ?? new Map(),
+    // Igual que pendingSenders: si la sesión vuelve tras un reconnect, lo que
+    // quedó sin confirmar como leído se confirma con la próxima respuesta.
+    unreadKeys: existingSession?.unreadKeys ?? new Map(),
     ...(existingSession?.aiConfig && { aiConfig: existingSession.aiConfig }),
   });
 
@@ -610,6 +614,18 @@ async function startSession(sessionKey: string, accountId: string) {
             await resetUnrespondedCount(accountId, sessionForReset.phoneNumber, contactPhoneForCancel);
           }
 
+          // Le respondimos a este chat → confirmamos lectura de lo que tenía
+          // pendiente. Este es el ÚNICO punto donde se emite el recibo por una
+          // respuesta, y cubre todas las vías de salida: CRM, IA, keyword
+          // rules, recordatorios, follow-ups y el celular del operador.
+          //
+          // Va SIN el guard `isOwnAiChunk` a propósito: si contestó la IA,
+          // contestamos nosotros. Los chunks 2 y 3 encuentran el registro ya
+          // vacío y no hacen nada, así que se deduplica solo.
+          if (sessionForReset) {
+            await markChatAsReadIfEnabled(sessionForReset, accountId, contactPhoneForCancel, 'respuesta enviada');
+          }
+
           // --- BOT KEYWORD RULES (trigger 'outgoing' / 'both') ---
           // Si el operador (vía WhatHero, WA Web o celular) escribió algo que
           // matchea una regla con trigger outgoing/both, enviamos el canned
@@ -684,6 +700,11 @@ async function startSession(sessionKey: string, accountId: string) {
         console.warn(`[AI] Could not resolve LID ${contactPhone}, will use LID as contact identifier`);
       }
     }
+
+    // Queda pendiente de confirmar como leído ante WhatsApp. Se registra acá,
+    // antes de cualquier corte por rancio o por IA no elegible: TODO entrante
+    // cuenta, y el recibo sale recién cuando le respondamos a este chat.
+    trackUnreadMessage(session, contactPhone, message.key);
 
     // ¿Este mensaje todavía merece respuesta automática? Tras una caída del
     // backend, el lote offline puede traer decenas de mensajes de hace horas.
@@ -1535,6 +1556,41 @@ app.post('/send-reaction', express.json(), verifyHttpAuth(), async (req, res) =>
   }
 });
 
+// Confirma lectura en WhatsApp de todo lo pendiente de un chat, sin enviar
+// nada. Lo usa el botón "Listo" del CRM: el operador cierra el pendiente sin
+// responder (ya lo atendió por otro canal, o no hacía falta contestar), y el
+// teléfono tiene que enterarse — si no, ese chat se queda en negrita para
+// siempre y ensucia justo la bandeja que estamos tratando de dejar limpia.
+//
+// Respeta el switch `mark_read_on_reply` de la sesión: si el usuario apagó el
+// marcado automático, tampoco queremos tocarle el estado de lectura desde acá.
+app.post('/mark-chat-read', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const { phoneNumber, sessionKey, accountId } = req.body;
+
+    if (!phoneNumber || !sessionKey || !accountId) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const session = sessions.get(sessionKey);
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+    if (session.accountId !== accountId) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    const marked = await markChatAsReadIfEnabled(session, accountId, phoneNumber, 'cerrado con "Listo"');
+    res.json({ success: true, marked });
+  } catch (error) {
+    console.error('[/mark-chat-read] Error:', error);
+    res.status(500).json({
+      error: 'Failed to mark chat as read',
+      details: (error as any).message,
+    });
+  }
+});
+
 // Borrado completo de un chat: Storage + mensajes + chat doc.
 // Hard-delete irreversible. La UI exige doble confirmación antes de invocar este endpoint.
 app.post('/delete-chat', express.json(), verifyHttpAuth(), async (req, res) => {
@@ -1596,6 +1652,9 @@ app.post('/delete-chat', express.json(), verifyHttpAuth(), async (req, res) => {
 
     // Paso 3: Chat doc.
     await chatRef.delete();
+
+    // El chat ya no existe: sus llaves pendientes de confirmar no le sirven a nadie.
+    forgetChatUnread(session, phoneNumber);
 
     console.log(`[/delete-chat] ${phoneNumber} eliminado (Account: ${accountId}, Session: ${sessionId}) — ${deletedMessages} mensajes, ${deletedFiles} archivos`);
 

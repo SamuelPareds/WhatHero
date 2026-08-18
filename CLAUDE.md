@@ -169,6 +169,25 @@ Un `messages.upsert` **no es un mensaje: es un lote**. Baileys bufferea los even
 
 ---
 
+## 👁️ Confirmaciones de lectura (la bandeja del teléfono como red de seguridad)
+
+WhatHero es un dispositivo vinculado: **todo mensaje que ingiere sigue contando como NO leído en el WhatsApp del teléfono** hasta que alguien emita el recibo. Nadie lo emitía, así que la bandeja crecía sin techo y dejaba de servir para nada — justo cuando es el único lugar donde aparecen los mensajes que WhatsApp nunca nos entregó.
+
+**Política (`backend/src/services/readReceiptService.ts`): se marca leído SÓLO cuando respondemos.** Un chat sin responder se queda no-leído **a propósito**. Así lo que sigue en negrita en el teléfono es exactamente lo que falta atender, y el filtro "No leídos" se vuelve una lista corta y accionable en vez de un cementerio.
+
+- **Un solo punto de emisión:** la rama `fromMe` de `messages.upsert`, junto al `resetUnrespondedCount` que ya vivía ahí. Cubre todas las vías de salida —CRM, IA, keyword rules, recordatorios, follow-ups y el celular del operador— sin hooks dispersos por cada entry point.
+- **Va SIN el guard `isOwnAiChunk`**, al revés que el reset del contador: si contestó la IA, contestamos nosotros. Los chunks 2 y 3 encuentran el registro vacío y no hacen nada, así que se deduplica solo.
+- **El registro (`session.unreadKeys`) se llena con TODO entrante**, antes de cualquier corte por rancio o por IA no elegible, y también con el switch apagado: si el usuario lo enciende, la primera respuesta arrastra lo acumulado. Topes de 50 llaves por chat y 2000 chats por sesión (evicción del más viejo) para que un proceso de semanas no se infle.
+- **`sock.readMessages()` respeta la privacidad de la cuenta sin preguntarla:** manda `'read'` (palomitas azules) si el usuario tiene las confirmaciones activadas y `'read-self'` si no. En ambos casos la bandeja del teléfono se limpia, así que la decisión **no se expone en la UI**.
+- **Un fallo de red devuelve las llaves al registro** para que el próximo envío reintente. Un blip no debe dejar el chat en negrita para siempre.
+- **`POST /mark-chat-read`** hace lo mismo sin enviar nada: lo usa el botón "Listo" del CRM, porque cerrar un pendiente sin responder también tiene que limpiar el teléfono. Respeta el mismo switch.
+
+**Coherencia con `unresponded_count`:** un recordatorio o follow-up saliente marca leído, igual que ya reseteaba el contador de pendientes. Todo saliente cuenta como "atendido" en ambos sistemas — si algún día eso cambia, tiene que cambiar en los dos a la vez.
+
+**Switch:** `mark_read_on_reply` en el doc de sesión, default `true`, editable en *Ajustes de Sesión → General → Sincronización con WhatsApp*. Se lee dentro de `getAIConfig` (que ya cachea el doc 60s) para no pagar un read extra. Si la config no se puede leer, falla cerrado: no se toca el estado de lectura del teléfono.
+
+---
+
 ## 📱 Versión de WhatsApp Web (defensa anti-405)
 
 El backend se declara ante WhatsApp como una versión concreta de WhatsApp Web (`2.3000.<revisión>`). WhatsApp **corta las versiones viejas cada pocas semanas**, y cuando lo hace caen todas las sesiones a la vez con `405 Connection Failure` — sin poder siquiera generar un QR para revincular. Pasó el 28-jul-2026 con las 3 cuentas de producción.
