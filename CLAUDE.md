@@ -154,6 +154,21 @@ Cada chunk que manda la IA vuelve por `messages.upsert` como `fromMe`. Esa rama 
 
 ---
 
+## 📥 Ingesta de mensajes entrantes (defensa anti-pérdida)
+
+Un `messages.upsert` **no es un mensaje: es un lote**. Baileys bufferea los eventos durante el handshake (`socket.js`, `ev.buffer()`) y los vacía de golpe cuando WhatsApp avisa que terminó de entregar lo pendiente (`CB:ib,,offline`). El backlog completo acumulado durante una caída llega en **un único evento con un array de N mensajes**.
+
+- **Nunca leer `m.messages[0]`.** Fue el bug: cada redespliegue de Railway, cada reconexión y cada blip de red descartaba en silencio todo el backlog menos el primer mensaje. El cliente los veía en su WhatsApp y para WhatHero nunca existieron. Sin log, sin contador, sin rastro.
+- El listener recorre **todo** `m.messages` de forma **secuencial** (los buffers de IA y los contadores de pendientes dependen del orden) y llama a `handleUpsertedMessage(raw, m.type)` con un `try/catch` **por mensaje**: uno que falle no puede llevarse puesto al resto del lote.
+- Log `[Upsert] Lote de N mensajes (type=…)` cuando `N > 1` — es el termómetro de cuánto backlog está entrando por reconexión.
+
+### Las tres guardas de `handleUpsertedMessage`
+1. **Stub `CIPHERTEXT` → se descarta con `console.warn`.** Baileys emite el mensaje aunque no lo haya podido descifrar y en paralelo le pide un reintento al emisor. Ingerirlo escribía una burbuja vacía y sumaba un pendiente fantasma que se volvía a sumar cuando llegaba el reintento ya descifrado. El warn (con el `key.id`) es el único rastro si el reintento nunca llega.
+2. **Dedupe por `key.id`** (`processedMessageIds`, TTL 10 min). El vaciado del backlog se solapa con el tráfico vivo y un mismo id puede re-entregarse; reprocesarlo duplicaba `unresponded_count` y podía hacer que la IA contestara dos veces. **El stub `CIPHERTEXT` sale ANTES de registrarse a propósito**, para que su reintento —mismo id, ya descifrado— sí se procese. Las ediciones, revokes y reacciones tienen id propio de sobre (el target va en `protocolMessage.key` / `targetMessageKey`), así que el dedupe no las toca.
+3. **Mensajes rancios no disparan automatismos.** `AI_STALE_MESSAGE_MINUTES` (default 15) define la ventana. Fuera de ella el mensaje se guarda y queda como pendiente, pero no dispara IA, keyword rules ni cancelación del ciclo en curso: llegó tarde a una conversación que ya siguió sin él, y la IA no sabe disculparse por una demora de tres horas. `type === 'prepend'` (relleno de historial) es siempre rancio. Un `messageTimestamp` ausente o ilegible se trata como fresco (fail-open: no bloqueamos una respuesta por un timestamp raro).
+
+---
+
 ## 📱 Versión de WhatsApp Web (defensa anti-405)
 
 El backend se declara ante WhatsApp como una versión concreta de WhatsApp Web (`2.3000.<revisión>`). WhatsApp **corta las versiones viejas cada pocas semanas**, y cuando lo hace caen todas las sesiones a la vez con `405 Connection Failure` — sin poder siquiera generar un QR para revincular. Pasó el 28-jul-2026 con las 3 cuentas de producción.

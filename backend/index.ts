@@ -6,6 +6,7 @@ import { Server } from 'socket.io';
 import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
+  proto,
   type ConnectionState
 } from '@whiskeysockets/baileys';
 import { pino } from 'pino';
@@ -147,6 +148,34 @@ setInterval(() => {
     if (now - ts > BOT_RULE_COOLDOWN_MS) botRuleCooldowns.delete(key);
   }
 }, 10 * 60 * 1000);
+
+// IDs de mensajes entrantes ya procesados. Un mismo id puede llegar dos veces:
+// el vaciado del backlog offline se solapa con el tráfico vivo, y un mensaje
+// que falló al descifrar vuelve tras el reintento. Reprocesarlo duplicaría el
+// contador de pendientes y podría hacer que la IA conteste dos veces.
+// TTL holgado: sólo tiene que cubrir la ventana de re-entrega de WhatsApp.
+const PROCESSED_ID_TTL_MS = 10 * 60 * 1000;
+const processedMessageIds = new Set<string>();
+
+function rememberProcessedMessage(messageId: string): void {
+  processedMessageIds.add(messageId);
+  setTimeout(() => processedMessageIds.delete(messageId), PROCESSED_ID_TTL_MS);
+}
+
+// Ventana en la que un mensaje entrante todavía merece respuesta automática.
+// Configurable por si un cliente prefiere que la IA conteste backlogs largos.
+const AI_FRESH_WINDOW_MS = Number(process.env.AI_STALE_MESSAGE_MINUTES ?? 15) * 60_000;
+
+// `messageTimestamp` viene en segundos y puede ser un Long de protobufjs.
+// null = no vino o no es usable → tratamos el mensaje como fresco (no
+// bloqueamos una respuesta por un timestamp raro).
+function messageAgeMs(message: any): number | null {
+  const raw = message?.messageTimestamp;
+  if (raw === undefined || raw === null) return null;
+  const seconds = typeof raw === 'number' ? raw : Number(raw.toNumber?.() ?? raw);
+  if (!Number.isFinite(seconds) || seconds <= 0) return null;
+  return Date.now() - seconds * 1000;
+}
 
 // Descarga una URL (Storage o externa) a Buffer para enviarla por Baileys.
 async function fetchToBuffer(url: string, label: string): Promise<Buffer> {
@@ -475,10 +504,33 @@ async function startSession(sessionKey: string, accountId: string) {
     }
   });
 
-  // Listen for incoming and outgoing messages
-  sock.ev.on('messages.upsert', async (m) => {
-    const rawMessage = m.messages?.[0];
-    if (!rawMessage) return;
+  // Procesa UN mensaje del lote. Vive como closure de startSession para
+  // conservar `sock`, `sessionKey` y `accountId` sin arrastrarlos por firma.
+  const handleUpsertedMessage = async (rawMessage: any, upsertType: string) => {
+    // Baileys emite el mensaje aunque no haya podido descifrarlo (stub
+    // CIPHERTEXT, sin contenido) y en paralelo le pide un reintento al emisor.
+    // Ingerirlo acá escribiría una burbuja vacía y sumaría un pendiente
+    // fantasma que se volvería a sumar cuando llegue el reintento descifrado.
+    // Lo dejamos pasar y lo logueamos: si el reintento nunca llega, este warn
+    // es el único rastro de que WhatsApp nos debía un mensaje.
+    if (rawMessage.messageStubType === proto.WebMessageInfo.StubType.CIPHERTEXT) {
+      console.warn(
+        `[Upsert] Mensaje no descifrado ${rawMessage.key?.id} en ${rawMessage.key?.remoteJid} ` +
+        `(${rawMessage.messageStubParameters?.[0] ?? 'sin detalle'}); esperando reintento`
+      );
+      return;
+    }
+
+    // Dedupe. El stub de arriba sale ANTES de registrarse a propósito: así su
+    // reintento, que trae el mismo id ya descifrado, sí llega a procesarse.
+    const upsertId = rawMessage.key?.id;
+    if (upsertId) {
+      if (processedMessageIds.has(upsertId)) {
+        console.log(`[Upsert] Duplicado ignorado: ${upsertId}`);
+        return;
+      }
+      rememberProcessedMessage(upsertId);
+    }
 
     // Desempaquetar sobres (ephemeral / viewOnce) una sola vez al entrar.
     // Así TODO el handler (detección de metadata, extracción de texto entrante,
@@ -633,18 +685,37 @@ async function startSession(sessionKey: string, accountId: string) {
       }
     }
 
+    // ¿Este mensaje todavía merece respuesta automática? Tras una caída del
+    // backend, el lote offline puede traer decenas de mensajes de hace horas.
+    // Contestarlos como si acabaran de llegar es peor que no contestarlos: la
+    // IA no sabe disculparse por la demora y el cliente ya siguió con su día.
+    // Se guardan igual (arriba) y quedan como pendientes para el humano.
+    // 'prepend' es relleno de historial: nunca dispara nada.
+    const ageMs = messageAgeMs(message);
+    const isStale = upsertType === 'prepend' || (ageMs !== null && ageMs > AI_FRESH_WINDOW_MS);
+
     // El cliente escribió: si hay un ciclo de IA en vuelo (generando o mandando
     // chunks), lo cortamos. Esa respuesta contestaba lo anterior y ya quedó
     // vieja; el buffer que se arma abajo generará una que sí atienda esto
     // último. Simula lo que hace una persona al ver entrar un mensaje mientras
-    // escribe: se detiene y ajusta.
-    if (cancelAiCycle(sessionKey, contactPhone)) {
+    // escribe: se detiene y ajusta. Un mensaje rancio no corta nada: llegó
+    // tarde a una conversación que ya siguió sin él.
+    if (!isStale && cancelAiCycle(sessionKey, contactPhone)) {
       console.log(`[AI] Ciclo cancelado: el cliente ${contactPhone} escribió durante la respuesta`);
     }
 
     // Helper local: marca este mensaje como pendiente de respuesta humana
     const markUnresponded = (by: number = 1) =>
       incrementUnrespondedCount(accountId, session.phoneNumber!, contactPhone, by);
+
+    // Rancio: ya quedó guardado y visible en el chat. Sólo lo dejamos marcado
+    // como pendiente para que el humano lo vea en el filtro y decida.
+    if (isStale) {
+      const edad = ageMs !== null ? `${Math.round(ageMs / 60000)} min` : upsertType;
+      console.log(`[Upsert] Mensaje rancio de ${contactPhone} (${edad}): sin auto-respuesta, queda pendiente`);
+      await markUnresponded();
+      return;
+    }
 
     const messageText = message.message?.conversation ||
                         message.message?.extendedTextMessage?.text || '';
@@ -933,6 +1004,31 @@ async function startSession(sessionKey: string, accountId: string) {
       messageBuffers.delete(bufferKey);
       console.log(`[Buffer] Cleared buffer for ${contactPhone}`);
     }, aiConfig.responseDelayMs);
+  };
+
+  // Un solo `messages.upsert` puede traer VARIOS mensajes. Baileys bufferea los
+  // eventos mientras dura el handshake y los vacía de golpe cuando WhatsApp
+  // avisa que terminó de entregar lo pendiente (`CB:ib,,offline`): TODO el
+  // backlog acumulado durante una caída llega en un único evento con un array.
+  // Leer sólo `m.messages[0]` descartaba el resto en silencio — mensajes que el
+  // cliente veía en su WhatsApp y que nunca existieron para WhatHero.
+  //
+  // Secuencial a propósito: los buffers de IA y los contadores de pendientes
+  // dependen del orden en que llegaron. El try/catch es por mensaje para que
+  // uno que falle no se lleve puesto al resto del lote.
+  sock.ev.on('messages.upsert', async (m) => {
+    const batch = m.messages ?? [];
+    if (batch.length > 1) {
+      console.log(`[Upsert] Lote de ${batch.length} mensajes (type=${m.type})`);
+    }
+    for (const raw of batch) {
+      if (!raw) continue;
+      try {
+        await handleUpsertedMessage(raw, m.type);
+      } catch (err) {
+        console.error(`[Upsert] Error procesando ${raw?.key?.id}:`, err);
+      }
+    }
   });
 
   // Store socket reference in session
