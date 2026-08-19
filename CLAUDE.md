@@ -226,6 +226,17 @@ El logger raíz (`index.ts`) aplica `redact` sobre los campos base64 gigantes de
 - **`Runner.xcworkspace` se conserva** aunque no haya pods: la plantilla oficial de Flutter lo incluye y `flutter build` lo usa si existe. Debe referenciar **sólo** `Runner.xcodeproj`.
 - **macOS todavía usa CocoaPods**, aunque también tiene SPM activo y su `Podfile.lock` sólo trae `FlutterMacOS`. Se puede desintegrar igual el día que se retome esa plataforma.
 
+### `file_picker` 12 y la cadena DKImagePickerController (ITMS-90683)
+
+`file_picker` ≤11 arrastra por SPM la cadena `DKImagePickerController → DKCamera`, y `DKCameraLocationManager.swift` llama a `CLLocationManager.requestWhenInUseAuthorization()`. Como se linkea estático dentro de `Runner`, el analizador de Apple ve la API y devuelve **ITMS-90683: Missing purpose string** exigiendo `NSLocationWhenInUseUsageDescription` — aunque ese código nunca corra. Pasó con el build 11 de la 1.1.1.
+
+- **Nunca se ejecutaba.** Los tres `_pickDocument()` usan `FileType.any` / `FileType.custom`, que en iOS abren `UIDocumentPickerViewController`. `DKImagePickerController` sólo entra con `FileType.media/image/video`, y las fotos las maneja `image_picker`. Eran 6 SDKs de terceros (DKImagePickerController, DKCamera, DKPhotoGallery, SDWebImage, SwiftyGif, TOCropViewController) linkeados sin dar servicio.
+- **Se resolvió subiendo a `file_picker: ^12.0.0`**, que borró toda la cadena (`dependencies: []` en su `Package.swift`). **No agregar el purpose string** para callar la advertencia: declara un permiso de ubicación que la app no usa y deja los 6 SDKs dentro del binario.
+- **Arrastra a `package_info_plus`, y no hay atajo.** `file_picker` 12 exige `win32 ^6.3.0`; `package_info_plus` 8 lo pinea `<6.0.0`. Por eso también subió a `^10`.
+- **El changelog de `package_info_plus` 9 asusta de más.** Dice exigir AGP ≥8.12.1, Gradle ≥8.13 y Kotlin 2.2.0, pero eso es el `buildscript` de su propio módulo, no un requisito para la app que lo consume: el `assembleRelease` pasa tal cual con Gradle 8.12 / AGP 8.9.1 / Kotlin 2.1.0. Verificado el 19-ago-2026. (Flutter sí avisa por su cuenta que va a dejar de soportar esas versiones — es un aviso preexistente y ajeno a este cambio.)
+- **No intentes cortar por lo sano con `dependency_overrides: win32: ^6.4.0`.** `flutter pub get` lo acepta y parece que funciona — pero `package_info_plus` 8 no compila contra win32 6.x (`GetFileVersionInfo` cambió de firma y devuelve `Win32Result<bool>`). Y aunque `file_version_info.dart` sea Windows-only en runtime, **`kernel_snapshot_program` type-checkea todo el grafo Dart sin importar la plataforma destino**, así que revienta también el build de iOS. Resolver dependencias no es compilar: verificar con un build real, no con `pub get`.
+- **`PlatformFile` cambió de forma en 12:** ya no expone `bytes` ni `extension`, sólo `name`, `uri`, `path`, `length()`, `readAsBytes()` y `readAsByteStream()`. Y `pickFiles()` pasó a `allowMultiple: true` por default — para selección única va `FilePicker.pickFile()`, que devuelve `PlatformFile?` directo. Ojo también con `FilePicker.platform`: desapareció, los métodos ahora son estáticos.
+
 ---
 
 ## 🤖 Reglas de Oro para el Desarrollo

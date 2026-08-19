@@ -7,7 +7,7 @@ import Foundation
 
 import audio_session
 import cloud_firestore
-import file_picker
+import file_picker_darwin
 import file_selector_macos
 import firebase_auth
 import firebase_core

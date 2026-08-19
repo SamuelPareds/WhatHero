@@ -233,6 +233,12 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
     });
   }
 
+  // PlatformFile dejó de exponer `extension` en file_picker 12: sólo hay `name`.
+  String _extOf(String name) {
+    final i = name.lastIndexOf('.');
+    return (i > 0 && i < name.length - 1) ? name.substring(i + 1).toLowerCase() : '';
+  }
+
   // Validación de seguridad: rechazar tipos peligrosos
   bool _isSafeFileType(String ext) {
     final dangerous = {'exe', 'bat', 'cmd', 'com', 'scr', 'vbs', 'js', 'jar', 'app', 'deb', 'rpm'};
@@ -241,23 +247,10 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
 
   Future<void> _pickDocument() async {
     try {
-      final result = await FilePicker.platform.pickFiles(
-        withData: true,
-        allowMultiple: false,
-      );
-      if (result == null || result.files.isEmpty) return;
+      final f = await FilePicker.pickFile();
+      if (f == null) return;
 
-      final f = result.files.first;
-      final bytes = f.bytes;
-      if (bytes == null) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('No se pudo leer el archivo')),
-          );
-        }
-        return;
-      }
-
+      final bytes = await f.readAsBytes();
       if (bytes.length > _maxDocumentBytes) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -267,7 +260,7 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
         return;
       }
 
-      final ext = (f.extension ?? '').toLowerCase();
+      final ext = _extOf(f.name);
       if (!_isSafeFileType(ext)) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(

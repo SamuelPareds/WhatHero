@@ -1613,15 +1613,13 @@ class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
   // Elige un documento PDF. Limpia la imagen (adjunto mutuamente excluyente).
   Future<void> _pickDocument() async {
     try {
-      final result = await FilePicker.platform.pickFiles(
+      final file = await FilePicker.pickFile(
         type: FileType.custom,
         allowedExtensions: ['pdf'],
-        withData: true, // necesitamos los bytes para subirlos a Storage
       );
-      if (result == null || result.files.isEmpty) return;
-      final file = result.files.single;
-      final bytes = file.bytes;
-      if (bytes == null) return;
+      if (file == null) return;
+      // readAsBytes: necesitamos los bytes para subirlos a Storage.
+      final bytes = await file.readAsBytes();
 
       if (bytes.length > _maxDocBytes) {
         if (mounted) {

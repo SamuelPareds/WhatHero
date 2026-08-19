@@ -731,22 +731,18 @@ class _MessagesViewState extends State<MessagesView> {
 
   Future<void> _pickDocument() async {
     try {
-      // withData: necesitamos los bytes en memoria (también en Web, donde no
-      // hay path de filesystem accesible).
-      final result = await FilePicker.platform.pickFiles(withData: true);
-      if (result == null || result.files.isEmpty) return;
-      final f = result.files.first;
-      final bytes = f.bytes;
-      if (bytes == null) {
-        _showAttachmentError('No se pudo leer el archivo');
-        return;
-      }
+      final f = await FilePicker.pickFile();
+      if (f == null) return;
+      // readAsBytes: necesitamos los bytes en memoria (también en Web, donde no
+      // hay path de filesystem accesible). El límite lo aplica
+      // _confirmAndSendAttachment, único guard de tamaño para los tres kinds.
+      final bytes = await f.readAsBytes();
       // Desde "Documento" siempre enviamos como archivo descargable, aunque
       // sea una imagen: el usuario quiere el original sin recomprimir.
       await _confirmAndSendAttachment(
         bytes: bytes,
         fileName: f.name,
-        ext: (f.extension ?? _extOf(f.name)).toLowerCase(),
+        ext: _extOf(f.name),
         kind: 'document',
       );
     } catch (e) {
