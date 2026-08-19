@@ -94,12 +94,37 @@ class _MessagesViewState extends State<MessagesView> {
 
   bool _isSending = false;
   bool _isGenerating = false;
+
+  // 📋 Selector de respuestas rápidas ("/filtro" en el composer).
+  // El panel es inline (se apila arriba del input, dentro del mismo Column) en
+  // vez de flotar en un Overlay: así queda anclado al composer aunque crezca.
+  // Con el cintillo de "respondiendo a…" o 6 líneas escritas, un panel con
+  // offset fijo terminaba tapando el propio input.
+  static const double _qrRowHeight = 44;
+  static const double _qrMaxHeight = _qrRowHeight * 4;
+
   String _quickResponseFilter = '';
-  OverlayEntry? _quickResponseOverlay;
+  // Catálogo completo de la sesión. Se lee UNA vez por apertura del selector y
+  // se filtra en memoria: antes había un .get() por tecla que, además de
+  // cobrar N lecturas por palabra, podía resolver fuera de orden y pintar una
+  // lista vieja encima de la nueva.
+  List<Map<String, dynamic>> _qrAll = [];
+  bool _qrLoaded = false;
+  bool _qrLoading = false;
+  // Lo que se ve ahora y cuál fila está resaltada (navegable con ↑/↓).
+  List<Map<String, dynamic>> _qrFiltered = [];
+  int _qrIndex = 0;
+  // Esc cierra el panel sin borrar el "/filtro" ya escrito; sin esta bandera
+  // la siguiente tecla lo reabriría y el Esc no serviría de nada.
+  bool _qrDismissed = false;
+  final ScrollController _qrScroll = ScrollController();
   // Rango del token "/filtro" activo en el composer (para reemplazarlo en su
   // sitio al insertar, sin pisar el resto del texto). Se guarda al escribir
-  // porque al tocar el overlay el TextField puede perder el foco/selección.
+  // porque al tocar el panel el TextField puede perder el foco/selección.
   TextRange? _activeTokenRange;
+
+  // Panel abierto ⇢ el teclado le pertenece (flechas, Enter, Tab, Esc).
+  bool get _qrOpen => _qrFiltered.isNotEmpty;
 
   // Seguimiento de ventas: si este chat fue encolado por el agente, al abrirlo
   // pre-llenamos el composer con el borrador y mostramos un cintillo. true
@@ -226,7 +251,7 @@ class _MessagesViewState extends State<MessagesView> {
     _messageController.dispose();
     _hasText.dispose();
     _scrollController.dispose();
-    _quickResponseOverlay?.remove();
+    _qrScroll.dispose();
     _replyDraft.dispose();
     _isFollowupChat.dispose();
     _inputFocusNode.dispose();
@@ -543,6 +568,10 @@ class _MessagesViewState extends State<MessagesView> {
       ),
     );
     _messageController.clear();
+    // clear() no dispara onChanged, así que el selector no se entera solo.
+    _activeTokenRange = null;
+    _qrDismissed = false;
+    _closeQuickResponses();
     _clearReplyDraft();
     if (wasFollowup) _markFollowupSent();
     _scrollToNewest();
@@ -1129,18 +1158,32 @@ class _MessagesViewState extends State<MessagesView> {
 
     if (token == null) {
       _activeTokenRange = null;
-      _quickResponseOverlay?.remove();
-      _quickResponseOverlay = null;
+      // El "/" desapareció: el próximo vuelve a abrir el panel aunque el
+      // anterior se hubiera cerrado con Esc.
+      _qrDismissed = false;
+      _closeQuickResponses();
       return;
     }
 
+    // Un "/" en otra posición es otra invocación: el Esc anterior no la ata.
+    if (_activeTokenRange?.start != token.start) _qrDismissed = false;
     _activeTokenRange = token;
-    final filter = value.substring(token.start + 1, token.end).toLowerCase();
-    setState(() => _quickResponseFilter = filter);
-    _showQuickResponsesOverlay();
+    if (_qrDismissed) return; // cerrado a mano: no reaparece solo
+    _quickResponseFilter =
+        value.substring(token.start + 1, token.end).toLowerCase();
+
+    if (_qrLoaded) {
+      _applyQuickResponseFilter();
+    } else {
+      _loadQuickResponses();
+    }
   }
 
-  void _showQuickResponsesOverlay() async {
+  // Una sola lectura por apertura del selector: el catálogo entra en memoria y
+  // las teclas siguientes sólo filtran sobre lo ya cargado.
+  Future<void> _loadQuickResponses() async {
+    if (_qrLoading) return; // ya hay una en vuelo: al resolver filtra lo último
+    _qrLoading = true;
     try {
       final snapshot = await FirebaseFirestore.instance
           .collection(accountsCollection)
@@ -1152,95 +1195,177 @@ class _MessagesViewState extends State<MessagesView> {
           .get();
 
       if (!mounted) return;
+      // El token pudo morir mientras volaba el .get() (borró el "/", envió el
+      // mensaje o cerró con Esc): no abrimos un panel que ya nadie pidió.
+      if (_activeTokenRange == null || _qrDismissed) return;
 
-      final allResponses = snapshot.docs
-          .map((doc) => {...doc.data(), 'id': doc.id})
-          .toList();
+      _qrAll = snapshot.docs.map((doc) => {...doc.data(), 'id': doc.id}).toList();
+      _qrLoaded = true;
+      _applyQuickResponseFilter();
+    } catch (e) {
+      debugPrint('Error loading quick responses: $e');
+    } finally {
+      _qrLoading = false;
+    }
+  }
 
-      final filtered = allResponses
-          .where((qr) {
-            final title = (qr['title'] as String? ?? '').toLowerCase();
-            return title.contains(_quickResponseFilter);
-          })
-          .toList();
+  void _applyQuickResponseFilter() {
+    final filtered = _qrAll.where((qr) {
+      final title = (qr['title'] as String? ?? '').toLowerCase();
+      return title.contains(_quickResponseFilter);
+    }).toList();
 
-      _quickResponseOverlay?.remove();
+    setState(() {
+      _qrFiltered = filtered;
+      _qrIndex = 0; // otra lista, el resaltado vuelve arriba
+    });
+    if (_qrScroll.hasClients) _qrScroll.jumpTo(0);
+  }
 
-      if (filtered.isEmpty) {
-        _quickResponseOverlay = null;
-        return;
-      }
+  // `dismissed: true` sólo cuando lo cierra el usuario con Esc. Soltar el
+  // catálogo hace que la próxima apertura relea (así se ven al instante las
+  // respuestas que se acaban de editar en Ajustes).
+  void _closeQuickResponses({bool dismissed = false}) {
+    if (dismissed) _qrDismissed = true;
+    _qrAll = [];
+    _qrLoaded = false;
+    if (_qrFiltered.isEmpty) return;
+    setState(() {
+      _qrFiltered = [];
+      _qrIndex = 0;
+    });
+  }
 
-      _quickResponseOverlay = OverlayEntry(
-        builder: (context) => Positioned(
-          bottom: MediaQuery.of(context).viewInsets.bottom + 140,
-          left: 12,
-          right: 12,
-          child: Material(
-            color: Colors.transparent,
-            child: Container(
-              decoration: BoxDecoration(
-                color: surfaceDark,
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: primaryAqua.withValues(alpha: 0.2)),
-                boxShadow: [
-                  BoxShadow(color: Colors.black.withValues(alpha: 0.3), blurRadius: 12, offset: const Offset(0, 2)),
-                ],
+  // ↑/↓ con vuelta al otro extremo: en una lista corta llegar al último
+  // subiendo desde el primero es más rápido que recorrerla entera.
+  void _moveQuickResponseSelection(int delta) {
+    if (_qrFiltered.isEmpty) return;
+    final len = _qrFiltered.length;
+    setState(() => _qrIndex = (_qrIndex + delta + len) % len);
+    _ensureQuickResponseVisible();
+  }
+
+  // Con filas de alto fijo, "traer a la vista" es aritmética pura: no hace
+  // falta esperar al layout ni sembrar una GlobalKey por fila.
+  void _ensureQuickResponseVisible() {
+    if (!_qrScroll.hasClients) return;
+    final top = _qrIndex * _qrRowHeight;
+    final bottom = top + _qrRowHeight;
+    final offset = _qrScroll.offset;
+    final viewport = _qrScroll.position.viewportDimension;
+
+    double? target;
+    if (top < offset) {
+      target = top;
+    } else if (bottom > offset + viewport) {
+      target = bottom - viewport;
+    }
+    if (target == null) return;
+    // jumpTo, no animateTo: mantener pulsada la flecha dispara repeticiones a
+    // ~30/s y las animaciones encoladas se sentirían como un arrastre pastoso.
+    _qrScroll.jumpTo(target.clamp(0.0, _qrScroll.position.maxScrollExtent));
+  }
+
+  // El panel vive dentro del Column del composer: al abrirse encoge la
+  // conversación en vez de flotar sobre ella. La lista de mensajes es
+  // `reverse: true`, así que el mensaje más nuevo sigue clavado abajo y no hay
+  // salto de scroll.
+  Widget _quickResponsesPanel() {
+    if (!_qrOpen) return const SizedBox.shrink();
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      constraints: const BoxConstraints(maxHeight: _qrMaxHeight),
+      decoration: BoxDecoration(
+        color: darkBg.withValues(alpha: 0.6),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: primaryAqua.withValues(alpha: 0.2)),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: ListView.builder(
+        controller: _qrScroll,
+        padding: EdgeInsets.zero,
+        shrinkWrap: true,
+        itemExtent: _qrRowHeight,
+        itemCount: _qrFiltered.length,
+        itemBuilder: (_, idx) => _quickResponseRow(_qrFiltered[idx], idx),
+      ),
+    );
+  }
+
+  Widget _quickResponseRow(Map<String, dynamic> qr, int idx) {
+    final selected = idx == _qrIndex;
+    final isLast = idx == _qrFiltered.length - 1;
+    final title = qr['title'] as String? ?? '';
+    // Vista previa en una línea: los saltos se aplanan para que el texto no
+    // se corte en la primera frase corta de una plantilla larga.
+    final preview = (qr['text'] as String? ?? '').replaceAll('\n', ' ').trim();
+    final imageUrl = qr['imageUrl'] as String? ?? '';
+    final documentName = qr['documentName'] as String? ?? '';
+
+    return MouseRegion(
+      // El hover mueve el MISMO resaltado que las flechas: con dos highlights
+      // independientes no se sabría cuál se lleva el Enter.
+      onEnter: (_) {
+        if (_qrIndex != idx) setState(() => _qrIndex = idx);
+      },
+      child: InkWell(
+        // Sin foco propio: el clic no debe quitárselo al composer.
+        canRequestFocus: false,
+        onTap: () => _selectQuickResponse(qr),
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(8, 4, 10, 4),
+          decoration: BoxDecoration(
+            color: selected ? primaryAqua.withValues(alpha: 0.12) : null,
+            border: Border(
+              left: BorderSide(
+                color: selected ? primaryAqua : Colors.transparent,
+                width: 2,
               ),
-              constraints: const BoxConstraints(maxHeight: 160),
-              child: ListView.separated(
-                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-                itemCount: filtered.length,
-                separatorBuilder: (_, __) => Divider(color: primaryAqua.withValues(alpha: 0.1), height: 1, indent: 8, endIndent: 8),
-                itemBuilder: (_, idx) {
-                  final qr = filtered[idx];
-                  final title = qr['title'] as String? ?? '';
-                  final text = qr['text'] as String? ?? '';
-                  final imageUrl = qr['imageUrl'] as String? ?? '';
-                  final documentName = qr['documentName'] as String? ?? '';
-
-                  return InkWell(
-                    onTap: () => _selectQuickResponse(qr),
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(title, style: const TextStyle(color: primaryAqua, fontWeight: FontWeight.w600, fontSize: 12), maxLines: 1, overflow: TextOverflow.ellipsis),
-                                if (text.isNotEmpty)
-                                  Padding(
-                                    padding: const EdgeInsets.only(top: 2),
-                                    child: Text(text.substring(0, (text.length < 40 ? text.length : 40)), style: TextStyle(color: lightText.withValues(alpha: 0.5), fontSize: 10), maxLines: 1, overflow: TextOverflow.ellipsis),
-                                  ),
-                              ],
-                            ),
-                          ),
-                          if (imageUrl.isNotEmpty) ...[
-                            const SizedBox(width: 4),
-                            Icon(Icons.image, size: 14, color: primaryAqua.withValues(alpha: 0.6)),
-                          ],
-                          if (documentName.isNotEmpty) ...[
-                            const SizedBox(width: 4),
-                            Icon(Icons.description, size: 14, color: primaryAqua.withValues(alpha: 0.6)),
-                          ],
-                        ],
-                      ),
-                    ),
-                  );
-                },
+              bottom: BorderSide(
+                color: isLast ? Colors.transparent : primaryAqua.withValues(alpha: 0.1),
               ),
             ),
           ),
+          child: Row(
+            children: [
+              Expanded(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: const TextStyle(color: primaryAqua, fontWeight: FontWeight.w600, fontSize: 12),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    if (preview.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 2),
+                        child: Text(
+                          preview,
+                          style: TextStyle(color: lightText.withValues(alpha: 0.5), fontSize: 10),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              if (imageUrl.isNotEmpty) ...[
+                const SizedBox(width: 4),
+                Icon(Icons.image, size: 14, color: primaryAqua.withValues(alpha: 0.6)),
+              ],
+              if (documentName.isNotEmpty) ...[
+                const SizedBox(width: 4),
+                Icon(Icons.description, size: 14, color: primaryAqua.withValues(alpha: 0.6)),
+              ],
+            ],
+          ),
         ),
-      );
-
-      Overlay.of(context).insert(_quickResponseOverlay!);
-    } catch (e) {
-      debugPrint('Error loading quick responses: $e');
-    }
+      ),
+    );
   }
 
   void _selectQuickResponse(Map<String, dynamic> template) {
@@ -1250,8 +1375,7 @@ class _MessagesViewState extends State<MessagesView> {
     final documentName = template['documentName'] as String? ?? '';
     final title = template['title'] as String? ?? '';
 
-    _quickResponseOverlay?.remove();
-    _quickResponseOverlay = null;
+    _closeQuickResponses();
 
     if (documentUrl.isNotEmpty) {
       _showDocumentConfirmationDialog(title, text, documentUrl, documentName);
@@ -1645,6 +1769,9 @@ class _MessagesViewState extends State<MessagesView> {
                 return Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
+                    // Selector de respuestas rápidas ("/"): arriba de todo,
+                    // pegado al composer y navegable con ↑/↓ + Enter.
+                    _quickResponsesPanel(),
                     // Cintillo del agente de seguimiento: aparece cuando el chat
                     // trae un borrador encolado. Comunica que el texto del
                     // composer es una propuesta editable, y ofrece descartarla.
@@ -1775,8 +1902,45 @@ class _MessagesViewState extends State<MessagesView> {
                     ),
                     Expanded(
                       child: Focus(
+                        // Este Focus está por DEBAJO de DefaultTextEditingShortcuts
+                        // en el árbol, así que ve las teclas antes que el
+                        // TextField: por eso puede quedarse con las flechas
+                        // (que si no moverían el cursor) y con el Enter.
                         onKeyEvent: (node, event) {
-                          if (event.logicalKey == LogicalKeyboardKey.enter && !HardwareKeyboard.instance.isShiftPressed && event is KeyDownEvent) {
+                          final key = event.logicalKey;
+                          final isPress = event is KeyDownEvent;
+                          // Las flechas también aceptan repetición: mantenerlas
+                          // pulsadas recorre la lista.
+                          final isPressOrRepeat = isPress || event is KeyRepeatEvent;
+                          final shift = HardwareKeyboard.instance.isShiftPressed;
+
+                          // Con el selector de respuestas rápidas abierto, el
+                          // teclado le pertenece a él.
+                          if (_qrOpen) {
+                            if (isPressOrRepeat && key == LogicalKeyboardKey.arrowDown) {
+                              _moveQuickResponseSelection(1);
+                              return KeyEventResult.handled;
+                            }
+                            if (isPressOrRepeat && key == LogicalKeyboardKey.arrowUp) {
+                              _moveQuickResponseSelection(-1);
+                              return KeyEventResult.handled;
+                            }
+                            if (isPress && key == LogicalKeyboardKey.escape) {
+                              // Cierra el panel pero deja el "/filtro" escrito:
+                              // si de verdad querías mandar ese texto, Enter ya
+                              // lo envía en vez de elegir una plantilla.
+                              _closeQuickResponses(dismissed: true);
+                              return KeyEventResult.handled;
+                            }
+                            if (isPress &&
+                                (key == LogicalKeyboardKey.tab ||
+                                    (key == LogicalKeyboardKey.enter && !shift))) {
+                              _selectQuickResponse(_qrFiltered[_qrIndex]);
+                              return KeyEventResult.handled;
+                            }
+                          }
+
+                          if (isPress && key == LogicalKeyboardKey.enter && !shift) {
                             _sendMessage();
                             return KeyEventResult.handled;
                           }
