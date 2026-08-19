@@ -8,7 +8,7 @@ enum PendingStatus {
   sending,
 
   /// Backend confirmó el envío (tenemos messageId real) pero el doc todavía
-  /// no llega por el stream de Firestore → ✓✓ desde ya; la burbuja local se
+  /// no llega por el stream de Firestore → ✓ desde ya; la burbuja local se
   /// retira sola cuando el doc real aparece (cero flicker, cero duplicados).
   sent,
 

@@ -834,6 +834,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
     final contactName = chatData?['contactName'] as String? ?? '';
     final lastMessage = chatData?['lastMessage'] ?? 'Sin mensajes';
     final timestamp = (chatData?['lastMessageTimestamp'] as Timestamp?)?.toDate();
+    // null en chats que no reciben un mensaje desde antes de este campo: el
+    // tile simplemente no pinta ✓ y se auto-repara con el siguiente mensaje.
+    final lastMessageFromMe = chatData?['lastMessageFromMe'] as bool?;
     final unrespondedCount = (chatData?['unresponded_count'] as num?)?.toInt() ?? 0;
     final markedPending = chatData?['marked_pending'] as bool? ?? false;
     // Un chat está "pendiente" por la señal automática o por la marca
@@ -848,6 +851,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
       phoneNumber: phoneNumber,
       contactName: contactName,
       lastMessage: lastMessage,
+      lastMessageFromMe: lastMessageFromMe,
       timestamp: timestamp,
       isSelected: selectedChatPhone == phoneNumber,
       unrespondedCount: unrespondedCount,
@@ -2233,6 +2237,10 @@ class _ChatTile extends StatelessWidget {
   final String phoneNumber;
   final String contactName;
   final String lastMessage;
+  // Dirección del último mensaje. true → ✓ antes del preview (salió de
+  // nosotros); false → sin marca (habló el cliente, igual que WhatsApp).
+  // null → chat sin mensajes nuevos desde que existe el campo: sin marca.
+  final bool? lastMessageFromMe;
   final DateTime? timestamp;
   final bool isSelected;
   final int unrespondedCount;
@@ -2253,6 +2261,7 @@ class _ChatTile extends StatelessWidget {
     required this.phoneNumber,
     required this.contactName,
     required this.lastMessage,
+    required this.lastMessageFromMe,
     required this.timestamp,
     required this.isSelected,
     required this.unrespondedCount,
@@ -2439,15 +2448,33 @@ class _ChatTile extends StatelessWidget {
                     ],
                   ),
                   const SizedBox(height: 4),
-                  Text(
-                    lastMessage,
-                    style: const TextStyle(
-                      fontSize: 12,
-                      color: lightText,
-                      height: 1.4,
-                    ),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
+                  // Preview del último mensaje. Si salió de nosotros lleva ✓
+                  // delante; el entrante va limpio. Esa asimetría (la misma de
+                  // WhatsApp) es la que deja leer la dirección de un vistazo:
+                  // sin palomita = habló el cliente = probablemente tu turno.
+                  Row(
+                    children: [
+                      if (lastMessageFromMe == true) ...[
+                        Icon(
+                          Icons.done,
+                          size: 14,
+                          color: lightText.withValues(alpha: 0.7),
+                        ),
+                        const SizedBox(width: 4),
+                      ],
+                      Expanded(
+                        child: Text(
+                          lastMessage,
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: lightText,
+                            height: 1.4,
+                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
                   ),
                   // Etiquetas + nota en UNA línea a lo ancho del Expanded.
                   // Las etiquetas toman su ancho (acotado al 50% para no

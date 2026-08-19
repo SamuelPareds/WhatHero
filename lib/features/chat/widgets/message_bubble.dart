@@ -348,12 +348,24 @@ class _MessageBubbleState extends State<MessageBubble> {
             const SizedBox(height: 6),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 12),
-              child: Text(
-                _formatTime(widget.timestamp),
-                style: const TextStyle(
-                    color: lightText,
-                    fontSize: 12,
-                    fontWeight: FontWeight.w400),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    _formatTime(widget.timestamp),
+                    style: const TextStyle(
+                        color: lightText,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w400),
+                  ),
+                  // Mismo ✓ que el resto de los salientes. Los stickers nunca
+                  // pasan por burbuja optimista, así que no hay estado en vuelo.
+                  if (widget.fromMe) ...[
+                    const SizedBox(width: 4),
+                    Icon(Icons.done,
+                        size: 14, color: lightText.withValues(alpha: 0.7)),
+                  ],
+                ],
               ),
             ),
           ],
@@ -1611,8 +1623,14 @@ class _MessageBubbleState extends State<MessageBubble> {
                   // Estado de envío al estilo WhatsApp, solo en salientes:
                   //   🕓 relojito  → en vuelo (burbuja optimista 'pending')
                   //   ✕ rojo      → falló; el tap en la burbuja abre reintentar
-                  //   ✓✓ gris     → confirmado ('sent' o mensaje real de Firestore:
+                  //   ✓ gris      → salió ('sent' o mensaje real de Firestore:
                   //                 si está en la DB es que WhatsApp lo aceptó)
+                  //
+                  // Es ✓ simple a propósito, NO ✓✓. No rastreamos acks de
+                  // entrega ni de lectura (no hay listener de `messages.update`
+                  // en el backend), así que lo único que sabemos es que salió —
+                  // que es justo lo que significa una palomita sola en WhatsApp.
+                  // Un ✓✓ aquí prometería "entregado al cliente" y sería mentira.
                   if (widget.fromMe) ...[
                     const SizedBox(width: 4),
                     if (widget.sendStatus == 'pending')
@@ -1622,7 +1640,7 @@ class _MessageBubbleState extends State<MessageBubble> {
                       const Icon(Icons.error_outline,
                           size: 14, color: Color(0xFFF87171))
                     else
-                      Icon(Icons.done_all,
+                      Icon(Icons.done,
                           size: 14, color: lightText.withValues(alpha: 0.7)),
                   ],
                 ],

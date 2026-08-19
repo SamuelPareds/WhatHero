@@ -392,6 +392,7 @@ export async function recalcChatLastMessage(
       lastMessage: admin.firestore.FieldValue.delete(),
       lastMessageTimestamp: admin.firestore.FieldValue.delete(),
       lastMessageId: admin.firestore.FieldValue.delete(),
+      lastMessageFromMe: admin.firestore.FieldValue.delete(),
     });
     console.log(`[recalcChatLastMessage] chat ${phoneNumber} sin mensajes restantes, campos limpiados`);
     return;
@@ -403,6 +404,7 @@ export async function recalcChatLastMessage(
     lastMessage: (newestData.text as string | undefined)?.substring(0, 100) ?? '',
     lastMessageTimestamp: newestData.timestamp ?? admin.firestore.FieldValue.delete(),
     lastMessageId: newest.id,
+    lastMessageFromMe: !!newestData.fromMe,
   });
   console.log(`[recalcChatLastMessage] chat ${phoneNumber} → último ahora ${newest.id}`);
 }
@@ -896,6 +898,10 @@ export async function saveMessageToFirestore(
       lastMessage: lastMessagePreview.substring(0, 100),
       lastMessageTimestamp: msgTimestamp,
       lastMessageId: messageId,
+      // Dirección del último mensaje: la lista de chats pinta ✓ antes del
+      // preview cuando salió de nosotros (estilo WhatsApp). Viaja en este mismo
+      // write, así que no cuesta un write extra.
+      lastMessageFromMe: !!message.key.fromMe,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     };
     if (cachedNameForIndex) {

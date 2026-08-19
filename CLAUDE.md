@@ -188,6 +188,19 @@ WhatHero es un dispositivo vinculado: **todo mensaje que ingiere sigue contando 
 
 ---
 
+## ✓ Dirección del mensaje (una palomita, y sólo una)
+
+El operador tiene que poder distinguir de un vistazo lo que **salió** de lo que **entró**. Se resuelve con el mismo patrón asimétrico de WhatsApp: el saliente lleva ✓ delante, el entrante va limpio. Sin palomita = habló el cliente = probablemente es tu turno.
+
+- **Es `Icons.done` (✓), NUNCA `Icons.done_all` (✓✓).** No rastreamos acks: no hay listener de `messages.update` ni de `message-receipt.update` en el backend, así que lo único que sabemos de un saliente es que WhatsApp lo aceptó — que es exactamente lo que significa una palomita sola. Un ✓✓ prometería "entregado al dispositivo del cliente" y sería mentira. **Si alguien lo "arregla" a ✓✓ para parecerse más a WhatsApp, está reintroduciendo el bug.**
+- **Dos lugares, un solo significado:** la burbuja saliente (`message_bubble.dart`, junto al timestamp — incluye stickers) y el preview de la lista de chats (`_ChatTile` en `chats_screen.dart`). La sección "Chats" del buscador lo hereda porque reusa `_buildChatTile`.
+- **En la burbuja el ✓ convive con dos estados en vuelo** que vienen de `PendingMessagesService`: 🕓 `pending` (emitido, sin ack del backend) y ✕ rojo `failed` (tap → reintentar). El ✓ es el estado confirmado; un mensaje que ya está en Firestore siempre lo tiene.
+- **La lista lee `lastMessageFromMe`** del chat doc, escrito por `saveMessageToFirestore` dentro del `set` que ya hacía (cero writes extra) y recalculado por `recalcChatLastMessage` cuando se borra el último mensaje. **Es `bool?`: `null` en chats sin mensajes nuevos desde que existe el campo** → no se pinta nada y se auto-repara con el siguiente mensaje. No se hizo backfill a propósito: un chat sin actividad es un chat que nadie está mirando.
+
+**Palomitas reales (entregado / leído) son Fase 2 y no están hechas.** Costo real: listener de `messages.update` + `message-receipt.update` (este último obligatorio para grupos, hay que agregar por participante), campo `status` con guarda monotónica (los acks llegan desordenados y un `delivered` tardío no puede pisar un `read`), +2 writes por saliente sobre los 3 actuales —multiplicado por chunk, y la IA manda 2-3 por respuesta— y +2 reads por cliente conectado. Se difiere hasta que un operador pregunte "¿le llegó?", no antes.
+
+---
+
 ## 📱 Versión de WhatsApp Web (defensa anti-405)
 
 El backend se declara ante WhatsApp como una versión concreta de WhatsApp Web (`2.3000.<revisión>`). WhatsApp **corta las versiones viejas cada pocas semanas**, y cuando lo hace caen todas las sesiones a la vez con `405 Connection Failure` — sin poder siquiera generar un QR para revincular. Pasó el 28-jul-2026 con las 3 cuentas de producción.
