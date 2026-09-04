@@ -15,7 +15,7 @@ import { rmSync, existsSync, readdirSync, writeFileSync, readFileSync, mkdirSync
 import { randomUUID } from 'crypto';
 import cron from 'node-cron';
 import { SessionData, MessageBuffer } from './src/types';
-import { extractPhoneNumber, storeLIDMapping, resolveLIDViaSock, isConversationalJid } from './src/utils/phone';
+import { extractPhoneNumber, storeLIDMapping, resolveLIDViaSock, isConversationalJid, waNumberCandidates } from './src/utils/phone';
 import { unwrapMessageContent } from './src/utils/message';
 import { initializeSession, saveMessageToFirestore, getAIConfig, cacheContactName, applyContactUpdate, reconcileContactNames, consolidateLIDChat, incrementUnrespondedCount, resetUnrespondedCount, writeMediaIndexEntry, isIndexableMedia, writeMessageIndexEntry } from './src/services/firestoreService';
 import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer, emitAiState, getSessionTimezone, AiError, cancelAiCycle, isAiSentMessage } from './src/services/aiService';
@@ -1246,6 +1246,147 @@ app.post('/send-message', express.json(), verifyHttpAuth(), async (req, res) => 
       error: 'Failed to send message',
       details: (error as any).message,
     });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Verificar un número antes de abrir un chat con alguien que nunca escribió.
+//
+// Sin esta verificación hay dos fallas silenciosas, y las dos terminan con el
+// operador esperando una respuesta que nunca va a llegar:
+//
+//   1. Número sin WhatsApp: el envío se acepta, el eco vuelve y se crea el
+//      chat doc con el mensaje adentro, palomita ✓ incluida. Todo parece bien.
+//   2. México/Argentina: si mandamos a la variante equivocada ('52' vs '521'),
+//      el eco vuelve con el JID que WhatsApp considera bueno y el mensaje se
+//      guarda en OTRO chat doc del que la app está mostrando.
+//
+// Ninguna de las dos se arregla con una tabla de prefijos más lista. Se
+// arreglan preguntándole a WhatsApp: `onWhatsApp` devuelve el JID canónico y
+// filtra los que no existen. Mismo principio que `resolveWaVersion()` — no
+// adivinamos, preguntamos.
+// ---------------------------------------------------------------------------
+
+// Consultar números en masa es la firma de un spammer y WhatsApp banea cuentas
+// por eso. Este endpoint se dispara SÓLO con acción explícita del operador
+// (nunca por tecla), y aun así lo topamos: si alguien automatiza sobre él, el
+// costo lo paga la cuenta de WhatsApp del cliente, no la nuestra.
+const RESOLVE_CONTACT_LIMIT = 20;
+const RESOLVE_CONTACT_WINDOW_MS = 60_000;
+const RESOLVE_CONTACT_TIMEOUT_MS = 15_000;
+const resolveContactHits = new Map<string, number[]>();
+
+function hitResolveContactLimit(sessionKey: string): boolean {
+  const now = Date.now();
+  const hits = (resolveContactHits.get(sessionKey) ?? []).filter(
+    t => now - t < RESOLVE_CONTACT_WINDOW_MS,
+  );
+  resolveContactHits.set(sessionKey, hits);
+  if (hits.length >= RESOLVE_CONTACT_LIMIT) return true;
+  hits.push(now);
+  return false;
+}
+
+app.post('/resolve-contact', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const { accountId, sessionKey, phone } = req.body;
+    if (!sessionKey || !phone) {
+      return res.status(400).json({ error: 'Missing sessionKey or phone' });
+    }
+
+    const session = sessions.get(sessionKey);
+    if (!session || session.accountId !== accountId) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    if (!session.isReady || !session.sock || !session.phoneNumber) {
+      return res.status(503).json({ error: 'session_not_ready' });
+    }
+
+    const digits = String(phone).replace(/\D/g, '');
+    if (digits.length < 6 || digits.length > 15) {
+      return res.status(400).json({ error: 'invalid_phone' });
+    }
+
+    if (hitResolveContactLimit(sessionKey)) {
+      console.warn(`[/resolve-contact] Rate limit alcanzado en sesión ${sessionKey}`);
+      return res.status(429).json({ error: 'rate_limited' });
+    }
+
+    // `onWhatsApp` es variádico: preguntamos por todas las variantes del número
+    // en UNA sola consulta USync y nos quedamos con la que exista. Así el
+    // '521' mexicano y el '549' argentino dejan de ser una decisión nuestra.
+    const candidates = waNumberCandidates(digits);
+    let results: Array<{ jid: string; exists: boolean }> | undefined;
+    let timeoutTimer: NodeJS.Timeout | undefined;
+    try {
+      // Con techo de tiempo: `onWhatsApp` puede quedarse colgado si el socket
+      // está a medio morir, y un request eterno deja al operador mirando un
+      // spinner. La consulta que pierde la carrera NO queda como unhandled
+      // rejection: `race` le dejó su handler puesto aunque ya haya settleado.
+      results = await Promise.race([
+        session.sock.onWhatsApp(...candidates.map(c => `+${c}`)),
+        new Promise<never>((_, reject) => {
+          timeoutTimer = setTimeout(
+            () => reject(new Error('timeout')),
+            RESOLVE_CONTACT_TIMEOUT_MS,
+          );
+        }),
+      ]);
+    } catch (err) {
+      console.warn(`[/resolve-contact] onWhatsApp falló para ${digits}:`, (err as Error).message);
+      return res.status(502).json({ error: 'lookup_failed' });
+    } finally {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+    }
+
+    const hit = (results ?? []).find(r => r?.exists && r?.jid);
+    if (!hit) {
+      console.log(`[/resolve-contact] ${digits} no tiene WhatsApp (probadas: ${candidates.join(', ')})`);
+      return res.json({ exists: false });
+    }
+
+    // El id del chat sale del JID que devolvió WhatsApp, no del que tecleó el
+    // operador: es el mismo que usará `saveMessageToFirestore` al guardar el
+    // eco del saliente, así que la app y Firestore no pueden desincronizarse.
+    const canonicalId = extractPhoneNumber(hit.jid);
+
+    // ¿Ya hablábamos con este número? Miramos también el id hermano (52/521):
+    // un contacto viejo puede estar guardado bajo la otra forma, y abrir el
+    // canónico le partiría el historial en dos. Si existe el hermano, ganamos
+    // ese id — `performSendMessage` lee el `remoteJid` guardado en ese doc, así
+    // que el envío sigue saliendo por donde ya salía.
+    let chatId = canonicalId;
+    let hasHistory = false;
+    let contactName: string | null = null;
+
+    for (const candidate of waNumberCandidates(canonicalId)) {
+      const snap = await db
+        .collection(ACCOUNTS_COLLECTION)
+        .doc(accountId)
+        .collection('whatsapp_sessions')
+        .doc(session.phoneNumber)
+        .collection('chats')
+        .doc(candidate)
+        .get();
+      if (snap.exists) {
+        chatId = candidate;
+        hasHistory = true;
+        contactName = (snap.get('contactName') as string | undefined) ?? null;
+        break;
+      }
+    }
+
+    // Sin historial previo, el nombre de agenda que ya está cacheado en la
+    // sesión le da un encabezado decente al chat nuevo (cero reads extra).
+    if (!contactName) contactName = session.contactNames?.get(chatId) ?? null;
+
+    console.log(
+      `[/resolve-contact] ${digits} → ${hit.jid} (chatId=${chatId}, historial=${hasHistory})`,
+    );
+    res.json({ exists: true, chatId, jid: hit.jid, hasHistory, contactName });
+  } catch (error) {
+    console.error('[/resolve-contact] Error:', error);
+    res.status(500).json({ error: 'Failed to resolve contact' });
   }
 });
 

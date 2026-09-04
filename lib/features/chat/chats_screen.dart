@@ -19,6 +19,7 @@ import 'messages_view.dart';
 import 'media_vault_screen.dart';
 import 'widgets/ai_state_indicator.dart';
 import 'widgets/message_search_results.dart';
+import 'widgets/new_chat_sheet.dart';
 import 'widgets/unread_badge.dart';
 import 'widgets/label_chip.dart';
 import 'widgets/labels_selector_sheet.dart';
@@ -333,6 +334,53 @@ class _ChatsScreenState extends State<ChatsScreen> {
     });
   }
 
+  // "Nuevo chat": escribirle a un número que nunca nos escribió.
+  //
+  // El sheet devuelve el chatId YA VERIFICADO contra WhatsApp (ver
+  // /resolve-contact en el backend), así que aquí sólo abrimos. No creamos
+  // ningún doc: el chat existe en Firestore recién cuando el operador manda
+  // el primer mensaje y su eco vuelve por messages.upsert. Si se arrepiente y
+  // no escribe nada, no queda basura en la lista.
+  Future<void> _openNewChat() async {
+    if (widget.sessionId == null || widget.sessionKey == null) return;
+    final target = await showModalBottomSheet<NewChatTarget>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => NewChatSheet(
+        accountId: widget.accountId,
+        sessionId: widget.sessionId!,
+        sessionKey: widget.sessionKey,
+      ),
+    );
+    if (target == null || !mounted) return;
+
+    setState(() {
+      selectedChatPhone = target.chatId;
+      // Salir de la búsqueda: el chat que se abre casi nunca es uno de los
+      // resultados que quedaron en pantalla.
+      if (_searchExpanded) {
+        _searchExpanded = false;
+        searchController.clear();
+        searchQuery = '';
+      }
+    });
+
+    // Tecleó a alguien que ya le había escrito: avisamos para que el historial
+    // que aparece no lo tome por sorpresa.
+    if (target.hasHistory) {
+      final who = (target.contactName ?? '').trim();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(who.isEmpty
+              ? 'Ya tenías una conversación con este número'
+              : 'Ya tenías una conversación con $who'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
+  }
+
   // Abre la galería de medios de la sesión actual. En vez de empujar una ruta,
   // levantamos una capa dentro de esta pantalla (ver build): así, al saltar a un
   // chat desde la galería, ésta sobrevive Offstage y el back vuelve a ella.
@@ -620,6 +668,19 @@ class _ChatsScreenState extends State<ChatsScreen> {
           ),
         ),
       ),
+      // Entrada a "Nuevo chat": escribirle a alguien que nunca escribió. Va
+      // como FAB porque es el gesto que el usuario ya tiene aprendido de
+      // WhatsApp. Requiere sessionKey: sin sesión conectada no hay a quién
+      // preguntarle si el número existe.
+      floatingActionButton: widget.sessionKey == null
+          ? null
+          : FloatingActionButton(
+              onPressed: _openNewChat,
+              backgroundColor: primaryAqua,
+              foregroundColor: darkBg,
+              tooltip: 'Nuevo chat',
+              child: const Icon(Icons.add_comment_outlined),
+            ),
       body: StreamBuilder<QuerySnapshot>(
         stream: FirebaseFirestore.instance
             .collection(accountsCollection)
@@ -1191,7 +1252,10 @@ class _ChatsScreenState extends State<ChatsScreen> {
           .doc(widget.sessionId)
           .collection('chats')
           .doc(selectedChatPhone)
-          .update({'ai_auto_response': !currentValue});
+          // set+merge, no update: un chat recién abierto desde "Nuevo chat"
+          // todavía no tiene doc (lo crea el eco del primer saliente), y un
+          // update sobre un doc inexistente tira excepción.
+          .set({'ai_auto_response': !currentValue}, SetOptions(merge: true));
     } catch (e) {
       debugPrint('Error toggling AI: $e');
       _showEtherealToast(false, 'Error al cambiar IA', isActivating: false);

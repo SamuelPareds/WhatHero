@@ -95,3 +95,45 @@ export async function resolveLIDViaSock(lid: string, sock: any): Promise<string 
     return null;
   }
 }
+
+// Variantes del mismo número que WhatsApp podría considerar canónicas.
+//
+// México y Argentina insertan un dígito entre el código de país y el número
+// nacional para líneas móviles ('521…' / '549…'). WhatsApp cambió de criterio
+// con los años: hay cuentas mexicanas registradas como '521' y otras como
+// '52', y no hay forma de saber cuál desde afuera. Adivinar mal tiene un costo
+// concreto: el mensaje se guarda bajo un chat doc distinto del que la app está
+// mostrando, así que el operador ve su mensaje desaparecer.
+//
+// La solución es no elegir: `onWhatsApp` es variádico, así que preguntamos por
+// las dos variantes en una sola consulta y nos quedamos con la que WhatsApp
+// diga que existe. Un USync en vez de una tabla de reglas que envejece.
+//
+// También sirve al revés: dado un chatId ya canónico, genera el id hermano
+// para buscar historial viejo guardado bajo la otra forma.
+export function waNumberCandidates(e164: string): string[] {
+  const digits = e164.replace(/\D/g, '');
+  if (!digits) return [];
+
+  const out = [digits];
+  const add = (n: string) => {
+    if (!out.includes(n)) out.push(n);
+  };
+
+  // [código de país, dígito móvil, largo del número nacional]
+  const rules: Array<[string, string, number]> = [
+    ['52', '1', 10], // México
+    ['54', '9', 10], // Argentina
+  ];
+
+  for (const [dial, mobile, nationalLen] of rules) {
+    const withMobile = `${dial}${mobile}`;
+    if (digits.startsWith(withMobile) && digits.length === withMobile.length + nationalLen) {
+      add(`${dial}${digits.slice(withMobile.length)}`);
+    } else if (digits.startsWith(dial) && digits.length === dial.length + nationalLen) {
+      add(`${dial}${mobile}${digits.slice(dial.length)}`);
+    }
+  }
+
+  return out;
+}

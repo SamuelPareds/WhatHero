@@ -201,6 +201,40 @@ El operador tiene que poder distinguir de un vistazo lo que **salió** de lo que
 
 ---
 
+## 💬 Escribir primero (chat con un número que nunca escribió)
+
+El FAB de la lista de chats abre `NewChatSheet`: bandera + código de país a la izquierda, número nacional a la derecha. El operador escribe **sus 10 dígitos de siempre** y nosotros armamos el E.164.
+
+**El país por defecto sale del número de la propia sesión** (`countryForE164(sessionId)`): un cliente mexicano abre el panel ya en 🇲🇽 y uno colombiano en 🇨🇴, sin configurar nada. La bandera va SIEMPRE junto al `+52` porque en Windows el emoji no renderiza y el código tiene que seguir diciendo todo.
+
+### El campo se limpia solo (`normalizeTyped`, `lib/core/utils/phone_input.dart`)
+
+Quien ya sabe de códigos los pega incluidos; quien no sabe, no los pone. Las dos formas funcionan porque el campo guarda **siempre** el número nacional pelado y quita lo que sobre, avisando qué quitó: `+52`, el `521` legacy, el `549` argentino, el `0` de marcado nacional. Pegar un `+57` estando en 🇲🇽 mueve el selector a Colombia solo.
+
+**Manda el largo, no el prefijo.** Un número que ya cabe en el rango nacional del país se respeta intacto aunque empiece con los mismos dígitos que su código de país — sin esa regla, un `5212345678` mexicano legítimo perdería sus primeros dígitos. Cuando nada encaja, no tocamos nada: preferimos que el operador vea su número raro a recortárselo por nuestra cuenta. Las reglas viven en `test/phone_input_test.dart`; es lógica sutil y silenciosa cuando falla.
+
+### `onWhatsApp` es la fuente de verdad, no una tabla de prefijos
+
+`POST /resolve-contact` verifica el número **antes** de abrir el chat. Es obligatorio, y cierra dos fallas que terminan igual: el operador esperando una respuesta que nunca va a llegar.
+
+1. **Número sin WhatsApp:** el envío se acepta, el eco vuelve, se crea el chat doc con el mensaje adentro y su palomita ✓. Todo parece bien. Nunca llega nada.
+2. **México/Argentina:** hay cuentas registradas como `521` y otras como `52`, y desde afuera no se puede saber cuál. Si mandamos a la variante equivocada, el eco vuelve con el JID que WhatsApp considera bueno y el mensaje se guarda en **otro chat doc** del que la app está mostrando: el operador ve su mensaje desaparecer.
+
+Ninguna se arregla con una tabla de prefijos más lista. Se arreglan preguntando: `onWhatsApp` devuelve el JID canónico (`node.attrs.jid` del USync) y omite de la lista a los que no existen. Mismo principio que `resolveWaVersion()` — **no adivinamos, preguntamos**.
+
+- **`onWhatsApp` es variádico y lo aprovechamos:** `waNumberCandidates()` arma las dos variantes y ambas viajan en **una sola** consulta USync. Cuál existe deja de ser decisión nuestra.
+- **El `chatId` que abre la app es el que devolvió WhatsApp**, no el que se tecleó: es el mismo bajo el que `saveMessageToFirestore` guardará el eco, así que pantalla y Firestore no pueden desincronizarse.
+- **Si ya existe chat bajo el id hermano, gana el hermano.** Abrir el canónico partiría el historial en dos. `performSendMessage` lee el `remoteJid` guardado en ese doc, así que el envío sigue saliendo por donde ya salía.
+- **Rate limit de 20/min por sesión.** Consultar números en masa es la firma de un spammer y WhatsApp banea por eso; el costo lo pagaría la cuenta del cliente. Sólo se consulta con acción explícita del operador, **nunca por tecla**.
+
+### El chat no existe hasta que se manda el primer mensaje
+
+`NewChatSheet` **no escribe nada en Firestore** y el botón dice "Abrir chat", no "Enviar": abrimos la conversación vacía (`selectedChatPhone`) y el operador escribe con el composer de siempre. El doc lo crea el eco del primer saliente, como cualquier otro chat. Si se arrepiente y no escribe, no queda basura en la lista.
+
+Por eso el toggle de IA del chat abierto usa `set(merge)` y no `update`: en un chat recién abierto todavía no hay doc, y un `update` sobre un doc inexistente tira excepción.
+
+---
+
 ## 📱 Versión de WhatsApp Web (defensa anti-405)
 
 El backend se declara ante WhatsApp como una versión concreta de WhatsApp Web (`2.3000.<revisión>`). WhatsApp **corta las versiones viejas cada pocas semanas**, y cuando lo hace caen todas las sesiones a la vez con `405 Connection Failure` — sin poder siquiera generar un QR para revincular. Pasó el 28-jul-2026 con las 3 cuentas de producción.
