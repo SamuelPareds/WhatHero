@@ -235,6 +235,30 @@ Por eso el toggle de IA del chat abierto usa `set(merge)` y no `update`: en un c
 
 ---
 
+## ⇅ Recorrer chats sin volver a la lista (cola congelada)
+
+Revisar la bandeja de ayer costaba dos gestos por chat: back a la lista, encontrar dónde te quedaste, entrar al siguiente. Encontrar dónde te quedaste era el caro, porque **la lista se mueve debajo de los pies**: la ordena `lastMessageTimestamp descending`, así que contestar un chat lo manda al puesto 1, y en *Pendientes* además lo saca del filtro al poner `unresponded_count: 0`. La referencia visual se evapora justo por haber hecho el trabajo.
+
+Por eso el stepper del AppBar (`ChatNavStepper`, ↑ 4/12 ↓) **no camina la lista viva**. Camina `_navQueue`: una **foto** del orden filtrado, copiada en `_openChatFromList` en el momento de entrar desde la lista.
+
+- **Congelada es la característica, no un atajo.** Contestar reordena y filtra la lista real; la cola no se entera y tu posición sobrevive. ↑ te devuelve al chat que acabas de contestar **aunque ya no figure en el filtro**, porque la cola conserva a los que salieron.
+- **Sale del mismo `filteredChats`** que pinta la lista ([`chats_screen.dart`](lib/features/chat/chats_screen.dart)), o sea con filtro rápido + búsqueda ya aplicados: funciona igual en *Todos*, *Pendientes*, *Seguimiento*, *Con notas* y cualquier etiqueta, sin código por filtro.
+- **Sin cola no hay flechas.** Abrir por push, desde la galería de medios, desde un hit de la sección "Mensajes" o con "Nuevo chat" limpia la cola: ninguna de esas aperturas es una posición dentro de una secuencia, y un `4/12` ahí sería mentira. El guard `_hasNavQueue` exige además que el cursor apunte al chat abierto.
+- **Cambiar de filtro a mano** (`_setFilter`) la limpia — la secuencia que recorrías ya no es la que se ve. La degradación **automática** de *Seguimiento* → *Todos* (cuando el agente vacía la cola) **no** la limpia a propósito: el usuario no cambió de contexto, y es justo el momento en que perder las flechas dolería.
+- **La geometría manda sobre la semántica:** la lista es reciente↑ / antiguo↓, así que ↓ avanza hacia lo más viejo. Chevrones verticales, no flechas ←→.
+- **El contador es la mitad del valor y no cuesta nada.** Responde el "¿dónde me quedé?" que era el dolor original y comunica sin palabras que recorres una secuencia congelada. `_navQueue.length` cuenta una lista en RAM que salió del `snapshot` que la lista **ya** tenía suscrito: cero lecturas extra a Firestore.
+- **La cola guarda sólo `d.id`, nunca un campo del documento.** Se arma en cada build de la lista —que rebuildea con cada mensaje entrante— y recorre *todos* los chats, no los ~10 que el `ListView` construye perezosamente. Leer un campo obligaría a `d.data()`, que reconstruye el mapa completo del doc en cada llamada: en "Todos" con miles de conversaciones son miles de deserializaciones por mensaje recibido. La primera versión pagaba eso **dos veces por chat** para precargar el nombre del contacto en el tooltip de la flecha; el tooltip se quitó, no valía su precio. El id del doc **es** el número (el backend siempre escribe en `.doc(phoneNumber)`), así que abrir por id abre el mismo chat.
+- **Cambiar de chat limpia `_jumpToMessageId`/`_jumpToTimestamp`** (`_clearJumpTarget`): un salto a mensaje pertenece al chat del que salió, y MessagesView intentaría anclar en un id que no vive en la conversación nueva.
+- **Borrar un chat lo saca de la cola** y corrige el índice: las flechas no pueden aterrizar en una conversación que ya no existe.
+
+**Atajos Alt+↑ / Alt+↓** (`ChatNavShortcuts` envuelve al detalle entero). Van con Alt porque las flechas solas ya son del selector de respuestas rápidas del composer, y el `Shortcuts` queda por **debajo** de `DefaultTextEditingShortcuts` en el árbol, así que gana la tecla con el foco en el input — que es donde vive el 99% del tiempo. `includeRepeats: false` para que mantener la flecha no atraviese la cola de un tirón.
+
+**Cuidado con el ancho del AppBar:** el stepper comparte fila con el nombre del contacto, el toggle de IA y el botón de info. `test/chat_nav_stepper_test.dart` fija que quepa en un teléfono de 360dp con un nombre largo; si engorda, ese test revienta con un `RenderFlex overflow` en vez de degradar el título en silencio.
+
+**Fase 2 (no está hecho):** "siguiente y marcar Listo" en un gesto para el filtro *Pendientes* (un tap accidental cerraría un pendiente real), y auto-scroll de la lista al chat activo en desktop.
+
+---
+
 ## 📱 Versión de WhatsApp Web (defensa anti-405)
 
 El backend se declara ante WhatsApp como una versión concreta de WhatsApp Web (`2.3000.<revisión>`). WhatsApp **corta las versiones viejas cada pocas semanas**, y cuando lo hace caen todas las sesiones a la vez con `405 Connection Failure` — sin poder siquiera generar un QR para revincular. Pasó el 28-jul-2026 con las 3 cuentas de producción.

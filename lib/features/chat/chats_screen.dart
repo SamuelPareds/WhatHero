@@ -18,6 +18,7 @@ import 'package:crm_whatsapp/features/accounts.dart';
 import 'messages_view.dart';
 import 'media_vault_screen.dart';
 import 'widgets/ai_state_indicator.dart';
+import 'widgets/chat_nav_stepper.dart';
 import 'widgets/message_search_results.dart';
 import 'widgets/new_chat_sheet.dart';
 import 'widgets/unread_badge.dart';
@@ -95,6 +96,16 @@ class _ChatsScreenState extends State<ChatsScreen> {
   // y filtros intactos — mismo patrón que la persistencia del buscador.
   bool _showMediaVault = false;
 
+  // Cola de navegación entre chats: una FOTO del orden filtrado, tomada al
+  // abrir un chat desde la lista. NO es la lista viva, y esa es toda la idea:
+  // contestar un chat lo manda al tope (`orderBy lastMessageTimestamp`) y en
+  // "Pendientes" además lo saca del filtro, así que caminar la lista viva
+  // perdería el lugar justo en la pasada de revisión donde más duele.
+  // Congelada, ↑/↓ recorren la misma secuencia que veías al entrar — incluido
+  // el chat que acabas de contestar, al que ↑ te devuelve aunque ya no figure.
+  List<String> _navQueue = const [];
+  int _navIndex = -1;
+
   @override
   void initState() {
     super.initState();
@@ -147,7 +158,11 @@ class _ChatsScreenState extends State<ChatsScreen> {
       return;
     }
     debugPrint('[ChatsScreen] Deep-link a chat ${push.chatId}');
-    setState(() => selectedChatPhone = push.chatId);
+    setState(() {
+      selectedChatPhone = push.chatId;
+      // Un push no define ninguna secuencia que recorrer: sin cola, sin flechas.
+      _clearNavQueue();
+    });
     // Consumimos la intención (si vino del notifier compartido) para que no se
     // re-dispare en rebuilds. El cold-start llega por initialTapReady, donde
     // pendingTap es null, así que el guard `== push` evita limpiar de más.
@@ -357,6 +372,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
     setState(() {
       selectedChatPhone = target.chatId;
+      // Un chat recién abierto no pertenece a ninguna secuencia de revisión.
+      _clearNavQueue();
       // Salir de la búsqueda: el chat que se abre casi nunca es uno de los
       // resultados que quedaron en pantalla.
       if (_searchExpanded) {
@@ -400,7 +417,72 @@ class _ChatsScreenState extends State<ChatsScreen> {
     final isMobile = MediaQuery.of(context).size.width < 600;
     setState(() {
       selectedChatPhone = chatId;
+      // Saltar desde la galería no es recorrer la lista: sin cola, sin flechas.
+      _clearNavQueue();
       if (!isMobile) _showMediaVault = false;
+    });
+  }
+
+  // La cola sólo vale si su cursor apunta al chat que está abierto. Toda
+  // apertura fuera de la lista (push, galería, búsqueda de mensajes, chat
+  // nuevo) la limpia, así que este guard es la última red contra un contador
+  // que mienta.
+  bool get _hasNavQueue =>
+      _navQueue.length > 1 &&
+      _navIndex >= 0 &&
+      _navIndex < _navQueue.length &&
+      _navQueue[_navIndex] == selectedChatPhone;
+
+  void _clearNavQueue() {
+    _navQueue = const [];
+    _navIndex = -1;
+  }
+
+  // El salto a un mensaje concreto pertenece al chat del que salió: si no se
+  // limpia al cambiar de chat, MessagesView intentaría anclar en un id que no
+  // vive en esta conversación.
+  void _clearJumpTarget() {
+    _jumpToMessageId = null;
+    _jumpToTimestamp = null;
+  }
+
+  // Abre un chat desde la lista y congela el orden visible como cola. `order`
+  // ya viene con filtro rápido + búsqueda aplicados, así que la secuencia es
+  // exactamente la que el operador tenía en pantalla.
+  void _openChatFromList(String phoneNumber, List<String> order) {
+    // La lista sobrevive Offstage al abrir el chat; si el campo de búsqueda
+    // estaba enfocado, su teclado quedaría montado sobre el detalle.
+    FocusScope.of(context).unfocus();
+    setState(() {
+      selectedChatPhone = phoneNumber;
+      _navQueue = order;
+      _navIndex = order.indexOf(phoneNumber);
+      _clearJumpTarget();
+    });
+  }
+
+  // Salta `delta` posiciones dentro de la cola: +1 baja en la lista (más
+  // antiguo), -1 sube (más reciente).
+  void _stepChat(int delta) {
+    if (!_hasNavQueue) return;
+    final next = _navIndex + delta;
+    if (next < 0 || next >= _navQueue.length) return;
+    HapticFeedback.selectionClick();
+    setState(() {
+      _navIndex = next;
+      selectedChatPhone = _navQueue[next];
+      _clearJumpTarget();
+    });
+  }
+
+  // Cambiar de filtro a mano invalida la cola: la secuencia que recorrías ya
+  // no es la que está en pantalla. Las flechas desaparecen hasta que abras un
+  // chat desde la lista nueva.
+  void _setFilter(ChatFilter filter, {String? labelId}) {
+    setState(() {
+      _activeFilter = filter;
+      _activeLabelId = labelId;
+      _clearNavQueue();
     });
   }
 
@@ -724,6 +806,10 @@ class _ChatsScreenState extends State<ChatsScreen> {
             }
             // Si vaciaron la cola estando en el filtro "Seguimiento", el chip se
             // oculta; degradamos a "Todos" para no dejar al usuario mirando vacío.
+            // Ojo: aquí NO se limpia la cola de navegación. El usuario no
+            // cambió de contexto —el agente vació su lista mientras él la
+            // recorría— y quitarle las flechas en ese momento sería quitarle
+            // justo la forma de volver a lo que acaba de contestar.
             if (mounted &&
                 followupsTotal == 0 &&
                 _activeFilter == ChatFilter.seguimiento) {
@@ -778,6 +864,17 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 contactName.toLowerCase().contains(searchQuery) ||
                 note.toLowerCase().contains(searchQuery);
           }).toList();
+
+          // El orden que las flechas del chat abierto van a recorrer si el
+          // operador entra desde aquí. Se calcula una vez por build de la lista
+          // (que rebuildea con cada mensaje entrante) y la copia congelada se
+          // hace al abrir (_openChatFromList). Por eso guarda SÓLO `d.id`, que
+          // ya está materializado: leer un campo obligaría a `d.data()`, y ése
+          // reconstruye el mapa completo del documento en cada llamada — sobre
+          // todos los chats, no sólo los ~10 visibles que arma el ListView.
+          // El id del doc ES el número (el backend siempre escribe en
+          // `.doc(phoneNumber)`), así que abrir por id es abrir el mismo chat.
+          final navOrder = [for (final d in filteredChats) d.id];
 
           // El empty-state grande solo aplica SIN búsqueda. Al buscar, aunque
           // ningún chat coincida por nombre, _buildSearchBody igual muestra la
@@ -865,7 +962,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
           // (match en memoria por nombre/teléfono/nota) y "Mensajes" (hits del
           // message_index por contenido). Sin búsqueda, lista normal.
           if (searchQuery.isNotEmpty) {
-            return _buildSearchBody(filteredChats);
+            return _buildSearchBody(filteredChats, navOrder);
           }
 
           return _withMediaShortcut(ListView.separated(
@@ -879,7 +976,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 color: white.withValues(alpha: 0.06),
               ),
             ),
-            itemBuilder: (context, index) => _buildChatTile(filteredChats[index]),
+            itemBuilder: (context, index) =>
+                _buildChatTile(filteredChats[index], navOrder),
           ));
         },
       ),
@@ -888,7 +986,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
   // Construye el tile de un chat (con su swipe). Reutilizado por la lista normal
   // y por la sección "Chats" del buscador.
-  Widget _buildChatTile(QueryDocumentSnapshot chatDoc) {
+  Widget _buildChatTile(QueryDocumentSnapshot chatDoc, List<String> navOrder) {
     final chatData = chatDoc.data() as Map<String, dynamic>?;
 
     final phoneNumber = chatData?['phoneNumber'] as String? ?? '';
@@ -921,16 +1019,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
       labelIds: labelIds,
       labelsCatalog: _labelsCatalog,
       note: note,
-      onTap: () {
-        // La lista ahora sobrevive Offstage al abrir el chat; si el campo de
-        // búsqueda estaba enfocado, su teclado quedaría montado sobre el
-        // detalle. Soltamos el foco explícitamente (antes lo resolvía el
-        // desmontaje de la lista).
-        FocusScope.of(context).unfocus();
-        setState(() {
-          selectedChatPhone = phoneNumber;
-        });
-      },
+      onTap: () => _openChatFromList(phoneNumber, navOrder),
       onLongPress: () => _showChatOptions(
           phoneNumber, contactName, labelIds, note, isPending),
     );
@@ -1030,12 +1119,13 @@ class _ChatsScreenState extends State<ChatsScreen> {
   // Cuerpo del buscador: sección "Chats" (en memoria) + sección "Mensajes"
   // (asíncrona, contra message_index). La sección Mensajes ignora el chip de
   // filtro activo: busca contenido en toda la sesión.
-  Widget _buildSearchBody(List<QueryDocumentSnapshot> filteredChats) {
+  Widget _buildSearchBody(
+      List<QueryDocumentSnapshot> filteredChats, List<String> navOrder) {
     return ListView(
       children: [
         if (filteredChats.isNotEmpty) ...[
           _searchSectionHeader('Chats'),
-          ...filteredChats.map(_buildChatTile),
+          ...filteredChats.map((d) => _buildChatTile(d, navOrder)),
         ],
         _searchSectionHeader('Mensajes'),
         MessageSearchResults(
@@ -1048,6 +1138,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
             FocusScope.of(context).unfocus();
             setState(() {
               selectedChatPhone = chatId;
+              // Un hit de texto no es una posición dentro de la lista: la
+              // sección "Mensajes" no tiene el mismo orden que los chats.
+              _clearNavQueue();
               // Objetivo de salto: si se tocó una fila de mensaje, MessagesView
               // cargará hasta él y lo resaltará. El header del grupo no manda
               // messageId → abre el chat normal (abajo).
@@ -1133,10 +1226,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
               _FilterChip(
                 label: 'Todos',
                 selected: _activeFilter == ChatFilter.todos,
-                onTap: () => setState(() {
-                  _activeFilter = ChatFilter.todos;
-                  _activeLabelId = null;
-                }),
+                onTap: () => _setFilter(ChatFilter.todos),
               ),
               // Chip del agente de seguimiento: solo aparece cuando hay chats
               // encolados, justo después de "Todos" para máxima visibilidad.
@@ -1146,10 +1236,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                   label: 'Seguimiento',
                   count: counts.followups,
                   selected: _activeFilter == ChatFilter.seguimiento,
-                  onTap: () => setState(() {
-                    _activeFilter = ChatFilter.seguimiento;
-                    _activeLabelId = null;
-                  }),
+                  onTap: () => _setFilter(ChatFilter.seguimiento),
                 ),
               ],
               const SizedBox(width: 8),
@@ -1157,20 +1244,14 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 label: 'Pendientes',
                 count: counts.unresponded,
                 selected: _activeFilter == ChatFilter.noRespondidos,
-                onTap: () => setState(() {
-                  _activeFilter = ChatFilter.noRespondidos;
-                  _activeLabelId = null;
-                }),
+                onTap: () => _setFilter(ChatFilter.noRespondidos),
               ),
               const SizedBox(width: 8),
               _FilterChip(
                 label: 'Con notas',
                 count: counts.notes,
                 selected: _activeFilter == ChatFilter.conNotas,
-                onTap: () => setState(() {
-                  _activeFilter = ChatFilter.conNotas;
-                  _activeLabelId = null;
-                }),
+                onTap: () => _setFilter(ChatFilter.conNotas),
               ),
               // Un chip por etiqueta del catálogo, con su propio color. Tocar
               // filtra los chats que la tengan asignada.
@@ -1180,10 +1261,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
                   label: label,
                   selected: _activeFilter == ChatFilter.etiqueta &&
                       _activeLabelId == label.id,
-                  onTap: () => setState(() {
-                    _activeFilter = ChatFilter.etiqueta;
-                    _activeLabelId = label.id;
-                  }),
+                  onTap: () =>
+                      _setFilter(ChatFilter.etiqueta, labelId: label.id),
                 ),
               ],
             ],
@@ -1263,6 +1342,15 @@ class _ChatsScreenState extends State<ChatsScreen> {
   }
 
   Widget _buildMessageDetail() {
+    // Los atajos envuelven al detalle entero para que funcionen con el foco
+    // en el composer, que es donde vive el 99% del tiempo.
+    return ChatNavShortcuts(
+      onStep: _stepChat,
+      child: _buildChatDetail(),
+    );
+  }
+
+  Widget _buildChatDetail() {
     // StreamBuilder externo: escucha el documento de la sesión para conocer
     // si el asistente IA fue configurado (ai_enabled). Ese estado lo necesitan
     // tanto el toggle del AppBar como el botón "generar respuesta" dentro
@@ -1430,6 +1518,18 @@ class _ChatsScreenState extends State<ChatsScreen> {
                   ],
                 ),
                 actions: [
+                  // Recorrer la cola congelada sin volver a la lista. Sólo
+                  // aparece si entraste desde la lista: abrir por push,
+                  // galería o búsqueda de mensajes no define secuencia alguna.
+                  if (_hasNavQueue)
+                    ChatNavStepper(
+                      position: _navIndex + 1,
+                      total: _navQueue.length,
+                      onPrev: _navIndex > 0 ? () => _stepChat(-1) : null,
+                      onNext: _navIndex < _navQueue.length - 1
+                          ? () => _stepChat(1)
+                          : null,
+                    ),
                   // Toggle puro de 2 estados: activar/desactivar IA en este
                   // chat. Ya no muta a spinner durante el ciclo IA — la
                   // actividad se comunica vía subtítulo + barra de carga.
@@ -1782,10 +1882,17 @@ class _ChatsScreenState extends State<ChatsScreen> {
       if (!mounted) return;
 
       if (response.statusCode == 200) {
-        // Si el chat eliminado estaba abierto en split-view, cerramos el panel.
-        if (selectedChatPhone == phoneNumber) {
-          setState(() => selectedChatPhone = null);
-        }
+        setState(() {
+          // Fuera de la cola: las flechas no pueden aterrizar en una
+          // conversación que ya no existe.
+          final gone = _navQueue.indexOf(phoneNumber);
+          if (gone >= 0) {
+            _navQueue = List.of(_navQueue)..removeAt(gone);
+            if (gone <= _navIndex) _navIndex--;
+          }
+          // Si estaba abierto en split-view, cerramos el panel.
+          if (selectedChatPhone == phoneNumber) selectedChatPhone = null;
+        });
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text('Chat con $displayName eliminado'),
