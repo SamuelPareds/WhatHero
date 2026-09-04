@@ -11,14 +11,43 @@ export interface SenderInfo {
   uid?: string;     // sólo cuando type='human' y vino vía app autenticada
 }
 
+/** Estados que puede tener el doc de sesión en Firestore. */
+export type SessionStatus =
+  | 'connected'
+  | 'reconnecting'
+  | 'reconnect_failed'
+  | 'disconnected';
+
 export interface SessionData {
   sock: any;
   isReady: boolean;
   currentQR: string | undefined;
   phoneNumber: string | undefined;
-  isReconnecting: boolean;
   reconnectCount: number;
   accountId: string;
+
+  // --- Supervisión de la conexión (ver services/sessionSupervisor.ts) ---
+  // Contador monotónico de sockets creados para esta sessionKey. Cada
+  // `startSession` lo incrementa y el handler de `connection.update` captura el
+  // suyo al nacer: así un socket viejo que emite tarde se descarta comparando,
+  // en vez de programar una reconexión que mataría al socket sano que ya tomó
+  // su lugar.
+  generation: number;
+  // Timer del deadline de arranque. Si el socket no da señales de vida (`qr` u
+  // `open`) antes de que venza, lo damos por muerto por nuestra cuenta: Baileys
+  // puede no avisar NUNCA si el connect TCP queda colgado.
+  connectDeadline?: NodeJS.Timeout;
+  // Timer del próximo intento de reconexión. Su ausencia, con la sesión
+  // desconectada, es la firma exacta de una sesión huérfana: es lo que busca
+  // el watchdog.
+  reconnectTimer?: NodeJS.Timeout;
+  // Epoch ms en que se creó el socket actual.
+  socketStartedAt: number;
+  // Epoch ms de la última vez que la sesión llegó a `open`. undefined = nunca.
+  lastConnectedAt?: number;
+  // Último status que escribimos en Firestore. Memo para que el barrido
+  // periódico no pague un read por sesión sólo para comparar.
+  lastWrittenStatus?: SessionStatus;
   // Cache en memoria de nombres de agenda (phoneNumber -> name).
   // Se llena con contacts.upsert/contacts.update sin tocar Firestore.
   // Se persiste a un chat doc solo cuando hay un mensaje real para ese contacto

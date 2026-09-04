@@ -20,6 +20,18 @@ import { unwrapMessageContent } from './src/utils/message';
 import { initializeSession, saveMessageToFirestore, getAIConfig, cacheContactName, applyContactUpdate, reconcileContactNames, consolidateLIDChat, incrementUnrespondedCount, resetUnrespondedCount, writeMediaIndexEntry, isIndexableMedia, writeMessageIndexEntry } from './src/services/firestoreService';
 import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer, emitAiState, getSessionTimezone, AiError, cancelAiCycle, isAiSentMessage } from './src/services/aiService';
 import { trackUnreadMessage, markChatAsReadIfEnabled, forgetChatUnread } from './src/services/readReceiptService';
+import {
+  initSessionSupervisor,
+  startSupervisorLoops,
+  sweepFirestoreGhosts,
+  armConnectDeadline,
+  noteSignOfLife,
+  clearSessionTimers,
+  scheduleReconnect,
+  retireSession,
+  retireDuplicateSessions,
+  teardownSocket,
+} from './src/services/sessionSupervisor';
 
 // Mapeo de códigos de AiError → HTTP para el endpoint manual (copiloto). El
 // frontend usa el `code` para mostrar un mensaje claro con acción "Reintentar".
@@ -236,34 +248,88 @@ async function buildRuleMessageContent(rule: any): Promise<any | null> {
 // Make io available to aiService via global variable for lazy evaluation
 (global as any).__WhatHeroIO = io;
 
+// `meta.json` es lo único de una sesión que sobrevive a un reinicio del
+// contenedor. Guarda a qué cuenta pertenece y —desde el incidente del
+// 03-sep-2026— qué número tiene vinculado. Sin el número, un arranque en frío
+// no sabía a qué doc de Firestore escribirle el estado (`phoneNumber` sólo se
+// conocía tras el primer `open`), así que una sesión que moría antes de
+// conectar dejaba el doc congelado en lo último que dijera.
+interface SessionMeta {
+  accountId: string;
+  phoneNumber?: string;
+}
+
+function readSessionMeta(sessionKey: string): SessionMeta | null {
+  try {
+    const meta = JSON.parse(readFileSync(`auth_info/${sessionKey}/meta.json`, 'utf-8'));
+    return meta?.accountId ? meta : null;
+  } catch {
+    return null;
+  }
+}
+
+// Merge, nunca overwrite: `startSession` la reescribe en cada reconexión y sin
+// el merge borraría el `phoneNumber` aprendido en la conexión anterior.
+function writeSessionMeta(sessionKey: string, patch: SessionMeta): void {
+  try {
+    const current = readSessionMeta(sessionKey) ?? {};
+    writeFileSync(`auth_info/${sessionKey}/meta.json`, JSON.stringify({ ...current, ...patch }));
+  } catch (error) {
+    console.error(`[startSession] No se pudo escribir meta.json de ${sessionKey}:`, error);
+  }
+}
+
 async function startSession(sessionKey: string, accountId: string) {
   const { state, saveCreds } = await useMultiFileAuthState(`auth_info/${sessionKey}`);
   const version = await resolveWaVersion();
   console.log(`[startSession] ${sessionKey} → handshake con WA Web ${version.join('.')}`);
 
-  // Write metadata file so startExistingSessions() can recover this session on reboot
-  writeFileSync(`auth_info/${sessionKey}/meta.json`, JSON.stringify({ accountId }));
+  writeSessionMeta(sessionKey, { accountId });
 
-  // Initialize session data
-  const existingSession = sessions.get(sessionKey);
-  sessions.set(sessionKey, {
+  // De aquí al final NO hay awaits: el retiro del socket viejo, la publicación
+  // del nuevo y el armado de su deadline ocurren en el mismo tick. Así el
+  // watchdog nunca alcanza a ver una sesión sin socket y sin timers, que es
+  // justo la firma que él interpreta como huérfana.
+  const previous = sessions.get(sessionKey);
+
+  // Un rearranque REEMPLAZA al socket anterior: si quedaba uno vivo (o colgado)
+  // se mata acá, y sus timers se desarman para que no disparen un tercer
+  // arranque. Antes no se hacía teardown en ningún lado: cada reconexión
+  // apilaba un socket zombi con sus listeners intactos, capaz de escribir sobre
+  // el estado del socket sano que lo había reemplazado.
+  if (previous) {
+    clearSessionTimers(previous);
+    teardownSocket(previous.sock);
+  }
+
+  // Cada socket nace con su propia generación. El handler de eventos captura la
+  // suya y se calla si ya fue reemplazado (ver SessionData.generation).
+  const generation = (previous?.generation ?? 0) + 1;
+
+  const session: SessionData = {
     sock: null,
     isReady: false,
     currentQR: undefined,
-    phoneNumber: existingSession?.phoneNumber || undefined,
-    isReconnecting: false,
-    reconnectCount: existingSession?.reconnectCount || 0,
+    // Hidratar desde meta.json es lo que permite reportar el estado de una
+    // sesión que muere antes de llegar a `open` en un arranque en frío.
+    phoneNumber: previous?.phoneNumber ?? readSessionMeta(sessionKey)?.phoneNumber,
+    reconnectCount: previous?.reconnectCount ?? 0,
     accountId,
+    generation,
+    socketStartedAt: Date.now(),
+    lastConnectedAt: previous?.lastConnectedAt,
+    lastWrittenStatus: previous?.lastWrittenStatus,
     // Preservamos el cache de nombres si la sesión se está reconectando.
-    contactNames: existingSession?.contactNames ?? new Map<string, string>(),
+    contactNames: previous?.contactNames ?? new Map<string, string>(),
     // Mismo criterio para el Map de senders pendientes: si la sesión vuelve
     // tras un reconnect, los envíos en vuelo conservan su intención.
-    pendingSenders: existingSession?.pendingSenders ?? new Map(),
+    pendingSenders: previous?.pendingSenders ?? new Map(),
     // Igual que pendingSenders: si la sesión vuelve tras un reconnect, lo que
     // quedó sin confirmar como leído se confirma con la próxima respuesta.
-    unreadKeys: existingSession?.unreadKeys ?? new Map(),
-    ...(existingSession?.aiConfig && { aiConfig: existingSession.aiConfig }),
-  });
+    unreadKeys: previous?.unreadKeys ?? new Map(),
+    ...(previous?.aiConfig && { aiConfig: previous.aiConfig }),
+  };
+  sessions.set(sessionKey, session);
 
   const sock = makeWASocket({
     version,
@@ -280,6 +346,13 @@ async function startSession(sessionKey: string, accountId: string) {
     defaultQueryTimeoutMs: 20000,
     getMessage: async () => undefined,
   });
+
+  session.sock = sock;
+
+  // Red #1: el socket tiene un plazo para dar señales de vida. Si Baileys se
+  // queda mudo —connect TCP colgado, sin `open` ni `close` ni `error`— lo damos
+  // por muerto nosotros. Ver el encabezado de sessionSupervisor.ts.
+  armConnectDeadline(sessionKey, session, generation);
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -326,185 +399,105 @@ async function startSession(sessionKey: string, accountId: string) {
 
   sock.ev.on('connection.update', async (update: Partial<ConnectionState>) => {
     const { connection, lastDisconnect, qr } = update;
-    const session = sessions.get(sessionKey);
-    if (!session) return;
+    const current = sessions.get(sessionKey);
+    if (!current) return;
+
+    // Un socket viejo puede emitir DESPUÉS de que ya arrancó su reemplazo. Sin
+    // este corte su `close` programaría una reconexión que mataría al socket
+    // sano que acaba de tomar su lugar.
+    if (current.generation !== generation) {
+      console.log(`[Conexión] Evento de socket obsoleto (gen ${generation} ≠ ${current.generation}) en ${sessionKey}; ignorado.`);
+      return;
+    }
 
     if (qr) {
-      console.log('[startSession] QR Code recibido para sessionKey:', sessionKey);
-      console.log('[startSession] accountId:', session.accountId);
-      session.currentQR = qr;
-      session.isReady = false;
-      console.log('[startSession] Emitiendo QR a io.to("' + session.accountId + '").emit("qr", ...)');
-      io.to(session.accountId).emit('qr', { qr, sessionKey });
-      console.log('[startSession] QR emitido exitosamente');
+      // El socket habla: está vivo aunque todavía no esté vinculado. A partir de
+      // acá supervisa Baileys con su propio qrTimeout.
+      noteSignOfLife(current);
+      current.currentQR = qr;
+      current.isReady = false;
+      console.log(`[startSession] QR recibido para ${sessionKey} (cuenta ${current.accountId})`);
+      io.to(current.accountId).emit('qr', { qr, sessionKey });
+    }
+
+    if (connection === 'open') {
+      clearSessionTimers(current);
+      current.isReady = true;
+      current.currentQR = undefined;
+      current.reconnectCount = 0;
+      current.lastConnectedAt = Date.now();
+      console.log(`[startSession] Conexión abierta para sessionKey: ${sessionKey}`);
+
+      if (sock.user?.id) {
+        const phoneNumber = extractPhoneNumber(sock.user.id);
+        current.phoneNumber = phoneNumber;
+        // Persistir el número es lo que permite que el próximo arranque en frío
+        // sepa a qué doc escribirle aunque el socket muera antes de conectar.
+        writeSessionMeta(sessionKey, { accountId: current.accountId, phoneNumber });
+        console.log(`[startSession] WhatsApp conectado como: ${phoneNumber} (session: ${sessionKey})`);
+
+        await initializeSession(phoneNumber, sessionKey, current.accountId);
+        current.lastWrittenStatus = 'connected';
+
+        // Un número, una sesión: re-vincular crea un sessionKey nuevo y el
+        // anterior se quedaba peleando por la misma cuenta de WhatsApp.
+        await retireDuplicateSessions(sessionKey, current);
+      }
+
+      io.to(current.accountId).emit('ready', { phoneNumber: current.phoneNumber, sessionKey });
+      console.log(`[startSession] READY emitido para ${sessionKey}`);
+      return;
     }
 
     if (connection === 'close') {
-      session.isReady = false;
+      current.isReady = false;
+      noteSignOfLife(current); // el socket habló; el deadline de arranque ya no aplica
+
       const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
       const errorMessage = (lastDisconnect?.error as any)?.message;
+      console.log(`[Conexión] ${sessionKey} cerró (code: ${statusCode ?? 'sin código'}${errorMessage ? `, ${errorMessage}` : ''})`);
 
-      // Mark session as disconnected in Firestore if we have a phone number
-      if (session.phoneNumber) {
-        try {
-          const sessionDocRef = db
-            .collection(ACCOUNTS_COLLECTION)
-            .doc(session.accountId)
-            .collection('whatsapp_sessions')
-            .doc(session.phoneNumber);
+      // --- Casos terminales: no vuelve sola, hace falta re-vincular ---
 
-          await sessionDocRef.update({
-            status: 'disconnected',
-            last_sync: admin.firestore.Timestamp.now(),
-          });
-        } catch (error) {
-          console.error('Error updating session status:', error);
-        }
-      }
-
-      // CHECK: If session was removed from the map, don't attempt reconnect
-      if (!sessions.has(sessionKey)) {
-        console.log(`[startSession] Session ${sessionKey} was explicitly cancelled. Stopping reconnect loop.`);
+      if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+        const motivo = statusCode === 401 ? 'SESIÓN INVÁLIDA O NO AUTORIZADA' : 'LOGOUT DESDE EL TELÉFONO';
+        console.log(`[ALERTA] WhatsApp cerró la sesión ${sessionKey}. Motivo: ${motivo}. Limpiando credenciales.`);
+        const accountId = current.accountId;
+        const phoneNumber = current.phoneNumber;
+        await retireSession(sessionKey, statusCode === 401 ? 'unauthorized' : 'logged_out', { wipeAuth: true });
+        io.to(accountId).emit('status_update', { status: 'logged_out', sessionKey, phoneNumber });
         return;
       }
 
-      if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
-        const reasonMsg = statusCode === 401 ? 'SESIÓN INVÁLIDA O NO AUTORIZADA' : 'LOGOUT DESDE EL TELÉFONO';
-        console.log(`[ALERTA] WhatsApp cerró la sesión (${sessionKey}). Motivo: ${reasonMsg}. Limpiando credenciales locales.`);
-
-        // Clear auth folder for this session
-        try {
-          rmSync(`auth_info/${sessionKey}`, { recursive: true, force: true });
-          console.log(`[startSession] Carpeta auth_info/${sessionKey} eliminada.`);
-        } catch (error) {
-          console.error('Error clearing auth folder:', error);
-        }
-
-        session.currentQR = undefined;
-        session.phoneNumber = undefined;
-        sessions.delete(sessionKey);
-
-        // Notify frontend
-        io.to(session.accountId).emit('status_update', { 
-          status: 'logged_out', 
-          sessionKey,
-          phoneNumber: session.phoneNumber 
-        });
-      } else if (statusCode === 409) {
-        console.log(`[ALERTA] Conflicto multidispositivo para ${sessionKey}. Se ha iniciado sesión en otro lugar. Limpiando para re-vincular.`);
-        
-        try {
-          rmSync(`auth_info/${sessionKey}`, { recursive: true, force: true });
-        } catch (e) {}
-        
-        sessions.delete(sessionKey);
-        io.to(session.accountId).emit('status_update', { status: 'logged_out', sessionKey });
-      } else if (statusCode === 408 && !session.phoneNumber) {
-        // QR Timeout on a session that was never connected
-        console.log(`[startSession] QR Timeout for new session ${sessionKey}. Cleaning up instead of reconnecting.`);
-        
-        // Clean up memory and files to prevent leaks
-        try {
-          rmSync(`auth_info/${sessionKey}`, { recursive: true, force: true });
-        } catch (e) {}
-        sessions.delete(sessionKey);
-        
-        io.to(session.accountId).emit('status_update', { status: 'qr_timeout', sessionKey });
-      } else {
-        // Regular disconnection - attempt reconnect with exponential backoff
-        const MAX_RECONNECT_ATTEMPTS = 10;
-        const BASE_DELAY_MS = 3000;
-
-        session.reconnectCount = (session.reconnectCount || 0) + 1;
-
-        console.log(`[Reconexión] Intento ${session.reconnectCount}/${MAX_RECONNECT_ATTEMPTS} para ${sessionKey} (code: ${statusCode})`);
-
-        if (session.reconnectCount > MAX_RECONNECT_ATTEMPTS) {
-          // Reached max reconnect attempts - mark as failed
-          console.log(`[ALERTA] Sesión ${sessionKey} alcanzó máximo de intentos de reconexión (${MAX_RECONNECT_ATTEMPTS}). Marcando como fallida.`);
-          session.isReady = false;
-          sessions.delete(sessionKey);
-
-          if (session.phoneNumber) {
-            try {
-              const sessionDocRef = db
-                .collection(ACCOUNTS_COLLECTION)
-                .doc(session.accountId)
-                .collection('whatsapp_sessions')
-                .doc(session.phoneNumber);
-              await sessionDocRef.update({
-                status: 'reconnect_failed',
-                last_sync: admin.firestore.Timestamp.now(),
-              });
-            } catch (e) {}
-          }
-
-          io.to(session.accountId).emit('status_update', {
-            status: 'reconnect_failed',
-            sessionKey,
-            phoneNumber: session.phoneNumber
-          });
-          return;
-        }
-
-        // Exponential backoff: 3s, 6s, 12s, 24s, 48s, 96s, 192s, 384s, 768s, 1200s (max)
-        const delay = Math.min(BASE_DELAY_MS * Math.pow(2, session.reconnectCount - 1), 300000);
-
-        console.log(`[Reconexión] Esperando ${delay}ms antes de reintento...`);
-
-        // Notify frontend that we're reconnecting
-        io.to(session.accountId).emit('status_update', {
-          status: 'reconnecting',
-          sessionKey,
-          attempt: session.reconnectCount,
-          maxAttempts: MAX_RECONNECT_ATTEMPTS,
-          phoneNumber: session.phoneNumber,
-        });
-
-        // Update Firestore
-        if (session.phoneNumber) {
-          try {
-            const sessionDocRef = db
-              .collection(ACCOUNTS_COLLECTION)
-              .doc(session.accountId)
-              .collection('whatsapp_sessions')
-              .doc(session.phoneNumber);
-            await sessionDocRef.update({
-              status: 'reconnecting',
-              last_sync: admin.firestore.Timestamp.now(),
-            });
-          } catch (e) {}
-        }
-
-        if (!session.isReconnecting) {
-          session.isReconnecting = true;
-          setTimeout(() => {
-            if (sessions.has(sessionKey)) {
-              startSession(sessionKey, session.accountId);
-            }
-            session.isReconnecting = false;
-          }, delay);
-        }
-      }
-    } else if (connection === 'open') {
-      console.log('[startSession] Conexión abierta para sessionKey:', sessionKey);
-      session.isReady = true;
-      session.currentQR = undefined;
-      session.reconnectCount = 0; // Reset counter on successful connection
-
-      // Extract and store the connected phone number
-      if (sock.user?.id) {
-        const phoneNumber = extractPhoneNumber(sock.user.id);
-        session.phoneNumber = phoneNumber;
-        console.log(`[startSession] WhatsApp conectado como: ${phoneNumber} (session: ${sessionKey})`);
-
-        // Initialize session document in Firestore
-        await initializeSession(phoneNumber, sessionKey, session.accountId);
+      if (statusCode === 409) {
+        console.log(`[ALERTA] Conflicto multidispositivo en ${sessionKey}: se inició sesión en otro lugar.`);
+        const accountId = current.accountId;
+        const phoneNumber = current.phoneNumber;
+        await retireSession(sessionKey, 'conflict_409', { wipeAuth: true });
+        io.to(accountId).emit('status_update', { status: 'logged_out', sessionKey, phoneNumber });
+        return;
       }
 
-      console.log('[startSession] Emitiendo READY a io.to("' + session.accountId + '")');
-      io.to(session.accountId).emit('ready', { phoneNumber: session.phoneNumber, sessionKey });
-      console.log('[startSession] READY emitido exitosamente');
+      // QR abandonado: la sesión nunca llegó a vincularse con ningún número.
+      // Se mira TAMBIÉN meta.json a propósito. Antes bastaba con que
+      // `session.phoneNumber` estuviera vacío — y en un arranque en frío TODA
+      // sesión restaurada lo tiene vacío, así que un 408 al bootear borraba
+      // credenciales perfectamente válidas y exigía re-escanear el QR.
+      if (statusCode === DisconnectReason.timedOut && !current.phoneNumber && !readSessionMeta(sessionKey)?.phoneNumber) {
+        console.log(`[startSession] QR expirado en ${sessionKey} (nunca se vinculó). Limpiando.`);
+        const accountId = current.accountId;
+        await retireSession(sessionKey, 'qr_timeout', { wipeAuth: true });
+        io.to(accountId).emit('status_update', { status: 'qr_timeout', sessionKey });
+        return;
+      }
+
+      // --- Caso normal: se reintenta, indefinidamente ---
+      // El `close` ya NO es el motor de la reconexión: sólo aporta el motivo.
+      // Quien decide y agenda es el supervisor, que además tiene un watchdog
+      // por si este evento no llegara nunca (que es justo lo que pasó).
+      teardownSocket(current.sock);
+      current.sock = null;
+      scheduleReconnect(sessionKey, current, `close_${statusCode ?? 'unknown'}`);
     }
   });
 
@@ -1052,13 +1045,14 @@ async function startSession(sessionKey: string, accountId: string) {
     }
   });
 
-  // Store socket reference in session
-  const session = sessions.get(sessionKey);
-  if (session) session.sock = sock;
-
+  // `session.sock` ya quedó asignado arriba, junto al deadline de arranque.
   return sock;
 }
 
+// Cancelación explícita desde la app (cerrar la pantalla del QR, o /cancel-session).
+// Delega en `retireSession` para no reimplementar el teardown: lo importante es
+// que además DESARMA los timers, que antes quedaban vivos y hacían que una
+// sesión cancelada intentara reconectarse un rato más.
 async function cancelSession(sessionKey: string) {
   const session = sessions.get(sessionKey);
   if (!session) {
@@ -1066,33 +1060,9 @@ async function cancelSession(sessionKey: string) {
     return false;
   }
 
-  console.log(`[cancelSession] Cancelando sesión: ${sessionKey}`);
-
-  // Close the Baileys socket
-  if (session.sock) {
-    try {
-      await session.sock.ws?.close();
-      console.log(`[cancelSession] Socket cerrado para ${sessionKey}`);
-    } catch (error) {
-      console.error(`[cancelSession] Error cerrando socket:`, error);
-    }
-  }
-
-  // Clean up auth directory
-  try {
-    rmSync(`auth_info/${sessionKey}`, { recursive: true, force: true });
-    console.log(`[cancelSession] Auth directory eliminado: auth_info/${sessionKey}`);
-  } catch (error) {
-    console.error(`[cancelSession] Error limpiando auth:`, error);
-  }
-
-  // Remove from sessions map
-  sessions.delete(sessionKey);
-  console.log(`[cancelSession] Sesión eliminada del mapa`);
-
-  // Notify frontend
-  io.to(session.accountId).emit('session_cancelled', { sessionKey });
-
+  const accountId = session.accountId;
+  await retireSession(sessionKey, 'cancelled_by_user', { wipeAuth: true });
+  io.to(accountId).emit('session_cancelled', { sessionKey });
   return true;
 }
 
@@ -2417,53 +2387,12 @@ io.on('connection', (socket) => {
 });
 
 async function startExistingSessions() {
-  // --- HEALTH CHECK: Synchronize Firestore status with local auth_info ---
-  try {
-    console.log('[HealthCheck] Sincronizando estados fantasma con Firestore...');
-    
-    // Get all account documents first to avoid collectionGroup index requirement
-    const accountsSnapshot = await db.collection(ACCOUNTS_COLLECTION).get();
-    let cleanedCount = 0;
-
-    for (const accountDoc of accountsSnapshot.docs) {
-      const sessionsSnapshot = await accountDoc.ref
-        .collection('whatsapp_sessions')
-        .where('status', '==', 'connected')
-        .get();
-
-      for (const sessionDoc of sessionsSnapshot.docs) {
-        const data = sessionDoc.data();
-        const sessionKey = data.session_key;
-        
-        // If no sessionKey is stored or the local auth directory/creds don't exist
-        if (!sessionKey || !existsSync(`auth_info/${sessionKey}/creds.json`)) {
-          console.log(`[HealthCheck] Marcando sesión huérfana como desconectada: ${sessionDoc.id} (Account: ${accountDoc.id})`);
-          await sessionDoc.ref.update({
-            status: 'disconnected',
-            disconnect_reason: 'health_check_cleanup',
-            last_sync: admin.firestore.Timestamp.now(),
-          });
-          cleanedCount++;
-        }
-      }
-    }
-
-    if (cleanedCount > 0) {
-      console.log(`[HealthCheck] ✅ Sincronización completada. Limpiadas ${cleanedCount} sesiones fantasma.`);
-    } else {
-      console.log('[HealthCheck] ✅ Todo en orden. No hay sesiones fantasma.');
-    }
-  } catch (error) {
-    console.error('[HealthCheck] Error durante la sincronización:', error);
-  }
-
   if (!existsSync('auth_info')) {
     console.log('No existing auth_info directory');
     return;
   }
 
-  const entries = readdirSync('auth_info', { withFileTypes: true });
-  const subdirs = entries
+  const subdirs = readdirSync('auth_info', { withFileTypes: true })
     .filter(e => e.isDirectory() && existsSync(`auth_info/${e.name}/creds.json`))
     .map(e => e.name);
 
@@ -2474,23 +2403,20 @@ async function startExistingSessions() {
 
   console.log(`Auto-reconnecting ${subdirs.length} existing session(s)...`);
   for (const sessionKey of subdirs) {
-    const metaPath = `auth_info/${sessionKey}/meta.json`;
-    if (!existsSync(metaPath)) {
-      console.warn(`Skipping session ${sessionKey}: no meta.json (pre-migration session?)`);
+    const meta = readSessionMeta(sessionKey);
+    if (!meta) {
+      console.warn(`Skipping session ${sessionKey}: meta.json ausente o sin accountId`);
       continue;
     }
 
     try {
-      const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
-      const accountId = meta.accountId as string;
-      if (!accountId) {
-        console.warn(`Skipping session ${sessionKey}: meta.json has no accountId`);
-        continue;
-      }
-
-      await startSession(sessionKey, accountId);
+      await startSession(sessionKey, meta.accountId);
     } catch (error) {
-      console.error(`Error reading meta.json for ${sessionKey}:`, error);
+      console.error(`Error arrancando ${sessionKey}:`, error);
+      // Que una sesión falle al arrancar no puede dejarla sin ningún reintento
+      // programado: ese silencio es exactamente el bug que estamos cerrando.
+      const session = sessions.get(sessionKey);
+      if (session) scheduleReconnect(sessionKey, session, 'boot_failed');
     }
   }
 }
@@ -2500,7 +2426,16 @@ httpServer.listen(PORT, async () => {
   const envLabel = IS_PRODUCTION ? 'PRODUCTION 🚀' : 'DEVELOPMENT 🛠️';
   console.log(`Server running on port ${PORT}`);
   console.log(`[Env] ${envLabel} | NODE_ENV=${process.env.NODE_ENV ?? 'undefined'} | Firestore collection: "${ACCOUNTS_COLLECTION}"`);
+
+  initSessionSupervisor({ sessions, db, io, startSession });
   await startExistingSessions();
+
+  // El barrido de fantasmas va DESPUÉS de restaurar las sesiones: si corriera
+  // antes marcaría como desconectadas justo las que están por volver. Sustituye
+  // al viejo HealthCheck, que sólo miraba `status == 'connected'` y por eso no
+  // veía los docs atascados en `reconnecting`.
+  await sweepFirestoreGhosts();
+  startSupervisorLoops();
 
   // Setup cron for reminders (checks every minute)
   cron.schedule('* * * * *', () => {

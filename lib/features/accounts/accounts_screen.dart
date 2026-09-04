@@ -239,23 +239,20 @@ class _AccountsScreenState extends State<AccountsScreen> {
             itemBuilder: (context, index) {
               final sessionDoc = sessions[index];
               final phoneNumber = sessionDoc.id;
-              final alias = sessionDoc['alias'] ?? phoneNumber;
-              final status = sessionDoc['status'] ?? 'disconnected';
-              final isConnected = status == 'connected';
-              final isReconnecting = status == 'reconnecting';
+              final data = sessionDoc.data() as Map<String, dynamic>? ?? {};
+              final alias = data['alias'] ?? phoneNumber;
+              final visual = _SessionVisual.from(
+                data['status'] as String?,
+                (data['last_sync'] as Timestamp?)?.toDate(),
+              );
+              final isConnected = visual.isConnected;
 
               return Container(
                 margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                 decoration: BoxDecoration(
                   color: surfaceDark.withValues(alpha: 0.6),
                   borderRadius: BorderRadius.circular(12),
-                  border: Border.all(
-                    color: isConnected
-                        ? primaryAqua.withValues(alpha: 0.2)
-                        : isReconnecting
-                            ? Colors.orange.withValues(alpha: 0.2)
-                            : Colors.red.withValues(alpha: 0.2),
-                  ),
+                  border: Border.all(color: visual.color.withValues(alpha: 0.2)),
                 ),
                 child: InkWell(
                   onTap: () {
@@ -285,22 +282,14 @@ class _AccountsScreenState extends State<AccountsScreen> {
                               width: 56,
                               height: 56,
                               decoration: BoxDecoration(
-                                color: isConnected
-                                    ? primaryAqua.withValues(alpha: 0.2)
-                                    : isReconnecting
-                                        ? Colors.orange.withValues(alpha: 0.15)
-                                        : Colors.red.withValues(alpha: 0.1),
+                                color: visual.color.withValues(alpha: 0.18),
                                 borderRadius: BorderRadius.circular(14),
                               ),
                               child: Center(
                                 child: Text(
                                   alias.substring(0, 1).toUpperCase(),
                                   style: TextStyle(
-                                    color: isConnected
-                                        ? primaryAqua
-                                        : isReconnecting
-                                            ? Colors.orange.shade400
-                                            : Colors.red.shade400,
+                                    color: visual.color,
                                     fontWeight: FontWeight.w700,
                                     fontSize: 22,
                                   ),
@@ -366,48 +355,40 @@ class _AccountsScreenState extends State<AccountsScreen> {
                             Container(
                               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                               decoration: BoxDecoration(
-                                color: isConnected
-                                    ? accentAqua.withValues(alpha: 0.2)
-                                    : isReconnecting
-                                        ? Colors.orange.withValues(alpha: 0.2)
-                                        : Colors.red.withValues(alpha: 0.2),
+                                color: visual.color.withValues(alpha: 0.2),
                                 borderRadius: BorderRadius.circular(12),
                               ),
                               child: Row(
                                 mainAxisSize: MainAxisSize.min,
                                 children: [
-                                  if (isReconnecting)
+                                  if (visual.showSpinner) ...[
                                     SizedBox(
                                       width: 10,
                                       height: 10,
                                       child: CircularProgressIndicator(
                                         strokeWidth: 1.5,
-                                        valueColor: AlwaysStoppedAnimation<Color>(
-                                          Colors.orange.shade400,
-                                        ),
+                                        valueColor: AlwaysStoppedAnimation<Color>(visual.color),
                                       ),
                                     ),
-                                  if (isReconnecting) const SizedBox(width: 4),
+                                    const SizedBox(width: 4),
+                                  ],
                                   Text(
-                                    isConnected
-                                        ? 'Conectado'
-                                        : isReconnecting
-                                            ? 'Reconectando...'
-                                            : 'Desvinculado',
+                                    visual.label,
                                     style: TextStyle(
                                       fontSize: 11,
-                                      color: isConnected
-                                          ? accentAqua
-                                          : isReconnecting
-                                              ? Colors.orange.shade400
-                                              : Colors.red.shade400,
+                                      color: visual.color,
                                       fontWeight: FontWeight.w700,
                                     ),
                                   ),
                                 ],
                               ),
                             ),
-                            if (!isConnected && !isReconnecting)
+                            // Visible en CUALQUIER estado que no sea "conectado",
+                            // reconexión incluida. Esconderlo durante `reconnecting`
+                            // dejó a un cliente 26 horas sin salida cuando el estado
+                            // se congeló ahí: la única acción que lo arreglaba era
+                            // justo la que la UI ocultaba.
+                            if (!isConnected)
                               IconButton(
                                 icon: const Icon(Icons.sync, color: primaryAqua, size: 22),
                                 onPressed: _startNewSession,
@@ -443,5 +424,56 @@ class _AccountsScreenState extends State<AccountsScreen> {
         },
       ),
     );
+  }
+}
+
+/// Cómo se ve una sesión en la lista, derivado de `status` + `last_sync`.
+///
+/// No basta con leer `status`: ese campo lo escribe el backend y, si el backend
+/// se cae o pierde el hilo de una sesión, el doc queda congelado en lo último
+/// que alcanzó a decir. El 03-sep-2026 una sesión pasó 26 horas mostrando
+/// "Reconectando..." con un spinner girando sobre algo que ya no estaba pasando.
+///
+/// Por eso se cruza con `last_sync`: mientras una sesión está reconectando, el
+/// watchdog del backend refresca ese timestamp cada 2 minutos. Si lleva más de
+/// [_staleAfter] sin latir, el que se cayó fue el backend — y el spinner deja de
+/// prometer una reconexión que nadie está intentando.
+class _SessionVisual {
+  final String label;
+  final Color color;
+  final bool showSpinner;
+  final bool isConnected;
+
+  const _SessionVisual({
+    required this.label,
+    required this.color,
+    this.showSpinner = false,
+    this.isConnected = false,
+  });
+
+  /// Holgado respecto al heartbeat de 2 min del backend: tres latidos perdidos
+  /// antes de desconfiar, para no acusar de muerto a un backend que sólo tuvo
+  /// un mal minuto.
+  static const _staleAfter = Duration(minutes: 5);
+
+  factory _SessionVisual.from(String? status, DateTime? lastSync) {
+    if (status == 'connected') {
+      return const _SessionVisual(label: 'Conectado', color: accentAqua, isConnected: true);
+    }
+
+    if (status == 'reconnecting') {
+      final beat = lastSync == null || DateTime.now().difference(lastSync) > _staleAfter;
+      return beat
+          ? _SessionVisual(label: 'Sin respuesta', color: Colors.orange.shade400)
+          : _SessionVisual(label: 'Reconectando...', color: Colors.orange.shade400, showSpinner: true);
+    }
+
+    if (status == 'reconnect_failed') {
+      // El backend sigue reintentando de fondo, pero ya lleva rato caída: se
+      // dice tal cual y se ofrece la salida manual.
+      return _SessionVisual(label: 'Sin conexión', color: Colors.red.shade400);
+    }
+
+    return _SessionVisual(label: 'Desvinculado', color: Colors.red.shade400);
   }
 }

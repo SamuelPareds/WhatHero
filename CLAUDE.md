@@ -215,6 +215,58 @@ El logger raíz (`index.ts`) aplica `redact` sobre los campos base64 gigantes de
 
 ---
 
+## 🔌 Supervisión de la conexión (nadie se queda sin quien lo reconecte)
+
+El 03-sep-2026 una sesión de producción pasó **26 horas** mostrando "Reconectando…" sin que nadie la estuviera reconectando. El log entero del incidente son tres líneas:
+
+```
+17:39:34  [Reconexión] Intento 1/10 para d34a3443 (code: 428)
+17:39:37  [startSession] d34a3443 → handshake con WA Web 2.3000.1046734560
+          ...silencio absoluto durante 26 horas
+```
+
+El socket de ese reintento quedó colgado en `CONNECTING`. Baileys emite `connection.update {connection:'close'}` **sólo** desde su `end()`, y `end()` se dispara únicamente desde los handlers del WebSocket (`open`, `close`, `error`, `CB:*`). Si el connect TCP se traga los paquetes —un SYN sin respuesta, un blackhole en el NAT de salida— no ocurre ninguno y `end()` no corre jamás. El `handshakeTimeout` de la librería `ws` tampoco cubre eso: mide el upgrade HTTP, ya con TCP+TLS establecidos.
+
+**El bug de fondo no era de Baileys, era nuestro.** El reintento N+1 lo disparaba exclusivamente el `close` del intento N: una cadena de un solo eslabón que apostaba toda la recuperación a que una librería de terceros avisara siempre que falla. El día que no avisó no había timer, ni watchdog, ni segunda opinión — ni un log que lo delatara.
+
+### La regla: Baileys informa, el supervisor decide
+
+Toda la lógica vive en `backend/src/services/sessionSupervisor.ts`. **Ninguna reconexión se agenda fuera de `scheduleReconnect()`.** Tres capas redundantes a propósito:
+
+1. **Deadline de arranque** (`armConnectDeadline`, 60s) — un socket que no da señales de vida se da por muerto sin esperar a Baileys. Un `qr` o un `open` lo desarman: a partir de ahí supervisan el `qrTimeout` de Baileys y el watchdog.
+2. **Scheduler propio** — `restartSession` envuelve a `startSession` en un `try/catch` que reprograma. Antes iba sin `await` ni `.catch()`: una excepción ahí era una unhandled rejection, que en Node 20 tumba el proceso.
+3. **Watchdog** (`sweepSessions`, cada 2 min) — busca la firma exacta del incidente: sesión no conectada **y sin ningún timer armado**. Excepción: la que está mostrando un QR no está huérfana, está esperando a un humano.
+
+**Se reintenta indefinidamente** (backoff 3s→5min). El viejo tope de 10 intentos borraba la sesión del Map a los 21 minutos y dejaba el fantasma. Una caída de red puede durar horas y exigirle al cliente que escanee un QR por eso es peor producto: reintentar es gratis, mentir no.
+
+### El `status` de Firestore es una proyección, no un log de eventos
+
+Se escribía sólo desde `connection.update`, así que cuando el evento no llegó quedó congelado en `reconnecting` para siempre. Ahora `projectStatus()` lo **deriva del estado en memoria** y el barrido lo recalcula cada 2 minutos: no puede desincronizarse.
+
+- `connected` ⟺ `isReady` · `reconnecting` ⟺ caída hace <10 min · `reconnect_failed` ⟺ caída hace >10 min (el backend **sigue** intentando) · `disconnected` ⟺ no está en el Map.
+- **`writeSessionStatus()` es el único escritor de ese campo.** No escribir `status` desde ningún otro lado.
+- Mientras el estado es `reconnecting` se refresca `last_sync` cada barrido aunque nada cambie. Ese **heartbeat es lo que le permite a la app distinguir "el backend sigue intentando" de "el doc lleva horas congelado"**. Late sólo en esa ventana de 10 min para que una sesión muerta durante días no cueste una escritura cada dos minutos.
+- `sweepFirestoreGhosts()` (cada 15 min y al bootear, **después** de restaurar sesiones) es lo único que paga reads: corrige docs que afirman tener sesión viva cuando en memoria no hay ninguna. Reemplaza al viejo HealthCheck, que sólo miraba `status == 'connected'` y por eso era ciego a los atascados en `reconnecting`.
+
+### Un socket por sesión, un número por sesión
+
+- **Teardown antes de reemplazar.** Antes no se hacía en ningún lado: cada reconexión apilaba un socket zombi con sus listeners intactos, capaz de escribir sobre el estado del socket sano. El orden importa — primero `ev.removeAllListeners()`, después `end()`.
+- **`generation`**: cada socket nace con un número y su handler captura el suyo. Un socket viejo que emite tarde se descarta comparando, en vez de programar una reconexión que mataría a su reemplazo.
+- **`retireDuplicateSessions`**: re-vincular genera un `sessionKey` nuevo, y el anterior se quedaba vivo peleando por la misma cuenta de WhatsApp *y* resucitando en cada arranque desde su `auth_info`. Al conectar, toda otra sesión del mismo número se retira con sus credenciales.
+
+### `meta.json` guarda el número, no sólo la cuenta
+
+`phoneNumber` sólo se conocía tras el primer `open`, y **todas** las escrituras de estado colgaban de `if (session.phoneNumber)`. En un arranque en frío eso significaba que una sesión que moría antes de conectar no podía ni reportar su propia caída. Ahora se persiste al conectar y se hidrata al arrancar.
+
+Eso además desactiva una bomba: la rama `408 && !session.phoneNumber` borraba `auth_info` tratándolo como "QR abandonado" — y en un arranque en frío **toda** sesión restaurada tenía el número vacío, así que un timeout al bootear **destruía credenciales válidas**. Ahora la condición mira también `meta.json`: sólo se limpia lo que nunca llegó a vincularse.
+
+### En la app: el botón de re-vincular no se esconde nunca
+
+`_SessionVisual` (`accounts_screen.dart`) deriva el chip de `status` **cruzado con `last_sync`**: si dice `reconnecting` pero no late hace más de 5 min, el spinner deja de prometer algo que nadie está intentando y pasa a "Sin respuesta". Y el botón de re-vincular aparece en **cualquier** estado que no sea conectado. Esconderlo durante `reconnecting` fue lo que dejó al cliente sin salida: la única acción que arreglaba el problema era justo la que la UI ocultaba.
+
+---
+
+
 ## 📦 Dependencias iOS: sólo Swift Package Manager
 
 **iOS no tiene CocoaPods.** No hay `ios/Podfile`, ni `Podfile.lock`, ni `Pods/`. Los 14 plugins con código nativo iOS —Firebase completo, `just_audio`, `file_picker`, `image_picker_ios`, `video_player_avfoundation`…— se resuelven por SPM a través de `ios/Flutter/ephemeral/Packages/FlutterGeneratedPluginSwiftPackage`, y hasta el propio engine llega por ahí (`FLUTTER_FRAMEWORK_SWIFT_PACKAGE_PATH`).
