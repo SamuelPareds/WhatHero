@@ -114,36 +114,99 @@ void main() {
     expect(next, 1, reason: 'abajo está deshabilitado en la última posición');
   });
 
-  testWidgets('Alt+↑ / Alt+↓ recorren la cola con el foco en un TextField',
-      (tester) async {
+  // El detalle del chat casi nunca tiene el foco adentro: MessagesView no
+  // enfoca el composer al abrir, y tocar la conversación hace un `unfocus()`
+  // para bajar el teclado. `Shortcuts` sólo ve teclas que suben desde el
+  // widget enfocado, así que estos tres escenarios son el atajo entero.
+  Future<List<int>> pressArrows(
+    WidgetTester tester,
+    LogicalKeyboardKey modifier, {
+    required Future<void> Function(WidgetTester) setUpFocus,
+  }) async {
     final steps = <int>[];
-    final focusNode = FocusNode();
-    addTearDown(focusNode.dispose);
-
     await tester.pumpWidget(MaterialApp(
       home: Scaffold(
         body: ChatNavShortcuts(
           onStep: steps.add,
-          // El foco vive en el composer casi siempre: si el atajo no gana ahí,
-          // no sirve de nada.
-          child: TextField(focusNode: focusNode, autofocus: true),
+          child: const TextField(),
         ),
       ),
     ));
     await tester.pump();
+    await setUpFocus(tester);
 
-    await tester.sendKeyDownEvent(LogicalKeyboardKey.altLeft);
+    await tester.sendKeyDownEvent(modifier);
     await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
     await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
-    await tester.sendKeyUpEvent(LogicalKeyboardKey.altLeft);
+    await tester.sendKeyUpEvent(modifier);
+    await tester.pump();
+    return steps;
+  }
+
+  testWidgets('funciona recién abierto el chat, sin foco en el composer',
+      (tester) async {
+    final steps = await pressArrows(
+      tester,
+      LogicalKeyboardKey.altLeft,
+      setUpFocus: (_) async {},
+    );
+    expect(steps, [1, -1]);
+  });
+
+  testWidgets('funciona con el foco puesto en el composer', (tester) async {
+    final steps = await pressArrows(
+      tester,
+      LogicalKeyboardKey.altLeft,
+      setUpFocus: (t) async {
+        await t.tap(find.byType(TextField));
+        await t.pump();
+      },
+    );
+    expect(steps, [1, -1]);
+  });
+
+  testWidgets('sobrevive al unfocus de tocar la conversación', (tester) async {
+    final steps = await pressArrows(
+      tester,
+      LogicalKeyboardKey.altLeft,
+      setUpFocus: (t) async {
+        await t.tap(find.byType(TextField));
+        await t.pump();
+        // Lo mismo que hace el GestureDetector del ListView de mensajes.
+        FocusManager.instance.primaryFocus?.unfocus();
+        await t.pump();
+      },
+    );
+    expect(steps, [1, -1]);
+  });
+
+  testWidgets('⌘ también sirve: confundirla con ⌥ no cuesta el atajo',
+      (tester) async {
+    final steps = await pressArrows(
+      tester,
+      LogicalKeyboardKey.metaLeft,
+      setUpFocus: (t) async {
+        await t.tap(find.byType(TextField));
+        await t.pump();
+      },
+    );
+    expect(steps, [1, -1]);
+  });
+
+  testWidgets('sin modificador las flechas no son nuestras', (tester) async {
+    final steps = <int>[];
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: ChatNavShortcuts(onStep: steps.add, child: const TextField()),
+      ),
+    ));
     await tester.pump();
 
-    expect(steps, [1, -1]);
-
-    // Sin Alt las flechas son del TextField (y del selector de respuestas
-    // rápidas), no nuestras.
     await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+    await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
     await tester.pump();
-    expect(steps, [1, -1]);
+
+    // Son del selector de respuestas rápidas y del cursor del TextField.
+    expect(steps, isEmpty);
   });
 }

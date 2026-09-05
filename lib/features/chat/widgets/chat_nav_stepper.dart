@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:crm_whatsapp/core.dart';
@@ -36,7 +37,7 @@ class ChatNavStepper extends StatelessWidget {
       children: [
         _NavArrow(
           icon: Icons.keyboard_arrow_up,
-          tooltip: 'Anterior · más reciente  (Alt+↑)',
+          tooltip: 'Anterior · más reciente  (${chatNavShortcutHint('↑')})',
           onTap: onPrev,
         ),
         // El contador es la mitad del valor: dice "vas en la 4 de 12" y, de
@@ -53,7 +54,7 @@ class ChatNavStepper extends StatelessWidget {
         ),
         _NavArrow(
           icon: Icons.keyboard_arrow_down,
-          tooltip: 'Siguiente · más antiguo  (Alt+↓)',
+          tooltip: 'Siguiente · más antiguo  (${chatNavShortcutHint('↓')})',
           onTap: onNext,
         ),
       ],
@@ -95,13 +96,16 @@ class _NavArrow extends StatelessWidget {
   }
 }
 
-/// Atajos Alt+↑ / Alt+↓ para recorrer la cola sin soltar el teclado.
+/// Atajos de teclado para recorrer la cola sin soltar el teclado: ⌥↑/⌥↓ en
+/// Mac, Alt+↑/Alt+↓ en Windows y Linux. **También ⌘↑/⌘↓**, porque en Mac
+/// mucha gente llama "alt" a Command y equivocarse de tecla no debería costar
+/// el atajo; eso pisa el "ir al inicio/fin del texto" de macOS dentro del
+/// composer, que en un input de seis líneas no vale lo que vale navegar.
 ///
-/// Van con Alt porque las flechas solas ya pertenecen al selector de
+/// Van con modificador porque las flechas solas ya pertenecen al selector de
 /// respuestas rápidas del composer. Envuelve al detalle del chat, así que
-/// queda por DEBAJO de `DefaultTextEditingShortcuts` en el árbol y se queda
-/// con la tecla aunque el foco esté en el input (MessagesView lo enfoca al
-/// montar). `includeRepeats: false` evita que mantener la flecha pulsada
+/// queda por DEBAJO de `DefaultTextEditingShortcuts` en el árbol y le gana la
+/// tecla. `includeRepeats: false` evita que mantener la flecha pulsada
 /// atraviese la cola entera de un tirón.
 class ChatNavShortcuts extends StatelessWidget {
   /// `delta` en posiciones de la cola: -1 hacia lo más reciente, +1 hacia lo
@@ -119,10 +123,16 @@ class ChatNavShortcuts extends StatelessWidget {
   Widget build(BuildContext context) {
     return Shortcuts(
       shortcuts: const <ShortcutActivator, Intent>{
+        // ⌥ en Mac, Alt en Windows/Linux.
         SingleActivator(LogicalKeyboardKey.arrowUp,
             alt: true, includeRepeats: false): _StepChatIntent(-1),
         SingleActivator(LogicalKeyboardKey.arrowDown,
             alt: true, includeRepeats: false): _StepChatIntent(1),
+        // ⌘, para que confundir Command con Option no rompa nada.
+        SingleActivator(LogicalKeyboardKey.arrowUp,
+            meta: true, includeRepeats: false): _StepChatIntent(-1),
+        SingleActivator(LogicalKeyboardKey.arrowDown,
+            meta: true, includeRepeats: false): _StepChatIntent(1),
       },
       child: Actions(
         actions: <Type, Action<Intent>>{
@@ -133,10 +143,28 @@ class ChatNavShortcuts extends StatelessWidget {
             },
           ),
         },
-        child: child,
+        // `Shortcuts` sólo ve las teclas que SUBEN desde el widget enfocado,
+        // y el detalle del chat pasa la mayor parte del tiempo sin foco
+        // adentro: MessagesView no enfoca el composer al abrir un chat (sólo
+        // al activar un draft de respuesta), y tocar la conversación hace un
+        // `unfocus()` explícito para bajar el teclado. Sin este scope el
+        // atajo quedaba sordo salvo que el cursor estuviera en el input.
+        //
+        // Con él: `autofocus` toma el foco al montar el detalle, y el
+        // `unfocus()` del tap devuelve el foco a ESTE scope (la regla es "al
+        // scope más cercano"), que sigue estando debajo del `Shortcuts`.
+        child: FocusScope(autofocus: true, child: child),
       ),
     );
   }
+}
+
+/// Cómo se escribe el atajo en esta plataforma. En Mac el modificador se
+/// dibuja; en el resto se nombra.
+String chatNavShortcutHint(String arrow) {
+  final isApple = defaultTargetPlatform == TargetPlatform.macOS ||
+      defaultTargetPlatform == TargetPlatform.iOS;
+  return isApple ? '⌥$arrow o ⌘$arrow' : 'Alt+$arrow';
 }
 
 class _StepChatIntent extends Intent {

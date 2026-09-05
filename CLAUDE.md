@@ -251,7 +251,13 @@ Por eso el stepper del AppBar (`ChatNavStepper`, ↑ 4/12 ↓) **no camina la li
 - **Cambiar de chat limpia `_jumpToMessageId`/`_jumpToTimestamp`** (`_clearJumpTarget`): un salto a mensaje pertenece al chat del que salió, y MessagesView intentaría anclar en un id que no vive en la conversación nueva.
 - **Borrar un chat lo saca de la cola** y corrige el índice: las flechas no pueden aterrizar en una conversación que ya no existe.
 
-**Atajos Alt+↑ / Alt+↓** (`ChatNavShortcuts` envuelve al detalle entero). Van con Alt porque las flechas solas ya son del selector de respuestas rápidas del composer, y el `Shortcuts` queda por **debajo** de `DefaultTextEditingShortcuts` en el árbol, así que gana la tecla con el foco en el input — que es donde vive el 99% del tiempo. `includeRepeats: false` para que mantener la flecha no atraviese la cola de un tirón.
+### Los atajos (`ChatNavShortcuts` envuelve al detalle entero)
+
+**⌥↑/⌥↓ en Mac, Alt+↑/Alt+↓ en Windows y Linux — y también ⌘↑/⌘↓.** Van con modificador porque las flechas solas ya son del selector de respuestas rápidas del composer, y el `Shortcuts` queda por **debajo** de `DefaultTextEditingShortcuts` en el árbol, así que le gana la tecla. `includeRepeats: false` para que mantener la flecha no atraviese la cola de un tirón.
+
+- **⌘ está atado a propósito.** En Mac la tecla "alt" es Option (⌥), pero mucha gente llama alt a Command; equivocarse no debería costar el atajo. Pisa el "ir al inicio/fin del texto" de macOS dentro del composer — en un input de seis líneas eso no vale lo que vale navegar.
+- **El `FocusScope` interno no es decorativo: sin él el atajo está sordo.** `Shortcuts` sólo ve las teclas que **suben desde el widget enfocado**, y el detalle del chat casi nunca tiene foco adentro: `MessagesView` **no** enfoca el composer al abrir un chat (`_inputFocusNode.requestFocus()` sólo corre al activar un draft de respuesta), y tocar la conversación hace un `unfocus()` explícito para bajar el teclado, que manda el foco al scope de la ruta — por **encima** del `Shortcuts`. Con el scope: `autofocus` toma el foco al montar, y el `unfocus()` lo devuelve a ese scope (la regla es "al más cercano"), que sigue estando debajo. Fue el bug de la primera versión: sólo funcionaba con el cursor puesto en el input.
+- **Un test que enfoca a mano lo que el app no enfoca es un test que miente.** El primero pasaba con `autofocus: true` en su `TextField` y por eso no vio nada. Los tres escenarios de `test/chat_nav_stepper_test.dart` (recién abierto, con foco en el composer, después del `unfocus`) son el atajo entero.
 
 **Cuidado con el ancho del AppBar:** el stepper comparte fila con el nombre del contacto, el toggle de IA y el botón de info. `test/chat_nav_stepper_test.dart` fija que quepa en un teléfono de 360dp con un nombre largo; si engorda, ese test revienta con un `RenderFlex overflow` en vez de degradar el título en silencio.
 
