@@ -1036,7 +1036,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
     final List<Map<String, String>> models = _selectedProvider == 'openai'
       ? [
           {'id': 'gpt-4.1-mini', 'name': 'GPT-4.1 Mini', 'desc': 'Recomendado'},
-          {'id': 'gpt-4o-mini', 'name': 'GPT-4o Mini', 'desc': 'Más barato'},
+          {'id': 'gpt-5.6-luna', 'name': 'GPT-5.6 Luna', 'desc': 'Más barato y razona'},
           {'id': 'gpt-5-mini', 'name': 'GPT-5 Mini', 'desc': 'A prueba'},
         ]
       : _selectedProvider == 'deepseek'
@@ -1050,6 +1050,15 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
           {'id': 'gemini-2.5-pro', 'name': 'Pro 2.5', 'desc': 'Más preciso'},
           {'id': 'gemini-2.5-flash-lite', 'name': 'Flash Lite', 'desc': 'Más barato'},
         ];
+
+    // Un modelo guardado que ya no está en la lista (retirado, como el viejo
+    // `gpt-4o-mini`) reventaba el panel entero: `DropdownButton` exige que su
+    // `value` aparezca EXACTAMENTE una vez entre los items. Lo agregamos como
+    // entrada extra en vez de coercionarlo al default, para que el operador vea
+    // qué tiene configurado de verdad y no le cambiemos el modelo en silencio.
+    if (!models.any((m) => m['id'] == _selectedModel)) {
+      models.add({'id': _selectedModel, 'name': _selectedModel, 'desc': 'retirado'});
+    }
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,

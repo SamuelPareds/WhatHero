@@ -40,12 +40,42 @@ export type AiProvider = 'gemini' | 'openai' | 'deepseek';
 // la familia GPT-5 descuentan de este mismo presupuesto.
 const AI_MAX_OUTPUT_TOKENS = 4000;
 
-// Los modelos de razonamiento (GPT-5, familia o*) rechazan `max_tokens` —exigen
-// `max_completion_tokens`— y solo aceptan la temperatura por defecto. Sin esta
-// distinción, elegir "GPT-5 Mini" en el panel de sesión hacía fallar la llamada
-// entera con un 400 del proveedor.
+// Los de razonamiento necesitan MUCHO más aire: el presupuesto que gastan
+// pensando sale de aquí, y un modelo con esfuerzo medio (el default de
+// GPT-5.6) puede quemar miles de tokens antes de escribir la primera letra.
+// Con 4000 el riesgo no era una respuesta cortada sino NINGUNA respuesta:
+// `finish_reason: 'length'` con el texto vacío → `truncated: true` → el
+// auto-responder deriva a humano y el copiloto lanza error. El techo alto no
+// cuesta nada porque se factura lo que se usa, no lo que se reserva.
+const AI_MAX_OUTPUT_TOKENS_REASONING = 16000;
+
+// Presupuesto de los clasificadores (discriminador y agente de seguimiento).
+// La respuesta útil son ~30 tokens, pero para un modelo de razonamiento esos
+// 200 se los comía el pensamiento y devolvía texto vacío: el discriminador
+// caía a su fallback y las reglas del operador dejaban de aplicarse sin un
+// solo error en los logs. La versión de razonamiento es el arreglo.
+const AI_CLASSIFIER_MAX_TOKENS = 200;
+const AI_CLASSIFIER_MAX_TOKENS_REASONING = 2000;
+
+// Los modelos de razonamiento (GPT-5.x —incluida la familia 5.6 Luna—, o*)
+// rechazan `max_tokens` —exigen `max_completion_tokens`— y solo aceptan la
+// temperatura por defecto. Sin esta distinción, elegir "GPT-5 Mini" en el panel
+// de sesión hacía fallar la llamada entera con un 400 del proveedor.
 function isReasoningModel(modelName: string): boolean {
   return /^(gpt-5|o[1-9])/i.test(modelName);
+}
+
+// Parámetros de salida correctos para la familia del modelo. TODA llamada a
+// `chat.completions.create` de este archivo debe pasar por aquí: mandar
+// `temperature` o `max_tokens` a un modelo de razonamiento es un 400 que tumba
+// la llamada entera, y era el error que quedaba suelto en los clasificadores.
+function outputParams(
+  modelName: string,
+  opts: { plain: number; reasoning: number; temperature: number }
+) {
+  return isReasoningModel(modelName)
+    ? { max_completion_tokens: opts.reasoning }
+    : { max_tokens: opts.plain, temperature: opts.temperature };
 }
 
 // Resultado de una generación. `truncated` viaja aparte del texto porque un
@@ -484,14 +514,14 @@ async function generateAIResponseOpenAI(
       ...(operatorNote ? [{ role: 'system' as const, content: operatorNote }] : []),
     ];
 
-    const reasoning = isReasoningModel(modelName);
     const response = await client.chat.completions.create({
       model: modelName,
       messages,
-      ...(reasoning ? {} : { temperature: 0.7 }),
-      ...(reasoning
-        ? { max_completion_tokens: AI_MAX_OUTPUT_TOKENS }
-        : { max_tokens: AI_MAX_OUTPUT_TOKENS }),
+      ...outputParams(modelName, {
+        plain: AI_MAX_OUTPUT_TOKENS,
+        reasoning: AI_MAX_OUTPUT_TOKENS_REASONING,
+        temperature: 0.7,
+      }),
     });
 
     // `finish_reason: 'length'` = el modelo agotó el presupuesto y cortó a media
@@ -765,8 +795,11 @@ Razón: <una frase breve explicando por qué>`;
         { role: 'system', content: systemContent },
         { role: 'user', content: userContent },
       ],
-      temperature: 0.1,
-      max_tokens: 200,
+      ...outputParams(modelName, {
+        plain: AI_CLASSIFIER_MAX_TOKENS,
+        reasoning: AI_CLASSIFIER_MAX_TOKENS_REASONING,
+        temperature: 0.1,
+      }),
     });
 
     const responseText = response.choices[0]?.message.content || '';
@@ -878,8 +911,11 @@ Razón: <una frase breve explicando por qué>`;
             { role: 'system', content: systemContent },
             { role: 'user', content: userContent },
           ],
-          temperature: 0.1,
-          max_tokens: 200,
+          ...outputParams(modelName, {
+            plain: AI_CLASSIFIER_MAX_TOKENS,
+            reasoning: AI_CLASSIFIER_MAX_TOKENS_REASONING,
+            temperature: 0.1,
+          }),
         });
         return response.choices[0]?.message.content || '';
       }
