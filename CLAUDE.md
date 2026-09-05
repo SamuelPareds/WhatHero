@@ -236,6 +236,20 @@ Por eso el toggle de IA del chat abierto usa `set(merge)` y no `update`: en un c
 
 ---
 
+## 🔎 Buscar un chat pegando el número (cola de dígitos)
+
+El operador copia el número de WhatsApp Web, de un correo o de otro CRM y lo pega en el buscador. Lo pegado viene en E.164 con separadores y **sin el `1` móvil mexicano** (`+52 55 1234 5678`); lo guardado es el JID pelado (`5215512345678`). Como texto plano no coincide **nada**: ni el `+`, ni los espacios, ni el `521`. El chat existía y la búsqueda decía que no.
+
+**No se comparan números, se compara la cola de dígitos** (`lib/core/utils/phone_search.dart`). Se le quita al término todo lo que no sea dígito y se toman los **últimos 10** — el nacional más largo de la región. Eso deja fuera el código de país y el prefijo móvil sin tocar el número en sí, así que las dos formas colapsan en la misma cadena y da igual cuál de las dos esté guardada.
+
+- **10 es un techo, no un largo.** Un número más corto usa todos sus dígitos (`min(10, los que haya)`); nunca se rellena. Brasil móvil tiene 11 con la nona: recortarle el dígito de área no rompe nada, la cola sigue siendo un sufijo del guardado, que es lo único que la comparación necesita.
+- **Es `contains`, no `endsWith`**, para que escribir a mano los primeros dígitos siga encontrando. Con 10 dígitos la distinción es teórica.
+- **El guard `_phoneLike` es lo que evita inundar la lista.** Sólo se interpreta como teléfono lo que es dígitos + puntuación (`+ - ( ) . espacio`) con al menos un dígito. Sin él, buscar "Ana 2" daría una cola de `2` que coincide con casi todos los chats. Si hay letras, se busca como texto contra nombre y nota, igual que siempre.
+- **La cola se calcula una vez por build de la lista, no por chat.** Se compara contra `phoneNumber` y también contra `contactName` (hay contactos guardados con su propio número como nombre); la nota conserva su búsqueda de texto literal.
+- Las reglas viven en `test/phone_search_test.dart`. Es lógica silenciosa cuando falla: si se rompe, la búsqueda no da error, sólo dice que el chat no existe.
+
+---
+
 ## ⇅ Recorrer chats sin volver a la lista (cola congelada)
 
 Revisar la bandeja de ayer costaba dos gestos por chat: back a la lista, encontrar dónde te quedaste, entrar al siguiente. Encontrar dónde te quedaste era el caro, porque **la lista se mueve debajo de los pies**: la ordena `lastMessageTimestamp descending`, así que contestar un chat lo manda al puesto 1, y en *Pendientes* además lo saca del filtro al poner `unresponded_count: 0`. La referencia visual se evapora justo por haber hecho el trabajo.

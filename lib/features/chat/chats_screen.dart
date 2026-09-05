@@ -13,6 +13,7 @@ import 'package:crm_whatsapp/core/services/api_client.dart';
 import 'package:crm_whatsapp/core/services/notification_service.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/core/services/storage_service.dart';
+import 'package:crm_whatsapp/core/utils/phone_search.dart';
 import 'package:crm_whatsapp/features/settings.dart';
 import 'package:crm_whatsapp/features/accounts.dart';
 import 'messages_view.dart';
@@ -819,6 +820,12 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
           // 1) Filtro rápido (chip activo). 2) Búsqueda. Se encadenan: puedes
           // buscar dentro de un filtro.
+          //
+          // Si lo buscado parece un número, lo reducimos a su cola de dígitos
+          // UNA vez por build (no por chat) y comparamos contra eso: así pegar
+          // `+52 55 1234 5678` encuentra al `5215512345678` guardado. null =
+          // no es un número, se busca como texto.
+          final searchTail = phoneSearchTail(searchQuery);
           final filteredChats = allChats.where((chatDoc) {
             final chatData = chatDoc.data() as Map<String, dynamic>?;
 
@@ -860,8 +867,15 @@ class _ChatsScreenState extends State<ChatsScreen> {
             final phoneNumber = chatData?['phoneNumber'] as String? ?? '';
             final contactName = chatData?['contactName'] as String? ?? '';
             final note = chatData?['note'] as String? ?? '';
-            return phoneNumber.toLowerCase().contains(searchQuery) ||
-                contactName.toLowerCase().contains(searchQuery) ||
+            if (searchTail != null) {
+              // Buscó un número: el `+`, los espacios y el `521` no tienen por
+              // qué coincidir, sólo los dígitos del final. El nombre también
+              // se compara por si el contacto está guardado con su número.
+              return phoneMatchesTail(phoneNumber, searchTail) ||
+                  phoneMatchesTail(contactName, searchTail) ||
+                  note.toLowerCase().contains(searchQuery);
+            }
+            return contactName.toLowerCase().contains(searchQuery) ||
                 note.toLowerCase().contains(searchQuery);
           }).toList();
 
