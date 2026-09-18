@@ -34,6 +34,8 @@
 	<string>WhatHero necesita acceso al micrófono para grabar notas de voz y videos en tus chats.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>WhatHero necesita acceso a tus fotos para adjuntar imágenes a las respuestas rápidas.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>WhatHero guarda en tu carrete las fotos y videos que descargues de los chats.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

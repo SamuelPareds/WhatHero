@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.1.4+13
+version: 1.1.5+13
 
 environment:
   sdk: ^3.9.2
@@ -48,6 +48,16 @@ dependencies:
   firebase_storage: ^13.4.2
   image_picker: ^1.2.2
   file_picker: ^12.0.0
+  # Guardar en el carrete del teléfono (android/ios/macos/windows; NO tiene web).
+  # Elegido sobre `super_clipboard` porque no arrastra Rust/cargokit al build y
+  # trae `darwin/gal/Package.swift` con dependencies: [] → no reabre CocoaPods.
+  gal: ^2.3.3
+  # Ya estaba como transitiva; se promueve porque `media_transfer_io` necesita el
+  # temp dir real (en Android `Directory.systemTemp` depende de TMPDIR y puede
+  # caer en /tmp, que no existe). Cero bytes extra: sus plugins ya iban en el build.
+  path_provider: ^2.1.5
+  # Ya se importaba directo en notification_sound_web.dart sin estar declarada.
+  web: ^1.1.1
 
 dev_dependencies:
   flutter_test:

@@ -280,6 +280,85 @@ Por eso el stepper del AppBar (`ChatNavStepper`, ↑ 4/12 ↓) **no camina la li
 
 ---
 
+## 📤 Llevarse la evidencia (copiar y guardar fotos y videos)
+
+Una foto abierta a pantalla completa era un callejón sin salida: los dos visores
+(`_FullscreenImage`, `_FullscreenVideo` en `message_bubble.dart`) tenían el `AppBar` sin
+`actions`, y el menú de long-press sólo ofrecía "Copiar" con la guarda `text.isNotEmpty`, o
+sea **nada en una foto sin caption**. El operador que necesitaba adjuntar esa foto a un
+correo tenía que salirse de WhatHero.
+
+La acción vive en `lib/core/services/media_transfer.dart`, una fachada con import
+condicional calcada de `notification_sound.dart`. **Tiene que ser import condicional y no
+`if (kIsWeb)`**: la rama nativa importa `dart:io`, `path_provider` y `gal`, que no compilan
+en web; la web importa `package:web`, que no compila en móvil. Con un `if` el compilador
+tendría que tragarse las dos. La UI entra por un solo archivo,
+`lib/features/chat/widgets/media_actions.dart`, en los cuatro puntos donde aparece: los dos
+visores, el menú de long-press y la galería de medios.
+
+| | Web (Chrome/Edge) | Android / iOS |
+|---|---|---|
+| Foto | Copiar imagen · Descargar · Copiar enlace | Guardar en Fotos · Copiar enlace |
+| Video | Descargar · Copiar enlace | Guardar en Fotos · Copiar enlace |
+
+### Las tres cosas que se van a olvidar
+
+1. **El `<a download>` necesita bajar los bytes primero.** El atributo `download` **se
+   ignora en URLs cross-origin**, y Storage es otro origen que el Hosting: sin el `fetch`,
+   Chrome abre la foto en una pestaña en vez de descargarla con nuestro nombre. Funciona
+   porque `firebasestorage.googleapis.com` responde `access-control-allow-origin: *` — el
+   token de la URL es la credencial, no hace falta tocar el CORS del bucket ni mandar auth.
+2. **Hay que transcodificar a PNG para copiar.** Chrome sólo admite `image/png` en el
+   portapapeles y las fotos de WhatsApp son JPEG, así que van por `createImageBitmap` →
+   `OffscreenCanvas` → `convertToBlob`. Se hace `await` de los bytes y después `write`; la
+   variante de pasarle una `Promise<Blob>` sin resolver al `ClipboardItem` es la única que
+   acepta Safari (ahí el `await` consume el gesto del usuario), pero convierte cualquier
+   fallo en un rechazo genérico y perdemos el diagnóstico. Si entra Safari de escritorio al
+   alcance, son dos líneas.
+3. **No hay copiar-imagen en el celular, y es a propósito.** El único paquete serio que lo
+   hace es `super_clipboard`, que mete la cadena de compilación de Rust (cargokit) en cada
+   release de iOS y Android. Demasiado peaje para un gesto que en el teléfono casi nadie
+   usa: ahí se guarda en el carrete y se adjunta desde la galería. **Si alguien agrega
+   "copiar imagen en Android", que sepa que ése es el costo.** `canCopyImage` es la
+   constante que apaga el botón, no un `if` de plataforma disperso por la UI.
+
+**El plugin de galería es `gal` y se eligió por lo que NO trae:** `dependencies: []` y
+`darwin/gal/Package.swift`, o sea SPM puro — no reabre CocoaPods (ver *Dependencias iOS*).
+Al tocar esta zona, el chequeo obligatorio después del `pub get` es que los xcconfig sigan
+teniendo una sola línea y que no haya reaparecido `ios/Podfile`.
+
+### Detalles con motivo
+
+- **La extensión sale de la URL, nunca del `mediaType`** (`lib/core/utils/media_file_name.dart`).
+  El backend guarda en `…/<messageId>.<ext>`, así que la URL ya sabe si ese "video" es un
+  mp4. Deducirla del tipo daría un `.jpg` con bytes de webp: un archivo que no abre en
+  ningún lado y sin error que lo delate. Las reglas viven en `test/media_file_name_test.dart`.
+- **Un GIF se guarda como `.mp4`, porque eso es.** WhatsApp los manda como video con
+  `gifPlayback`; renombrarlo a `.gif` daría un archivo roto.
+- **Los stickers quedan fuera** aunque reusen `_FullscreenImage`: son webp y iOS los
+  rechaza en Fotos. Por eso el visor recibe sus `actions` por parámetro en vez de armarlas
+  adentro — no sabe qué está mostrando, y quien lo abre decide.
+- **La guarda es "hay URL y no falló", no `mediaStatus == 'ready'`.** Espeja la condición
+  con la que la burbuja ya habilita el tap al visor (`hasFullRes`). Con el `== 'ready'`
+  estricto habría fotos que se abren a pantalla completa pero sin botón para guardarlas, y
+  se rompería con los docs viejos que no tienen el campo.
+- **Las acciones reciben el `ScaffoldMessengerState`, no el `BuildContext`.** Bajar un video
+  son 16 MB: para cuando termina, la hoja se cerró y el visor puede estar cerrado. Capturado
+  antes del `await`, el toast sale igual y no hay `mounted` que chequear.
+- **El permiso de Fotos se pide ANTES de bajar los bytes.** Si el operador dice que no, no
+  le gastamos sus datos. `NSPhotoLibraryAddUsageDescription` en el `Info.plist` no es
+  opcional: sin esa clave la app **crashea** en el primer guardado, no falla.
+- **Si el navegador niega el portapapeles, se copia el enlace** y el toast lo dice. Un solo
+  fallback cubre los tres modos de fallo (permiso, pestaña sin foco, sin soporte) sin tener
+  que distinguirlos. Ojo: ese enlace lleva el token de Storage y sirve para siempre para
+  quien lo reciba.
+
+**Fuera de alcance a propósito:** audios y documentos siguen con "Abrir archivo" y
+`launchUrl`. En móvil la galería no los acepta, así que el mismo botón se comportaría
+distinto según el tipo de archivo.
+
+---
+
 ## 📱 Versión de WhatsApp Web (defensa anti-405)
 
 El backend se declara ante WhatsApp como una versión concreta de WhatsApp Web (`2.3000.<revisión>`). WhatsApp **corta las versiones viejas cada pocas semanas**, y cuando lo hace caen todas las sesiones a la vez con `405 Connection Failure` — sin poder siquiera generar un QR para revincular. Pasó el 28-jul-2026 con las 3 cuentas de producción.

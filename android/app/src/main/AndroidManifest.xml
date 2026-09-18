@@ -3,6 +3,11 @@
          anteriores se concede al instalar. Sin este flag, requestPermission()
          devuelve "denied" en API 33+ aunque la app ya esté permitida. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Android <=9 (API 28) todavía exige permiso para escribir en el carrete;
+         desde API 29 `gal` usa MediaStore y no necesita nada. El minSdk del
+         proyecto es 24, así que ese rango de dispositivos existe. -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
 
     <application
         android:label="WhatHero"

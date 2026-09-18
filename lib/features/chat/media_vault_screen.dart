@@ -19,6 +19,7 @@ import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
 import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/services/api_client.dart';
+import 'package:crm_whatsapp/features/chat/widgets/media_actions.dart';
 
 const int _pageSize = 30;
 
@@ -823,6 +824,47 @@ class _MediaVaultScreenState extends State<MediaVaultScreen> {
                     ),
                   ),
                 ),
+                // Llevarse el video. No aparece en documentos: ahí la acción
+                // sigue siendo "Abrir archivo".
+                if (canTransferMedia(
+                  mediaType: type,
+                  mediaUrl: d['mediaUrl'] as String?,
+                  mediaStatus: d['mediaStatus'] as String?,
+                )) ...[
+                  const SizedBox(height: 10),
+                  OutlinedButton.icon(
+                    onPressed: () {
+                      // El messenger se resuelve ANTES de cerrar la hoja: la
+                      // descarga termina mucho después de que este context
+                      // dejó de existir.
+                      final messenger = ScaffoldMessenger.of(sheetCtx);
+                      Navigator.of(sheetCtx).pop();
+                      runSaveMedia(
+                        messenger,
+                        url: d['mediaUrl'] as String,
+                        isVideo: true,
+                        fileNameHint: d['mediaFileName'] as String?,
+                        timestamp: ts is Timestamp ? ts.toDate() : null,
+                      );
+                    },
+                    icon: const Icon(Icons.save_alt),
+                    label: Text(saveMediaLabel),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: primaryAqua,
+                      minimumSize: const Size.fromHeight(48),
+                      side: BorderSide(
+                        color: primaryAqua.withValues(alpha: 0.5),
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      textStyle: const TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 10),
                 // Acción secundaria: abrir el archivo externamente.
                 OutlinedButton.icon(
@@ -989,6 +1031,22 @@ class _MediaFullscreenViewer extends StatelessWidget {
         backgroundColor: Colors.black.withValues(alpha: 0.6),
         elevation: 0,
         iconTheme: const IconThemeData(color: Colors.white),
+        // Este visor es sólo de imágenes: los videos van por la hoja de
+        // detalle (`_showMediaDetailSheet`).
+        actions: canTransferMedia(
+          mediaType: data['mediaType'] as String?,
+          mediaUrl: url,
+          mediaStatus: data['mediaStatus'] as String?,
+        )
+            ? [
+                MediaActionButtons(
+                  url: url!,
+                  isVideo: false,
+                  fileNameHint: data['mediaFileName'] as String?,
+                  timestamp: ts is Timestamp ? ts.toDate() : null,
+                ),
+              ]
+            : const [],
         title: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,

@@ -9,6 +9,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player/video_player.dart';
 import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/services/api_client.dart';
+import 'package:crm_whatsapp/features/chat/widgets/media_actions.dart';
 
 // Player global compartido: solo un audio suena a la vez (estilo WhatsApp).
 // Cada burbuja se identifica por messageId; al darle play a otra burbuja, la
@@ -279,12 +280,26 @@ class _MessageBubbleState extends State<MessageBubble> {
     );
   }
 
-  void _openFullscreen(String url) {
+  // `withActions: false` es para los stickers, que reusan este mismo visor:
+  // son webp y iOS los rechaza en Fotos, así que no les ofrecemos guardarlos.
+  void _openFullscreen(String url, {bool withActions = true}) {
     Navigator.of(context).push(
       PageRouteBuilder(
         opaque: false,
         barrierColor: Colors.black,
-        pageBuilder: (_, __, ___) => _FullscreenImage(url: url),
+        pageBuilder: (_, __, ___) => _FullscreenImage(
+          url: url,
+          actions: withActions
+              ? [
+                  MediaActionButtons(
+                    url: url,
+                    isVideo: false,
+                    fileNameHint: widget.mediaFileName,
+                    timestamp: widget.timestamp,
+                  ),
+                ]
+              : const [],
+        ),
       ),
     );
   }
@@ -308,7 +323,9 @@ class _MessageBubbleState extends State<MessageBubble> {
             _buildSenderLabel(),
             GestureDetector(
               onLongPress: _showMessageOptions,
-              onTap: isReady ? () => _openFullscreen(url) : null,
+              onTap: isReady
+                  ? () => _openFullscreen(url, withActions: false)
+                  : null,
               child: SizedBox(
                 width: 140,
                 height: 140,
@@ -726,8 +743,20 @@ class _MessageBubbleState extends State<MessageBubble> {
       PageRouteBuilder(
         opaque: false,
         barrierColor: Colors.black,
-        pageBuilder: (_, __, ___) =>
-            _FullscreenVideo(url: url, loop: widget.mediaIsGif ?? false),
+        pageBuilder: (_, __, ___) => _FullscreenVideo(
+          url: url,
+          loop: widget.mediaIsGif ?? false,
+          // Los GIFs entran por acá y se guardan como .mp4, que es lo que
+          // realmente son: renombrarlos a .gif daría un archivo roto.
+          actions: [
+            MediaActionButtons(
+              url: url,
+              isVideo: true,
+              fileNameHint: widget.mediaFileName,
+              timestamp: widget.timestamp,
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -892,6 +921,15 @@ class _MessageBubbleState extends State<MessageBubble> {
     // No permitimos reaccionar a stickers/sólo-media sin contenido si el
     // mensaje fue revocado (no tiene sentido reaccionar a evidencia).
     final canReact = widget.revoked != true;
+    // Foto o video ya subidos a Storage: se los puede llevar.
+    final canTransfer = canTransferMedia(
+      mediaType: widget.mediaType,
+      mediaUrl: widget.mediaUrl,
+      mediaStatus: widget.mediaStatus,
+    );
+    // El messenger sale del context del State, no del de la hoja: la hoja se
+    // cierra al tocar y los toasts de descarga llegan mucho después.
+    final messenger = ScaffoldMessenger.of(context);
 
     showModalBottomSheet(
       context: context,
@@ -972,6 +1010,17 @@ class _MessageBubbleState extends State<MessageBubble> {
                   Navigator.pop(context);
                   _copyToClipboard();
                 },
+              ),
+            // Media: debajo de "Copiar" (que es el texto del caption) y arriba
+            // de las acciones destructivas.
+            if (canTransfer)
+              ...mediaActionTiles(
+                sheetContext: context,
+                messenger: messenger,
+                url: widget.mediaUrl!,
+                isVideo: widget.mediaType == 'video',
+                fileNameHint: widget.mediaFileName,
+                timestamp: widget.timestamp,
               ),
             if (canEdit)
               ListTile(
@@ -1790,7 +1839,12 @@ class _LinkifiedTextState extends State<_LinkifiedText> {
 class _FullscreenVideo extends StatefulWidget {
   final String url;
   final bool loop;
-  const _FullscreenVideo({required this.url, required this.loop});
+  final List<Widget> actions;
+  const _FullscreenVideo({
+    required this.url,
+    required this.loop,
+    this.actions = const [],
+  });
 
   @override
   State<_FullscreenVideo> createState() => _FullscreenVideoState();
@@ -1843,6 +1897,7 @@ class _FullscreenVideoState extends State<_FullscreenVideo> {
         backgroundColor: Colors.transparent,
         elevation: 0,
         iconTheme: const IconThemeData(color: Colors.white),
+        actions: widget.actions,
       ),
       body: _error != null
           ? Center(
@@ -1945,7 +2000,13 @@ class _FullscreenVideoState extends State<_FullscreenVideo> {
 // que ya viene en Flutter.
 class _FullscreenImage extends StatelessWidget {
   final String url;
-  const _FullscreenImage({required this.url});
+
+  // Acciones del AppBar. Van por parámetro y no armadas acá adentro porque el
+  // visor no sabe qué está mostrando: quien lo abre decide si hay botones
+  // (los stickers no los llevan).
+  final List<Widget> actions;
+
+  const _FullscreenImage({required this.url, this.actions = const []});
 
   @override
   Widget build(BuildContext context) {
@@ -1955,6 +2016,7 @@ class _FullscreenImage extends StatelessWidget {
         backgroundColor: Colors.transparent,
         elevation: 0,
         iconTheme: const IconThemeData(color: Colors.white),
+        actions: actions,
       ),
       body: Center(
         child: InteractiveViewer(
