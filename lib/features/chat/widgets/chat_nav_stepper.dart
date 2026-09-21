@@ -99,64 +99,112 @@ class _NavArrow extends StatelessWidget {
 /// Atajos de teclado para recorrer la cola sin soltar el teclado: ⌥↑/⌥↓ en
 /// Mac, Alt+↑/Alt+↓ en Windows y Linux. **También ⌘↑/⌘↓**, porque en Mac
 /// mucha gente llama "alt" a Command y equivocarse de tecla no debería costar
-/// el atajo; eso pisa el "ir al inicio/fin del texto" de macOS dentro del
-/// composer, que en un input de seis líneas no vale lo que vale navegar.
+/// el atajo.
+///
+/// **No depende del foco.** Escucha el teclado directo en [HardwareKeyboard]
+/// en vez de usar `Shortcuts`, que sólo oye las teclas que suben desde el
+/// widget enfocado. El foco se escapaba del detalle por tres caminos, y cada
+/// uno dejaba el atajo sordo sin aviso: `unfocus()` sobre el propio scope (un
+/// tap en la conversación lo manda al scope PADRE), el `unfocus()` de abrir un
+/// chat desde la lista, y la web, que al cerrarse el input estaciona el foco
+/// en la raíz y al volver lo reparte al primer campo enfocable, casi siempre
+/// el buscador de la lista. En web el motor escucha el teclado en `window`,
+/// así que las teclas llegan igual; lo que fallaba era a quién se las daba.
+///
+/// Sin el foco para acotarlo, el atajo se apaga solo en tres casos:
+/// - **Hay una ruta encima** (diálogo, hoja, visor de fotos): no es suyo.
+/// - **[enabled] en `false`**: lo que tapa el detalle sin ser ruta, como la
+///   galería de medios en desktop.
+/// - **Escribiendo, las flechas son del texto.** Con el foco en un input que
+///   ya tiene texto, ⌘⇧↑, ⌘↑ o ⌥↑ llegan al editor: seleccionar hasta el
+///   inicio, ir al final, saltar de párrafo. Navegar ahí tiraba el borrador,
+///   que muere con el chat. No basta con confiar en `shift: false`: en Chrome
+///   sobre Mac el framework a veces recibe ⌘↑ cuando se tecleó ⌘⇧↑ (el ⇧ llega
+///   tarde en el acorde). Devolviendo `false`, el navegador aplica el evento
+///   DOM real, con su ⇧ verdadero, al `<textarea>`.
 ///
 /// Van con modificador porque las flechas solas ya pertenecen al selector de
-/// respuestas rápidas del composer. Envuelve al detalle del chat, así que
-/// queda por DEBAJO de `DefaultTextEditingShortcuts` en el árbol y le gana la
-/// tecla. `includeRepeats: false` evita que mantener la flecha pulsada
-/// atraviese la cola entera de un tirón.
-class ChatNavShortcuts extends StatelessWidget {
+/// respuestas rápidas del composer. `includeRepeats: false` evita que mantener
+/// la flecha pulsada atraviese la cola entera de un tirón.
+class ChatNavShortcuts extends StatefulWidget {
   /// `delta` en posiciones de la cola: -1 hacia lo más reciente, +1 hacia lo
   /// más antiguo.
   final void Function(int delta) onStep;
+
+  /// `false` mientras algo que no es una ruta tapa el detalle. Las rutas se
+  /// detectan solas.
+  final bool enabled;
+
   final Widget child;
 
   const ChatNavShortcuts({
     required this.onStep,
     required this.child,
+    this.enabled = true,
     super.key,
   });
 
   @override
-  Widget build(BuildContext context) {
-    return Shortcuts(
-      shortcuts: const <ShortcutActivator, Intent>{
-        // ⌥ en Mac, Alt en Windows/Linux.
-        SingleActivator(LogicalKeyboardKey.arrowUp,
-            alt: true, includeRepeats: false): _StepChatIntent(-1),
-        SingleActivator(LogicalKeyboardKey.arrowDown,
-            alt: true, includeRepeats: false): _StepChatIntent(1),
-        // ⌘, para que confundir Command con Option no rompa nada.
-        SingleActivator(LogicalKeyboardKey.arrowUp,
-            meta: true, includeRepeats: false): _StepChatIntent(-1),
-        SingleActivator(LogicalKeyboardKey.arrowDown,
-            meta: true, includeRepeats: false): _StepChatIntent(1),
-      },
-      child: Actions(
-        actions: <Type, Action<Intent>>{
-          _StepChatIntent: CallbackAction<_StepChatIntent>(
-            onInvoke: (intent) {
-              onStep(intent.delta);
-              return null;
-            },
-          ),
-        },
-        // `Shortcuts` sólo ve las teclas que SUBEN desde el widget enfocado,
-        // y el detalle del chat pasa la mayor parte del tiempo sin foco
-        // adentro: MessagesView no enfoca el composer al abrir un chat (sólo
-        // al activar un draft de respuesta), y tocar la conversación hace un
-        // `unfocus()` explícito para bajar el teclado. Sin este scope el
-        // atajo quedaba sordo salvo que el cursor estuviera en el input.
-        //
-        // Con él: `autofocus` toma el foco al montar el detalle, y el
-        // `unfocus()` del tap devuelve el foco a ESTE scope (la regla es "al
-        // scope más cercano"), que sigue estando debajo del `Shortcuts`.
-        child: FocusScope(autofocus: true, child: child),
-      ),
-    );
+  State<ChatNavShortcuts> createState() => _ChatNavShortcutsState();
+}
+
+class _ChatNavShortcutsState extends State<ChatNavShortcuts> {
+  static const _bindings = <(SingleActivator, int)>[
+    // ⌥ en Mac, Alt en Windows/Linux.
+    (SingleActivator(LogicalKeyboardKey.arrowUp, alt: true, includeRepeats: false), -1),
+    (SingleActivator(LogicalKeyboardKey.arrowDown, alt: true, includeRepeats: false), 1),
+    // ⌘, para que confundir Command con Option no rompa nada.
+    (SingleActivator(LogicalKeyboardKey.arrowUp, meta: true, includeRepeats: false), -1),
+    (SingleActivator(LogicalKeyboardKey.arrowDown, meta: true, includeRepeats: false), 1),
+  ];
+
+  ModalRoute<Object?>? _route;
+
+  @override
+  void initState() {
+    super.initState();
+    HardwareKeyboard.instance.addHandler(_handleKey);
   }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _route = ModalRoute.of(context);
+  }
+
+  @override
+  void dispose() {
+    HardwareKeyboard.instance.removeHandler(_handleKey);
+    super.dispose();
+  }
+
+  bool _handleKey(KeyEvent event) {
+    if (!widget.enabled) return false;
+    if (!(_route?.isCurrent ?? true)) return false;
+
+    int? delta;
+    for (final (activator, step) in _bindings) {
+      if (activator.accepts(event, HardwareKeyboard.instance)) {
+        delta = step;
+        break;
+      }
+    }
+    if (delta == null || _isEditingText()) return false;
+
+    widget.onStep(delta);
+    return true;
+  }
+
+  // Foco en un input con texto. El contexto del nodo enfocado es el `Focus`
+  // que monta `EditableText` por dentro, así que el estado está arriba.
+  bool _isEditingText() {
+    final editing = FocusManager.instance.primaryFocus?.context
+        ?.findAncestorStateOfType<EditableTextState>();
+    return editing != null && editing.textEditingValue.text.isNotEmpty;
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
 }
 
 /// Cómo se escribe el atajo en esta plataforma. En Mac el modificador se
@@ -165,9 +213,4 @@ String chatNavShortcutHint(String arrow) {
   final isApple = defaultTargetPlatform == TargetPlatform.macOS ||
       defaultTargetPlatform == TargetPlatform.iOS;
   return isApple ? '⌥$arrow o ⌘$arrow' : 'Alt+$arrow';
-}
-
-class _StepChatIntent extends Intent {
-  final int delta;
-  const _StepChatIntent(this.delta);
 }

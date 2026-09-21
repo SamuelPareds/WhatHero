@@ -521,7 +521,10 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 SizedBox(width: 400, child: _buildChatsList()),
                 Expanded(
                   child: selectedChatPhone != null
-                      ? _buildMessageDetail()
+                      // En desktop la galería se abre a pantalla completa
+                      // ENCIMA del detalle (capa, no ruta): con ella abierta
+                      // las flechas cambiarían de chat a ciegas.
+                      ? _buildMessageDetail(shortcutsEnabled: !_showMediaVault)
                       : Container(
                           color: darkBg,
                           child: const Center(
@@ -1355,11 +1358,12 @@ class _ChatsScreenState extends State<ChatsScreen> {
     }
   }
 
-  Widget _buildMessageDetail() {
-    // Los atajos envuelven al detalle entero para que funcionen con el foco
-    // en el composer, que es donde vive el 99% del tiempo.
+  Widget _buildMessageDetail({bool shortcutsEnabled = true}) {
+    // Los atajos viven mientras el detalle esté montado; no dependen de dónde
+    // quede el foco (ver ChatNavShortcuts).
     return ChatNavShortcuts(
       onStep: _stepChat,
+      enabled: shortcutsEnabled,
       child: _buildChatDetail(),
     );
   }
