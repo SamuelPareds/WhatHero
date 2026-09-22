@@ -1,6 +1,11 @@
 # Baileys v7.0 uses ESM - run directly with tsx in both dev and prod
 FROM node:20-alpine
 
+# ffmpeg: Baileys lo invoca para extraer la miniatura de los videos salientes.
+# Sin el binario falla dentro de un catch que solo loguea en debug, y el
+# destinatario ve un recuadro negro hasta que descarga el video.
+RUN apk add --no-cache ffmpeg
+
 WORKDIR /app
 
 # Create auth_info directory with proper permissions

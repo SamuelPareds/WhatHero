@@ -5,6 +5,9 @@ import 'package:firebase_storage/firebase_storage.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:crm_whatsapp/core.dart';
+import 'package:crm_whatsapp/core/utils/media_mime.dart';
+import 'package:crm_whatsapp/core/utils/quick_response_attachment.dart';
+import 'package:crm_whatsapp/features/chat/widgets/fullscreen_video.dart';
 
 class QuickResponsesPanel extends StatefulWidget {
   final String sessionId;
@@ -35,27 +38,31 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
   // Snapshot de los valores originales para detectar cambios (habilita Guardar)
   String _origTitle = '';
   String _origText = '';
-  String _origImageUrl = '';
-  String _origDocumentUrl = '';
-  String _origDocumentName = '';
+  QrAttachment _origAttach = QrAttachment.none;
+  // El doc crudo que se está editando. Se guarda entero porque al salvar hay
+  // que saber qué objetos de Storage tenía antes para borrar los que sobran.
+  Map<String, dynamic> _origDoc = const {};
 
-  // Estado de imagen del editor:
-  // - _imageUrl: URL ya persistida (Storage o externa legacy)
-  // - _pickedBytes: imagen recién elegida pendiente de subir (preview en memoria)
-  String _imageUrl = '';
+  // El adjunto del editor: imagen O video O documento, nunca dos.
+  //
+  // La exclusividad no necesita lógica de cruce porque hay un solo slot:
+  // elegir cualquier cosa pisa lo que hubiera. Es la misma regla de WhatsApp
+  // (un media por mensaje) y la del backend, que manda el primero de
+  // `documentUrl > videoUrl > imageUrl` y descarta el resto en silencio.
+  //
+  // - `_attach.url` vacía + `_pickedBytes` != null → recién elegido, sin subir
+  // - `_attach.url` con valor → ya persistido en Storage
+  QrAttachment _attach = QrAttachment.none;
   Uint8List? _pickedBytes;
-  final ImagePicker _picker = ImagePicker();
-  static const int _maxImageBytes = 10 * 1024 * 1024; // tope de seguridad: 10 MB
+  String _pickedName = '';
 
-  // Estado de documento del editor:
-  // - _documentUrl: URL ya persistida
-  // - _pickedDocumentBytes: documento recién elegido pendiente de subir
-  String _documentUrl = '';
-  String _documentName = '';
-  String _documentMimeType = '';
-  Uint8List? _pickedDocumentBytes;
-  String _pickedDocumentName = '';
-  static const int _maxDocumentBytes = 10 * 1024 * 1024; // 10 MB
+  final ImagePicker _picker = ImagePicker();
+
+  // Topes por tipo. El de video es el límite documentado de WhatsApp para
+  // video; los otros dos venían de antes.
+  static const int _maxImageBytes = 10 * 1024 * 1024;
+  static const int _maxVideoBytes = 16 * 1024 * 1024;
+  static const int _maxDocumentBytes = 10 * 1024 * 1024;
 
   // Búsqueda en la lista
   String _searchQuery = '';
@@ -114,30 +121,20 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
   // Abre el editor: con qr=null crea una nueva; con qr edita la existente
   void _openEditor([Map<String, dynamic>? qr]) {
     setState(() {
-      if (qr == null) {
-        _editingId = null;
-        _origTitle = '';
-        _origText = '';
-        _origImageUrl = '';
-        _origDocumentUrl = '';
-        _origDocumentName = '';
-      } else {
-        _editingId = qr['id'] as String;
-        _origTitle = qr['title'] as String? ?? '';
-        _origText = qr['text'] as String? ?? '';
-        _origImageUrl = qr['imageUrl'] as String? ?? '';
-        _origDocumentUrl = qr['documentUrl'] as String? ?? '';
-        _origDocumentName = qr['documentName'] as String? ?? '';
-      }
+      _editingId = qr?['id'] as String?;
+      _origTitle = qr?['title'] as String? ?? '';
+      _origText = qr?['text'] as String? ?? '';
+      _origDoc = qr ?? const {};
+      // Un doc legacy puede traer imagen Y documento a la vez. attachmentFromDoc
+      // resuelve cuál es "el" adjunto con la misma prioridad que usaría el
+      // backend al enviarlo, para que el editor muestre lo que realmente sale.
+      _origAttach = attachmentFromDoc(_origDoc);
+
       _titleController.text = _origTitle;
       _textController.text = _origText;
-      _imageUrl = _origImageUrl;
+      _attach = _origAttach;
       _pickedBytes = null;
-      _documentUrl = _origDocumentUrl;
-      _documentName = _origDocumentName;
-      _documentMimeType = qr?['documentMimeType'] as String? ?? '';
-      _pickedDocumentBytes = null;
-      _pickedDocumentName = '';
+      _pickedName = '';
       _showEditor = true;
     });
   }
@@ -149,49 +146,71 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
       _editingId = null;
       _titleController.clear();
       _textController.clear();
-      _imageUrl = '';
+      _origDoc = const {};
+      _origAttach = QrAttachment.none;
+      _attach = QrAttachment.none;
       _pickedBytes = null;
-      _documentUrl = '';
-      _documentName = '';
-      _documentMimeType = '';
-      _pickedDocumentBytes = null;
-      _pickedDocumentName = '';
+      _pickedName = '';
     });
   }
-
-  // Hay imagen si hay una recién elegida (en memoria) o una URL ya persistida
-  bool get _hasImage => _pickedBytes != null || _imageUrl.isNotEmpty;
-
-  // Hay documento si hay uno recién elegido o una URL ya persistida
-  bool get _hasDocument => _pickedDocumentBytes != null || _documentUrl.isNotEmpty;
 
   // Guardar habilitado solo si es válido y (al editar) hay cambios reales.
   // Así "si no hay cambios, no pasa nada" → el botón queda inactivo.
   bool get _canSave {
     final title = _titleController.text.trim();
     final text = _textController.text.trim();
-    final isValid = title.isNotEmpty && (text.isNotEmpty || _hasImage || _hasDocument);
+    final isValid = title.isNotEmpty && (text.isNotEmpty || _attach.isNotEmpty);
     if (!isValid) return false;
     if (_editingId == null) return true; // crear: cualquier contenido válido
-    // editar: exige al menos un cambio (texto, imagen o documento) respecto al original
-    final imageChanged = _pickedBytes != null || _imageUrl != _origImageUrl;
-    final documentChanged = _pickedDocumentBytes != null || _documentUrl != _origDocumentUrl;
-    return title != _origTitle || text != _origText || imageChanged || documentChanged;
+    // editar: exige al menos un cambio real respecto al original
+    final attachChanged = _pickedBytes != null ||
+        _attach.kind != _origAttach.kind ||
+        _attach.url != _origAttach.url;
+    return title != _origTitle || text != _origText || attachChanged;
   }
 
   // Path determinista en Storage: un archivo por respuesta (reemplazar =
   // sobrescribir, sin huérfanos). Usa accountsCollection para respetar las
   // storage.rules (accounts/... en prod, accounts_dev/... en desarrollo).
-  Reference _imageRef(String docId) => FirebaseStorage.instance.ref(
+  //
+  // La extensión es la del archivo real: si fuera fija, un png subido desde la
+  // web quedaría servido como .jpg y un video como un archivo sin tipo.
+  Reference _attachRef(String docId, String ext) => FirebaseStorage.instance.ref(
         '$accountsCollection/${widget.accountId}/whatsapp_sessions/'
-        '${widget.sessionId}/quick_responses/$docId.jpg',
+        '${widget.sessionId}/quick_responses/$docId.${ext.isNotEmpty ? ext : 'bin'}',
       );
 
-  // Document reference: preserva extensión original para integridad
-  Reference _documentRef(String docId, String ext) => FirebaseStorage.instance.ref(
-        '$accountsCollection/${widget.accountId}/whatsapp_sessions/'
-        '${widget.sessionId}/quick_responses/$docId.${ext.isNotEmpty ? ext.replaceFirst(RegExp(r'^\.'), '') : 'bin'}',
-      );
+  // El nombre a mostrar del adjunto: el del archivo recién elegido, o el que
+  // quedó guardado al subirlo.
+  String get _attachDisplayName =>
+      _pickedName.isNotEmpty ? _pickedName : _attach.name;
+
+  String _megabytes(int bytes) => (bytes / (1024 * 1024)).toStringAsFixed(1);
+
+  void _toast(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  // Rechaza lo que no entra, diciendo cuánto pesa y cuánto cabe: con sólo el
+  // límite el operador no sabe si le sobra un poco o si eligió el archivo
+  // equivocado.
+  bool _fits(int size, int limit, String what) {
+    if (size <= limit) return true;
+    _toast('$what pesa ${_megabytes(size)} MB y el límite es '
+        '${limit ~/ (1024 * 1024)} MB');
+    return false;
+  }
+
+  // Deja el adjunto elegido pendiente de subir, pisando el que hubiera.
+  void _setPicked(QrAttachKind kind, Uint8List bytes, String name) {
+    if (!mounted) return;
+    setState(() {
+      _attach = QrAttachment(kind: kind);
+      _pickedBytes = bytes;
+      _pickedName = name;
+    });
+  }
 
   // Elige una imagen de la galería. image_picker ya redimensiona y recomprime
   // (maxWidth 1600 / quality 80) → archivo liviano sin librería extra.
@@ -205,38 +224,34 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
       if (picked == null) return;
 
       final bytes = await picked.readAsBytes();
-      // Red de seguridad: rechazar si aún supera el tope de 10 MB
-      if (bytes.length > _maxImageBytes) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('La imagen supera el límite de 10 MB')),
-          );
-        }
-        return;
-      }
+      // Red de seguridad: el picker recomprime, pero un original enorme puede
+      // seguir pasándose.
+      if (!_fits(bytes.length, _maxImageBytes, 'La imagen')) return;
 
-      if (mounted) setState(() => _pickedBytes = bytes);
+      _setPicked(QrAttachKind.image, bytes, picked.name);
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('No se pudo cargar la imagen: $e')),
-        );
-      }
+      _toast('No se pudo cargar la imagen: $e');
     }
   }
 
-  // Quita la imagen del editor (se aplica al guardar)
-  void _removeImage() {
-    setState(() {
-      _pickedBytes = null;
-      _imageUrl = '';
-    });
-  }
+  // Elige un video de la galería.
+  //
+  // Va SIN `maxDuration` y sin recomprimir a propósito: Baileys sube a
+  // WhatsApp exactamente los bytes que le damos, así que no tocar el archivo
+  // es lo que hace que el cliente reciba el video en su calidad original. No
+  // hay un flag "HD" que activar — hay un original que no hay que estropear.
+  Future<void> _pickVideo() async {
+    try {
+      final picked = await _picker.pickVideo(source: ImageSource.gallery);
+      if (picked == null) return;
 
-  // PlatformFile dejó de exponer `extension` en file_picker 12: sólo hay `name`.
-  String _extOf(String name) {
-    final i = name.lastIndexOf('.');
-    return (i > 0 && i < name.length - 1) ? name.substring(i + 1).toLowerCase() : '';
+      final bytes = await picked.readAsBytes();
+      if (!_fits(bytes.length, _maxVideoBytes, 'El video')) return;
+
+      _setPicked(QrAttachKind.video, bytes, picked.name);
+    } catch (e) {
+      _toast('No se pudo cargar el video: $e');
+    }
   }
 
   // Validación de seguridad: rechazar tipos peligrosos
@@ -251,47 +266,26 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
       if (f == null) return;
 
       final bytes = await f.readAsBytes();
-      if (bytes.length > _maxDocumentBytes) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('El documento supera el límite de 10 MB')),
-          );
-        }
-        return;
-      }
+      if (!_fits(bytes.length, _maxDocumentBytes, 'El documento')) return;
 
-      final ext = _extOf(f.name);
+      final ext = fileExtension(f.name);
       if (!_isSafeFileType(ext)) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Tipo de archivo no permitido: .$ext')),
-          );
-        }
+        _toast('Tipo de archivo no permitido: .$ext');
         return;
       }
 
-      if (mounted) {
-        setState(() {
-          _pickedDocumentBytes = bytes;
-          _pickedDocumentName = f.name;
-        });
-      }
+      _setPicked(QrAttachKind.document, bytes, f.name);
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error al cargar documento: $e')),
-        );
-      }
+      _toast('Error al cargar documento: $e');
     }
   }
 
-  void _removeDocument() {
+  // Quita el adjunto del editor (se aplica al guardar)
+  void _removeAttachment() {
     setState(() {
-      _pickedDocumentBytes = null;
-      _pickedDocumentName = '';
-      _documentUrl = '';
-      _documentName = '';
-      _documentMimeType = '';
+      _attach = QrAttachment.none;
+      _pickedBytes = null;
+      _pickedName = '';
     });
   }
 
@@ -307,61 +301,46 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
       final docRef = isEditing ? _collectionRef.doc(_editingId) : _collectionRef.doc();
       final docId = docRef.id;
 
-      // Resolver URL final de la imagen
-      String imageUrl = _imageUrl;
+      // Subir el adjunto recién elegido, si lo hay. Si no, lo que esté en
+      // `_attach` ya está en Storage (o no hay adjunto).
+      var attach = _attach;
+      String? uploadedPath;
       if (_pickedBytes != null) {
-        final ref = _imageRef(docId);
-        await ref.putData(
-          _pickedBytes!,
-          SettableMetadata(contentType: 'image/jpeg'),
+        final ext = fileExtension(_pickedName);
+        final mime = mimeForExtension(ext, fallback: _defaultMime(attach.kind));
+        final ref = _attachRef(docId, ext);
+        await ref.putData(_pickedBytes!, SettableMetadata(contentType: mime));
+        uploadedPath = ref.fullPath;
+        attach = QrAttachment(
+          kind: attach.kind,
+          url: await ref.getDownloadURL(),
+          name: _pickedName,
+          mimeType: mime,
         );
-        imageUrl = await ref.getDownloadURL();
-      } else if (imageUrl.isEmpty && _origImageUrl.isNotEmpty) {
-        await _deleteImageObject(docId);
       }
 
-      // Resolver URL final del documento
-      String documentUrl = _documentUrl;
-      String documentName = _documentName;
-      String documentMimeType = _documentMimeType;
-      if (_pickedDocumentBytes != null) {
-        final ext = _pickedDocumentName.contains('.')
-            ? _pickedDocumentName.split('.').last
-            : 'bin';
-        final ref = _documentRef(docId, ext);
-        await ref.putData(
-          _pickedDocumentBytes!,
-          SettableMetadata(contentType: 'application/octet-stream'),
-        );
-        documentUrl = await ref.getDownloadURL();
-        documentName = _pickedDocumentName;
-        documentMimeType = _getMimeType(ext);
-      } else if (documentUrl.isEmpty && _origDocumentUrl.isNotEmpty) {
-        await _deleteDocumentObject(docId);
-      }
-
+      final data = {
+        'title': title,
+        'text': text,
+        ...attachmentFields(attach),
+      };
       if (isEditing) {
-        await docRef.update({
-          'title': title,
-          'text': text,
-          'imageUrl': imageUrl,
-          'documentUrl': documentUrl,
-          'documentName': documentName,
-          'documentMimeType': documentMimeType,
-        });
+        await docRef.update(data);
       } else {
         await docRef.set({
+          ...data,
           'id': docId,
-          'title': title,
-          'text': text,
-          'imageUrl': imageUrl,
-          'documentUrl': documentUrl,
-          'documentName': documentName,
-          'documentMimeType': documentMimeType,
           'order': _quickResponses.length,
           'createdAt': FieldValue.serverTimestamp(),
         });
       }
+
+      // Recién con el doc ya escrito: si el borrado falla, lo peor que queda
+      // es un archivo de más, no una respuesta apuntando a un archivo muerto.
+      await _deleteStorageObjects(
+        orphanAttachmentUrls(_origDoc, attach),
+        keepPath: uploadedPath,
+      );
 
       await _loadQuickResponses();
 
@@ -386,50 +365,37 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
     }
   }
 
-  // Borra el objeto de imagen en Storage; ignora si no existe (p.ej. respuestas
-  // legacy con URL externa, que no tienen archivo en nuestro bucket).
-  Future<void> _deleteImageObject(String docId) async {
-    try {
-      await _imageRef(docId).delete();
-    } catch (_) {
-      // Sin archivo o sin permiso → no es crítico, seguimos
-    }
-  }
-
-  // Borra el documento en Storage; ignora si no existe
-  Future<void> _deleteDocumentObject(String docId) async {
-    try {
-      // Intentar con extensiones comunes
-      final exts = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'zip', 'bin'];
-      for (final ext in exts) {
-        try {
-          await _documentRef(docId, ext).delete();
-          return;
-        } catch (_) {
-          // Continuar con la siguiente
-        }
+  // Borra objetos de Storage por su URL de descarga. Nunca es crítico: un
+  // archivo huérfano no rompe nada, y frenar el guardado por eso sí.
+  //
+  // [keepPath] protege lo que se acaba de subir. Sobrescribir un path regenera
+  // el token de descarga, así que la URL vieja del doc y la nueva son
+  // distintas aunque apunten al mismo objeto — sin este guard, reemplazar una
+  // imagen por otra imagen borraría la que se acaba de subir.
+  Future<void> _deleteStorageObjects(
+    Iterable<String> urls, {
+    String? keepPath,
+  }) async {
+    for (final url in urls) {
+      try {
+        final ref = FirebaseStorage.instance.refFromURL(url);
+        if (ref.fullPath == keepPath) continue;
+        await ref.delete();
+      } catch (_) {
+        // URL externa legacy (no es de nuestro bucket), archivo ya borrado o
+        // sin permiso → seguimos.
       }
-    } catch (_) {
-      // Sin archivo o sin permiso → no es crítico
     }
   }
 
-  // Detectar MIME type basado en extensión
-  String _getMimeType(String ext) {
-    final mimeMap = {
-      'pdf': 'application/pdf',
-      'doc': 'application/msword',
-      'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-      'xls': 'application/vnd.ms-excel',
-      'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-      'ppt': 'application/vnd.ms-powerpoint',
-      'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-      'txt': 'text/plain',
-      'csv': 'text/csv',
-      'zip': 'application/zip',
-    };
-    return mimeMap[ext.toLowerCase()] ?? 'application/octet-stream';
-  }
+  // El MIME con el que subir cuando la extensión no está en la tabla. Importa
+  // sobre todo para el video: con el genérico, WhatsApp lo trataría como
+  // archivo adjunto en vez de reproducirlo.
+  String _defaultMime(QrAttachKind kind) => switch (kind) {
+        QrAttachKind.image => 'image/jpeg',
+        QrAttachKind.video => 'video/mp4',
+        QrAttachKind.document || QrAttachKind.none => 'application/octet-stream',
+      };
 
   // Confirma antes de borrar (acción destructiva, estilo WhatsApp)
   Future<void> _confirmDelete() async {
@@ -461,8 +427,11 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
     if (confirmed != true) return;
 
     try {
-      // Borrar también la imagen asociada en Storage (limpieza)
-      await _deleteImageObject(id);
+      // Borrar también el adjunto en Storage. Antes sólo se limpiaba la
+      // imagen, así que cada respuesta con documento dejaba un huérfano.
+      await _deleteStorageObjects(
+        orphanAttachmentUrls(_origDoc, QrAttachment.none),
+      );
       await _collectionRef.doc(id).delete();
       await _loadQuickResponses();
       if (mounted) {
@@ -649,10 +618,12 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
     final filtered = _quickResponses.where((qr) {
       final title = (qr['title'] as String? ?? '').toLowerCase();
       final text = (qr['text'] as String? ?? '').toLowerCase();
-      final docName = (qr['documentName'] as String? ?? '').toLowerCase();
+      // El nombre del archivo adjunto, sea documento o video: buscar
+      // "catalogo.pdf" o "demo.mp4" tiene que encontrar su respuesta.
+      final fileName = attachmentFromDoc(qr).name.toLowerCase();
       return title.contains(_searchQuery) ||
           text.contains(_searchQuery) ||
-          docName.contains(_searchQuery);
+          fileName.contains(_searchQuery);
     }).toList();
 
     if (filtered.isEmpty && _searchQuery.isNotEmpty) {
@@ -691,12 +662,10 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
   Widget _responseTile(Map<String, dynamic> qr) {
     final title = qr['title'] as String? ?? '';
     final text = qr['text'] as String? ?? '';
-    final hasImage = (qr['imageUrl'] as String?)?.isNotEmpty ?? false;
-    final documentName = qr['documentName'] as String? ?? '';
-    final hasDocument = documentName.isNotEmpty;
+    final attach = attachmentFromDoc(qr);
 
-    // Preview: el texto si existe, si no un indicio de imagen/documento
-    final preview = text.isNotEmpty ? text : (hasImage ? 'Imagen' : (hasDocument ? 'Documento' : ''));
+    // Preview: el texto si existe, si no el tipo de adjunto
+    final preview = text.isNotEmpty ? text : _attachLabel(attach.kind);
 
     return InkWell(
       onTap: () => _openEditor(qr),
@@ -718,18 +687,13 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                   ),
-                  if (preview.isNotEmpty || hasImage || hasDocument)
+                  if (preview.isNotEmpty || attach.isNotEmpty)
                     Padding(
                       padding: const EdgeInsets.only(top: 3),
                       child: Row(
                         children: [
-                          if (hasImage) ...[
-                            Icon(Icons.image_outlined,
-                                size: 13, color: lightText.withValues(alpha: 0.6)),
-                            const SizedBox(width: 4),
-                          ],
-                          if (hasDocument) ...[
-                            Icon(Icons.description_outlined,
+                          if (attach.isNotEmpty) ...[
+                            Icon(_attachIcon(attach.kind, outlined: true),
                                 size: 13, color: lightText.withValues(alpha: 0.6)),
                             const SizedBox(width: 4),
                           ],
@@ -861,15 +825,12 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
                 _fieldLabel('Mensaje'),
                 _textField(
                   controller: _textController,
-                  hint: 'Mensaje o caption para la imagen/documento',
+                  hint: 'Mensaje o caption del adjunto',
                   maxLines: 4,
                 ),
                 const SizedBox(height: 20),
-                _fieldLabel('Imagen (opcional)'),
-                _imagePickerField(),
-                const SizedBox(height: 20),
-                _fieldLabel('Documento (opcional)'),
-                _documentPickerField(),
+                _fieldLabel('Adjunto (opcional)'),
+                _attachmentField(),
                 // Eliminar solo tiene sentido al editar una existente
                 if (isEditing) ...[
                   const SizedBox(height: 32),
@@ -898,57 +859,88 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
 
   // ────────────────────────────── Helpers UI ───────────────────────────────
 
-  // Selector de imagen: muestra preview (bytes recién elegidos o URL persistida)
-  // con opción de cambiar/quitar, o un área para agregar si no hay ninguna.
-  Widget _imagePickerField() {
-    if (_hasImage) {
-      return Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          ClipRRect(
-            borderRadius: BorderRadius.circular(12),
-            child: SizedBox(
-              width: double.infinity,
-              height: 180,
-              child: _pickedBytes != null
-                  ? Image.memory(_pickedBytes!, fit: BoxFit.cover)
-                  : Image.network(
-                      _imageUrl,
-                      fit: BoxFit.cover,
-                      errorBuilder: (_, __, ___) => Container(
-                        color: surfaceDark,
-                        child: Icon(Icons.broken_image_outlined,
-                            color: lightText.withValues(alpha: 0.5), size: 40),
-                      ),
-                    ),
-            ),
-          ),
-          const SizedBox(height: 8),
-          Row(
-            children: [
-              TextButton.icon(
-                onPressed: _pickImage,
-                icon: const Icon(Icons.swap_horiz, size: 18, color: primaryAqua),
-                label: const Text('Cambiar', style: TextStyle(color: primaryAqua)),
-              ),
-              TextButton.icon(
-                onPressed: _removeImage,
-                icon: const Icon(Icons.delete_outline, size: 18, color: Colors.red),
-                label: const Text('Quitar', style: TextStyle(color: Colors.red)),
-              ),
-            ],
-          ),
-        ],
-      );
-    }
+  String _attachLabel(QrAttachKind kind) => switch (kind) {
+        QrAttachKind.image => 'Imagen',
+        QrAttachKind.video => 'Video',
+        QrAttachKind.document => 'Documento',
+        QrAttachKind.none => '',
+      };
 
-    // Sin imagen: área tappable para agregar
+  IconData _attachIcon(QrAttachKind kind, {bool outlined = false}) =>
+      switch (kind) {
+        QrAttachKind.image =>
+          outlined ? Icons.image_outlined : Icons.image_rounded,
+        QrAttachKind.video =>
+          outlined ? Icons.videocam_outlined : Icons.videocam_rounded,
+        QrAttachKind.document =>
+          outlined ? Icons.description_outlined : Icons.description,
+        QrAttachKind.none => Icons.attach_file,
+      };
+
+  // La sección de adjunto: un solo slot.
+  //
+  // Sin adjunto se ven las tres opciones; con uno elegido se ve sólo ése. Esa
+  // es toda la explicación de la exclusividad — no hace falta un texto que
+  // diga "sólo puedes elegir uno" si nunca hay dos casillas abiertas.
+  Widget _attachmentField() =>
+      _attach.isEmpty ? _attachmentChooser() : _attachmentPreview();
+
+  Widget _attachmentChooser() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: _attachOption(
+                icon: Icons.add_photo_alternate_outlined,
+                label: 'Imagen',
+                onTap: _pickImage,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: _attachOption(
+                icon: Icons.video_call_outlined,
+                label: 'Video',
+                onTap: _pickVideo,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: _attachOption(
+                icon: Icons.upload_file_outlined,
+                label: 'Documento',
+                onTap: _pickDocument,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4),
+          child: Text(
+            // El video es el único que se manda tal cual, y conviene decirlo:
+            // es lo que hace que llegue en la calidad original.
+            'Imagen y documento hasta 10 MB · Video hasta 16 MB, '
+            'se envía sin recomprimir',
+            style: TextStyle(color: lightText.withValues(alpha: 0.5), fontSize: 11),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _attachOption({
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+  }) {
     return InkWell(
-      onTap: _pickImage,
+      onTap: onTap,
       borderRadius: BorderRadius.circular(12),
       child: Container(
-        width: double.infinity,
-        padding: const EdgeInsets.symmetric(vertical: 28),
+        padding: const EdgeInsets.symmetric(vertical: 18),
         decoration: BoxDecoration(
           color: darkBg.withValues(alpha: 0.3),
           borderRadius: BorderRadius.circular(12),
@@ -956,15 +948,15 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
         ),
         child: Column(
           children: [
-            Icon(Icons.add_photo_alternate_outlined,
-                size: 32, color: primaryAqua.withValues(alpha: 0.7)),
-            const SizedBox(height: 8),
-            const Text('Agregar imagen',
-                style: TextStyle(color: primaryAqua, fontWeight: FontWeight.w600)),
-            const SizedBox(height: 4),
+            Icon(icon, size: 26, color: primaryAqua.withValues(alpha: 0.7)),
+            const SizedBox(height: 6),
             Text(
-              'Se optimiza automáticamente (máx. 10 MB)',
-              style: TextStyle(color: lightText.withValues(alpha: 0.5), fontSize: 11),
+              label,
+              style: const TextStyle(
+                color: primaryAqua,
+                fontWeight: FontWeight.w600,
+                fontSize: 12,
+              ),
             ),
           ],
         ),
@@ -972,93 +964,123 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
     );
   }
 
-  // Selector de documento: muestra nombre y tamaño si está cargado, o área para agregar
-  Widget _documentPickerField() {
-    if (_hasDocument) {
-      final displayName = _pickedDocumentName.isNotEmpty ? _pickedDocumentName : _documentName;
-      return Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
-            decoration: BoxDecoration(
-              color: surfaceDark.withValues(alpha: 0.6),
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: primaryAqua.withValues(alpha: 0.2)),
-            ),
-            child: Row(
-              children: [
-                Icon(Icons.description, size: 24, color: primaryAqua.withValues(alpha: 0.7)),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        displayName,
-                        style: const TextStyle(color: white, fontWeight: FontWeight.w600, fontSize: 13),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        (_pickedDocumentBytes?.length ?? 0) > 0
-                            ? '${((_pickedDocumentBytes!.length) / (1024 * 1024)).toStringAsFixed(2)} MB'
-                            : 'Documento',
-                        style: TextStyle(color: lightText.withValues(alpha: 0.6), fontSize: 11),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 8),
-          Row(
-            children: [
-              TextButton.icon(
-                onPressed: _pickDocument,
-                icon: const Icon(Icons.swap_horiz, size: 18, color: primaryAqua),
-                label: const Text('Cambiar', style: TextStyle(color: primaryAqua)),
-              ),
-              TextButton.icon(
-                onPressed: _removeDocument,
-                icon: const Icon(Icons.delete_outline, size: 18, color: Colors.red),
-                label: const Text('Quitar', style: TextStyle(color: Colors.red)),
-              ),
-            ],
-          ),
-        ],
-      );
-    }
+  Widget _attachmentPreview() {
+    // "Cambiar" reabre el picker del mismo tipo; para cambiar de tipo se quita
+    // primero y vuelven a aparecer las tres opciones.
+    final repick = switch (_attach.kind) {
+      QrAttachKind.image => _pickImage,
+      QrAttachKind.video => _pickVideo,
+      QrAttachKind.document || QrAttachKind.none => _pickDocument,
+    };
 
-    // Sin documento: área tappable para agregar
-    return InkWell(
-      onTap: _pickDocument,
-      borderRadius: BorderRadius.circular(12),
-      child: Container(
-        width: double.infinity,
-        padding: const EdgeInsets.symmetric(vertical: 28),
-        decoration: BoxDecoration(
-          color: darkBg.withValues(alpha: 0.3),
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: primaryAqua.withValues(alpha: 0.2)),
-        ),
-        child: Column(
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (_attach.kind == QrAttachKind.image) _imagePreview() else _fileCard(),
+        const SizedBox(height: 8),
+        Row(
           children: [
-            Icon(Icons.upload_file_outlined,
-                size: 32, color: primaryAqua.withValues(alpha: 0.7)),
-            const SizedBox(height: 8),
-            const Text('Agregar documento',
-                style: TextStyle(color: primaryAqua, fontWeight: FontWeight.w600)),
-            const SizedBox(height: 4),
-            Text(
-              'PDF, Word, Excel, etc. (máx. 10 MB)',
-              style: TextStyle(color: lightText.withValues(alpha: 0.5), fontSize: 11),
+            TextButton.icon(
+              onPressed: repick,
+              icon: const Icon(Icons.swap_horiz, size: 18, color: primaryAqua),
+              label: const Text('Cambiar', style: TextStyle(color: primaryAqua)),
+            ),
+            TextButton.icon(
+              onPressed: _removeAttachment,
+              icon: const Icon(Icons.delete_outline, size: 18, color: Colors.red),
+              label: const Text('Quitar', style: TextStyle(color: Colors.red)),
             ),
           ],
         ),
+      ],
+    );
+  }
+
+  Widget _imagePreview() {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(12),
+      child: SizedBox(
+        width: double.infinity,
+        height: 180,
+        child: _pickedBytes != null
+            ? Image.memory(_pickedBytes!, fit: BoxFit.cover)
+            : Image.network(
+                _attach.url,
+                fit: BoxFit.cover,
+                errorBuilder: (_, __, ___) => Container(
+                  color: surfaceDark,
+                  child: Icon(Icons.broken_image_outlined,
+                      color: lightText.withValues(alpha: 0.5), size: 40),
+                ),
+              ),
+      ),
+    );
+  }
+
+  // Tarjeta para video y documento: icono, nombre y tamaño.
+  //
+  // Un video ya guardado se reproduce con un tap. Es la única forma de
+  // confirmar que la plantilla es el video correcto: el nombre del archivo no
+  // alcanza cuando son "IMG_4821.mov" e "IMG_4822.mov".
+  Widget _fileCard() {
+    final playable = _attach.kind == QrAttachKind.video && _attach.url.isNotEmpty;
+    final subtitle = _pickedBytes != null
+        ? '${_megabytes(_pickedBytes!.length)} MB'
+        : (playable ? 'Toca para reproducir' : _attachLabel(_attach.kind));
+
+    return InkWell(
+      onTap: playable ? _playAttachedVideo : null,
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+        decoration: BoxDecoration(
+          color: surfaceDark.withValues(alpha: 0.6),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: primaryAqua.withValues(alpha: 0.2)),
+        ),
+        child: Row(
+          children: [
+            Icon(_attachIcon(_attach.kind),
+                size: 24, color: primaryAqua.withValues(alpha: 0.7)),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    _attachDisplayName.isNotEmpty
+                        ? _attachDisplayName
+                        : _attachLabel(_attach.kind),
+                    style: const TextStyle(
+                        color: white, fontWeight: FontWeight.w600, fontSize: 13),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    subtitle,
+                    style: TextStyle(
+                        color: lightText.withValues(alpha: 0.6), fontSize: 11),
+                  ),
+                ],
+              ),
+            ),
+            if (playable)
+              Icon(Icons.play_circle_outline,
+                  size: 26, color: primaryAqua.withValues(alpha: 0.8)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _playAttachedVideo() {
+    Navigator.of(context).push(
+      PageRouteBuilder(
+        opaque: false,
+        barrierColor: Colors.black,
+        pageBuilder: (_, __, ___) => FullscreenVideo(url: _attach.url, loop: false),
       ),
     );
   }

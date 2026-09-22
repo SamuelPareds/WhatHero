@@ -8,6 +8,8 @@ import 'package:file_picker/file_picker.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:http/http.dart' as http;
 import 'package:crm_whatsapp/core.dart';
+import 'package:crm_whatsapp/core/utils/media_mime.dart';
+import 'package:crm_whatsapp/core/utils/quick_response_attachment.dart';
 import 'package:crm_whatsapp/core/services/api_client.dart';
 import 'package:crm_whatsapp/core/services/pending_messages_service.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
@@ -715,7 +717,7 @@ class _MessagesViewState extends State<MessagesView> {
       final XFile? file = await ImagePicker().pickMedia();
       if (file == null) return;
       final bytes = await file.readAsBytes();
-      final ext = _extOf(file.name);
+      final ext = fileExtension(file.name);
       // pickMedia sólo devuelve imagen o video; si no lo reconocemos por
       // extensión, lo enviamos como documento para no fallar.
       await _confirmAndSendAttachment(
@@ -742,7 +744,7 @@ class _MessagesViewState extends State<MessagesView> {
       await _confirmAndSendAttachment(
         bytes: bytes,
         fileName: f.name,
-        ext: _extOf(f.name),
+        ext: fileExtension(f.name),
         kind: 'document',
       );
     } catch (e) {
@@ -849,11 +851,6 @@ class _MessagesViewState extends State<MessagesView> {
     }
   }
 
-  String _extOf(String name) {
-    final i = name.lastIndexOf('.');
-    return (i > 0 && i < name.length - 1) ? name.substring(i + 1).toLowerCase() : '';
-  }
-
   String _kindForExt(String ext) {
     const images = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'heif', 'bmp'};
     const videos = {'mp4', 'mov', '3gp', 'webm', 'mkv', 'avi', 'm4v'};
@@ -862,32 +859,16 @@ class _MessagesViewState extends State<MessagesView> {
     return 'document';
   }
 
-  String _mimeFor(String ext, String kind) {
-    const map = {
-      'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
-      'gif': 'image/gif', 'webp': 'image/webp', 'heic': 'image/heic',
-      'heif': 'image/heif', 'bmp': 'image/bmp',
-      'mp4': 'video/mp4', 'mov': 'video/quicktime', '3gp': 'video/3gpp',
-      'webm': 'video/webm', 'mkv': 'video/x-matroska', 'm4v': 'video/x-m4v',
-      'pdf': 'application/pdf',
-      'doc': 'application/msword',
-      'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-      'xls': 'application/vnd.ms-excel',
-      'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-      'ppt': 'application/vnd.ms-powerpoint',
-      'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-      'txt': 'text/plain', 'csv': 'text/csv', 'zip': 'application/zip',
-      'rar': 'application/vnd.rar', '7z': 'application/x-7z-compressed',
-      'mp3': 'audio/mpeg', 'ogg': 'audio/ogg', 'm4a': 'audio/mp4',
-      'wav': 'audio/wav', 'aac': 'audio/aac',
-    };
-    return map[ext] ??
-        (kind == 'image'
-            ? 'image/jpeg'
-            : kind == 'video'
-                ? 'video/mp4'
-                : 'application/octet-stream');
-  }
+  // El fallback depende de lo que estemos mandando: con el genérico, WhatsApp
+  // trataría un video de extensión rara como archivo adjunto.
+  String _mimeFor(String ext, String kind) => mimeForExtension(
+        ext,
+        fallback: switch (kind) {
+          'image' => 'image/jpeg',
+          'video' => 'video/mp4',
+          _ => 'application/octet-stream',
+        },
+      );
 
   void _showAttachmentError(Object e) {
     if (!mounted) return;
@@ -1296,8 +1277,7 @@ class _MessagesViewState extends State<MessagesView> {
     // Vista previa en una línea: los saltos se aplanan para que el texto no
     // se corte en la primera frase corta de una plantilla larga.
     final preview = (qr['text'] as String? ?? '').replaceAll('\n', ' ').trim();
-    final imageUrl = qr['imageUrl'] as String? ?? '';
-    final documentName = qr['documentName'] as String? ?? '';
+    final attachKind = attachmentFromDoc(qr).kind;
 
     return MouseRegion(
       // El hover mueve el MISMO resaltado que las flechas: con dos highlights
@@ -1349,13 +1329,17 @@ class _MessagesViewState extends State<MessagesView> {
                   ],
                 ),
               ),
-              if (imageUrl.isNotEmpty) ...[
+              if (attachKind != QrAttachKind.none) ...[
                 const SizedBox(width: 4),
-                Icon(Icons.image, size: 14, color: primaryAqua.withValues(alpha: 0.6)),
-              ],
-              if (documentName.isNotEmpty) ...[
-                const SizedBox(width: 4),
-                Icon(Icons.description, size: 14, color: primaryAqua.withValues(alpha: 0.6)),
+                Icon(
+                  switch (attachKind) {
+                    QrAttachKind.image => Icons.image,
+                    QrAttachKind.video => Icons.videocam,
+                    QrAttachKind.document || QrAttachKind.none => Icons.description,
+                  },
+                  size: 14,
+                  color: primaryAqua.withValues(alpha: 0.6),
+                ),
               ],
             ],
           ),
@@ -1366,20 +1350,30 @@ class _MessagesViewState extends State<MessagesView> {
 
   void _selectQuickResponse(Map<String, dynamic> template) {
     final text = template['text'] as String? ?? '';
-    final imageUrl = template['imageUrl'] as String? ?? '';
-    final documentUrl = template['documentUrl'] as String? ?? '';
-    final documentName = template['documentName'] as String? ?? '';
     final title = template['title'] as String? ?? '';
+    // attachmentFromDoc aplica la misma prioridad que el backend al enviar
+    // (documento > video > imagen), así que lo que se confirma en el diálogo
+    // es lo que realmente sale.
+    final attach = attachmentFromDoc(template);
 
     _closeQuickResponses();
 
-    if (documentUrl.isNotEmpty) {
-      _showDocumentConfirmationDialog(title, text, documentUrl, documentName);
-    } else if (imageUrl.isNotEmpty) {
-      _showImageConfirmationDialog(title, text, imageUrl);
-    } else {
+    // Sólo texto: no se envía, se inserta en el composer para poder editarlo.
+    if (attach.isEmpty) {
       _insertAtToken(text);
+      return;
     }
+
+    showDialog(
+      context: context,
+      builder: (_) => _QuickResponseDialog(
+        title: title,
+        caption: text,
+        attachment: attach,
+        // Enviar con el texto editado (puede quedar vacío → adjunto solo)
+        onSend: (editedCaption) => _sendQuickResponseMedia(attach, editedCaption),
+      ),
+    );
   }
 
   // Reemplaza el token "/filtro" por el texto de la respuesta, conservando lo
@@ -1404,52 +1398,34 @@ class _MessagesViewState extends State<MessagesView> {
     _inputFocusNode.requestFocus();
   }
 
-  void _showImageConfirmationDialog(String title, String caption, String imageUrl) {
-    // El diálogo es un widget con estado propio para que el controller del
-    // caption se libere en su dispose() (evita "used after dispose")
-    showDialog(
-      context: context,
-      builder: (_) => _ImageCaptionDialog(
-        title: title,
-        caption: caption,
-        imageUrl: imageUrl,
-        // Enviar con el texto editado (puede quedar vacío → imagen sola)
-        onSend: (editedCaption) =>
-            _sendQuickResponse({'text': editedCaption, 'imageUrl': imageUrl}),
-      ),
-    );
-  }
-
-  void _showDocumentConfirmationDialog(String title, String caption, String documentUrl, String documentName) {
-    showDialog(
-      context: context,
-      builder: (_) => _DocumentCaptionDialog(
-        title: title,
-        caption: caption,
-        documentUrl: documentUrl,
-        documentName: documentName,
-        onSend: (editedCaption) => _sendQuickResponseWithDocument(
-          {'text': editedCaption, 'documentUrl': documentUrl, 'documentName': documentName},
-        ),
-      ),
-    );
-  }
-
-  Future<void> _sendQuickResponse(Map<String, dynamic> template) async {
-    final text = template['text'] as String? ?? '';
-    final imageUrl = template['imageUrl'] as String? ?? '';
-
-    if (imageUrl.isEmpty) return;
+  // Envía una respuesta rápida con adjunto. El caption ya viene editado por el
+  // operador y puede ir vacío (adjunto solo).
+  //
+  // Los tres tipos pasan por acá. Antes había un método por tipo, copiados
+  // enteros salvo por dos claves del payload.
+  Future<void> _sendQuickResponseMedia(QrAttachment attach, String text) async {
+    if (attach.isEmpty) return;
 
     setState(() => _isSending = true);
 
     try {
-      final messageData = {
+      final messageData = <String, dynamic>{
         'to': widget.phoneNumber,
         'text': text,
-        'imageUrl': imageUrl,
         'sessionKey': widget.sessionKey,
         'accountId': widget.accountId,
+        // Sin `cleanupAfterSend`: la plantilla vive en `quick_responses/` y
+        // tiene que sobrevivir al envío para poder reusarse.
+        if (attach.mimeType.isNotEmpty) 'mimetype': attach.mimeType,
+        ...switch (attach.kind) {
+          QrAttachKind.image => {'imageUrl': attach.url},
+          QrAttachKind.video => {'videoUrl': attach.url},
+          QrAttachKind.document => {
+              'documentUrl': attach.url,
+              'documentName': attach.name,
+            },
+          QrAttachKind.none => const <String, dynamic>{},
+        },
       };
 
       if (SocketService().isConnected) {
@@ -1457,52 +1433,6 @@ class _MessagesViewState extends State<MessagesView> {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('✓ Respuesta enviada'), duration: Duration(seconds: 2), backgroundColor: Color(0xFF06B6D4)),
-          );
-        }
-      } else {
-        final response = await http.post(
-          Uri.parse('$backendUrl/send-message'),
-          headers: await authHeaders(),
-          body: jsonEncode(messageData),
-        ).timeout(const Duration(seconds: 10));
-
-        if (response.statusCode != 200) throw Exception(response.body);
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error al enviar: ${e.toString()}'), backgroundColor: Colors.red.shade600),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => _isSending = false);
-    }
-  }
-
-  Future<void> _sendQuickResponseWithDocument(Map<String, dynamic> template) async {
-    final text = template['text'] as String? ?? '';
-    final documentUrl = template['documentUrl'] as String? ?? '';
-    final documentName = template['documentName'] as String? ?? '';
-
-    if (documentUrl.isEmpty) return;
-
-    setState(() => _isSending = true);
-
-    try {
-      final messageData = {
-        'to': widget.phoneNumber,
-        'text': text,
-        'documentUrl': documentUrl,
-        'documentName': documentName,
-        'sessionKey': widget.sessionKey,
-        'accountId': widget.accountId,
-      };
-
-      if (SocketService().isConnected) {
-        SocketService().sendMessage(messageData);
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('✓ Documento enviado'), duration: Duration(seconds: 2), backgroundColor: Color(0xFF06B6D4)),
           );
         }
       } else {
@@ -2102,29 +2032,33 @@ class _DateSeparator extends StatelessWidget {
   }
 }
 
-// Diálogo de confirmación para respuestas con imagen, con caption editable.
+// Diálogo de confirmación de una respuesta rápida con adjunto, con el caption
+// editable antes de enviar.
+//
+// Es uno solo para los tres tipos. Antes había dos clases idénticas salvo por
+// el preview, así que sumar video habría sido la tercera copia del mismo
+// TextField, los mismos botones y el mismo manejo del controller.
+//
 // Es StatefulWidget para que el controller se libere en dispose() de forma
 // segura (sin "used after dispose" al cerrar el diálogo).
-class _DocumentCaptionDialog extends StatefulWidget {
+class _QuickResponseDialog extends StatefulWidget {
   final String title;
   final String caption;
-  final String documentUrl;
-  final String documentName;
+  final QrAttachment attachment;
   final void Function(String editedCaption) onSend;
 
-  const _DocumentCaptionDialog({
+  const _QuickResponseDialog({
     required this.title,
     required this.caption,
-    required this.documentUrl,
-    required this.documentName,
+    required this.attachment,
     required this.onSend,
   });
 
   @override
-  State<_DocumentCaptionDialog> createState() => _DocumentCaptionDialogState();
+  State<_QuickResponseDialog> createState() => _QuickResponseDialogState();
 }
 
-class _DocumentCaptionDialogState extends State<_DocumentCaptionDialog> {
+class _QuickResponseDialogState extends State<_QuickResponseDialog> {
   late final TextEditingController _captionController;
 
   @override
@@ -2139,127 +2073,53 @@ class _DocumentCaptionDialogState extends State<_DocumentCaptionDialog> {
     super.dispose();
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      backgroundColor: surfaceDark,
-      scrollable: true,
-      title: Text(widget.title, style: const TextStyle(color: white, fontWeight: FontWeight.w600)),
-      content: SizedBox(
-        width: double.maxFinite,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
-              decoration: BoxDecoration(
-                color: darkBg.withValues(alpha: 0.5),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: primaryAqua.withValues(alpha: 0.2)),
-              ),
-              child: Column(
-                children: [
-                  Icon(Icons.description, size: 40, color: primaryAqua.withValues(alpha: 0.7)),
-                  const SizedBox(height: 12),
-                  Text(
-                    widget.documentName,
-                    style: const TextStyle(color: white, fontWeight: FontWeight.w600, fontSize: 14),
-                    textAlign: TextAlign.center,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    'Documento listo para enviar',
-                    style: TextStyle(color: lightText.withValues(alpha: 0.6), fontSize: 12),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: _captionController,
-              minLines: 1,
-              maxLines: null,
-              keyboardType: TextInputType.multiline,
-              textCapitalization: TextCapitalization.sentences,
-              style: const TextStyle(color: white, fontSize: 13),
-              decoration: InputDecoration(
-                hintText: 'Añade un texto (opcional)',
-                hintStyle: TextStyle(color: lightText.withValues(alpha: 0.5)),
-                filled: true,
-                fillColor: darkBg.withValues(alpha: 0.5),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(10),
-                  borderSide: BorderSide(color: primaryAqua.withValues(alpha: 0.2)),
-                ),
-                enabledBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(10),
-                  borderSide: BorderSide(color: primaryAqua.withValues(alpha: 0.2)),
-                ),
-                contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-              ),
-            ),
-          ],
-        ),
+  // Imagen: se ve. Video y documento: ficha con el nombre del archivo, que es
+  // lo único que tenemos sin bajar los bytes.
+  Widget _preview() {
+    final a = widget.attachment;
+    if (a.kind == QrAttachKind.image) {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(8),
+        child: Image.network(a.url, height: 150, fit: BoxFit.cover),
+      );
+    }
+
+    final isVideo = a.kind == QrAttachKind.video;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
+      decoration: BoxDecoration(
+        color: darkBg.withValues(alpha: 0.5),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: primaryAqua.withValues(alpha: 0.2)),
       ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: Text('Cancelar', style: TextStyle(color: lightText.withValues(alpha: 0.6))),
-        ),
-        ElevatedButton(
-          style: ElevatedButton.styleFrom(backgroundColor: primaryAqua),
-          onPressed: () {
-            final edited = _captionController.text.trim();
-            Navigator.pop(context);
-            widget.onSend(edited);
-          },
-          child: const Text('Enviar', style: TextStyle(color: darkBg, fontWeight: FontWeight.w600)),
-        ),
-      ],
+      child: Column(
+        children: [
+          Icon(isVideo ? Icons.videocam_rounded : Icons.description,
+              size: 40, color: primaryAqua.withValues(alpha: 0.7)),
+          const SizedBox(height: 12),
+          Text(
+            a.name.isNotEmpty ? a.name : (isVideo ? 'Video' : 'Documento'),
+            style: const TextStyle(color: white, fontWeight: FontWeight.w600, fontSize: 14),
+            textAlign: TextAlign.center,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+          ),
+          const SizedBox(height: 4),
+          Text(
+            isVideo ? 'Video listo para enviar' : 'Documento listo para enviar',
+            style: TextStyle(color: lightText.withValues(alpha: 0.6), fontSize: 12),
+          ),
+        ],
+      ),
     );
   }
-}
-
-class _ImageCaptionDialog extends StatefulWidget {
-  final String title;
-  final String caption;
-  final String imageUrl;
-  final void Function(String editedCaption) onSend;
-
-  const _ImageCaptionDialog({
-    required this.title,
-    required this.caption,
-    required this.imageUrl,
-    required this.onSend,
-  });
-
-  @override
-  State<_ImageCaptionDialog> createState() => _ImageCaptionDialogState();
-}
-
-class _ImageCaptionDialogState extends State<_ImageCaptionDialog> {
-  late final TextEditingController _captionController;
-
-  @override
-  void initState() {
-    super.initState();
-    _captionController = TextEditingController(text: widget.caption);
-  }
-
-  @override
-  void dispose() {
-    _captionController.dispose();
-    super.dispose();
-  }
 
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
       backgroundColor: surfaceDark,
-      // scrollable: con el teclado abierto en mobile el contenido (imagen +
+      // scrollable: con el teclado abierto en mobile el contenido (preview +
       // caption) se scrollea en vez de comprimirse, así el final del texto
       // largo siempre es alcanzable.
       scrollable: true,
@@ -2269,10 +2129,7 @@ class _ImageCaptionDialogState extends State<_ImageCaptionDialog> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            ClipRRect(
-              borderRadius: BorderRadius.circular(8),
-              child: Image.network(widget.imageUrl, height: 150, fit: BoxFit.cover),
-            ),
+            _preview(),
             const SizedBox(height: 16),
             TextField(
               controller: _captionController,
