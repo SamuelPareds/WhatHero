@@ -370,6 +370,31 @@ distinto según el tipo de archivo.
 
 ---
 
+## 🎞️ Videos salientes: tamaño y duración
+
+WhatsApp dibuja la burbuja de un video con el `width`/`height` que viajan **en el mensaje**, no con
+el archivo. Baileys mide las imágenes pero **no los videos**: saca la miniatura con ffmpeg y deja
+`width`, `height` y `seconds` vacíos. Resultado: en iPhone el video se veía en un cuadro 1:1 y sin
+duración, y sólo al pasarlo a Picture-in-Picture recuperaba su proporción. **Parecía un video mal
+exportado y era el código.**
+
+- **`probeVideo()` (`backend/src/utils/videoProbe.ts`) mide con `ffprobe` justo antes de enviar**, en
+  la rama `videoUrl` de `performSendMessage`, el único punto por donde sale video (composer y
+  respuestas rápidas). **Todo camino nuevo que mande video tiene que pasar por ahí.** El binario viene
+  en el mismo `apk add ffmpeg` que usa Baileys para la miniatura.
+- **La rotación es la trampa.** Un vertical de iPhone está codificado como 1920×1080 con una marca de
+  −90°. Sin intercambiar ancho y alto llega horizontal: el mismo bug al revés. La marca se lee de
+  `side_data_list[].rotation` (ffmpeg ≥5) o de `tags.rotate` (viejo).
+- **Va por archivo temporal, no por stdin.** Los `.mov`/`.mp4` de iPhone traen el `moov` al final, y
+  por un pipe no se puede llegar ahí.
+- **Fail-open:** si `ffprobe` falla o no existe (en la Mac de dev no está), el video sale igual que
+  antes y queda un `[probeVideo]` en el log. Si ese warn aparece en Railway, la imagen perdió el binario.
+- **El eco hereda las medidas:** `mediaService` guarda `mediaWidth/Height/Duration` desde el mismo
+  `videoMessage`, así que la burbuja saliente de WhatHero también sale con su proporción y su duración.
+  Los videos enviados antes de esto no se corrigen; no hay backfill.
+
+---
+
 ## 📱 Versión de WhatsApp Web (defensa anti-405)
 
 El backend se declara ante WhatsApp como una versión concreta de WhatsApp Web (`2.3000.<revisión>`). WhatsApp **corta las versiones viejas cada pocas semanas**, y cuando lo hace caen todas las sesiones a la vez con `405 Connection Failure` — sin poder siquiera generar un QR para revincular. Pasó el 28-jul-2026 con las 3 cuentas de producción.

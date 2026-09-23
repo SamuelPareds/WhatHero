@@ -54,6 +54,7 @@ import { ACCOUNTS_COLLECTION, IS_PRODUCTION } from './src/config/env';
 import { resolveWaVersion } from './src/config/waVersion';
 import { verifyHttpAuth, verifySocketAuth, invalidateMembershipCache } from './src/middleware/auth';
 import { generateTempPassword } from './src/utils/password';
+import { probeVideo } from './src/utils/videoProbe';
 import { resolveHumanSender, BOT_SENDER, invalidateHumanNameCache } from './src/services/senderResolver';
 
 // Ensure auth_info directory exists
@@ -1137,10 +1138,14 @@ async function performSendMessage(
     };
     tempMediaUrl = documentUrl;
   } else if (videoUrl) {
+    const video = await fetchToBuffer(videoUrl, 'video');
     content = {
-      video: await fetchToBuffer(videoUrl, 'video'),
+      video,
       mimetype: mimetype || 'video/mp4',
       caption,
+      // Baileys mide las imágenes pero no los videos: sin width/height WhatsApp
+      // iOS dibuja la burbuja cuadrada. Ver src/utils/videoProbe.ts.
+      ...(await probeVideo(video)),
     };
     tempMediaUrl = videoUrl;
   } else if (audioUrl) {
