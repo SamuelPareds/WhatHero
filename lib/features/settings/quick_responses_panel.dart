@@ -50,11 +50,27 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
   // (un media por mensaje) y la del backend, que manda el primero de
   // `documentUrl > videoUrl > imageUrl` y descarta el resto en silencio.
   //
-  // - `_attach.url` vacía + `_pickedBytes` != null → recién elegido, sin subir
-  // - `_attach.url` con valor → ya persistido en Storage
+  // - `_uploadTask` != null → recién elegido y subiendo; `_attach.url` vacía
+  // - `_attach.url` con valor → ya está en Storage (subido al elegirlo, o el
+  //   que la respuesta tenía guardado)
   QrAttachment _attach = QrAttachment.none;
+  // Bytes del recién elegido: preview de la imagen sin bajarla, y su peso.
   Uint8List? _pickedBytes;
-  String _pickedName = '';
+
+  // El archivo se sube apenas se elige, no al tocar "Guardar": el operador
+  // escribe el título mientras sube, y guardar es instantáneo.
+  //
+  // [_stagedRef] es lo subido en esta edición que el doc todavía no
+  // referencia. Si se elige otro, se quita o el editor se cierra sin guardar,
+  // se borra: no le sirve a nadie. (Cerrar la pestaña a mitad de edición sí
+  // deja un huérfano; es raro y pesa poco.)
+  UploadTask? _uploadTask;
+  double? _uploadProgress;
+  Reference? _stagedRef;
+
+  // Id del doc que se edita, o el que va a tener la respuesta nueva. Hace
+  // falta antes de guardar porque va en el path del archivo.
+  String _docId = '';
 
   final ImagePicker _picker = ImagePicker();
 
@@ -122,6 +138,9 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
   void _openEditor([Map<String, dynamic>? qr]) {
     setState(() {
       _editingId = qr?['id'] as String?;
+      // doc() genera el id sin escribir nada: la respuesta nueva lo necesita
+      // ya, porque su adjunto se sube antes de guardar.
+      _docId = _editingId ?? _collectionRef.doc().id;
       _origTitle = qr?['title'] as String? ?? '';
       _origText = qr?['text'] as String? ?? '';
       _origDoc = qr ?? const {};
@@ -134,56 +153,57 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
       _textController.text = _origText;
       _attach = _origAttach;
       _pickedBytes = null;
-      _pickedName = '';
       _showEditor = true;
     });
   }
 
-  // Vuelve a la lista descartando el estado del editor
+  // Vuelve a la lista descartando el estado del editor, incluido lo subido y
+  // no guardado.
   void _closeEditor() {
+    _discardStaged();
     setState(() {
       _showEditor = false;
       _editingId = null;
+      _docId = '';
       _titleController.clear();
       _textController.clear();
       _origDoc = const {};
       _origAttach = QrAttachment.none;
       _attach = QrAttachment.none;
       _pickedBytes = null;
-      _pickedName = '';
     });
   }
 
   // Guardar habilitado solo si es válido y (al editar) hay cambios reales.
   // Así "si no hay cambios, no pasa nada" → el botón queda inactivo.
   bool get _canSave {
+    // Mientras el adjunto sube todavía no hay URL que guardar.
+    if (_uploadTask != null) return false;
     final title = _titleController.text.trim();
     final text = _textController.text.trim();
     final isValid = title.isNotEmpty && (text.isNotEmpty || _attach.isNotEmpty);
     if (!isValid) return false;
     if (_editingId == null) return true; // crear: cualquier contenido válido
     // editar: exige al menos un cambio real respecto al original
-    final attachChanged = _pickedBytes != null ||
-        _attach.kind != _origAttach.kind ||
-        _attach.url != _origAttach.url;
+    final attachChanged =
+        _attach.kind != _origAttach.kind || _attach.url != _origAttach.url;
     return title != _origTitle || text != _origText || attachChanged;
   }
 
-  // Path determinista en Storage: un archivo por respuesta (reemplazar =
-  // sobrescribir, sin huérfanos). Usa accountsCollection para respetar las
+  // Un path nuevo por cada archivo subido: `<docId>-<ms>.<ext>`. No puede ser
+  // uno fijo por respuesta porque el archivo se sube al elegirlo, antes de
+  // "Guardar": sobre el path fijo pisaría el que la respuesta guardada está
+  // usando, y "Cancelar" la dejaría rota. El reemplazado se borra al guardar
+  // (orphanAttachmentUrls). Usa accountsCollection para respetar las
   // storage.rules (accounts/... en prod, accounts_dev/... en desarrollo).
   //
   // La extensión es la del archivo real: si fuera fija, un png subido desde la
   // web quedaría servido como .jpg y un video como un archivo sin tipo.
-  Reference _attachRef(String docId, String ext) => FirebaseStorage.instance.ref(
+  Reference _attachRef(String ext) => FirebaseStorage.instance.ref(
         '$accountsCollection/${widget.accountId}/whatsapp_sessions/'
-        '${widget.sessionId}/quick_responses/$docId.${ext.isNotEmpty ? ext : 'bin'}',
+        '${widget.sessionId}/quick_responses/'
+        '$_docId-${DateTime.now().millisecondsSinceEpoch}.${ext.isNotEmpty ? ext : 'bin'}',
       );
-
-  // El nombre a mostrar del adjunto: el del archivo recién elegido, o el que
-  // quedó guardado al subirlo.
-  String get _attachDisplayName =>
-      _pickedName.isNotEmpty ? _pickedName : _attach.name;
 
   String _megabytes(int bytes) => (bytes / (1024 * 1024)).toStringAsFixed(1);
 
@@ -202,14 +222,82 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
     return false;
   }
 
-  // Deja el adjunto elegido pendiente de subir, pisando el que hubiera.
+  // Pone el adjunto elegido en el slot, pisando el que hubiera, y lo empieza a
+  // subir ya.
   void _setPicked(QrAttachKind kind, Uint8List bytes, String name) {
     if (!mounted) return;
+    _discardStaged();
+
+    final ext = fileExtension(name);
+    final mime = mimeForExtension(ext, fallback: _defaultMime(kind));
+    final ref = _attachRef(ext);
+    final task = ref.putData(bytes, SettableMetadata(contentType: mime));
+
     setState(() {
-      _attach = QrAttachment(kind: kind);
+      _attach = QrAttachment(kind: kind, name: name, mimeType: mime);
       _pickedBytes = bytes;
-      _pickedName = name;
+      _uploadTask = task;
+      _uploadProgress = 0;
+      _stagedRef = ref;
     });
+
+    task.snapshotEvents.listen(
+      (s) {
+        if (!mounted || _uploadTask != task || s.totalBytes <= 0) return;
+        setState(() => _uploadProgress = s.bytesTransferred / s.totalBytes);
+      },
+      // El error lo atiende _finishUpload. Sin este handler, cancelar una
+      // subida saldría como error no capturado.
+      onError: (_) {},
+    );
+    _finishUpload(task, ref);
+  }
+
+  // Espera la subida y deja su URL en el slot.
+  //
+  // Si mientras tanto se eligió otro archivo o se cerró el editor,
+  // `_uploadTask` ya no es esta tarea: el archivo quedó sin dueño y se borra.
+  // Eso cubre la subida que terminó justo antes de que la cancelaran.
+  Future<void> _finishUpload(UploadTask task, Reference ref) async {
+    try {
+      await task;
+      final url = await ref.getDownloadURL();
+      if (!mounted || _uploadTask != task) {
+        ref.delete().ignore();
+        return;
+      }
+      setState(() {
+        _attach = QrAttachment(
+          kind: _attach.kind,
+          url: url,
+          name: _attach.name,
+          mimeType: _attach.mimeType,
+        );
+        _uploadTask = null;
+        _uploadProgress = null;
+      });
+    } catch (e) {
+      // Cancelada a propósito (otro archivo, Quitar, Cancelar): nada que avisar.
+      if (!mounted || _uploadTask != task) return;
+      // Falló de verdad: vuelve lo que la respuesta tenía guardado.
+      _discardStaged();
+      setState(() {
+        _attach = _origAttach;
+        _pickedBytes = null;
+      });
+      _toast('No se pudo subir el archivo: $e');
+    }
+  }
+
+  // Suelta lo subido en esta edición que el doc todavía no referencia: cancela
+  // la subida si sigue en curso y borra el archivo si ya llegó. No llama a
+  // setState porque también corre en dispose().
+  void _discardStaged() {
+    _uploadTask?.cancel().ignore();
+    _stagedRef?.delete().ignore();
+    _uploadTask = null;
+    _uploadProgress = null;
+    _stagedRef = null;
   }
 
   // Elige una imagen de la galería. image_picker ya redimensiona y recomprime
@@ -280,12 +368,13 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
     }
   }
 
-  // Quita el adjunto del editor (se aplica al guardar)
+  // Quita el adjunto del editor. Lo recién subido se borra ya; el que la
+  // respuesta tenía guardado, recién al guardar.
   void _removeAttachment() {
+    _discardStaged();
     setState(() {
       _attach = QrAttachment.none;
       _pickedBytes = null;
-      _pickedName = '';
     });
   }
 
@@ -297,27 +386,10 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
 
     try {
       final isEditing = _editingId != null;
-      // Para crear necesitamos el id antes de subir archivos (path determinista)
-      final docRef = isEditing ? _collectionRef.doc(_editingId) : _collectionRef.doc();
-      final docId = docRef.id;
-
-      // Subir el adjunto recién elegido, si lo hay. Si no, lo que esté en
-      // `_attach` ya está en Storage (o no hay adjunto).
-      var attach = _attach;
-      String? uploadedPath;
-      if (_pickedBytes != null) {
-        final ext = fileExtension(_pickedName);
-        final mime = mimeForExtension(ext, fallback: _defaultMime(attach.kind));
-        final ref = _attachRef(docId, ext);
-        await ref.putData(_pickedBytes!, SettableMetadata(contentType: mime));
-        uploadedPath = ref.fullPath;
-        attach = QrAttachment(
-          kind: attach.kind,
-          url: await ref.getDownloadURL(),
-          name: _pickedName,
-          mimeType: mime,
-        );
-      }
+      final docRef = _collectionRef.doc(_docId);
+      // El adjunto ya está en Storage: se subió al elegirlo, y "Guardar" no se
+      // habilita hasta que termina (_canSave).
+      final attach = _attach;
 
       final data = {
         'title': title,
@@ -329,18 +401,17 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
       } else {
         await docRef.set({
           ...data,
-          'id': docId,
+          'id': _docId,
           'order': _quickResponses.length,
           'createdAt': FieldValue.serverTimestamp(),
         });
       }
+      // Lo subido ya es del doc: cerrar el editor no lo tiene que borrar.
+      _stagedRef = null;
 
       // Recién con el doc ya escrito: si el borrado falla, lo peor que queda
       // es un archivo de más, no una respuesta apuntando a un archivo muerto.
-      await _deleteStorageObjects(
-        orphanAttachmentUrls(_origDoc, attach),
-        keepPath: uploadedPath,
-      );
+      await _deleteStorageObjects(orphanAttachmentUrls(_origDoc, attach));
 
       await _loadQuickResponses();
 
@@ -367,20 +438,10 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
 
   // Borra objetos de Storage por su URL de descarga. Nunca es crítico: un
   // archivo huérfano no rompe nada, y frenar el guardado por eso sí.
-  //
-  // [keepPath] protege lo que se acaba de subir. Sobrescribir un path regenera
-  // el token de descarga, así que la URL vieja del doc y la nueva son
-  // distintas aunque apunten al mismo objeto — sin este guard, reemplazar una
-  // imagen por otra imagen borraría la que se acaba de subir.
-  Future<void> _deleteStorageObjects(
-    Iterable<String> urls, {
-    String? keepPath,
-  }) async {
+  Future<void> _deleteStorageObjects(Iterable<String> urls) async {
     for (final url in urls) {
       try {
-        final ref = FirebaseStorage.instance.refFromURL(url);
-        if (ref.fullPath == keepPath) continue;
-        await ref.delete();
+        await FirebaseStorage.instance.refFromURL(url).delete();
       } catch (_) {
         // URL externa legacy (no es de nuestro bucket), archivo ya borrado o
         // sin permiso → seguimos.
@@ -451,6 +512,10 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
 
   @override
   void dispose() {
+    // Cerrar el panel a mitad de edición es cancelar: lo subido y no guardado
+    // se borra. Con un guardado en vuelo no se toca, porque el doc puede estar
+    // apuntándole ya.
+    if (!_isSaving) _discardStaged();
     _titleController.dispose();
     _textController.dispose();
     _searchController.dispose();
@@ -1002,31 +1067,43 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
       child: SizedBox(
         width: double.infinity,
         height: 180,
-        child: _pickedBytes != null
-            ? Image.memory(_pickedBytes!, fit: BoxFit.cover)
-            : Image.network(
-                _attach.url,
-                fit: BoxFit.cover,
-                errorBuilder: (_, __, ___) => Container(
-                  color: surfaceDark,
-                  child: Icon(Icons.broken_image_outlined,
-                      color: lightText.withValues(alpha: 0.5), size: 40),
-                ),
-              ),
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            _pickedBytes != null
+                ? Image.memory(_pickedBytes!, fit: BoxFit.cover)
+                : Image.network(
+                    _attach.url,
+                    fit: BoxFit.cover,
+                    errorBuilder: (_, __, ___) => Container(
+                      color: surfaceDark,
+                      child: Icon(Icons.broken_image_outlined,
+                          color: lightText.withValues(alpha: 0.5), size: 40),
+                    ),
+                  ),
+            if (_uploadTask != null)
+              Align(alignment: Alignment.bottomCenter, child: _uploadBar()),
+          ],
+        ),
       ),
     );
   }
 
-  // Tarjeta para video y documento: icono, nombre y tamaño.
+  // Tarjeta para video y documento: icono, nombre, tamaño y, mientras sube,
+  // el progreso.
   //
-  // Un video ya guardado se reproduce con un tap. Es la única forma de
-  // confirmar que la plantilla es el video correcto: el nombre del archivo no
-  // alcanza cuando son "IMG_4821.mov" e "IMG_4822.mov".
+  // Un video ya subido se reproduce con un tap, también antes de guardar. Es
+  // la única forma de confirmar que la plantilla es el video correcto: el
+  // nombre del archivo no alcanza cuando son "IMG_4821.mov" e "IMG_4822.mov".
   Widget _fileCard() {
+    final uploading = _uploadTask != null;
     final playable = _attach.kind == QrAttachKind.video && _attach.url.isNotEmpty;
-    final subtitle = _pickedBytes != null
-        ? '${_megabytes(_pickedBytes!.length)} MB'
-        : (playable ? 'Toca para reproducir' : _attachLabel(_attach.kind));
+    final subtitle = uploading
+        ? 'Subiendo… ${((_uploadProgress ?? 0) * 100).round()}%'
+        : [
+            if (_pickedBytes != null) '${_megabytes(_pickedBytes!.length)} MB',
+            if (playable) 'Toca para reproducir',
+          ].join(' · ');
 
     return InkWell(
       onTap: playable ? _playAttachedVideo : null,
@@ -1039,41 +1116,57 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
           borderRadius: BorderRadius.circular(12),
           border: Border.all(color: primaryAqua.withValues(alpha: 0.2)),
         ),
-        child: Row(
+        child: Column(
           children: [
-            Icon(_attachIcon(_attach.kind),
-                size: 24, color: primaryAqua.withValues(alpha: 0.7)),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    _attachDisplayName.isNotEmpty
-                        ? _attachDisplayName
-                        : _attachLabel(_attach.kind),
-                    style: const TextStyle(
-                        color: white, fontWeight: FontWeight.w600, fontSize: 13),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
+            Row(
+              children: [
+                Icon(_attachIcon(_attach.kind),
+                    size: 24, color: primaryAqua.withValues(alpha: 0.7)),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        _attach.name.isNotEmpty
+                            ? _attach.name
+                            : _attachLabel(_attach.kind),
+                        style: const TextStyle(
+                            color: white, fontWeight: FontWeight.w600, fontSize: 13),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        subtitle.isNotEmpty ? subtitle : _attachLabel(_attach.kind),
+                        style: TextStyle(
+                            color: lightText.withValues(alpha: 0.6), fontSize: 11),
+                      ),
+                    ],
                   ),
-                  const SizedBox(height: 2),
-                  Text(
-                    subtitle,
-                    style: TextStyle(
-                        color: lightText.withValues(alpha: 0.6), fontSize: 11),
-                  ),
-                ],
-              ),
+                ),
+                if (playable)
+                  Icon(Icons.play_circle_outline,
+                      size: 26, color: primaryAqua.withValues(alpha: 0.8)),
+              ],
             ),
-            if (playable)
-              Icon(Icons.play_circle_outline,
-                  size: 26, color: primaryAqua.withValues(alpha: 0.8)),
+            if (uploading) ...[
+              const SizedBox(height: 10),
+              _uploadBar(),
+            ],
           ],
         ),
       ),
     );
   }
+
+  // Barra de la subida en curso. "Guardar" se habilita cuando llega al final.
+  Widget _uploadBar() => LinearProgressIndicator(
+        value: _uploadProgress,
+        minHeight: 3,
+        color: primaryAqua,
+        backgroundColor: primaryAqua.withValues(alpha: 0.15),
+      );
 
   void _playAttachedVideo() {
     Navigator.of(context).push(

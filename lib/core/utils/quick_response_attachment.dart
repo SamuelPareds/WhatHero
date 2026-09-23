@@ -123,13 +123,14 @@ Map<String, dynamic> attachmentFields(QrAttachment a) => {
 ///
 /// Son los objetos de Storage que hay que borrar al guardar: el adjunto que se
 /// reemplazó, y los sobrantes de un doc legacy con dos. Se comparan por URL y
-/// no por tipo porque un mismo tipo puede cambiar de archivo (y de extensión,
-/// o sea de path) sin cambiar de `kind`.
+/// no por tipo porque un mismo tipo puede cambiar de archivo sin cambiar de
+/// `kind`.
 ///
-/// **El llamador tiene que descartar las que resuelvan al mismo objeto que
-/// acaba de subir.** Sobrescribir un path en Storage regenera el token de
-/// descarga, así que la URL nueva es distinta de la vieja aunque el archivo
-/// sea el mismo — y borrar por la vieja borraría lo recién subido.
+/// **Comparar por URL es seguro sólo porque cada subida va a un path nuevo**
+/// (`_attachRef` en el panel): lo recién subido nunca es un objeto viejo. Si
+/// algún día se vuelve a sobrescribir un path fijo, esto se rompe: el token
+/// de descarga cambia al sobrescribir, la URL vieja deja de coincidir con la
+/// nueva, y borrar por la vieja borraría lo recién subido.
 List<String> orphanAttachmentUrls(Map<String, dynamic> qr, QrAttachment keep) {
   final previous = [
     _str(qr, 'imageUrl'),
