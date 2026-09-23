@@ -1143,8 +1143,8 @@ async function performSendMessage(
       video,
       mimetype: mimetype || 'video/mp4',
       caption,
-      // Baileys mide las imágenes pero no los videos: sin width/height WhatsApp
-      // iOS dibuja la burbuja cuadrada. Ver src/utils/videoProbe.ts.
+      // Baileys no mide los videos: ancho, alto y duración los ponemos
+      // nosotros. Ver src/utils/videoProbe.ts.
       ...(await probeVideo(video)),
     };
     tempMediaUrl = videoUrl;

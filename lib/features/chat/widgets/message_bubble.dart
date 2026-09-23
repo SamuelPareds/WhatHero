@@ -1834,8 +1834,6 @@ class _LinkifiedTextState extends State<_LinkifiedText> {
   Widget build(BuildContext context) => Text.rich(_rootSpan);
 }
 
-// Visor fullscreen de video con controles propios (sin chewie).
-// Autoplay al abrir, dispose al cerrar para evitar audio remanente.
 // Visor fullscreen con zoom/pan. Sin deps extra: usamos el InteractiveViewer
 // que ya viene en Flutter.
 class _FullscreenImage extends StatelessWidget {

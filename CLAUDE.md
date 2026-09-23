@@ -372,26 +372,40 @@ distinto según el tipo de archivo.
 
 ## 🎞️ Videos salientes: tamaño y duración
 
-WhatsApp dibuja la burbuja de un video con el `width`/`height` que viajan **en el mensaje**, no con
-el archivo. Baileys mide las imágenes pero **no los videos**: saca la miniatura con ffmpeg y deja
-`width`, `height` y `seconds` vacíos. Resultado: en iPhone el video se veía en un cuadro 1:1 y sin
-duración, y sólo al pasarlo a Picture-in-Picture recuperaba su proporción. **Parecía un video mal
-exportado y era el código.**
+Baileys mide las **imágenes**, pero de un **video** sólo saca la miniatura con ffmpeg: `width`,
+`height` y `seconds` quedan vacíos. Sin `seconds` la burbuja del cliente dice `0:00`. Y como el eco
+`fromMe` es de donde `mediaService` saca `mediaWidth/Height/Duration`, la burbuja saliente de WhatHero
+quedaba en 16:9 y `0:00`.
 
 - **`probeVideo()` (`backend/src/utils/videoProbe.ts`) mide con `ffprobe` justo antes de enviar**, en
   la rama `videoUrl` de `performSendMessage`, el único punto por donde sale video (composer y
   respuestas rápidas). **Todo camino nuevo que mande video tiene que pasar por ahí.** El binario viene
   en el mismo `apk add ffmpeg` que usa Baileys para la miniatura.
-- **La rotación es la trampa.** Un vertical de iPhone está codificado como 1920×1080 con una marca de
-  −90°. Sin intercambiar ancho y alto llega horizontal: el mismo bug al revés. La marca se lee de
-  `side_data_list[].rotation` (ffmpeg ≥5) o de `tags.rotate` (viejo).
+- **Manda cómo se VE el video, no cómo está guardado.** ffprobe da los píxeles guardados y dos marcas
+  del archivo los corrigen: la rotación (un vertical de la cámara del iPhone viene como 1920×1080 más
+  −90°; sin intercambiar ancho y alto llegaría horizontal) y la proporción de píxel (ver abajo).
 - **Va por archivo temporal, no por stdin.** Los `.mov`/`.mp4` de iPhone traen el `moov` al final, y
   por un pipe no se puede llegar ahí.
-- **Fail-open:** si `ffprobe` falla o no existe (en la Mac de dev no está), el video sale igual que
-  antes y queda un `[probeVideo]` en el log. Si ese warn aparece en Railway, la imagen perdió el binario.
-- **El eco hereda las medidas:** `mediaService` guarda `mediaWidth/Height/Duration` desde el mismo
-  `videoMessage`, así que la burbuja saliente de WhatHero también sale con su proporción y su duración.
-  Los videos enviados antes de esto no se corrigen; no hay backfill.
+- **Fail-open:** si `ffprobe` falla o no existe (en la Mac de dev no está), el video sale sin medidas
+  y queda `[probeVideo] No se pudo medir` en el log. Si aparece en Railway, la imagen perdió el binario.
+- Los videos enviados antes de esto no se corrigen; no hay backfill.
+
+### "En iPhone el video se ve cuadrado y aplastado" → es el archivo, no el código
+
+Pasó el 22-sep-2026 con un tutorial comprimido en **HandBrake**. Con *Anamórfico: Automático* (su
+default), al bajar un video vertical a 1080 de alto HandBrake conserva el ancho guardado y agrega una
+marca de píxel no cuadrado (caja `pasp`): el archivo guardaba **1076×1080** y pedía mostrarse como
+**533×1080**. Android, el mini reproductor de iOS y QuickTime respetan la marca; **el reproductor de
+WhatsApp en iPhone no**: dibuja los píxeles guardados. Por eso sólo falla en iPhone y parece bug nuestro.
+
+- **Arreglo: reexportar** con *Dimensiones → Anamórfico: Off*. `probeVideo` ya manda el ancho corregido
+  (la burbuja sale con la forma correcta), pero todo indica que ese reproductor mira los píxeles y no
+  el mensaje, así que desde el backend no hay arreglo seguro.
+- **Diagnóstico sin pedirle el archivo al cliente:** al enviarlo, Railway loguea
+  `[probeVideo] Video anamórfico (SAR …)`. Con el archivo en la Mac: `avmediainfo video.mp4`; si
+  `Encoded Pixels` ≠ `Presentation Dimensions`, es esto.
+- **Recodificar en el backend lo resolvería para todos**, pero cuesta CPU y segundos en cada envío. Se
+  descartó mientras sea un caso raro; si empieza a repetirse, ése es el camino.
 
 ---
 

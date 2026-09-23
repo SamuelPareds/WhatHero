@@ -4,8 +4,8 @@ FROM node:20-alpine
 # ffmpeg: Baileys lo invoca para extraer la miniatura de los videos salientes.
 # Sin el binario falla dentro de un catch que solo loguea en debug, y el
 # destinatario ve un recuadro negro hasta que descarga el video.
-# El mismo paquete trae ffprobe, que usa src/utils/videoProbe.ts para medir
-# ancho/alto/duración: sin eso WhatsApp iOS muestra el video en un cuadro 1:1.
+# El mismo paquete trae ffprobe: src/utils/videoProbe.ts mide ancho, alto y
+# duración, que Baileys no calcula para video (sin eso la burbuja dice 0:00).
 RUN apk add --no-cache ffmpeg
 
 WORKDIR /app

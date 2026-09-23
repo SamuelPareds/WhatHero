@@ -10,25 +10,34 @@ const execFileAsync = promisify(execFile);
 // Tamaño y duración de un video saliente, con los nombres de campo de
 // `videoMessage` para poder esparcirlos directo en el contenido de Baileys.
 //
-// Baileys mide las imágenes (`originalImageDimensions`) pero NO los videos: saca
-// la miniatura con ffmpeg y deja `width`/`height`/`seconds` sin llenar. Sin esas
-// medidas WhatsApp iOS dibuja la burbuja en un cuadro 1:1 y sin duración; sólo
-// al pasarlo a Picture-in-Picture se ve con su proporción real. El eco `fromMe`
-// hereda estos mismos campos (mediaWidth/Height/Duration en Firestore), así que
-// también es lo que usa la burbuja saliente de WhatHero.
+// Baileys mide las imágenes (`originalImageDimensions`) pero de un video sólo
+// saca la miniatura: `width`/`height`/`seconds` quedan vacíos. Sin `seconds` la
+// burbuja del cliente dice 0:00, y el eco `fromMe` —de donde salen
+// mediaWidth/Height/Duration en Firestore— deja la burbuja saliente de WhatHero
+// en 16:9 y 0:00.
 export interface VideoInfo {
   width?: number;
   height?: number;
   seconds?: number;
 }
 
+// "54:109" → 54/109. null si falta o no sirve: "0:1" es la forma de ffprobe de
+// decir que el archivo no declara proporción de píxel.
+function parseRatio(value: unknown): number | null {
+  if (typeof value !== 'string') return null;
+  const [num, den] = value.split(':').map(Number);
+  return num > 0 && den > 0 ? num / den : null;
+}
+
 // Interpreta el JSON de `ffprobe -show_streams -show_format`. Pura a propósito:
 // es la parte con reglas sutiles y se puede probar sin el binario.
 //
-// La rotación es la trampa: un video vertical de iPhone viene codificado como
-// 1920×1080 con una marca de "girar -90°". Si no se intercambian ancho y alto,
-// el vertical llega horizontal — el mismo bug al revés. ffmpeg ≥5 la expone en
-// `side_data_list[].rotation`; las versiones viejas en `tags.rotate`.
+// ffprobe da los píxeles GUARDADOS; WhatsApp necesita la forma en que el video
+// SE VE. Dos marcas del archivo separan una cosa de la otra:
+// - Píxeles no cuadrados (`sample_aspect_ratio`): el ancho visible es el
+//   guardado por esa proporción. Ver "video cuadrado en iPhone" en CLAUDE.md.
+// - Rotación: un vertical de la cámara del iPhone viene como 1920×1080 más una
+//   marca de -90°. Sin intercambiar ancho y alto llegaría horizontal.
 //
 // Un campo inválido o ≤0 se omite: preferimos que WhatsApp use su default a
 // mandarle un 0.
@@ -36,13 +45,13 @@ export function videoInfoFromProbe(probe: any): VideoInfo {
   const stream = probe?.streams?.[0];
   const info: VideoInfo = {};
 
-  let width = Number(stream?.width);
+  const pixelAspect = parseRatio(stream?.sample_aspect_ratio) ?? 1;
+  let width = Math.round(Number(stream?.width) * pixelAspect);
   let height = Number(stream?.height);
   if (width > 0 && height > 0) {
-    const sideRotation = Array.isArray(stream?.side_data_list)
-      ? stream.side_data_list.find((d: any) => d?.rotation != null)?.rotation
-      : undefined;
-    const rotation = Number(sideRotation ?? stream?.tags?.rotate ?? 0);
+    const rotation = Number(
+      stream?.side_data_list?.find((d: any) => d?.rotation != null)?.rotation ?? 0,
+    );
     if (Math.abs(rotation) % 180 === 90) {
       [width, height] = [height, width];
     }
@@ -50,10 +59,7 @@ export function videoInfoFromProbe(probe: any): VideoInfo {
     info.height = height;
   }
 
-  // ffprobe escribe "N/A" (no null) cuando el contenedor no declara duración,
-  // así que el respaldo al stream va por validez numérica, no por `??`.
-  const formatDuration = Number(probe?.format?.duration);
-  const duration = formatDuration > 0 ? formatDuration : Number(stream?.duration);
+  const duration = Number(probe?.format?.duration);
   if (duration > 0) {
     info.seconds = Math.max(1, Math.round(duration));
   }
@@ -77,9 +83,21 @@ export async function probeVideo(buffer: Buffer): Promise<VideoInfo> {
     const { stdout } = await execFileAsync(
       'ffprobe',
       ['-v', 'error', '-select_streams', 'v:0', '-show_streams', '-show_format', '-of', 'json', path],
-      { timeout: 10_000, maxBuffer: 1024 * 1024 },
+      { timeout: 10_000 },
     );
-    return videoInfoFromProbe(JSON.parse(stdout));
+    const probe = JSON.parse(stdout);
+
+    // Píxeles no cuadrados: las medidas salen bien, pero el reproductor de
+    // WhatsApp en iPhone dibuja los píxeles guardados y el video se ve
+    // aplastado. No tiene arreglo desde acá; este log es el diagnóstico cuando
+    // un cliente lo reporta.
+    const sar = probe?.streams?.[0]?.sample_aspect_ratio;
+    const pixelAspect = parseRatio(sar);
+    if (pixelAspect !== null && pixelAspect !== 1) {
+      console.warn(`[probeVideo] Video anamórfico (SAR ${sar}): en iPhone se verá aplastado. Hay que reexportarlo sin anamórfico.`);
+    }
+
+    return videoInfoFromProbe(probe);
   } catch (error) {
     console.warn(`[probeVideo] No se pudo medir el video, sale sin width/height:`, (error as any)?.message);
     return {};

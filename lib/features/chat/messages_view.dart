@@ -1436,11 +1436,14 @@ class _MessagesViewState extends State<MessagesView> {
           );
         }
       } else {
+        // Mismo plazo que los adjuntos del composer. Con 10 s, un video de
+        // 16 MB podía dar "Error al enviar" mientras el backend lo mandaba
+        // igual, y el reintento del operador le llegaría duplicado al cliente.
         final response = await http.post(
           Uri.parse('$backendUrl/send-message'),
           headers: await authHeaders(),
           body: jsonEncode(messageData),
-        ).timeout(const Duration(seconds: 10));
+        ).timeout(const Duration(seconds: 30));
 
         if (response.statusCode != 200) throw Exception(response.body);
       }
