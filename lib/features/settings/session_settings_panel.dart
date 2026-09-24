@@ -1576,6 +1576,19 @@ class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
     } catch (_) {/* sin archivo o URL externa legacy → ignorar */}
   }
 
+  // Mismo límite para el peso informado por el selector y los bytes leídos.
+  bool _fitsAttachment(int size, String what) {
+    if (size <= maxAttachmentBytes) return true;
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('$what supera el límite de $maxAttachmentMegabytes MB'),
+        ),
+      );
+    }
+    return false;
+  }
+
   // Elige una imagen de la galería. image_picker ya redimensiona y recomprime.
   // Limpia el documento: el adjunto es mutuamente excluyente.
   Future<void> _pickImage() async {
@@ -1587,15 +1600,9 @@ class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
       );
       if (picked == null) return;
 
+      if (!_fitsAttachment(await picked.length(), 'La imagen')) return;
       final bytes = await picked.readAsBytes();
-      if (bytes.length > maxAttachmentBytes) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('La imagen supera el límite de $maxAttachmentMegabytes MB')),
-          );
-        }
-        return;
-      }
+      if (!_fitsAttachment(bytes.length, 'La imagen')) return;
       if (mounted) {
         setState(() {
           _pickedBytes = bytes;
@@ -1622,17 +1629,11 @@ class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
         allowedExtensions: ['pdf'],
       );
       if (file == null) return;
+      if (!_fitsAttachment(await file.length(), 'El documento')) return;
       // readAsBytes: necesitamos los bytes para subirlos a Storage.
       final bytes = await file.readAsBytes();
 
-      if (bytes.length > maxAttachmentBytes) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('El documento supera el límite de $maxAttachmentMegabytes MB')),
-          );
-        }
-        return;
-      }
+      if (!_fitsAttachment(bytes.length, 'El documento')) return;
       if (mounted) {
         setState(() {
           _pickedDocBytes = bytes;

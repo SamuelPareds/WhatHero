@@ -707,10 +707,20 @@ class _MessagesViewState extends State<MessagesView> {
     );
   }
 
+  // Mismo límite para el peso informado por el selector y los bytes leídos.
+  bool _fitsAttachment(int size) {
+    if (size <= maxAttachmentBytes) return true;
+    _showAttachmentError(
+      'El archivo supera el límite de $maxAttachmentMegabytes MB',
+    );
+    return false;
+  }
+
   Future<void> _pickFromGallery() async {
     try {
       final XFile? file = await ImagePicker().pickMedia();
       if (file == null) return;
+      if (!_fitsAttachment(await file.length())) return;
       final bytes = await file.readAsBytes();
       final ext = fileExtension(file.name);
       // pickMedia sólo devuelve imagen o video; si no lo reconocemos por
@@ -730,9 +740,10 @@ class _MessagesViewState extends State<MessagesView> {
     try {
       final f = await FilePicker.pickFile();
       if (f == null) return;
+      if (!_fitsAttachment(await f.length())) return;
       // readAsBytes: necesitamos los bytes en memoria (también en Web, donde no
-      // hay path de filesystem accesible). El límite lo aplica
-      // _confirmAndSendAttachment, único guard de tamaño para los tres kinds.
+      // hay path de filesystem accesible). _confirmAndSendAttachment vuelve a
+      // comprobar el peso real de los bytes antes de mostrar el preview.
       final bytes = await f.readAsBytes();
       // Desde "Documento" siempre enviamos como archivo descargable, aunque
       // sea una imagen: el usuario quiere el original sin recomprimir.
@@ -756,10 +767,7 @@ class _MessagesViewState extends State<MessagesView> {
     required String ext,
     required String kind,
   }) async {
-    if (bytes.length > maxAttachmentBytes) {
-      _showAttachmentError('El archivo supera el límite de $maxAttachmentMegabytes MB');
-      return;
-    }
+    if (!_fitsAttachment(bytes.length)) return;
 
     final caption = await showDialog<String>(
       context: context,

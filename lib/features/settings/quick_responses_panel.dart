@@ -208,7 +208,7 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
 
   // Rechaza lo que no entra, diciendo cuánto pesa y cuánto cabe: con sólo el
   // límite el operador no sabe si le sobra un poco o si eligió el archivo
-  // equivocado.
+  // equivocado. Se usa antes de leer el archivo y sobre los bytes leídos.
   bool _fits(int size, String what) {
     if (size <= maxAttachmentBytes) return true;
     _toast('$what pesa ${_megabytes(size)} MB y el límite es '
@@ -305,9 +305,9 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
       );
       if (picked == null) return;
 
+      if (!_fits(await picked.length(), 'La imagen')) return;
       final bytes = await picked.readAsBytes();
-      // Red de seguridad: el picker recomprime, pero un original enorme puede
-      // seguir pasándose.
+      // Confirmar el peso real aunque el selector haya informado otro tamaño.
       if (!_fits(bytes.length, 'La imagen')) return;
 
       _setPicked(QrAttachKind.image, bytes, picked.name);
@@ -327,6 +327,7 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
       final picked = await _picker.pickVideo(source: ImageSource.gallery);
       if (picked == null) return;
 
+      if (!_fits(await picked.length(), 'El video')) return;
       final bytes = await picked.readAsBytes();
       if (!_fits(bytes.length, 'El video')) return;
 
@@ -347,6 +348,7 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
       final f = await FilePicker.pickFile();
       if (f == null) return;
 
+      if (!_fits(await f.length(), 'El documento')) return;
       final bytes = await f.readAsBytes();
       if (!_fits(bytes.length, 'El documento')) return;
 
