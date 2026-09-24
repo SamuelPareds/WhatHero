@@ -45,11 +45,11 @@ class PresenceReporter {
   }) =>
       PresenceReporter._(emit: emit, isConnected: isConnected, clock: clock);
 
-  /// Salir de un chat a la lista no se anuncia al instante: volver a la lista
-  /// y entrar al siguiente es un gesto de dos segundos, y sin esta espera los
-  /// compañeros verían tu nombre parpadear. Pasar de un chat a OTRO sí es
-  /// inmediato.
-  static const leaveGrace = Duration(seconds: 5);
+  // Salir de un chat se anuncia AL INSTANTE, a propósito. Hubo una espera de
+  // 5 s para que tu nombre no parpadeara si volvías enseguida, pero lo único
+  // que lograba era atrasar un dato cierto ("ya salí"): dos operadores en el
+  // mismo chat se quedaban esperándose para ver quién soltaba primero. Pasar
+  // de un chat a otro nunca la tuvo. No volver a ponerla.
 
   /// App en segundo plano o pestaña oculta. La espera cubre el selector de
   /// fotos y el alt-tab de ida y vuelta, que también ocultan la app.
@@ -81,7 +81,6 @@ class PresenceReporter {
   bool _idle = false;
   DateTime _lastActivity = DateTime.fromMillisecondsSinceEpoch(0);
 
-  Timer? _leaveTimer;
   Timer? _hiddenTimer;
   Timer? _idleTimer;
   bool _flushScheduled = false;
@@ -267,28 +266,6 @@ class PresenceReporter {
 
   void _flush() {
     final desired = _desired();
-    final sent = _sent;
-
-    // Salir de un chat a la lista espera `leaveGrace`. Ausencia e inactividad
-    // ya esperaron lo suyo, así que ésas salen de inmediato.
-    final leavingToList = sent?.chatId != null &&
-        desired.chatId == null &&
-        desired.sessionPhone == sent?.sessionPhone &&
-        !_away &&
-        !_idle;
-    if (leavingToList) {
-      _leaveTimer ??= Timer(leaveGrace, () {
-        _leaveTimer = null;
-        _send(_desired());
-      });
-      return;
-    }
-    _leaveTimer?.cancel();
-    _leaveTimer = null;
-    _send(desired);
-  }
-
-  void _send(_PresenceState desired) {
     // emit() descarta en silencio si el socket está caído. No damos por
     // enviado lo que no salió: onConnected reenvía el estado completo.
     if (!_isConnected()) return;

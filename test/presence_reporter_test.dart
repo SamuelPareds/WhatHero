@@ -109,15 +109,16 @@ void main() {
     });
   });
 
+  // Salir se anuncia al instante: con una espera, dos operadores en el mismo
+  // chat se quedaban aguardando a ver quién soltaba primero.
   group('salir de un chat', () {
-    testWidgets('a la lista espera la gracia', (tester) async {
+    testWidgets('a la lista es inmediato y conserva la sesión', (tester) async {
       reporter.register(screenA);
       open(screenA, '5215511111111');
       await tester.pump();
       open(screenA, null);
       await tester.pump();
-      expect(sent, hasLength(1));
-      await advance(tester, PresenceReporter.leaveGrace);
+      expect(sent, hasLength(2));
       expect(last()!['chatId'], isNull);
       expect(last()!['sessionPhone'], '5215500000001');
     });
@@ -126,25 +127,21 @@ void main() {
       reporter.register(screenA);
       open(screenA, '5215511111111');
       await tester.pump();
-      open(screenA, null);
-      await tester.pump();
       open(screenA, '5215522222222');
       await tester.pump();
-      expect(last()!['chatId'], '5215522222222');
-      // La gracia pendiente se canceló: no manda un null tardío.
-      await advance(tester, PresenceReporter.leaveGrace);
+      expect(sent, hasLength(2));
       expect(last()!['chatId'], '5215522222222');
     });
 
-    testWidgets('ir a la lista y volver al mismo chat no parpadea', (tester) async {
+    testWidgets('cambios dentro del mismo frame se funden en un envío', (tester) async {
       reporter.register(screenA);
       open(screenA, '5215511111111');
       await tester.pump();
+      // Cerrar y abrir otro antes del microtask: sólo sale el estado final.
       open(screenA, null);
+      open(screenA, '5215522222222');
       await tester.pump();
-      open(screenA, '5215511111111');
-      await advance(tester, PresenceReporter.leaveGrace);
-      expect(sent, hasLength(1));
+      expect(sent.map((m) => m['chatId']), ['5215511111111', '5215522222222']);
     });
   });
 
