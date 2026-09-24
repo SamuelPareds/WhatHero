@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'dart:ui';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_slidable/flutter_slidable.dart';
 import 'package:http/http.dart' as http;
 import 'package:crm_whatsapp/core.dart';
@@ -11,8 +12,10 @@ import 'package:crm_whatsapp/core/services/active_chat_tracker.dart';
 import 'package:crm_whatsapp/core/services/ai_state_service.dart';
 import 'package:crm_whatsapp/core/services/api_client.dart';
 import 'package:crm_whatsapp/core/services/notification_service.dart';
+import 'package:crm_whatsapp/core/services/presence_reporter.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/core/services/storage_service.dart';
+import 'package:crm_whatsapp/core/services/team_presence_service.dart';
 import 'package:crm_whatsapp/core/utils/phone_search.dart';
 import 'package:crm_whatsapp/features/settings.dart';
 import 'package:crm_whatsapp/features/accounts.dart';
@@ -22,6 +25,7 @@ import 'widgets/ai_state_indicator.dart';
 import 'widgets/chat_nav_stepper.dart';
 import 'widgets/message_search_results.dart';
 import 'widgets/new_chat_sheet.dart';
+import 'widgets/team_presence_banner.dart';
 import 'widgets/unread_badge.dart';
 import 'widgets/label_chip.dart';
 import 'widgets/labels_selector_sheet.dart';
@@ -52,6 +56,8 @@ class ChatsScreen extends StatefulWidget {
 
 class _ChatsScreenState extends State<ChatsScreen> {
   String? selectedChatPhone;
+  // Para rotular "tu usuario en otro dispositivo" en la presencia del equipo.
+  final String? _myUid = FirebaseAuth.instance.currentUser?.uid;
   // Salto a un mensaje concreto al abrir un chat desde el buscador. Lo consume
   // MessagesView (carga hasta él + scroll + resalte) y avisa con onJumpConsumed
   // para limpiarlo, de modo que volver a tocar el mismo resultado re-dispare.
@@ -111,6 +117,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
   @override
   void initState() {
     super.initState();
+    // Presencia del equipo: esta pantalla cuenta como "dónde estoy" mientras
+    // esté en pantalla (ver build).
+    PresenceReporter.instance.register(this);
     if (widget.sessionId != null && widget.sessionKey != null) {
       _setupSocketListeners();
       // Guardar esta sesión como la última activa
@@ -225,7 +234,10 @@ class _ChatsScreenState extends State<ChatsScreen> {
     _pendingTap?.removeListener(_onPendingTap);
     _cancelledTimer?.cancel();
     _filterCounts.dispose();
-    ActiveChatTracker.instance.clear();
+    PresenceReporter.instance.unregister(this);
+    // Sólo si el rastreador es nuestro: al cambiar de sesión, SessionDispatcher
+    // desmonta esta pantalla DESPUÉS de que la nueva ya reportó su chat.
+    ActiveChatTracker.instance.clearIfSession(widget.sessionId);
     super.dispose();
   }
 
@@ -490,15 +502,34 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final isMobile = MediaQuery.of(context).size.width < 600;
+
+    // ¿Esta pantalla es la que se ve? Puede haber dos ChatsScreen vivas (la
+    // raíz queda montada debajo de AccountsScreen) y la de abajo sigue
+    // rebuildeando. TickerMode se apaga bajo una ruta opaca y sigue encendido
+    // bajo diálogos, hojas y visores de fotos. Leerlo aquí crea la dependencia:
+    // al taparse o destaparse, la pantalla se rebuildea y vuelve a reportar.
+    final onScreen = TickerMode.valuesOf(context).enabled;
+
     // Reportamos al rastreador qué chat está abierto, para que el banner de
     // push se suprima si llega un aviso del chat que ya estás viendo. Es un
     // contenedor de valores sin listeners → no provoca rebuilds.
-    ActiveChatTracker.instance.update(
-      sessionPhone: widget.sessionId,
-      chatId: selectedChatPhone,
-    );
+    if (onScreen) {
+      ActiveChatTracker.instance.update(
+        sessionPhone: widget.sessionId,
+        chatId: selectedChatPhone,
+      );
+    }
 
-    final isMobile = MediaQuery.of(context).size.width < 600;
+    // Presencia del equipo. En desktop la galería de medios tapa el detalle
+    // sin ser una ruta: mientras está abierta no estás "en" ese chat. Seguro
+    // desde build: sólo compara y agenda el envío.
+    PresenceReporter.instance.report(
+      this,
+      sessionPhone: widget.sessionId,
+      chatId: (_showMediaVault && !isMobile) ? null : selectedChatPhone,
+      onScreen: onScreen,
+    );
 
     final Widget content = isMobile
         // Mantenemos la lista SIEMPRE montada (Offstage cuando hay un chat
@@ -1034,6 +1065,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
       unrespondedCount: unrespondedCount,
       markedPending: markedPending,
       sessionKey: widget.sessionKey,
+      sessionPhone: widget.sessionId,
+      myUid: _myUid,
       labelIds: labelIds,
       labelsCatalog: _labelsCatalog,
       note: note,
@@ -2340,6 +2373,10 @@ class _ChatTile extends StatelessWidget {
   // Puede ser null si la sesión está desconectada — en ese caso nunca habrá
   // estado de IA activo y el tile cae al render normal con el badge.
   final String? sessionKey;
+  // Presencia del equipo (clave: sesión + chat). myUid rotula "tu usuario en
+  // otro dispositivo" en equipos que comparten login.
+  final String? sessionPhone;
+  final String? myUid;
   final List<String> labelIds;
   final Map<String, ChatLabel> labelsCatalog;
   final String note;
@@ -2356,12 +2393,17 @@ class _ChatTile extends StatelessWidget {
     required this.unrespondedCount,
     required this.markedPending,
     required this.sessionKey,
+    required this.sessionPhone,
+    required this.myUid,
     required this.labelIds,
     required this.labelsCatalog,
     required this.note,
     required this.onTap,
     this.onLongPress,
   });
+
+  List<TeamViewer> _teamHere() =>
+      TeamPresenceService().othersIn(sessionPhone, phoneNumber);
 
   String _formatTimestamp(DateTime? dateTime) {
     if (dateTime == null) return '';
@@ -2463,6 +2505,50 @@ class _ChatTile extends StatelessWidget {
                       ),
                     ),
                   ),
+                // Compañeros dentro de este chat: inicial violeta abajo a la
+                // derecha (arriba a la derecha es de los pendientes). Con más
+                // de uno, cuántos son. El tooltip dice quiénes (desktop).
+                Positioned(
+                  bottom: -4,
+                  right: -4,
+                  child: ListenableBuilder(
+                    listenable: TeamPresenceService(),
+                    builder: (context, _) {
+                      final here = _teamHere();
+                      final presence = describeTeamPresence(here, myUid: myUid);
+                      if (presence == null) return const SizedBox.shrink();
+                      final people = {for (final v in here) v.uid: v.name};
+                      final first = people.values.first;
+                      final label = people.length > 1
+                          ? '${people.length}'
+                          : first.isEmpty
+                              ? '?'
+                              : first.characters.first.toUpperCase();
+                      return Tooltip(
+                        message: presence.text,
+                        child: Container(
+                          width: 20,
+                          height: 20,
+                          alignment: Alignment.center,
+                          decoration: BoxDecoration(
+                            color: teamViolet,
+                            shape: BoxShape.circle,
+                            border: Border.all(color: darkBg, width: 2),
+                          ),
+                          child: Text(
+                            label,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 9,
+                              fontWeight: FontWeight.w700,
+                              height: 1,
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
               ],
             ),
             const SizedBox(width: 12),
@@ -2541,29 +2627,61 @@ class _ChatTile extends StatelessWidget {
                   // delante; el entrante va limpio. Esa asimetría (la misma de
                   // WhatsApp) es la que deja leer la dirección de un vistazo:
                   // sin palomita = habló el cliente = probablemente tu turno.
-                  Row(
-                    children: [
-                      if (lastMessageFromMe == true) ...[
-                        Icon(
-                          Icons.done,
-                          size: 14,
-                          color: lightText.withValues(alpha: 0.7),
-                        ),
-                        const SizedBox(width: 4),
-                      ],
-                      Expanded(
-                        child: Text(
-                          lastMessage,
-                          style: const TextStyle(
-                            fontSize: 12,
-                            color: lightText,
-                            height: 1.4,
+                  // Si un compañero está respondiendo este chat, la línea lo
+                  // dice en su lugar (como el "escribiendo…" de WhatsApp):
+                  // es lo que decide si entras o lo dejas en paz.
+                  ListenableBuilder(
+                    listenable: TeamPresenceService(),
+                    builder: (context, _) {
+                      final presence =
+                          describeTeamPresence(_teamHere(), myUid: myUid);
+                      if (presence != null && presence.composing) {
+                        return Row(
+                          children: [
+                            const Icon(Icons.edit_note_rounded,
+                                size: 14, color: teamViolet),
+                            const SizedBox(width: 4),
+                            Expanded(
+                              child: Text(
+                                presence.text,
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: teamViolet,
+                                  height: 1.4,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ],
+                        );
+                      }
+                      return Row(
+                        children: [
+                          if (lastMessageFromMe == true) ...[
+                            Icon(
+                              Icons.done,
+                              size: 14,
+                              color: lightText.withValues(alpha: 0.7),
+                            ),
+                            const SizedBox(width: 4),
+                          ],
+                          Expanded(
+                            child: Text(
+                              lastMessage,
+                              style: const TextStyle(
+                                fontSize: 12,
+                                color: lightText,
+                                height: 1.4,
+                              ),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
                           ),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                    ],
+                        ],
+                      );
+                    },
                   ),
                   // Etiquetas + nota en UNA línea a lo ancho del Expanded.
                   // Las etiquetas toman su ancho (acotado al 50% para no

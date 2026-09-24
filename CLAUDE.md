@@ -58,9 +58,10 @@ Para evitar que el backend local y Railway se pisen entre sí (por ejemplo, el `
 
 ## 🌉 El Puente: Socket.io con Rooms
 Para garantizar que la data llegue al usuario correcto, implementamos **Rooms**:
-- El socket del cliente se une a una sala con su `userId` (Firebase UID).
-- El backend emite eventos (`qr`, `ready`) únicamente a esa sala: `io.to(userId).emit(...)`.
+- El socket del cliente se une a la sala de su cuenta, `accountId` (el UID del owner; un miembro del equipo entra a la del owner).
+- El backend emite eventos (`qr`, `ready`) únicamente a esa sala: `io.to(accountId).emit(...)`.
 - **Eventos:** Incluyen un `sessionKey` (UUID) para que el frontend distinja entre múltiples procesos de vinculación simultáneos.
+- **Ojo:** la sala `accountId` llega a **todos** los miembros, incluidos los restringidos a otras sesiones. Lo que no deba ver un miembro sin acceso a esa sesión va por salas por sesión con chequeo de acceso, como la presencia del equipo (`tp:{accountId}:{sessionPhone}`, ver *👥 Presencia del equipo*).
 
 ---
 
@@ -288,6 +289,53 @@ Por eso el stepper del AppBar (`ChatNavStepper`, ↑ 4/12 ↓) **no camina la li
 **Cuidado con el ancho del AppBar:** el stepper comparte fila con el nombre del contacto, el toggle de IA y el botón de info. `test/chat_nav_stepper_test.dart` fija que quepa en un teléfono de 360dp con un nombre largo; si engorda, ese test revienta con un `RenderFlex overflow` en vez de degradar el título en silencio.
 
 **Fase 2 (no está hecho):** "siguiente y marcar Listo" en un gesto para el filtro *Pendientes* (un tap accidental cerraría un pendiente real), y auto-scroll de la lista al chat activo en desktop.
+
+---
+
+## 👥 Presencia del equipo (quién está en un chat y quién está respondiendo)
+
+Dos operadores abrían el mismo chat sin saberlo y el cliente recibía dos respuestas. Ahora cada uno ve, en la lista y sobre el composer, si un compañero **está en ese chat** o **está respondiendo**, y un choque real ("te respondieron mientras escribías") lo frena antes de enviar.
+
+**Alcance: sólo WhatHero, por decisión de producto.** No se intenta adivinar actividad de WhatsApp Web ni del teléfono (desde un dispositivo vinculado no se ve quién es ni si está escribiendo). Que el equipo trabaje en WhatHero es decisión del dueño de la empresa. La única excepción es gratis: un mensaje enviado desde el teléfono llega etiquetado `senderName: 'WhatsApp'`, y la guarda de choque lo trata como cualquier otra respuesta ajena.
+
+### Efímero, en memoria, sin Firestore
+
+La presencia viaja por Socket.io y el backend la guarda en memoria (`presenceRegistry.ts` es el estado puro; `presenceService.ts`, el cableado). **Cero lecturas y escrituras de Firestore por presencia**, salvo el chequeo de acceso (cacheado) y el nombre (el mismo cache de `resolveHumanSender`).
+
+- **Un evento de ida y uno de vuelta.** El cliente manda `team_presence_set {clientId, sessionPhone|null, chatId|null, composing}` con su estado **completo**; el server responde a la sala `team_presence {sessionPhone, viewers:[…]}` con el estado **completo de la sesión**. No hay deltas que puedan desordenarse, ni watch/unwatch que olvidar: la sesión del set decide a qué sala entra el socket.
+- **La entrada muere con el socket. No hay heartbeat, a propósito.** El ping/pong de Socket.io retira a los clientes muertos en ≤45 s, y el cliente reenvía su estado en cada conexión (`PresenceReporter.onConnected`), así que un redeploy de Railway se reconstruye solo. Un heartbeat no arreglaba ningún fallo real y Chrome estrangula los timers de las pestañas ocultas: la presencia habría parpadeado.
+- **Salas por sesión con chequeo de acceso** (`memberAccess.ts`, que también usa `computeAllowedUids` de las notificaciones: un solo lugar decide quién ve qué sesión). Quitarle una sesión a un miembro (`PATCH …/access`) lo saca de la sala en el acto (`revalidatePresenceAccess`).
+- **Proceso único.** Con réplicas en Railway esto necesitaría el adapter de Redis y un registro compartido.
+- **Todo handler va envuelto en `.catch`** y cada set lleva un número de secuencia por socket: tras cada `await` se descarta si llegó uno más nuevo o si el socket se cerró. Sin eso, un set lento podía pisar a uno posterior o resucitar a un socket muerto.
+- **Token bucket (20, +5/s) que no pierde el último estado:** lo frenado se aplica igual cuando hay ficha. Tirarlo dejaría al equipo viendo un chat que ya no es.
+
+### Qué cuenta como "estar" y "responder" (`presence_reporter.dart`)
+
+- **`composing` = el composer tiene texto**, no "tecleó hace N segundos". Cambia unas dos veces por mensaje, sin throttle ni timers en el server. El borrador del agente de seguimiento cuenta: el operador está a punto de mandarlo.
+- **`clientId` por pestaña, no el socket ni el uid.** Al reconectar llega un socket nuevo antes de que muera el viejo, y el registro retira al "fantasma" de la misma pestaña. En el cliente, `othersIn` excluye **mi `clientId`**, no mi uid: en equipos que comparten login, "tu usuario en otro dispositivo" es otra persona y se muestra así.
+- **Registro por pantalla + `TickerMode`.** Puede haber dos `ChatsScreen` vivas (la raíz queda montada bajo `AccountsScreen`; `SessionDispatcher` monta la sesión nueva antes de desmontar la vieja) y la de abajo sigue rebuildeando. Manda la última registrada que está en pantalla (`TickerMode.valuesOf(context).enabled`: se apaga bajo rutas opacas, sigue encendido bajo diálogos, hojas y visores de fotos). `ActiveChatTracker` tenía el mismo bug; ahora sólo reporta en pantalla y su `dispose` sólo limpia si el rastreador es suyo.
+- **Esperas antes de soltar el chat:** salir de un chat a la lista espera 5 s (volver y entrar al siguiente no parpadea; chat→otro chat es inmediato). App oculta o en segundo plano: 15 s (cubre el selector de fotos y el alt-tab). `inactive` (blur de la ventana web) **no** es ausencia. Sin tocar la app 3 min = ya no estás en el chat, o un escritorio abandonado bloquearía al equipo. En móvil el teclado en pantalla no genera eventos de tecla: los cambios del composer cuentan como actividad.
+- **Ausente sólo suelta el chat, no la sesión:** sigues viendo la lista y la presencia de los demás.
+- En desktop, la galería de medios tapa el detalle sin ser ruta: mientras está abierta no estás "en" ese chat.
+- Con el socket caído, `TeamPresenceService` vacía la presencia a los 10 s si no reconecta: mostrar la última foto sería mentir.
+
+### La guarda de choque (`reply_collision.dart`)
+
+Cubre lo que la presencia no alcanza: dos personas escriben a la vez, una envía primero y la otra pulsa Enter sin mirar arriba.
+
+- **Se detecta por llegada, nunca por reloj.** Un mensaje es nuevo si aparece **arriba** del primer id ya conocido en el snapshot anterior. Paginar agrega ids abajo y borrar el más reciente "asciende" a uno viejo: ninguno de los dos cuenta. Sólo se deserializan los docs nuevos.
+- **Los primeros 3 s tras abrir el chat sólo aprenden la baseline**: el snapshot del servidor que sigue al del cache es la conversación poniéndose al día, no respuestas nuevas. No basta con `isFromCache`: si el cache ya estaba al día, Firestore no manda el snapshot del servidor (sólo cambió metadata) y la baseline nunca se fijaría.
+- **Choque = mensaje saliente ajeno mientras el composer tiene texto.** Excluye `bot` (reglas y recordatorios). "Mío" es `senderUid == mi uid` **y** que esta vista haya enviado algo en los últimos 2 min; no sirve `PendingMessagesService` porque los adjuntos no llevan `tempId` y la burbuja se purga al llegar el doc.
+- **Franja ámbar + diálogo al enviar, sólo en choque real.** `_confirmIfCollision()` es el único punto por el que pasa cada envío de la vista (Enter, botón, adjunto, respuesta rápida). "Revisar" tiene el foco (un Enter reflejo no manda la segunda respuesta) y marca el choque como visto: el siguiente Enter envía.
+- **Depende de que el eco traiga el `senderUid` correcto.** `performSendMessage` resuelve el remitente **antes** de `sock.sendMessage`: Baileys emite el eco dentro del propio envío y `saveMessageToFirestore` sólo espera ~60 ms la etiqueta. Resolverlo después metía en esa carrera una lectura de `users/{uid}` con el cache frío, y el mensaje del operador quedaba como "WhatsApp" y sin `senderUid`. **No volver a moverlo después del envío.**
+
+### UI
+- Violeta `teamViolet` (#8B5CF6) para el equipo; ámbar `collisionAmber` para el choque. No chocan con el aqua de la IA, el ámbar de "tu turno" (que vive en el AppBar) ni el rojo de "requiere humano".
+- **Sobre el composer** (`TeamPresenceBanner`, prioridad choque > respondiendo > en el chat): ahí se decide escribir o no, y sigue a la vista aunque subas a leer el historial. **El AppBar no se toca**: tiene su sistema de cuatro modos y el test de 360 dp.
+- **En la lista:** "Ana está respondiendo…" reemplaza la línea de preview (como el "escribiendo…" de WhatsApp) y una inicial violeta abajo a la derecha del avatar dice que alguien está dentro (arriba a la derecha es de los pendientes).
+- Las reglas viven en `test/reply_collision_test.dart`, `test/presence_reporter_test.dart`, `test/team_presence_service_test.dart` y `backend/src/services/presenceRegistry.test.ts` (`cd backend && npm test`).
+
+**Fase 2 (no está hecho):** la IA que espera mientras un compañero responde (si no llega a enviar, el cliente se quedaría sin respuesta: merece su propio análisis) y la asignación explícita de chats ("tomar chat").
 
 ---
 

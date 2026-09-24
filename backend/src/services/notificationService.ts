@@ -1,5 +1,6 @@
 import admin from 'firebase-admin';
 import { ACCOUNTS_COLLECTION } from '../config/env';
+import { memberHasSessionAccess, type MemberAccess } from './memberAccess';
 
 // Acceso perezoso a Firestore — admin.firestore() solo es seguro tras initializeApp()
 function getDb() {
@@ -122,21 +123,8 @@ async function computeAllowedUids(
       .get();
 
     membersSnap.forEach((doc) => {
-      const access = doc.data()?.access as
-        | { allSessions?: boolean; sessions?: Record<string, unknown> }
-        | undefined;
-      // Sin access → miembro legacy con acceso total.
-      if (!access) {
-        allowed.add(doc.id);
-        return;
-      }
-      if (access.allSessions === true) {
-        allowed.add(doc.id);
-        return;
-      }
-      if (access.sessions && sessionPhone in access.sessions) {
-        allowed.add(doc.id);
-      }
+      const access = doc.data()?.access as MemberAccess | undefined;
+      if (memberHasSessionAccess(access, sessionPhone)) allowed.add(doc.id);
     });
     return allowed;
   } catch (error) {

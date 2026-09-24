@@ -8,6 +8,7 @@
     "dev": "tsx watch index.ts",
     "build": "tsc",
     "check:wa": "tsx scripts/check-wa-version.ts",
+    "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "postinstall": "patch-package"
   },
   "dependencies": {

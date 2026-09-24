@@ -7,6 +7,12 @@ const Color surfaceDark = Color(0xFF1F2937); // Elementos oscuros (gris oscuro)
 const Color white = Color(0xFFF3F4F6); // Texto blanco (no puro)
 const Color lightText = Color(0xFFD1D5DB); // Gris claro secundario
 const Color accentAqua = Color(0xFF10B981); // Verde más saturado para detalles
+// Presencia del equipo (quién está en un chat / respondiendo). Violeta para no
+// confundirse con el aqua de la IA, el ámbar de "tu turno" ni el rojo de
+// "requiere humano".
+const Color teamViolet = Color(0xFF8B5CF6);
+// Aviso de choque: alguien respondió mientras escribías.
+const Color collisionAmber = Color(0xFFF59E0B);
 
 /// Build the WhatHero dark theme with aqua accent
 ThemeData buildWhatHeroTheme() {

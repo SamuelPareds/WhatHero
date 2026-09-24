@@ -10,6 +10,7 @@ import 'firebase_options.dart';
 import 'core.dart';
 import 'core/services/socket_service.dart';
 import 'core/services/notification_service.dart';
+import 'core/services/presence_reporter.dart';
 import 'core/services/storage_service.dart';
 import 'core/widgets/foreground_push_host.dart';
 import 'features/auth.dart';
@@ -100,6 +101,10 @@ class _SessionDispatcherState extends State<SessionDispatcher> {
     // Firebase para el handshake), pero no bloqueamos la UI: que se conecte
     // en background.
     unawaited(SocketService().init(widget.accountId));
+    // Presencia del equipo: escucha la conexión del socket (para reenviar su
+    // estado al reconectar), el ciclo de vida y la actividad. Mismo punto
+    // canónico que el socket, por la misma razón. Idempotente.
+    PresenceReporter.instance.start();
 
     // NotificationService.init sigue el MISMO patrón canónico: vive aquí, no
     // dentro de pantallas hijas. Si el día de mañana se agrega una pantalla

@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:image_picker/image_picker.dart';
@@ -12,9 +13,13 @@ import 'package:crm_whatsapp/core/utils/media_mime.dart';
 import 'package:crm_whatsapp/core/utils/quick_response_attachment.dart';
 import 'package:crm_whatsapp/core/services/api_client.dart';
 import 'package:crm_whatsapp/core/services/pending_messages_service.dart';
+import 'package:crm_whatsapp/core/services/presence_reporter.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
+import 'package:crm_whatsapp/core/services/team_presence_service.dart';
 import 'package:crm_whatsapp/features/settings.dart';
+import 'reply_collision.dart';
 import 'widgets/message_bubble.dart';
+import 'widgets/team_presence_banner.dart';
 
 // Draft de "responder a este mensaje". Vive en MessagesView mientras el
 // usuario está componiendo la respuesta — al enviar (o cancelar) se limpia.
@@ -149,6 +154,15 @@ class _MessagesViewState extends State<MessagesView> {
   // teclado salte automáticamente, sin requerir tap extra.
   final FocusNode _inputFocusNode = FocusNode();
 
+  // 👥 Guarda de choque: alguien (compañero, IA o WhatsApp) le respondió a
+  // este cliente mientras el composer tenía texto. Ver reply_collision.dart.
+  final ReplyCollisionDetector _collisionDetector = ReplyCollisionDetector();
+  final ValueNotifier<ReplyCollision?> _collision = ValueNotifier(null);
+  // "Revisar" en el diálogo = ya lo viste: el siguiente envío no vuelve a
+  // preguntar. Se rearma con cada choque nuevo.
+  bool _collisionAcked = false;
+  final String? _myUid = FirebaseAuth.instance.currentUser?.uid;
+
   void _setReplyDraft(ReplyDraft draft) {
     _replyDraft.value = draft;
     _inputFocusNode.requestFocus();
@@ -214,6 +228,20 @@ class _MessagesViewState extends State<MessagesView> {
   void _updateHasText() {
     final hasText = _messageController.text.isNotEmpty;
     if (hasText != _hasText.value) _hasText.value = hasText;
+
+    // Presencia: texto en el composer = "estoy respondiendo". Cambia unas dos
+    // veces por mensaje, no por tecla. En móvil el teclado en pantalla no
+    // genera eventos de tecla, así que escribir también cuenta como actividad.
+    final composing = _messageController.text.trim().isNotEmpty;
+    PresenceReporter.instance
+        .setComposing(widget.sessionId, widget.phoneNumber, composing);
+    PresenceReporter.instance.noteActivity();
+
+    // Composer vacío (enviaste o borraste): el choque ya no aplica.
+    if (!composing && _collision.value != null) {
+      _collision.value = null;
+      _collisionAcked = false;
+    }
   }
 
   @override
@@ -252,6 +280,10 @@ class _MessagesViewState extends State<MessagesView> {
     _messageController.removeListener(_updateHasText);
     _messageController.dispose();
     _hasText.dispose();
+    // El borrador muere con el chat: ya no estoy respondiendo aquí.
+    PresenceReporter.instance
+        .setComposing(widget.sessionId, widget.phoneNumber, false);
+    _collision.dispose();
     _scrollController.dispose();
     _qrScroll.dispose();
     _replyDraft.dispose();
@@ -536,6 +568,8 @@ class _MessagesViewState extends State<MessagesView> {
   Future<void> _sendMessage() async {
     final text = _messageController.text.trim();
     if (text.isEmpty) return;
+    // El diálogo es modal: el texto no puede cambiar mientras está abierto.
+    if (!await _confirmIfCollision()) return;
 
     // Snapshot del draft al momento del envío. Si el usuario cancela durante
     // el vuelo, queremos enviar lo que estaba activo cuando tocó "enviar".
@@ -588,6 +622,8 @@ class _MessagesViewState extends State<MessagesView> {
   Future<void> _transmitPending(Map<String, dynamic> messageData) async {
     final tempId = messageData['tempId'] as String;
     final service = PendingMessagesService();
+    // Su eco trae MI senderUid: la guarda de choque no debe tomarlo por otro.
+    _collisionDetector.noteLocalSend();
 
     if (SocketService().isConnected) {
       SocketService().sendMessage(messageData);
@@ -791,6 +827,7 @@ class _MessagesViewState extends State<MessagesView> {
     required String kind,
     required String caption,
   }) async {
+    if (!await _confirmIfCollision()) return;
     setState(() => _isSending = true);
     try {
       final mime = _mimeFor(ext, kind);
@@ -820,6 +857,7 @@ class _MessagesViewState extends State<MessagesView> {
         messageData['documentName'] = fileName;
       }
 
+      _collisionDetector.noteLocalSend();
       if (SocketService().isConnected) {
         SocketService().sendMessage(messageData);
       } else {
@@ -1403,6 +1441,7 @@ class _MessagesViewState extends State<MessagesView> {
   // enteros salvo por dos claves del payload.
   Future<void> _sendQuickResponseMedia(QrAttachment attach, String text) async {
     if (attach.isEmpty) return;
+    if (!await _confirmIfCollision()) return;
 
     setState(() => _isSending = true);
 
@@ -1426,6 +1465,7 @@ class _MessagesViewState extends State<MessagesView> {
         },
       };
 
+      _collisionDetector.noteLocalSend();
       if (SocketService().isConnected) {
         SocketService().sendMessage(messageData);
         if (mounted) {
@@ -1454,6 +1494,62 @@ class _MessagesViewState extends State<MessagesView> {
     } finally {
       if (mounted) setState(() => _isSending = false);
     }
+  }
+
+  // ─── Guarda de choque ──────────────────────────────────────────────────
+
+  // Corre en cada build del stream, pero es idempotente: un snapshot ya visto
+  // no trae ids nuevos. Sólo deserializa los docs nuevos.
+  void _detectCollision(QuerySnapshot snapshot) {
+    final docs = snapshot.docs;
+    final hit = _collisionDetector.onSnapshot(
+      idsNewestFirst: [for (final d in docs) d.id],
+      fromCache: snapshot.metadata.isFromCache,
+      composing: _messageController.text.trim().isNotEmpty,
+      myUid: _myUid,
+      read: (id) {
+        final data = docs.firstWhere((d) => d.id == id).data()
+            as Map<String, dynamic>;
+        return CollisionCandidate(
+          id: id,
+          fromMe: (data['fromMe'] as bool?) ?? false,
+          senderType: data['senderType'] as String?,
+          senderName: data['senderName'] as String?,
+          senderUid: data['senderUid'] as String?,
+          preview: _previewForDraft(
+            (data['text'] as String?) ?? '',
+            data['mediaType'] as String?,
+          ),
+        );
+      },
+    );
+    if (hit == null) return;
+    // Mutar un notifier durante build está prohibido.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _collision.value = hit;
+      _collisionAcked = false;
+    });
+  }
+
+  // Punto único por el que pasa cada envío de la vista. Sólo frena si hay un
+  // choque que todavía no viste: "Revisar" (o tocar fuera) cuenta como visto.
+  Future<bool> _confirmIfCollision() async {
+    final collision = _collision.value;
+    if (collision == null || _collisionAcked) return true;
+    final send = await showDialog<bool>(
+      context: context,
+      builder: (_) => _CollisionDialog(collision: collision),
+    );
+    if (!mounted) return false;
+    if (send == true) return true;
+    _collisionAcked = true;
+    return false;
+  }
+
+  void _dismissCollision() {
+    _collision.value = null;
+    _collisionAcked = false;
   }
 
   @override
@@ -1487,6 +1583,7 @@ class _MessagesViewState extends State<MessagesView> {
               if (!snapshot.hasData) return const Center(child: CircularProgressIndicator(valueColor: AlwaysStoppedAnimation<Color>(primaryAqua)));
               
               final messages = snapshot.data!.docs;
+              _detectCollision(snapshot.data!);
               
               // Si nos devuelven menos de lo que pedimos, es que ya no hay más mensajes en el servidor
               if (messages.length < _messageLimit) {
@@ -1696,6 +1793,19 @@ class _MessagesViewState extends State<MessagesView> {
                 return Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
+                    // 👥 Choque / compañeros en este chat. Arriba de todo: es
+                    // lo que hay que saber antes de escribir.
+                    ListenableBuilder(
+                      listenable: Listenable.merge(
+                          [_collision, TeamPresenceService()]),
+                      builder: (context, _) => TeamPresenceBanner(
+                        collision: _collision.value,
+                        onDismissCollision: _dismissCollision,
+                        viewers: TeamPresenceService()
+                            .othersIn(widget.sessionId, widget.phoneNumber),
+                        myUid: _myUid,
+                      ),
+                    ),
                     // Selector de respuestas rápidas ("/"): arriba de todo,
                     // pegado al composer y navegable con ↑/↓ + Enter.
                     _quickResponsesPanel(),
@@ -2175,6 +2285,75 @@ class _QuickResponseDialogState extends State<_QuickResponseDialog> {
             widget.onSend(edited);
           },
           child: const Text('Enviar', style: TextStyle(color: darkBg, fontWeight: FontWeight.w600)),
+        ),
+      ],
+    );
+  }
+}
+
+// Se interpone al enviar SÓLO cuando alguien respondió mientras escribías.
+// "Revisar" tiene el foco: un Enter reflejo no debe mandar la segunda
+// respuesta, que es justo lo que esta guarda existe para evitar.
+class _CollisionDialog extends StatelessWidget {
+  final ReplyCollision collision;
+
+  const _CollisionDialog({required this.collision});
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: surfaceDark,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      title: Row(
+        children: [
+          const Icon(Icons.warning_amber_rounded, color: collisionAmber),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              collision.headline,
+              style: const TextStyle(color: white, fontWeight: FontWeight.bold, fontSize: 18),
+            ),
+          ),
+        ],
+      ),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'Mientras escribías, se le envió al cliente:',
+            style: TextStyle(color: lightText, fontSize: 14, height: 1.4),
+          ),
+          const SizedBox(height: 10),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+            decoration: BoxDecoration(
+              color: darkBg.withValues(alpha: 0.6),
+              borderRadius: BorderRadius.circular(8),
+              border: const Border(left: BorderSide(color: collisionAmber, width: 3)),
+            ),
+            child: Text(
+              collision.preview.isEmpty ? '(sin contenido)' : collision.preview,
+              maxLines: 4,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: white, fontSize: 14, height: 1.4),
+            ),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          autofocus: true,
+          onPressed: () => Navigator.of(context).pop(false),
+          child: const Text('Revisar', style: TextStyle(color: lightText)),
+        ),
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(true),
+          child: const Text(
+            'Enviar igual',
+            style: TextStyle(color: collisionAmber, fontWeight: FontWeight.bold),
+          ),
         ),
       ],
     );

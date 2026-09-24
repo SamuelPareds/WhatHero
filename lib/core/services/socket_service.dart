@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import '../config.dart';
 import 'ai_state_service.dart';
 import 'pending_messages_service.dart';
+import 'team_presence_service.dart';
 
 /// Evento de QR recibido
 class QREvent {
@@ -104,6 +105,9 @@ class SocketService {
       debugPrint('[SocketService] ❌ Desconectado');
       _isConnected = false;
       _connectionController.add(false);
+      // Sin socket no nos enteramos de quién se va: la presencia caduca sola
+      // si no reconectamos pronto.
+      TeamPresenceService().markStale();
     });
 
     _socket?.on('qr', (data) {
@@ -143,6 +147,14 @@ class SocketService {
       AiStateService().applySocketPayload(Map<String, dynamic>.from(data));
     });
 
+    // Presencia del equipo: el estado completo de la sesión en cada cambio.
+    // Mismo patrón que ai_state.
+    _socket?.on('team_presence', (data) {
+      if (data is Map) {
+        TeamPresenceService().applyPayload(Map<String, dynamic>.from(data));
+      }
+    });
+
     // Acks de envío para las burbujas optimistas (relojito → ✓✓ / reintentar).
     // Mismo patrón que ai_state: directo al singleton, sin Stream intermedio.
     _socket?.on('message_sent_success', (data) {
@@ -165,6 +177,8 @@ class SocketService {
     _socket?.dispose();
     _socket = null;
     _isConnected = false;
+    // Cambio de cuenta o logout: la presencia de la cuenta anterior no aplica.
+    TeamPresenceService().clearAll();
   }
 
   /// Cierra el socket y deja de escuchar idTokenChanges. Llamar en logout

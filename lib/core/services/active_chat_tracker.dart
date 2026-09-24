@@ -25,8 +25,12 @@ class ActiveChatTracker {
     _chatId = chatId;
   }
 
-  /// Limpia el estado (al salir de la pantalla de chats).
-  void clear() {
+  /// Limpia el estado al salir de la pantalla de chats de [sessionPhone].
+  /// Si el rastreador ya apunta a otra sesión, no es nuestro y no se toca:
+  /// al cambiar de sesión, la pantalla nueva reporta antes de que la vieja
+  /// se desmonte.
+  void clearIfSession(String? sessionPhone) {
+    if (_sessionPhone != sessionPhone) return;
     _sessionPhone = null;
     _chatId = null;
   }

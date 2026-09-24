@@ -56,6 +56,7 @@ import { verifyHttpAuth, verifySocketAuth, invalidateMembershipCache } from './s
 import { generateTempPassword } from './src/utils/password';
 import { probeVideo } from './src/utils/videoProbe';
 import { resolveHumanSender, BOT_SENDER, invalidateHumanNameCache } from './src/services/senderResolver';
+import { initPresence, registerPresenceHandlers, revalidatePresenceAccess } from './src/services/presenceService';
 
 // Ensure auth_info directory exists
 const authInfoDir = 'auth_info';
@@ -248,6 +249,8 @@ async function buildRuleMessageContent(rule: any): Promise<any | null> {
 
 // Make io available to aiService via global variable for lazy evaluation
 (global as any).__WhatHeroIO = io;
+// Presencia del equipo (quién está en qué chat): salas por sesión, en memoria.
+initPresence(io);
 
 // `meta.json` es lo único de una sesión que sobrevive a un reinicio del
 // contenedor. Guarda a qué cuenta pertenece y —desde el incidente del
@@ -1165,6 +1168,14 @@ async function performSendMessage(
     content = { text };
   }
 
+  // Quién envía se resuelve ANTES de mandar. Baileys emite el eco
+  // (messages.upsert) dentro del propio sendMessage, y saveMessageToFirestore
+  // sólo espera ~60 ms la etiqueta. Resolverlo después metía en esa carrera una
+  // lectura de users/{uid} cada vez que el cache del nombre estaba frío. Si
+  // perdía, el mensaje del operador quedaba etiquetado "WhatsApp", sin
+  // senderUid, y la guarda de choque del cliente lo tomaba por un compañero.
+  const senderInfo = await resolveHumanSender(senderUid);
+
   const message = await session.sock.sendMessage(jid, content, sendOptions);
 
   // Limpieza del temporal sólo si el cliente lo pidió (envíos one-off del
@@ -1177,7 +1188,6 @@ async function performSendMessage(
   // Etiquetamos al humano que envió este mensaje. El handler de
   // messages.upsert consume esta entry al guardar el doc en Firestore.
   if (message?.key?.id) {
-    const senderInfo = await resolveHumanSender(senderUid);
     session.pendingSenders.set(message.key.id, senderInfo);
   }
 
@@ -2166,6 +2176,12 @@ app.patch('/accounts/members/:uid/access', express.json(), verifyHttpAuth(), asy
 
     await batch.commit();
 
+    // Quien perdió acceso a una sesión deja de ver (y de mostrar) presencia
+    // en ella en el acto, sin esperar a que venza el cache de accesos.
+    void revalidatePresenceAccess(accountId).catch((error) => {
+      console.error('[PATCH access] Error revalidando presencia:', error);
+    });
+
     console.log(
       `[PATCH access] owner=${requesterUid} actualizó permisos de ${targetUid} ` +
       `(allSessions=${access.allSessions}, sesiones=[${[...grantedPhones].join(',')}])`,
@@ -2448,6 +2464,9 @@ io.on('connection', (socket) => {
     }
   }
   console.log('[Socket.io] Total de sesiones encontradas para ' + accountId + ': ' + sessionCount);
+
+  // 👥 Presencia del equipo: team_presence_set + limpieza al desconectar.
+  registerPresenceHandlers(socket, accountId, uid);
 
   socket.on('cancel_session', async (data) => {
     const { sessionKey } = data;
