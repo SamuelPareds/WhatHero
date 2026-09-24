@@ -22,6 +22,10 @@ class SessionSettingsPanel extends StatefulWidget {
 }
 
 class _SessionSettingsPanelState extends State<SessionSettingsPanel> with SingleTickerProviderStateMixin {
+  static const _minResponseDelaySeconds = 8;
+  static const _maxResponseDelaySeconds = 30;
+  static const _recommendedResponseDelaySeconds = 20;
+
   late TabController _tabController;
   
   // Controllers
@@ -47,7 +51,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
   bool _aiEnabled = false;
   String _selectedProvider = 'gemini';
   String _selectedModel = 'gemini-2.5-flash';
-  int _responseDelayMs = 15000;
+  int _responseDelaySeconds = 15;
   bool _activeHoursEnabled = false;
   String _activeHoursTimezone = 'America/Mexico_City';
   TimeOfDay _activeHoursStart = const TimeOfDay(hour: 9, minute: 0);
@@ -123,7 +127,13 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
           _deepseekApiKeyController.text = data['ai_deepseek_api_key'] ?? '';
           _systemPromptController.text = data['ai_system_prompt'] ?? 'Eres un asistente útil.';
           _selectedModel = data['ai_model'] ?? _defaultModelFor(_selectedProvider);
-          _responseDelayMs = data['ai_response_delay_ms'] ?? 15000;
+          // Firestore conserva milisegundos; la UI trabaja en segundos enteros.
+          // Normalizar valores antiguos evita decimales y un Slider fuera de rango.
+          final delayMs = data['ai_response_delay_ms'];
+          _responseDelaySeconds = delayMs is num && delayMs.isFinite
+              ? (delayMs / Duration.millisecondsPerSecond).round().clamp(
+                  _minResponseDelaySeconds, _maxResponseDelaySeconds)
+              : 15;
 
           _reminderEnabled = data['reminder_enabled'] ?? false;
           _reminderApiUrlController.text = data['reminder_api_url'] ?? '';
@@ -215,7 +225,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
         'ai_deepseek_api_key': _deepseekApiKeyController.text,
         'ai_system_prompt': _systemPromptController.text,
         'ai_model': _selectedModel,
-        'ai_response_delay_ms': _responseDelayMs,
+        'ai_response_delay_ms': _responseDelaySeconds * Duration.millisecondsPerSecond,
         'ai_active_hours': {
           'enabled': _activeHoursEnabled,
           'timezone': _activeHoursTimezone,
@@ -438,15 +448,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
             focusNode: _systemPromptFocus,
           ),
           const SizedBox(height: 24),
-          _sliderTile(
-            'Espera para responder', 
-            '${(_responseDelayMs / 1000).toStringAsFixed(1)}s', 
-            'El asistente espera este tiempo para recibir más mensajes antes de procesar una respuesta única.',
-            _responseDelayMs.toDouble(), 
-            8000, 
-            30000, 
-            (v) => setState(() => _responseDelayMs = v.toInt())
-          ),
+          _responseDelayTile(),
           const SizedBox(height: 24),
           _sectionTitle('Control de Disponibilidad'),
           const SizedBox(height: 16),
@@ -1262,16 +1264,66 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
     );
   }
 
-  Widget _sliderTile(String label, String value, String description, double current, double min, double max, Function(double) onChanged) {
+  Widget _responseDelayTile() {
+    final belowRecommended = _responseDelaySeconds < _recommendedResponseDelaySeconds;
+    final hintColor = belowRecommended ? const Color(0xFFF59E0B) : primaryAqua;
+
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-        Text(label, style: const TextStyle(color: white, fontWeight: FontWeight.bold, fontSize: 13)),
-        Text(value, style: const TextStyle(color: primaryAqua, fontWeight: FontWeight.bold)),
+      Row(children: [
+        const Expanded(
+          child: Text('Espera para responder', style: TextStyle(color: white, fontWeight: FontWeight.bold, fontSize: 13)),
+        ),
+        const SizedBox(width: 8),
+        Text('$_responseDelaySeconds s', style: TextStyle(color: hintColor, fontWeight: FontWeight.bold)),
       ]),
       const SizedBox(height: 4),
-      Text(description, style: TextStyle(color: lightText.withValues(alpha: 0.7), fontSize: 12)),
+      Text(
+        'El asistente espera este tiempo para recibir más mensajes antes de procesar una respuesta única.',
+        style: TextStyle(color: lightText.withValues(alpha: 0.7), fontSize: 12),
+      ),
       const SizedBox(height: 8),
-      Slider(value: current, min: min, max: max, activeColor: primaryAqua, inactiveColor: darkBg, onChanged: onChanged),
+      Slider(
+        value: _responseDelaySeconds.toDouble(),
+        min: _minResponseDelaySeconds.toDouble(),
+        max: _maxResponseDelaySeconds.toDouble(),
+        divisions: _maxResponseDelaySeconds - _minResponseDelaySeconds,
+        label: '$_responseDelaySeconds s',
+        semanticFormatterCallback: (value) => '${value.round()} segundos',
+        activeColor: hintColor,
+        inactiveColor: darkBg,
+        onChanged: (value) => setState(() => _responseDelaySeconds = value.round()),
+      ),
+      const SizedBox(height: 8),
+      Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: hintColor.withValues(alpha: 0.08),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(belowRecommended ? Icons.warning_amber_rounded : Icons.info_outline, color: hintColor, size: 18),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Recomendado por WhatHero: $_recommendedResponseDelaySeconds s o más',
+                    style: TextStyle(color: hintColor, fontSize: 12, fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 4),
+                  const Text(
+                    'Da tiempo al cliente para completar su mensaje. WhatsApp puede restringir cuentas por automatización; esta espera no garantiza evitar bloqueos.',
+                    style: TextStyle(color: lightText, fontSize: 12, height: 1.4),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
     ]);
   }
 }
