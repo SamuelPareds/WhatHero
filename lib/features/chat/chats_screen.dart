@@ -25,6 +25,7 @@ import 'widgets/new_chat_sheet.dart';
 import 'widgets/unread_badge.dart';
 import 'widgets/label_chip.dart';
 import 'widgets/labels_selector_sheet.dart';
+import 'widgets/note_editor_dialog.dart';
 
 // Filtros rápidos de la lista de chats (estilo chips de WhatsApp).
 // todos / no respondidos / con notas son fijos; `etiqueta` filtra por una
@@ -2027,116 +2028,15 @@ class _ChatsScreenState extends State<ChatsScreen> {
     }
   }
 
-  // Editor de la nota/comentario del chat. Diálogo simple con TextField
-  // multilínea; persiste en el campo `note` del doc del chat con merge:true.
-  // Nota vacía → borra el campo para que no aparezca el chip ni cuente en
-  // búsqueda.
+  // Editor de la nota del chat (diálogo compartido con ContactInfoPanel).
   Future<void> _editNote(String phoneNumber, String currentNote) async {
-    final controller = TextEditingController(text: currentNote);
-
-    final saved = await showDialog<bool>(
+    if (widget.sessionId == null) return;
+    await showChatNoteEditor(
       context: context,
-      builder: (ctx) => Dialog(
-        backgroundColor: surfaceDark,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        child: Padding(
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Row(
-                children: [
-                  Icon(Icons.sticky_note_2_outlined,
-                      color: Color(0xFFF59E0B), size: 20),
-                  SizedBox(width: 8),
-                  Text(
-                    'Nota del chat',
-                    style: TextStyle(
-                      color: white,
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 16),
-              TextField(
-                controller: controller,
-                autofocus: true,
-                maxLines: 4,
-                maxLength: 200,
-                style: const TextStyle(color: white, fontSize: 14),
-                decoration: InputDecoration(
-                  hintText: 'Ej: El masajes es para dos personas',
-                  hintStyle: TextStyle(color: white.withValues(alpha: 0.3)),
-                  filled: true,
-                  fillColor: darkBg.withValues(alpha: 0.4),
-                  counterStyle: const TextStyle(color: lightText, fontSize: 10),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(12),
-                    borderSide: BorderSide.none,
-                  ),
-                  contentPadding: const EdgeInsets.all(14),
-                ),
-              ),
-              const SizedBox(height: 16),
-              Row(
-                children: [
-                  Expanded(
-                    child: OutlinedButton(
-                      onPressed: () => Navigator.pop(ctx, false),
-                      style: OutlinedButton.styleFrom(
-                        side: BorderSide(
-                            color: lightText.withValues(alpha: 0.3)),
-                        padding: const EdgeInsets.symmetric(vertical: 12),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                      ),
-                      child: const Text('Cancelar',
-                          style: TextStyle(color: lightText)),
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: ElevatedButton(
-                      onPressed: () => Navigator.pop(ctx, true),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: primaryAqua,
-                        foregroundColor: darkBg,
-                        padding: const EdgeInsets.symmetric(vertical: 12),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                        elevation: 0,
-                      ),
-                      child: const Text('Guardar',
-                          style: TextStyle(fontWeight: FontWeight.bold)),
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-
-    if (saved != true || widget.sessionId == null) return;
-
-    final trimmed = controller.text.trim();
-    final chatRef = FirebaseFirestore.instance
-        .collection(accountsCollection)
-        .doc(widget.accountId)
-        .collection('whatsapp_sessions')
-        .doc(widget.sessionId)
-        .collection('chats')
-        .doc(phoneNumber);
-
-    await chatRef.set(
-      {'note': trimmed.isEmpty ? FieldValue.delete() : trimmed},
-      SetOptions(merge: true),
+      accountId: widget.accountId,
+      sessionId: widget.sessionId!,
+      phoneNumber: phoneNumber,
+      currentNote: currentNote,
     );
   }
 

@@ -4,6 +4,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/features/chat/widgets/label_chip.dart';
 import 'package:crm_whatsapp/features/chat/widgets/labels_selector_sheet.dart';
+import 'package:crm_whatsapp/features/chat/widgets/note_editor_dialog.dart';
 
 class ContactInfoPanel extends StatelessWidget {
   final String phoneNumber;
@@ -44,6 +45,7 @@ class ContactInfoPanel extends StatelessWidget {
           final assignedIds = ((chatData?['labelIds'] as List?) ?? const [])
               .whereType<String>()
               .toList();
+          final note = (chatData?['note'] as String? ?? '').trim();
 
           return StreamBuilder<QuerySnapshot>(
             stream: FirebaseFirestore.instance
@@ -190,6 +192,16 @@ class ContactInfoPanel extends StatelessWidget {
                         ),
                       ),
                       const SizedBox(height: 24),
+                      // Nota del chat. Va antes de las etiquetas para quedar
+                      // visible sin scroll: es lo que se viene a editar aquí
+                      // sin tener que volver a la lista.
+                      _NoteSection(
+                        accountId: accountId,
+                        sessionId: sessionId,
+                        phoneNumber: phoneNumber,
+                        note: note,
+                      ),
+                      const SizedBox(height: 24),
                       // Sección de etiquetas asignadas. Lee el catálogo de
                       // la sesión y resuelve los IDs guardados en el chat.
                       _LabelsSection(
@@ -264,6 +276,116 @@ class ContactInfoPanel extends StatelessWidget {
     } else {
       return '${dateTime.day}/${dateTime.month}/${dateTime.year}';
     }
+  }
+}
+
+// Card con la nota del chat + botón para añadirla o editarla. La nota llega del
+// doc del chat que el panel ya escucha, así que se refresca sola al guardar.
+class _NoteSection extends StatelessWidget {
+  final String accountId;
+  final String sessionId;
+  final String phoneNumber;
+  final String note;
+
+  static const Color _amber = Color(0xFFF59E0B);
+
+  const _NoteSection({
+    required this.accountId,
+    required this.sessionId,
+    required this.phoneNumber,
+    required this.note,
+  });
+
+  void _openEditor(BuildContext context) {
+    showChatNoteEditor(
+      context: context,
+      accountId: accountId,
+      sessionId: sessionId,
+      phoneNumber: phoneNumber,
+      currentNote: note,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final hasNote = note.isNotEmpty;
+
+    return Container(
+      decoration: BoxDecoration(
+        color: darkBg.withValues(alpha: 0.5),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: primaryAqua.withValues(alpha: 0.1)),
+      ),
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Expanded(
+                child: Text(
+                  'Nota',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: lightText,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              TextButton.icon(
+                onPressed: () => _openEditor(context),
+                icon: Icon(hasNote ? Icons.edit_outlined : Icons.add,
+                    size: 14, color: primaryAqua),
+                label: Text(
+                  hasNote ? 'Editar' : 'Añadir',
+                  style: const TextStyle(color: primaryAqua, fontSize: 12, fontWeight: FontWeight.bold),
+                ),
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 0),
+                  minimumSize: Size.zero,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          InkWell(
+            borderRadius: BorderRadius.circular(8),
+            onTap: () => _openEditor(context),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: hasNote
+                  ? Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Icon(Icons.sticky_note_2_outlined, size: 16, color: _amber),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            note,
+                            style: const TextStyle(
+                              color: _amber,
+                              fontSize: 14,
+                              fontWeight: FontWeight.w500,
+                              height: 1.4,
+                            ),
+                          ),
+                        ),
+                      ],
+                    )
+                  : Text(
+                      'Sin nota. Toca "Añadir" para escribir una.',
+                      style: TextStyle(
+                        color: lightText.withValues(alpha: 0.7),
+                        fontSize: 13,
+                        fontStyle: FontStyle.italic,
+                      ),
+                    ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
 
