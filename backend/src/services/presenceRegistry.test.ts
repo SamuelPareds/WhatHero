@@ -131,6 +131,28 @@ describe('PresenceRegistry', () => {
     assert.equal(r.remove('sock-ana').size, 0);
   });
 
+  test('isComposingIn: sólo misma cuenta, sesión y chat con texto', () => {
+    const r = new PresenceRegistry();
+    r.set(entry({ composing: true }));
+    assert.equal(r.isComposingIn(ACC, S1, CHAT), true);
+    assert.equal(r.isComposingIn(ACC, S1, '5215599999999'), false);
+    assert.equal(r.isComposingIn(ACC, S2, CHAT), false);
+    assert.equal(r.isComposingIn('acc2', S1, CHAT), false);
+
+    r.set(entry({ composing: false }));
+    assert.equal(r.isComposingIn(ACC, S1, CHAT), false, 'borró el texto');
+    r.set(entry({ composing: true }));
+    r.remove('sock-ana');
+    assert.equal(r.isComposingIn(ACC, S1, CHAT), false, 'se desconectó');
+  });
+
+  test('isComposingIn: el fantasma reemplazado ya no cuenta', () => {
+    const r = new PresenceRegistry();
+    r.set(entry({ socketId: 'viejo', composing: true }));
+    r.set(entry({ socketId: 'nuevo', composing: false }));
+    assert.equal(r.isComposingIn(ACC, S1, CHAT), false);
+  });
+
   test('entriesForAccount no mezcla cuentas', () => {
     const r = new PresenceRegistry();
     r.set(entry());

@@ -9,14 +9,16 @@ function getDb() {
 
 // `ai_truncated`: el modelo cortó su respuesta por límite de tokens y preferimos
 // no enviar media frase. `send_failed`: un chunk no salió ni con reintento, así
-// que la respuesta quedó incompleta en el chat del cliente.
+// que la respuesta quedó incompleta en el chat del cliente. `ai_failed`: el
+// proveedor falló o no contestó a tiempo; antes ese mensaje se perdía en silencio.
 export type HumanAttentionReason =
   | 'discriminator'
   | 'blocked_media'
   | 'unanswered_media'
   | 'ai_off'
   | 'ai_truncated'
-  | 'send_failed';
+  | 'send_failed'
+  | 'ai_failed';
 
 export interface HumanAttentionPayload {
   accountId: string;          // UID del usuario dueño de la sesión

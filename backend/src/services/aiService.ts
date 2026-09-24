@@ -7,6 +7,13 @@ import { incrementUnrespondedCount, resetUnrespondedCount } from './firestoreSer
 import { sendHumanAttentionNotification, HumanAttentionReason } from './notificationService';
 import { isBlockedMediaDoc } from './mediaService';
 import { AI_SENDER } from './senderResolver';
+import { generateMessageIDV2 } from '@whiskeysockets/baileys';
+import {
+  AiStateRegistry,
+  aiStateKey,
+  type AiLifecycleState,
+  type AiStatePayload,
+} from './aiStateRegistry';
 
 // Lazy evaluation: getDb() is called only after Firebase is initialized
 function getDb() {
@@ -22,7 +29,18 @@ function getIO() {
 // Estados efímeros del ciclo de vida de la IA por chat. Se emiten via Socket.io
 // (no se persisten en Firestore) para que el frontend pinte feedback en vivo
 // sin disparar writes ni lecturas adicionales.
-export type AiLifecycleState = 'buffering' | 'thinking' | 'responding' | 'idle';
+export type { AiLifecycleState } from './aiStateRegistry';
+
+// La generación automática no puede quedarse "pensando…" indefinidamente: el
+// SDK de OpenAI espera hasta 600 s con 2 reintentos, o sea media hora con el
+// chat retenido. Pasado este plazo se deriva a humano ('ai_failed'). No aborta
+// la llamada en curso; sólo deja de esperarla.
+const AI_AUTO_GENERATION_TIMEOUT_MS = 120_000;
+
+// Cada cuánto se re-emiten los estados vivos. Mantiene vivo el watchdog de 90 s
+// del cliente durante una generación larga, y repara en ≤30 s a un cliente que
+// se perdió una transición sin haberse desconectado.
+const AI_STATE_HEARTBEAT_MS = 30_000;
 
 // DeepSeek es compatible con la API de OpenAI: reutilizamos el SDK de OpenAI
 // apuntando a este baseURL. Así no duplicamos las funciones de generación ni
@@ -147,8 +165,14 @@ function classifyAiError(error: any): AiError {
 type AiCycle = { cancelled: boolean };
 const activeAiCycles = new Map<string, AiCycle>();
 
-function cycleKey(sessionKey: string, contactPhone: string): string {
-  return `${sessionKey}:${contactPhone}`;
+// Misma clave que el registro de estados: un ciclo y su indicador son el mismo chat.
+const cycleKey = aiStateKey;
+
+// ¿Hay un ciclo de IA en vuelo (no cancelado) para esta clave? Lo usa el latido
+// para decidir si "pensando…/respondiendo…" sigue siendo verdad.
+export function isAiCycleLive(key: string): boolean {
+  const cycle = activeAiCycles.get(key);
+  return !!cycle && !cycle.cancelled;
 }
 
 // Corta el ciclo de IA en vuelo de ese chat. Devuelve true si había uno activo.
@@ -177,20 +201,71 @@ function rememberAiSentMessage(messageId: string): void {
   setTimeout(() => aiSentMessageIds.delete(messageId), AI_SENT_ID_TTL_MS);
 }
 
+// Último estado emitido por chat: se reenvía a quien conecta y lo re-emite el
+// latido. Ver aiStateRegistry.ts.
+const aiStates = new AiStateRegistry();
+
+// Emite el estado y lo registra. Devuelve el `seq` de esta emisión: quien la
+// hizo puede apagar el indicador después sólo si nadie emitió encima.
 export function emitAiState(
   accountId: string,
   sessionKey: string,
   contactPhone: string,
   state: AiLifecycleState,
   expectedRespondAt?: number,
-): void {
-  const io = getIO();
-  if (!io) return;
-  const payload: Record<string, unknown> = { sessionKey, contactPhone, state };
+): number {
+  const payload: AiStatePayload = { sessionKey, contactPhone, state };
   if (expectedRespondAt !== undefined) {
     payload.expectedRespondAt = expectedRespondAt;
   }
-  io.to(accountId).emit('ai_state', payload);
+  const seq = aiStates.apply(accountId, payload);
+  getIO()?.to(accountId).emit('ai_state', payload);
+  return seq;
+}
+
+// Apaga el indicador SÓLO si la última emisión de ese chat sigue siendo la del
+// `seq` dado. Si un buffer nuevo o el humano ya emitieron después, el indicador
+// es de ellos y no se toca.
+export function releaseAiState(
+  accountId: string,
+  sessionKey: string,
+  contactPhone: string,
+  seq: number,
+): void {
+  if (aiStates.isOwner(aiStateKey(sessionKey, contactPhone), seq)) {
+    emitAiState(accountId, sessionKey, contactPhone, 'idle');
+  }
+}
+
+export function hasAiState(sessionKey: string, contactPhone: string): boolean {
+  return aiStates.has(aiStateKey(sessionKey, contactPhone));
+}
+
+// Foto de los estados activos de una cuenta, para el socket que acaba de conectar.
+export function aiStateSnapshot(accountId: string): AiStatePayload[] {
+  return aiStates.snapshotFor(accountId);
+}
+
+// Latido: re-emite cada estado vivo como un `ai_state` más (sin nuevo seq, así
+// también lo entienden las apps viejas) y apaga los que ya no son verdad.
+// `isLive` lo aporta index.ts porque el buffer vive allá.
+export function startAiStateHeartbeat(
+  isLive: (key: string, state: AiLifecycleState) => boolean,
+): NodeJS.Timeout {
+  const timer = setInterval(() => {
+    try {
+      const io = getIO();
+      const { reemit, dead } = aiStates.sweep(isLive);
+      for (const entry of reemit) io?.to(entry.accountId).emit('ai_state', entry.payload);
+      for (const entry of dead) {
+        io?.to(entry.accountId).emit('ai_state', { ...entry.payload, state: 'idle' });
+      }
+    } catch (error) {
+      console.error('[AI] Error en el latido de estados:', error);
+    }
+  }, AI_STATE_HEARTBEAT_MS);
+  timer.unref();
+  return timer;
 }
 
 // Check if current time is within active hours
@@ -324,10 +399,10 @@ export async function generateAIResponse(
   deepseekApiKey?: string,
   timezone: string = DEFAULT_TIMEZONE,
   operatorInstruction?: string,
-  // Opciones SOLO usadas por el endpoint manual (copiloto). El auto-responder no
-  // las pasa → `throwOnError=false` y sin timeout = comportamiento idéntico al
-  // histórico: ante cualquier fallo devuelve `text: null` y el caller NO envía
-  // nada. El truncamiento sí viaja siempre en el resultado, para los dos modos.
+  // `throwOnError` sólo lo usa el endpoint manual (copiloto). El auto-responder
+  // no lo pasa: ante cualquier fallo (timeout incluido) devuelve `text: null` y
+  // el caller deriva el chat a un humano. El timeout lo usan los dos modos. El
+  // truncamiento viaja siempre en el resultado.
   options?: { throwOnError?: boolean; timeoutMs?: number }
 ): Promise<AiGenerationResult> {
   const throwOnError = options?.throwOnError ?? false;
@@ -379,8 +454,7 @@ export async function generateAIResponse(
       );
     }
 
-    // Timeout solo en modo manual (cuando se pasa timeoutMs). El auto-responder
-    // conserva su espera sin límite explícito de hoy.
+    // Con timeoutMs dejamos de esperar (la llamada no se aborta, sólo se ignora).
     const raw = timeoutMs ? await withTimeout(call, timeoutMs) : await call;
 
     // Red de seguridad contra fuga de la metadata temporal del historial.
@@ -1025,22 +1099,25 @@ async function sendChunkedResponse(
   cycle: AiCycle,
 ): Promise<{ sent: number; total: number; cancelled: boolean; failed: boolean }> {
   const sock = session.sock;
-  const tagAi = (sent: any) => {
-    if (sent?.key?.id) {
-      session.pendingSenders.set(sent.key.id, AI_SENDER);
-      rememberAiSentMessage(sent.key.id);
-    }
-  };
 
   // Un fallo puntual de WhatsApp (blip de conexión, rate limit) no debe dejar la
   // respuesta a medias sin que nadie se entere: reintentamos una vez y, si no
   // sale, el caller deriva el chat a un humano.
   const sendChunk = async (text: string): Promise<boolean> => {
     for (let attempt = 1; attempt <= 2; attempt++) {
+      // El id se genera ANTES de enviar y se etiqueta como IA de inmediato. Su
+      // eco vuelve por messages.upsert, y la rama fromMe cede la IA ante
+      // cualquier saliente que no sea suyo ANTES de guardarlo: si la etiqueta
+      // llegara después del envío, un chunk propio podía cancelar su propio
+      // ciclo. Antes sólo funcionaba gracias a los 100 ms que Baileys demora el eco.
+      const messageId = generateMessageIDV2(sock.user?.id);
+      session.pendingSenders.set(messageId, AI_SENDER);
+      rememberAiSentMessage(messageId);
       try {
-        tagAi(await sock.sendMessage(remoteJid, { text }));
+        await sock.sendMessage(remoteJid, { text }, { messageId });
         return true;
       } catch (error) {
+        session.pendingSenders.delete(messageId);
         console.error(`[AI] Error enviando chunk (intento ${attempt}/2):`, error);
         if (attempt === 1) await new Promise(resolve => setTimeout(resolve, 300));
       }
@@ -1095,8 +1172,10 @@ export async function processMessageBuffer(
 ) {
   // Marcamos 'thinking' al inicio: el buffer ya cerró y empieza el trabajo
   // pesado (historial + discriminador + generación). El frontend reemplaza
-  // el icono de IA por un spinner mientras dure este bloque.
-  emitAiState(accountId, sessionKey, contactPhone, 'thinking');
+  // el icono de IA por un spinner mientras dure este bloque. `mySeq` es la
+  // última emisión de este ciclo: el finally apaga el indicador sólo si
+  // nadie emitió encima.
+  let mySeq = emitAiState(accountId, sessionKey, contactPhone, 'thinking');
 
   // Registramos el ciclo para que un mensaje del cliente pueda cortarlo tanto
   // durante la generación como entre chunks.
@@ -1109,6 +1188,10 @@ export async function processMessageBuffer(
   // las que la IA se abstiene de responder (media que no puede leer,
   // discriminador, respuesta truncada por el modelo y chunk que no salió).
   const escalateToHuman = async (reason: HumanAttentionReason, pending: number) => {
+    // Un ciclo cancelado ya no manda: o el cliente escribió (y el buffer nuevo
+    // vuelve a evaluar toda la conversación) o un humano respondió (y contar
+    // pendientes ahora dejaría uno fantasma después de su respuesta).
+    if (cycle.cancelled) return;
     await incrementUnrespondedCount(accountId, session.phoneNumber!, contactPhone, pending);
 
     try {
@@ -1232,8 +1315,7 @@ export async function processMessageBuffer(
         console.log(
           `[Buffer] Emitted human_attention_required for ${contactPhone} (+${bufferedMessages.length} unresponded)`
         );
-        // Discriminador derivó a humano: terminamos el ciclo de IA → idle
-        emitAiState(accountId, sessionKey, contactPhone, 'idle');
+        // El finally apaga el indicador (si sigue siendo nuestro).
         return; // Skip AI response
       }
 
@@ -1260,7 +1342,9 @@ export async function processMessageBuffer(
       aiConfig.provider || 'gemini',
       aiConfig.openaiApiKey,
       aiConfig.deepseekApiKey,
-      timezone
+      timezone,
+      undefined,
+      { timeoutMs: AI_AUTO_GENERATION_TIMEOUT_MS },
     );
 
     // El cliente escribió mientras el modelo pensaba: esta respuesta ya nació
@@ -1281,33 +1365,40 @@ export async function processMessageBuffer(
       return;
     }
 
-    if (aiResponse.text) {
-      // Pasamos a 'responding' justo antes de empezar a mandar chunks: este es
-      // el momento crítico donde el usuario puede querer interceptar.
-      emitAiState(accountId, sessionKey, contactPhone, 'responding');
-      const result = await sendChunkedResponse(session, remoteJid, aiResponse.text, cycle);
-
-      if (result.cancelled) {
-        // Interrupción deseada, no un error: no reseteamos el contador porque
-        // el mensaje que interrumpió sigue pendiente de respuesta.
-        console.log(
-          `[Buffer] Envío interrumpido por el cliente en ${contactPhone}: ${result.sent}/${result.total} chunks enviados`
-        );
-        return;
-      }
-
-      if (result.failed) {
-        console.error(
-          `[Buffer] Envío incompleto a ${contactPhone}: ${result.sent}/${result.total} chunks; deriva a humano`
-        );
-        await escalateToHuman('send_failed', bufferedMessages.length);
-        return;
-      }
-
-      console.log(`[Buffer] Auto-responded to ${remoteJid} en ${result.total} chunk(s)`);
-      // La IA respondió: cualquier pendiente previo queda cubierto
-      await resetUnrespondedCount(accountId, session.phoneNumber!, contactPhone);
+    // El proveedor falló o no contestó a tiempo. Antes esto terminaba en
+    // silencio: sin respuesta de la IA y sin pendiente, el mensaje del cliente
+    // se perdía. Ahora el chat queda para un humano, con push.
+    if (!aiResponse.text) {
+      console.warn(`[Buffer] La IA no generó respuesta para ${contactPhone}; deriva a humano`);
+      await escalateToHuman('ai_failed', bufferedMessages.length);
+      return;
     }
+
+    // Pasamos a 'responding' justo antes de empezar a mandar chunks: este es
+    // el momento crítico donde el usuario puede querer interceptar.
+    mySeq = emitAiState(accountId, sessionKey, contactPhone, 'responding');
+    const result = await sendChunkedResponse(session, remoteJid, aiResponse.text, cycle);
+
+    if (result.cancelled) {
+      // Interrupción deseada, no un error: no reseteamos el contador porque
+      // el mensaje que interrumpió sigue pendiente de respuesta.
+      console.log(
+        `[Buffer] Envío interrumpido por el cliente en ${contactPhone}: ${result.sent}/${result.total} chunks enviados`
+      );
+      return;
+    }
+
+    if (result.failed) {
+      console.error(
+        `[Buffer] Envío incompleto a ${contactPhone}: ${result.sent}/${result.total} chunks; deriva a humano`
+      );
+      await escalateToHuman('send_failed', bufferedMessages.length);
+      return;
+    }
+
+    console.log(`[Buffer] Auto-responded to ${remoteJid} en ${result.total} chunk(s)`);
+    // La IA respondió: cualquier pendiente previo queda cubierto
+    await resetUnrespondedCount(accountId, session.phoneNumber!, contactPhone);
   } catch (error) {
     console.error('[Buffer] Error processing message buffer:', error);
   } finally {
@@ -1315,11 +1406,12 @@ export async function processMessageBuffer(
     // cancelaron y el buffer nuevo ya arrancó su propio ciclo, borrarlo aquí lo
     // dejaría fuera del alcance de futuras cancelaciones.
     if (activeAiCycles.get(key) === cycle) activeAiCycles.delete(key);
-    // Cierre garantizado del ciclo: tanto en éxito como en error volvemos a idle
-    // para que el frontend libere el spinner. Si nos cancelaron, no lo emitimos:
-    // ya hay un ciclo nuevo en marcha y su indicador ('buffering') es el válido.
-    if (!cycle.cancelled) {
-      emitAiState(accountId, sessionKey, contactPhone, 'idle');
-    }
+    // Cierre garantizado: éxito, error, derivación o cancelación. Apagamos el
+    // indicador SÓLO si la última emisión del chat sigue siendo nuestra. Si un
+    // buffer nuevo ya dijo "esperando…" o el humano ya lo apagó, es de ellos.
+    // Antes se decidía con `!cycle.cancelled`, y eso dejaba "pensando…" pegado
+    // cuando el mensaje que cancelaba no abría un buffer nuevo (rancio, regla,
+    // media), y el discriminador apagaba el "esperando…" del buffer nuevo.
+    releaseAiState(accountId, sessionKey, contactPhone, mySeq);
   }
 }

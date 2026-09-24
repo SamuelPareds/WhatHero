@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'package:flutter/foundation.dart';
@@ -22,6 +23,10 @@ class SessionStatusEvent {
   SessionStatusEvent({required this.status, required this.sessionKey, this.phoneNumber});
 }
 
+/// Espera antes del reintento manual N (0, 1, 2…): 2, 4, 8, 16 y luego 30 s.
+Duration socketRecoveryDelay(int attempt) =>
+    Duration(seconds: attempt >= 4 ? 30 : min(30, 2 << attempt));
+
 class SocketService {
   static final SocketService _instance = SocketService._internal();
   factory SocketService() => _instance;
@@ -30,7 +35,11 @@ class SocketService {
   IO.Socket? _socket;
   bool _isConnected = false;
   String? _currentAccountId;
-  StreamSubscription<User?>? _idTokenSub;
+
+  // Reintento manual para los casos en que socket_io_client NO reconecta solo
+  // (ver _setupListeners). Uno a la vez, con backoff.
+  Timer? _recoveryTimer;
+  int _recoveryAttempt = 0;
 
   // StreamControllers para distribuir eventos a las pantallas
   final _qrController = StreamController<QREvent>.broadcast();
@@ -57,60 +66,75 @@ class SocketService {
 
     debugPrint('[SocketService] Conectando a $backendUrl para accountId: $accountId');
 
-    // El backend valida el idToken contra Firebase Admin y verifica que el
-    // accountId esté en users/{uid}.memberOfAccounts. Sin token no se permite
-    // el handshake. getIdToken(false) usa el cacheado si sigue vigente; si
-    // expiró, Firebase lo refresca automáticamente.
-    final idToken = await FirebaseAuth.instance.currentUser?.getIdToken();
-
-    _socket = IO.io(backendUrl, IO.OptionBuilder()
-      .setTransports(['websocket'])
-      .setAuth({'accountId': accountId, 'idToken': idToken})
-      .enableAutoConnect()
-      .build());
-
-    _setupListeners();
-    _setupTokenRefresh();
-    _socket?.connect();
+    final socket = IO.io(
+      backendUrl,
+      IO.OptionBuilder()
+          .setTransports(['websocket'])
+          // Sin forceNew, IO.io reutiliza el Manager en cache para este host y
+          // devuelve el MISMO socket de antes, con el auth de antes: tras
+          // cambiar de cuenta (o logout + login) seguía conectando con el
+          // accountId y el token del usuario anterior.
+          .enableForceNew()
+          .disableAutoConnect()
+          // El backend valida el idToken en CADA handshake, reconexiones
+          // incluidas. Pedirlo en el momento (getIdToken lo renueva sólo si
+          // venció) evita reconectar con un token viejo después de que el
+          // celular o la laptop durmieron más de una hora: el server lo
+          // rechazaba y el socket moría para siempre.
+          .setAuthFn((send) => _handshakeAuth(accountId).then(send))
+          .build(),
+    );
+    _socket = socket;
+    _setupListeners(socket);
+    socket.connect();
   }
 
-  /// Mantiene el `auth.idToken` del socket actualizado conforme Firebase
-  /// rota el token (cada hora). En reconexiones automáticas el cliente
-  /// re-envía este `auth`, así que basta con mutarlo en su sitio.
-  void _setupTokenRefresh() {
-    _idTokenSub?.cancel();
-    _idTokenSub =
-        FirebaseAuth.instance.idTokenChanges().listen((user) async {
-      if (user == null || _socket == null) return;
-      try {
-        final fresh = await user.getIdToken();
-        final auth = _socket?.io.options?['auth'];
-        if (auth is Map) {
-          auth['idToken'] = fresh;
-        }
-      } catch (e) {
-        debugPrint('[SocketService] Error refrescando idToken: $e');
-      }
-    });
+  Future<Map<String, dynamic>> _handshakeAuth(String accountId) async {
+    String? idToken;
+    try {
+      idToken = await FirebaseAuth.instance.currentUser?.getIdToken();
+    } catch (e) {
+      // Sin red para renovarlo: el server rechazará y la recuperación reintenta.
+      debugPrint('[SocketService] No se pudo obtener el idToken: $e');
+    }
+    return {'accountId': accountId, 'idToken': idToken};
   }
 
-  void _setupListeners() {
-    _socket?.onConnect((_) {
+  void _setupListeners(IO.Socket socket) {
+    socket.onConnect((_) {
+      if (!identical(socket, _socket)) return;
       debugPrint('[SocketService] ✅ Conectado');
       _isConnected = true;
+      _recoveryTimer?.cancel();
+      _recoveryTimer = null;
+      _recoveryAttempt = 0;
       _connectionController.add(true);
     });
 
-    _socket?.onDisconnect((_) {
-      debugPrint('[SocketService] ❌ Desconectado');
+    socket.onDisconnect((reason) {
+      if (!identical(socket, _socket)) return;
+      debugPrint('[SocketService] ❌ Desconectado ($reason)');
       _isConnected = false;
       _connectionController.add(false);
       // Sin socket no nos enteramos de quién se va: la presencia caduca sola
       // si no reconectamos pronto.
       TeamPresenceService().markStale();
+      // Si nos cerró el server, socket_io_client no reconecta solo.
+      if (reason == 'io server disconnect') _scheduleRecovery(socket);
     });
 
-    _socket?.on('qr', (data) {
+    // El server rechazó el handshake (token inválido, error leyendo la
+    // membresía). socket_io_client destruye el socket y NO vuelve a intentar:
+    // quedaba muerto hasta reiniciar la app, sin estados de IA, sin presencia
+    // y sin acks. Un error de red común, en cambio, deja el socket activo y el
+    // Manager reintenta solo: ahí no hacemos nada.
+    socket.onConnectError((error) {
+      if (!identical(socket, _socket) || socket.active) return;
+      debugPrint('[SocketService] Handshake rechazado: $error');
+      _scheduleRecovery(socket);
+    });
+
+    socket.on('qr', (data) {
       debugPrint('[SocketService] QR recibido para ${data['sessionKey']}');
       _qrController.add(QREvent(
         qr: data['qr'],
@@ -118,7 +142,7 @@ class SocketService {
       ));
     });
 
-    _socket?.on('ready', (data) {
+    socket.on('ready', (data) {
       debugPrint('[SocketService] Sesión READY: ${data['sessionKey']}');
       _statusController.add(SessionStatusEvent(
         status: 'ready',
@@ -127,7 +151,7 @@ class SocketService {
       ));
     });
 
-    _socket?.on('status_update', (data) {
+    socket.on('status_update', (data) {
       debugPrint('[SocketService] Status update: ${data['status']} para ${data['sessionKey']}');
       _statusController.add(SessionStatusEvent(
         status: data['status'],
@@ -135,7 +159,7 @@ class SocketService {
       ));
     });
 
-    _socket?.on('human_attention_required', (data) {
+    socket.on('human_attention_required', (data) {
       debugPrint('[SocketService] Atención humana requerida: $data');
       _humanAttentionController.add(Map<String, dynamic>.from(data));
     });
@@ -143,13 +167,22 @@ class SocketService {
     // Estado del ciclo IA (buffering/thinking/responding/idle). No exponemos
     // un Stream porque el AiStateService ya es un ChangeNotifier al que los
     // widgets se suscriben directamente con ListenableBuilder.
-    _socket?.on('ai_state', (data) {
-      AiStateService().applySocketPayload(Map<String, dynamic>.from(data));
+    socket.on('ai_state', (data) {
+      if (data is Map) {
+        AiStateService().applySocketPayload(Map<String, dynamic>.from(data));
+      }
+    });
+
+    // Foto de los estados de IA en curso, al conectar. Reemplaza lo que había:
+    // un `idle` emitido mientras estábamos desconectados se perdió.
+    socket.on('ai_state_snapshot', (data) {
+      final states = data is Map ? data['states'] : null;
+      if (states is List) AiStateService().replaceAll(states);
     });
 
     // Presencia del equipo: el estado completo de la sesión en cada cambio.
     // Mismo patrón que ai_state.
-    _socket?.on('team_presence', (data) {
+    socket.on('team_presence', (data) {
       if (data is Map) {
         TeamPresenceService().applyPayload(Map<String, dynamic>.from(data));
       }
@@ -157,14 +190,14 @@ class SocketService {
 
     // Acks de envío para las burbujas optimistas (relojito → ✓✓ / reintentar).
     // Mismo patrón que ai_state: directo al singleton, sin Stream intermedio.
-    _socket?.on('message_sent_success', (data) {
+    socket.on('message_sent_success', (data) {
       PendingMessagesService().onSendSuccess(
         data['tempId'] as String?,
         data['messageId'] as String?,
       );
     });
 
-    _socket?.on('message_sent_error', (data) {
+    socket.on('message_sent_error', (data) {
       debugPrint('[SocketService] Envío falló: ${data['error']}');
       PendingMessagesService().onSendError(
         data['tempId'] as String?,
@@ -173,26 +206,40 @@ class SocketService {
     });
   }
 
+  void _scheduleRecovery(IO.Socket socket) {
+    if (_recoveryTimer != null) return;
+    final delay = socketRecoveryDelay(_recoveryAttempt++);
+    debugPrint('[SocketService] Reintento de conexión en ${delay.inSeconds}s');
+    _recoveryTimer = Timer(delay, () {
+      _recoveryTimer = null;
+      // Otro init (cambio de cuenta, logout) ya reemplazó o cerró este socket.
+      if (!identical(socket, _socket) || socket.connected || socket.active) return;
+      socket.connect();
+    });
+  }
+
   void _disconnect() {
+    _recoveryTimer?.cancel();
+    _recoveryTimer = null;
+    _recoveryAttempt = 0;
     _socket?.dispose();
     _socket = null;
     _isConnected = false;
-    // Cambio de cuenta o logout: la presencia de la cuenta anterior no aplica.
+    // Cambio de cuenta o logout: la presencia y los estados de IA de la cuenta
+    // anterior no aplican.
     TeamPresenceService().clearAll();
+    AiStateService().clearAll();
   }
 
-  /// Cierra el socket y deja de escuchar idTokenChanges. Llamar en logout
-  /// para que el siguiente usuario no herede el listener del anterior.
+  /// Cierra el socket. Llamar en logout para que el siguiente usuario no
+  /// herede la conexión del anterior.
   Future<void> shutdown() async {
-    await _idTokenSub?.cancel();
-    _idTokenSub = null;
     _disconnect();
     _currentAccountId = null;
   }
 
   /// Cerrar todos los streams al cerrar la app (opcional)
   void dispose() {
-    _idTokenSub?.cancel();
     _disconnect();
     _qrController.close();
     _statusController.close();

@@ -121,15 +121,27 @@ Transiciones entre modos: `AnimatedSwitcher` 220ms para no saltar.
 
 **No reinicializar en otras pantallas.** El bug histórico (estados IA mudos tras cold start con sesión guardada) existió porque el `init` vivía únicamente en `AccountsScreen.initState`; al saltar directo a `ChatsScreen` el listener `ai_state` nunca se registraba. Si en el futuro se agrega una nueva pantalla raíz post-login, el `init` debe vivir arriba de ella, no dentro.
 
+**El socket no puede morir en silencio.** `socket_io_client` reconecta solo ante un corte de red, pero si el **server rechaza el handshake** hace `destroy()` y no vuelve a intentar nunca. Pasaba al despertar un celular o una laptop tras más de una hora: el token del handshake había vencido, `verifySocketAuth` lo rechazaba y la app quedaba sin estados de IA, sin presencia y sin acks hasta reiniciarla. Tres piezas lo cierran en `socket_service.dart`:
+- **`setAuthFn`**: el token se pide en CADA handshake (`getIdToken()` lo renueva sólo si venció). No mutar `io.options['auth']`: funcionaba de casualidad (el Map era el mismo objeto) y nunca refrescaba a tiempo.
+- **`enableForceNew()`**: sin él, `IO.io` reutiliza el Manager en cache y devuelve el socket anterior con el auth anterior. Tras cambiar de cuenta (o logout + login) seguía conectando como el usuario de antes.
+- **Recuperación manual** (`_scheduleRecovery`, backoff 2-4-8-16-30 s) para `connect_error` con socket destruido y para `'io server disconnect'`. Chequea `identical(socket, _socket)`: un reintento viejo no puede resucitar el socket de otra cuenta.
+
 ### Flujo de eventos backend → UI
-1. Backend emite `ai_state` con `{sessionKey, contactPhone, state, expectedRespondAt?}` por Socket.io.
-2. `SocketService` (`socket_service.dart:112`) dispatcha al singleton `AiStateService.applySocketPayload(...)`.
+1. Backend emite `ai_state` con `{sessionKey, contactPhone, state, expectedRespondAt?}` por Socket.io. `emitAiState` (aiService.ts) es el único emisor y registra cada emisión en `aiStateRegistry.ts`.
+2. `SocketService` dispatcha al singleton `AiStateService.applySocketPayload(...)`.
 3. `AiStateService` (extends `ChangeNotifier`) actualiza el `Map<key, AiChatStatus>` y dispara `notifyListeners()`.
 4. Los `ListenableBuilder(listenable: AiStateService(), ...)` en el AppBar y en `_ChatTile` rebuildan.
-5. Watchdog de 90s: si en ese plazo no llega un nuevo evento, el estado vuelve a `idle` solo (evita spinners zombies si se cae el socket).
+5. **Al conectar**, el server manda `ai_state_snapshot` con los estados en curso de la cuenta y el cliente **reemplaza** todo (`replaceAll`). `ai_state` se emite una sola vez por transición: sin la foto, quien conectaba a mitad de un ciclo (celular que vuelve de segundo plano, app abierta desde un push) no veía "esperando…" y contestaba encima de la IA.
+6. **Latido cada 30 s**: el server re-emite cada estado vivo como un `ai_state` normal (así lo entienden también las apps viejas). "Vivo" lo decide la realidad, no el reloj: una espera mientras su buffer exista, pensando/respondiendo mientras su ciclo no esté cancelado. Los muertos reciben `idle`.
+7. Watchdog de 90s en el cliente: si en ese plazo no llega un nuevo evento, el estado vuelve a `idle` solo (evita spinners zombies si se cae el socket). Con el latido, un ciclo largo ya no lo vence.
+
+### Quién apaga el indicador
+Cada emisión lleva un `seq` **global**. Un ciclo que termina (bien, con error, derivado o cancelado) apaga el indicador **sólo si la última emisión de ese chat sigue siendo suya** (`releaseAiState`). Si después emitió un buffer nuevo ("esperando…") o un humano ya lo apagó, es de ellos. Antes se decidía con `!cycle.cancelled`, y fallaba en las dos direcciones: el discriminador apagaba el "esperando…" del buffer que sí iba a responder, y un ciclo cancelado por un mensaje que no abría buffer (rancio, regla, media) dejaba "pensando…" pegado 90 s. El `seq` es global a propósito: uno por chat se reinicia al borrarse la entrada y un ciclo viejo podía coincidir con el número del nuevo.
+
+**Pendiente conocido:** los estados se buscan por `sessionKey:contactPhone`, y `AccountsScreen` empuja `ChatsScreen` con el `session_key` leído una sola vez al tocar. Si la sesión se re-vincula con esa pantalla abierta (key nueva), ese chat deja de ver estados de IA hasta volver a entrar. La `ChatsScreen` raíz no tiene el problema: `SessionDispatcher` le pasa el key en vivo.
 
 ### Cancelar un ciclo IA desde el cliente
-`SocketService().emit('cancel_ai_buffer', {sessionKey, contactPhone})`. **Nunca** usar `sendMessage(...)` — ese método siempre emite `send_message_socket` (handler de mensajes WhatsApp) y rompe con `Unauthorized accountId`. El backend (`backend/index.ts:1199`) limpia el buffer y emite automáticamente `ai_state: idle`, así que la UI se apaga sola.
+`SocketService().emit('cancel_ai_buffer', {sessionKey, contactPhone})`. **Nunca** usar `sendMessage(...)` — ese método siempre emite `send_message_socket` (handler de mensajes WhatsApp) y rompe con `Unauthorized accountId`. El backend (`cancel_ai_buffer` → `aiBuffers.yieldToHuman`) corta la espera y el ciclo y emite `ai_state: idle`, así que la UI se apaga sola.
 
 ---
 
@@ -147,10 +159,23 @@ Tres caminos distintos hacían que el cliente viera media respuesta. Los tres es
 Un ciclo va desde que dispara el buffer hasta que sale el último chunk — pueden ser 10s. `activeAiCycles` permite cortarlo **durante la generación y entre chunks**: la respuesta contestaba lo anterior y ya nació vieja, así que se descarta y el buffer nuevo genera una que sí atienda lo último. Es lo que hace una persona al ver entrar un mensaje mientras escribe.
 - Cancelan: el cliente escribiendo, el humano respondiendo (CRM o celular) y `cancel_ai_buffer`.
 - Los chunks ya enviados se quedan; cancelar **no** resetea `unresponded_count` (el mensaje que interrumpió sigue pendiente).
-- El `finally` no emite `idle` si el ciclo fue cancelado: ya hay un ciclo nuevo y su indicador es el válido.
+- El `finally` apaga el indicador sólo si sigue siendo suyo (ver *Quién apaga el indicador*). Un ciclo cancelado tampoco escala a humano (`escalateToHuman` sale de entrada): el buffer nuevo re-evalúa la conversación, o el humano ya respondió y un pendiente ahora quedaría fantasma.
+- **El humano cancela al PEDIR el envío, no cuando vuelve el eco.** `performSendMessage` llama a `aiBuffers.yieldToHuman` antes de cualquier `await`. Esperar al eco dejaba una ventana (descarga del adjunto + ≥100 ms del buffer de eventos de Baileys + tres escrituras a Firestore, porque el save iba antes del cancel) en la que la IA alcanzaba a contestar encima del humano. Si el envío falla, los mensajes que la IA soltó se cuentan como pendientes.
+- **El eco de un envío del CRM no vuelve a ceder.** Mataría el buffer de un mensaje que el cliente mandó entre el envío y el eco, y quedaría sin respuesta y sin contar. Se reconoce porque la etiqueta `'human'` se pone en `pendingSenders` **antes** de enviar, con un id generado por nosotros (`generateMessageIDV2` + opción `messageId`). Los salientes del celular / WA Web sí ceden en el eco, y **antes** del save.
+- **Generación con timeout de 120 s** (el SDK de OpenAI esperaba hasta 600 s × 3). Si el proveedor falla o no contesta, `text: null` deriva a humano (`ai_failed`). Antes ese mensaje del cliente se perdía en silencio: ni respuesta ni pendiente.
+
+### La espera ("esperando…") vive en `aiBuffer.ts`, con tests
+Era un closure dentro de `startSession` y sus carreras hacían que **la IA contestara después del humano**. Tres reglas, fijadas en `aiBuffer.test.ts`:
+1. **Un buffer sólo se borra a sí mismo.** El timer del buffer A borraba del mapa a cualquiera: si el cliente escribía mientras A procesaba, el buffer B quedaba huérfano con su timer armado. La respuesta humana no lo encontraba, no lo cancelaba, y B disparaba igual.
+2. **Un timer cuyo buffer ya no está en el mapa no hace nada.**
+3. **Un buffer que ya está respondiendo no recibe mensajes**: el siguiente abre uno nuevo. Antes se empujaba también al array del ciclo en vuelo y los pendientes se contaban doble.
+
+**La IA cede el turno a quien escribe.** Mientras un operador tiene texto en el composer de ese chat (presencia del equipo, `isComposingIn`), la espera no dispara: re-chequea cada 3 s. Retoma sola cuando el operador envía (la IA se cancela), borra, sale del chat o pasan 3 min sin tocar la app. El flujo de adjunto (caption + subida) también cuenta como escribiendo. **Sólo "esperando…"**: un ciclo que ya piensa o responde sigue, y lo cubre la guarda de choque.
+
+El disparo usa la sesión viva (`sessions.get(sessionKey)`), no la capturada al llegar el mensaje: tras una reconexión la capturada tiene el socket muerto.
 
 ### 3. Los chunks propios no son "el humano tomó el control"
-Cada chunk que manda la IA vuelve por `messages.upsert` como `fromMe`. Esa rama cancelaba el buffer que el cliente acababa de crear al escribir durante el envío: **su mensaje se perdía sin respuesta y sin quedar marcado como pendiente**. `isAiSentMessage(id)` (set con TTL de 60s, poblado al enviar cada chunk) desactiva ahí el cancel y el reset. No sirve `pendingSenders` para esto: `saveMessageToFirestore` lo consume y borra antes de que corra esa rama.
+Cada chunk que manda la IA vuelve por `messages.upsert` como `fromMe`. Esa rama cancelaba el buffer que el cliente acababa de crear al escribir durante el envío: **su mensaje se perdía sin respuesta y sin quedar marcado como pendiente**. `isAiSentMessage(id)` (set con TTL de 60s) desactiva ahí el cancel y el reset. **Se puebla ANTES de enviar**, con un id generado por nosotros: la rama `fromMe` cede la IA antes del save, y una etiqueta puesta después del envío sólo llegaba a tiempo gracias a los 100 ms que Baileys demora el eco.
 
 **Chunking:** el envío en grupos de 2-3 párrafos con pausas es intencional y **no se toca** — humaniza la conversación. Un chunk que falla se reintenta una vez; si no sale, el chat se deriva a humano (`send_failed`) en vez de quedar mudo en un `console.error`.
 
@@ -335,7 +360,9 @@ Cubre lo que la presencia no alcanza: dos personas escriben a la vez, una envía
 - **En la lista:** "Ana está respondiendo…" reemplaza la línea de preview (como el "escribiendo…" de WhatsApp) y una inicial violeta abajo a la derecha del avatar dice que alguien está dentro (arriba a la derecha es de los pendientes).
 - Las reglas viven en `test/reply_collision_test.dart`, `test/presence_reporter_test.dart`, `test/team_presence_service_test.dart` y `backend/src/services/presenceRegistry.test.ts` (`cd backend && npm test`).
 
-**Fase 2 (no está hecho):** la IA que espera mientras un compañero responde (si no llega a enviar, el cliente se quedaría sin respuesta: merece su propio análisis) y la asignación explícita de chats ("tomar chat").
+**La IA espera a quien escribe:** mientras un operador tiene texto en ese chat, la IA en "esperando…" no dispara (ver *La espera vive en `aiBuffer.ts`*). El riesgo de "el operador abandona y el cliente queda sin respuesta" lo acota la propia presencia: borrar, salir, ocultar la app o 3 min sin actividad sueltan el turno.
+
+**Fase 2 (no está hecho):** la asignación explícita de chats ("tomar chat").
 
 ---
 

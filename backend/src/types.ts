@@ -119,10 +119,3 @@ export interface SessionData {
     loadedAt: number;
   };
 }
-
-export interface MessageBuffer {
-  contactPhone: string;
-  messages: string[];
-  timeout: NodeJS.Timeout | null;
-  responded: boolean;
-}

@@ -7,6 +7,7 @@ import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
   proto,
+  generateMessageIDV2,
   type ConnectionState
 } from '@whiskeysockets/baileys';
 import { pino } from 'pino';
@@ -14,11 +15,12 @@ import admin from 'firebase-admin';
 import { rmSync, existsSync, readdirSync, writeFileSync, readFileSync, mkdirSync } from 'fs';
 import { randomUUID } from 'crypto';
 import cron from 'node-cron';
-import { SessionData, MessageBuffer } from './src/types';
+import { SessionData } from './src/types';
 import { extractPhoneNumber, storeLIDMapping, resolveLIDViaSock, isConversationalJid, waNumberCandidates } from './src/utils/phone';
 import { unwrapMessageContent } from './src/utils/message';
 import { initializeSession, saveMessageToFirestore, getAIConfig, cacheContactName, applyContactUpdate, reconcileContactNames, consolidateLIDChat, incrementUnrespondedCount, resetUnrespondedCount, writeMediaIndexEntry, isIndexableMedia, writeMessageIndexEntry } from './src/services/firestoreService';
-import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer, emitAiState, getSessionTimezone, AiError, cancelAiCycle, isAiSentMessage } from './src/services/aiService';
+import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer, emitAiState, getSessionTimezone, AiError, cancelAiCycle, isAiSentMessage, hasAiState, aiStateSnapshot, isAiCycleLive, startAiStateHeartbeat } from './src/services/aiService';
+import { AiBuffers } from './src/services/aiBuffer';
 import { trackUnreadMessage, markChatAsReadIfEnabled, forgetChatUnread } from './src/services/readReceiptService';
 import {
   initSessionSupervisor,
@@ -56,7 +58,7 @@ import { verifyHttpAuth, verifySocketAuth, invalidateMembershipCache } from './s
 import { generateTempPassword } from './src/utils/password';
 import { probeVideo } from './src/utils/videoProbe';
 import { resolveHumanSender, BOT_SENDER, invalidateHumanNameCache } from './src/services/senderResolver';
-import { initPresence, registerPresenceHandlers, revalidatePresenceAccess } from './src/services/presenceService';
+import { initPresence, registerPresenceHandlers, revalidatePresenceAccess, isComposingIn } from './src/services/presenceService';
 
 // Ensure auth_info directory exists
 const authInfoDir = 'auth_info';
@@ -144,8 +146,18 @@ const logger = pino(
 
 const sessions = new Map<string, SessionData>();
 
-// Message buffers per chat: key = `${sessionKey}:${contactPhone}`
-const messageBuffers = new Map<string, MessageBuffer>();
+// Espera de la IA por chat ("esperando…"): junta la ráfaga del cliente y
+// dispara una respuesta. Ver src/services/aiBuffer.ts.
+const aiBuffers = new AiBuffers({
+  emitAiState,
+  cancelCycle: cancelAiCycle,
+  hasState: hasAiState,
+  // La IA cede el turno mientras un operador tiene texto escrito en el chat.
+  isComposing: ({ accountId, sessionKey, contactPhone }) => {
+    const sessionPhone = sessions.get(sessionKey)?.phoneNumber;
+    return !!sessionPhone && isComposingIn(accountId, sessionPhone, contactPhone);
+  },
+});
 
 // Cooldown anti-loop para keyword rules con trigger 'outgoing' o 'both'.
 // Key = `${sessionKey}::${contactPhone}::${keywordLower}`, valor = timestamp ms del último disparo.
@@ -566,45 +578,50 @@ async function startSession(sessionKey: string, accountId: string) {
       return;
     }
 
+    // Saliente (CRM, celular, WA Web, IA, reglas): resolvemos su chat una vez.
+    // Los chunks que manda la propia IA vuelven por aquí como `fromMe`.
+    // Tratarlos como "el humano tomó el control" cancelaba el buffer que el
+    // cliente acababa de crear al escribir durante el envío: su mensaje se
+    // perdía sin respuesta y sin quedar marcado como pendiente. Un chunk propio
+    // no cancela nada ni resetea contadores; de eso ya se encarga
+    // processMessageBuffer al terminar.
+    let contactPhoneForCancel: string | undefined;
+    const isOwnAiChunk = !!message.key.id && isAiSentMessage(message.key.id);
+    if (message.key.fromMe) {
+      const jid = message.key.remoteJid;
+      if (jid && !jid.endsWith('@g.us')) {
+        contactPhoneForCancel = extractPhoneNumber(jid) || undefined;
+        // Resolver LID al phone number real para apuntar al chat doc correcto
+        if (contactPhoneForCancel && jid.includes('@lid')) {
+          const resolved = await resolveLIDViaSock(contactPhoneForCancel, sock);
+          if (resolved) contactPhoneForCancel = resolved;
+        }
+      }
+
+      // Un humano respondió: la IA cede ANTES de guardar el mensaje. El guardado
+      // son tres escrituras a Firestore, y hacerlo primero dejaba una ventana en
+      // la que la IA alcanzaba a contestar encima de la respuesta humana.
+      // Un envío del CRM ya cedió al PEDIRSE (performSendMessage, etiqueta
+      // 'human' puesta antes de enviar): repetirlo acá mataría el buffer de un
+      // mensaje que el cliente mandó entre el envío y este eco, y ese mensaje
+      // quedaría sin respuesta y sin contar.
+      const crmAlreadyYielded =
+        !!message.key.id &&
+        sessions.get(sessionKey)?.pendingSenders.get(message.key.id)?.type === 'human';
+      if (contactPhoneForCancel && !isOwnAiChunk && !crmAlreadyYielded) {
+        aiBuffers.yieldToHuman({ accountId, sessionKey, contactPhone: contactPhoneForCancel }, 'respuesta enviada');
+      }
+    }
+
     await saveMessageToFirestore(message, sessionKey, accountId, sessions, sock.user?.id, sock);
 
     // AI auto-response: only for incoming messages (not from self)
     if (message.key.fromMe) {
-      // El dueño respondió (CRM web o celular físico): cancelar buffer + resetear contador
+      // El dueño respondió (CRM web o celular físico): resetear contador,
+      // confirmar lectura y reglas outgoing. La IA ya cedió arriba.
       const remoteJidForCancel = message.key.remoteJid;
-      if (remoteJidForCancel && !remoteJidForCancel.endsWith('@g.us')) {
-        let contactPhoneForCancel = extractPhoneNumber(remoteJidForCancel);
+      if (remoteJidForCancel) {
         if (contactPhoneForCancel) {
-          // Resolver LID al phone number real para apuntar al chat doc correcto
-          if (remoteJidForCancel.includes('@lid')) {
-            const resolved = await resolveLIDViaSock(contactPhoneForCancel, sock);
-            if (resolved) contactPhoneForCancel = resolved;
-          }
-
-          // Los chunks que manda la propia IA vuelven por aquí como `fromMe`.
-          // Tratarlos como "el humano tomó el control" cancelaba el buffer que
-          // el cliente acababa de crear al escribir durante el envío: su
-          // mensaje se perdía sin respuesta y sin quedar marcado como
-          // pendiente. Un chunk propio no cancela nada ni resetea contadores;
-          // de eso ya se encarga processMessageBuffer al terminar.
-          const isOwnAiChunk = !!message.key.id && isAiSentMessage(message.key.id);
-
-          const bufferKey = `${sessionKey}:${contactPhoneForCancel}`;
-          const buffer = messageBuffers.get(bufferKey);
-          if (!isOwnAiChunk && buffer?.timeout) {
-            clearTimeout(buffer.timeout);
-            messageBuffers.delete(bufferKey);
-            console.log(`[Buffer] CANCELLED: Human response detected for ${contactPhoneForCancel}`);
-            // El humano tomó el control: liberamos el indicador en el frontend
-            emitAiState(accountId, sessionKey, contactPhoneForCancel, 'idle');
-          }
-
-          // El humano escribiendo también corta un envío por chunks en curso:
-          // si ya contestó él, la IA no debe seguir soltando su respuesta.
-          if (!isOwnAiChunk && cancelAiCycle(sessionKey, contactPhoneForCancel)) {
-            console.log(`[AI] Ciclo cancelado por respuesta humana en ${contactPhoneForCancel}`);
-          }
-
           // Reset contador: el humano (o IA via CRM) acaba de responder
           const sessionForReset = sessions.get(sessionKey);
           if (!isOwnAiChunk && sessionForReset?.phoneNumber) {
@@ -807,17 +824,9 @@ async function startSession(sessionKey: string, accountId: string) {
     // (mediaClass='decorative') y no rompen este flujo.
     // ============================================
     if (aiEligible && mediaClass === 'blocked') {
-      const bufferKey = `${sessionKey}:${contactPhone}`;
-      const existingBuffer = messageBuffers.get(bufferKey);
-      const pendingTexts = existingBuffer?.messages.length ?? 0;
-
-      if (existingBuffer?.timeout) {
-        clearTimeout(existingBuffer.timeout);
-      }
-      messageBuffers.delete(bufferKey);
-
-      // Media bloqueada cortó el ciclo de IA: idle para liberar el spinner
-      emitAiState(accountId, sessionKey, contactPhone, 'idle');
+      // La media bloqueada corta la espera de la IA (y apaga su indicador): el
+      // chat pasa al humano con los textos que venían en la ráfaga.
+      const pendingTexts = aiBuffers.yieldToHuman({ accountId, sessionKey, contactPhone }, 'media bloqueada');
 
       // +1 por el mensaje multimedia que disparó el gate
       await incrementUnrespondedCount(accountId, session.phoneNumber, contactPhone, pendingTexts + 1);
@@ -958,70 +967,36 @@ async function startSession(sessionKey: string, accountId: string) {
     // ============================================
     // MESSAGE BUFFERING: Wait for more messages before processing
     // ============================================
-    const bufferKey = `${sessionKey}:${contactPhone}`;
-    let buffer = messageBuffers.get(bufferKey);
-
-    // If no existing buffer, create one
-    if (!buffer) {
-      buffer = {
-        contactPhone,
-        messages: [messageText],
-        timeout: null,
-        responded: false,
-      };
-      messageBuffers.set(bufferKey, buffer);
-      console.log(`[Buffer] Created new buffer for ${contactPhone}: message 1`);
-    } else {
-      // Add to existing buffer
-      buffer.messages.push(messageText);
-      console.log(`[Buffer] Added message to buffer for ${contactPhone}: now ${buffer.messages.length} messages`);
-
-      // If already responded, don't reset timeout - create new buffer for this message
-      if (buffer.responded) {
-        buffer = {
+    // Espera de la IA ("esperando…"): junta la ráfaga del cliente y dispara una
+    // sola respuesta tras el delay. Las carreras (buffers huérfanos, doble
+    // conteo, esperar a quien escribe) viven y se testean en aiBuffer.ts.
+    // `fire` se arma con el contexto de ESTE mensaje, el último de la ráfaga.
+    aiBuffers.push(
+      { accountId, sessionKey, contactPhone },
+      messageText,
+      aiConfig.responseDelayMs,
+      async (messages) => {
+        // La sesión viva al disparar, no la capturada acá: tras una reconexión
+        // la de este closure tiene el socket muerto y la respuesta no saldría.
+        const liveSession = sessions.get(sessionKey);
+        if (!liveSession?.phoneNumber) {
+          console.warn(`[Buffer] La sesión ${sessionKey} ya no existe; sin respuesta de IA para ${contactPhone}`);
+          emitAiState(accountId, sessionKey, contactPhone, 'idle');
+          return;
+        }
+        console.log(`[Buffer] Timeout expired for ${contactPhone}, processing ${messages.length} message(s)`);
+        // Emite 'thinking', 'responding' e 'idle' internamente.
+        await processMessageBuffer(
+          sessionKey,
+          accountId,
+          liveSession,
+          remoteJid,
           contactPhone,
-          messages: [messageText],
-          timeout: null,
-          responded: false,
-        };
-        messageBuffers.set(bufferKey, buffer);
-        console.log(`[Buffer] Buffer was responded, created new buffer for ${contactPhone}`);
-      }
-    }
-
-    // Clear existing timeout if any
-    if (buffer.timeout) {
-      clearTimeout(buffer.timeout);
-      console.log(`[Buffer] Cleared existing timeout for ${contactPhone}`);
-    }
-
-    // Notificamos al frontend: estamos esperando más mensajes del cliente.
-    // expectedRespondAt permite pintar un mini-countdown si quisiéramos.
-    const expectedRespondAt = Date.now() + aiConfig.responseDelayMs;
-    emitAiState(accountId, sessionKey, contactPhone, 'buffering', expectedRespondAt);
-
-    // Set new timeout to process buffer after delay
-    buffer.timeout = setTimeout(async () => {
-      console.log(`[Buffer] Timeout expired for ${contactPhone}, processing ${buffer.messages.length} message(s)`);
-
-      // Mark buffer as responded BEFORE processing to prevent race conditions
-      buffer.responded = true;
-
-      // Process the buffered messages (emite 'thinking', 'responding' e 'idle' internamente)
-      await processMessageBuffer(
-        sessionKey,
-        accountId,
-        session,
-        remoteJid,
-        contactPhone,
-        aiConfig,
-        buffer.messages
-      );
-
-      // Clear the buffer from map
-      messageBuffers.delete(bufferKey);
-      console.log(`[Buffer] Cleared buffer for ${contactPhone}`);
-    }, aiConfig.responseDelayMs);
+          aiConfig,
+          messages,
+        );
+      },
+    );
   };
 
   // Un solo `messages.upsert` puede traer VARIOS mensajes. Baileys bufferea los
@@ -1085,7 +1060,46 @@ async function performSendMessage(
   if (!session?.isReady || !session?.phoneNumber) {
     throw new Error('Session not ready');
   }
+  // El sessionKey viaja en el payload: tiene que ser de la cuenta de quien
+  // envía. Sin esto, alguien de otra cuenta que conociera el sessionKey podía
+  // mandar mensajes por un WhatsApp ajeno (y apagarle la IA con la línea de abajo).
+  if (session.accountId !== accountId) {
+    throw new Error('Unauthorized session');
+  }
 
+  // El humano va a responder: la IA cede YA, al pedirse el envío, no cuando
+  // vuelva el eco. Esa ventana (descarga del adjunto + ≥100 ms del buffer de
+  // Baileys + tres escrituras a Firestore) era donde la IA alcanzaba a
+  // contestar encima del humano. Antes de cualquier await, a propósito.
+  const chatPhone = to.includes('@') ? extractPhoneNumber(to) : to;
+  const droppedBurst = aiBuffers.yieldToHuman(
+    { accountId, sessionKey, contactPhone: chatPhone },
+    'envío desde el CRM',
+  );
+
+  try {
+    return await sendAsHuman(session, senderUid, {
+      to, text, imageUrl, documentUrl, documentName, videoUrl, audioUrl, mimetype, isPtt,
+      cleanupAfterSend, accountId, quotedMessageId, quotedText, quotedFromMe,
+    });
+  } catch (error) {
+    // No salió: la ráfaga que la IA soltó por este humano quedaría sin
+    // respuesta y sin contar. La dejamos pendiente para que alguien la vea.
+    if (droppedBurst > 0) {
+      incrementUnrespondedCount(accountId, session.phoneNumber, chatPhone, droppedBurst).catch((e) =>
+        console.error('[performSendMessage] No se pudo contar la ráfaga soltada:', e),
+      );
+    }
+    throw error;
+  }
+}
+
+// El envío en sí: arma el contenido y lo manda etiquetado como humano.
+async function sendAsHuman(
+  session: SessionData,
+  senderUid: string,
+  { to, text, imageUrl, documentUrl, documentName, videoUrl, audioUrl, mimetype, isPtt, cleanupAfterSend, accountId, quotedMessageId, quotedText, quotedFromMe }: any,
+) {
   // Try to get the stored remoteJid from the chat document
   let jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
 
@@ -1094,7 +1108,7 @@ async function performSendMessage(
       .collection(ACCOUNTS_COLLECTION)
       .doc(accountId)
       .collection('whatsapp_sessions')
-      .doc(session.phoneNumber)
+      .doc(session.phoneNumber!)
       .collection('chats')
       .doc(to);
 
@@ -1168,15 +1182,24 @@ async function performSendMessage(
     content = { text };
   }
 
-  // Quién envía se resuelve ANTES de mandar. Baileys emite el eco
-  // (messages.upsert) dentro del propio sendMessage, y saveMessageToFirestore
-  // sólo espera ~60 ms la etiqueta. Resolverlo después metía en esa carrera una
-  // lectura de users/{uid} cada vez que el cache del nombre estaba frío. Si
-  // perdía, el mensaje del operador quedaba etiquetado "WhatsApp", sin
-  // senderUid, y la guarda de choque del cliente lo tomaba por un compañero.
+  // La etiqueta de quién envía va ANTES de mandar, con un id generado por
+  // nosotros. El eco (messages.upsert) la necesita dos veces: para guardar el
+  // doc con senderUid (saveMessageToFirestore sólo espera ~60 ms) y para saber
+  // que este envío ya hizo ceder a la IA. Resolverla después del envío metía
+  // en esa carrera una lectura de users/{uid} con el cache frío: si perdía, el
+  // mensaje del operador quedaba como "WhatsApp", sin senderUid, y la guarda
+  // de choque del cliente lo tomaba por un compañero.
   const senderInfo = await resolveHumanSender(senderUid);
+  const messageId = generateMessageIDV2(session.sock.user?.id);
+  session.pendingSenders.set(messageId, senderInfo);
 
-  const message = await session.sock.sendMessage(jid, content, sendOptions);
+  let message;
+  try {
+    message = await session.sock.sendMessage(jid, content, { ...sendOptions, messageId });
+  } catch (error) {
+    session.pendingSenders.delete(messageId);
+    throw error;
+  }
 
   // Limpieza del temporal sólo si el cliente lo pidió (envíos one-off del
   // composer). Las quick responses NO pasan el flag: sus imágenes son
@@ -1185,15 +1208,9 @@ async function performSendMessage(
     void deleteTempStorageObject(tempMediaUrl);
   }
 
-  // Etiquetamos al humano que envió este mensaje. El handler de
-  // messages.upsert consume esta entry al guardar el doc en Firestore.
-  if (message?.key?.id) {
-    session.pendingSenders.set(message.key.id, senderInfo);
-  }
-
   return {
     success: true,
-    messageId: message.key.id,
+    messageId: message?.key?.id ?? messageId,
     timestamp: new Date().toISOString(),
   };
 }
@@ -2448,6 +2465,12 @@ io.on('connection', (socket) => {
   socket.join(accountId);
   console.log('[Socket.io] Socket ' + socket.id + ' unido a la sala: ' + accountId);
 
+  // Estados de IA en curso de la cuenta. `ai_state` se emite una sola vez por
+  // transición: sin esta foto, quien conecta a mitad de un ciclo (celular que
+  // vuelve de segundo plano, app abierta desde un push) no veía "esperando…" y
+  // contestaba encima de la IA. El cliente reemplaza todo lo que tenía.
+  socket.emit('ai_state_snapshot', { states: aiStateSnapshot(accountId) });
+
   // Replay only this user's session states
   console.log('[Socket.io] Buscando sesiones existentes para accountId: ' + accountId);
   let sessionCount = 0;
@@ -2528,25 +2551,11 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Apagar la IA a mitad de un ciclo también corta la generación y los chunks
-    // que falten: si el operador la desactivó, no debe seguir escribiendo.
-    if (cancelAiCycle(sessionKey, contactPhone)) {
-      console.log(`[AI] Ciclo cancelado: IA desactivada para ${contactPhone}`);
-    }
-
-    const bufferKey = `${sessionKey}:${contactPhone}`;
-    const buffer = messageBuffers.get(bufferKey);
-
-    if (buffer && buffer.timeout) {
-      clearTimeout(buffer.timeout);
-      messageBuffers.delete(bufferKey);
-      console.log(`[Buffer] CANCELLED via Socket.io: User disabled AI for ${contactPhone}`);
-      socket.emit('ai_toggle_result', { success: true, message: 'IA desactivada', contactPhone });
-    } else {
-      console.log(`[Buffer] No pending buffer found for ${contactPhone}`);
-      socket.emit('ai_toggle_result', { success: true, message: 'IA desactivada', contactPhone });
-    }
-    // Cualquiera de los dos caminos: el frontend ya no debe ver indicador de IA
+    // Apagar la IA corta la espera y también la generación y los chunks que
+    // falten: si el operador la desactivó, no debe seguir escribiendo.
+    aiBuffers.yieldToHuman({ accountId, sessionKey, contactPhone }, 'IA desactivada');
+    socket.emit('ai_toggle_result', { success: true, message: 'IA desactivada', contactPhone });
+    // Haya habido algo activo o no, el frontend ya no debe ver indicador de IA.
     emitAiState(accountId, sessionKey, contactPhone, 'idle');
   });
 });
@@ -2593,6 +2602,15 @@ httpServer.listen(PORT, async () => {
   console.log(`[Env] ${envLabel} | NODE_ENV=${process.env.NODE_ENV ?? 'undefined'} | Firestore collection: "${ACCOUNTS_COLLECTION}"`);
 
   initSessionSupervisor({ sessions, db, io, startSession });
+
+  // Latido de los estados de IA: re-emite los vivos cada 30 s y apaga los que
+  // ya no son verdad. "Vivo" lo decide la realidad, no el reloj: una espera
+  // sigue viva mientras su buffer exista (aunque espere a quien escribe) y un
+  // pensando/respondiendo, mientras su ciclo no esté cancelado.
+  startAiStateHeartbeat((key, state) =>
+    state === 'buffering' ? aiBuffers.has(key) : isAiCycleLive(key),
+  );
+
   await startExistingSessions();
 
   // El barrido de fantasmas va DESPUÉS de restaurar las sesiones: si corriera

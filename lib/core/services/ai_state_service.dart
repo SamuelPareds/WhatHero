@@ -27,6 +27,11 @@ class AiChatStatus {
 /// Singleton que mantiene en memoria el estado IA por chat.
 ///
 /// - Sin Firestore: los estados son efímeros (segundos) y se reciben por socket.
+/// - Al (re)conectar llega la foto completa (`ai_state_snapshot`) y reemplaza
+///   todo: sin ella, quien conectaba a mitad de un ciclo no veía "esperando…"
+///   y contestaba encima de la IA.
+/// - El backend re-emite los estados vivos cada 30 s (latido), así que un ciclo
+///   largo no vence el watchdog.
 /// - Salvavidas: si en 90s no hay nuevo evento (p.ej. cliente perdió la conexión
 ///   a mitad del ciclo), volvemos a `idle` solos para no dejar spinners zombies.
 class AiStateService extends ChangeNotifier {
@@ -70,6 +75,12 @@ class AiStateService extends ChangeNotifier {
       return;
     }
 
+    _store(key, state, expectedRespondAt);
+    notifyListeners();
+  }
+
+  // Guarda el estado y arma su watchdog, sin notificar.
+  void _store(String key, AiChatState state, DateTime? expectedRespondAt) {
     _states[key] = AiChatStatus(
       state: state,
       expectedRespondAt: expectedRespondAt,
@@ -80,35 +91,71 @@ class AiStateService extends ChangeNotifier {
       _watchdogs.remove(key);
       notifyListeners();
     });
-    notifyListeners();
   }
 
   /// Aplica el evento crudo recibido por socket. Tolerante a payloads malformados:
   /// en caso de duda, deja todo como está.
   void applySocketPayload(Map<String, dynamic> data) {
-    final sessionKey = data['sessionKey'] as String?;
-    final contactPhone = data['contactPhone'] as String?;
-    final stateRaw = data['state'] as String?;
-    if (sessionKey == null || contactPhone == null || stateRaw == null) return;
+    final parsed = _parse(data);
+    if (parsed == null) return;
+    update(
+      sessionKey: parsed.sessionKey,
+      contactPhone: parsed.contactPhone,
+      state: parsed.state,
+      expectedRespondAt: parsed.expectedRespondAt,
+    );
+  }
 
-    final parsedState = AiChatState.values.firstWhere(
+  /// Foto completa al (re)conectar (`ai_state_snapshot`). Reemplaza todo: lo
+  /// que no viene en la foto terminó mientras estábamos desconectados, y su
+  /// `idle` se perdió con la conexión.
+  void replaceAll(List<dynamic> states) {
+    for (final t in _watchdogs.values) {
+      t.cancel();
+    }
+    _watchdogs.clear();
+    _states.clear();
+    for (final raw in states) {
+      if (raw is! Map) continue;
+      final parsed = _parse(Map<String, dynamic>.from(raw));
+      if (parsed == null || parsed.state == AiChatState.idle) continue;
+      _store(
+        _key(parsed.sessionKey, parsed.contactPhone),
+        parsed.state,
+        parsed.expectedRespondAt,
+      );
+    }
+    notifyListeners();
+  }
+
+  ({
+    String sessionKey,
+    String contactPhone,
+    AiChatState state,
+    DateTime? expectedRespondAt,
+  })? _parse(Map<String, dynamic> data) {
+    final sessionKey = data['sessionKey'];
+    final contactPhone = data['contactPhone'];
+    final stateRaw = data['state'];
+    if (sessionKey is! String || contactPhone is! String || stateRaw is! String) {
+      return null;
+    }
+
+    final state = AiChatState.values.firstWhere(
       (s) => s.name == stateRaw,
       orElse: () => AiChatState.idle,
     );
 
     DateTime? expectedRespondAt;
     final expectedRaw = data['expectedRespondAt'];
-    if (expectedRaw is int) {
-      expectedRespondAt = DateTime.fromMillisecondsSinceEpoch(expectedRaw);
-    } else if (expectedRaw is num) {
+    if (expectedRaw is num) {
       expectedRespondAt =
           DateTime.fromMillisecondsSinceEpoch(expectedRaw.toInt());
     }
-
-    update(
+    return (
       sessionKey: sessionKey,
       contactPhone: contactPhone,
-      state: parsedState,
+      state: state,
       expectedRespondAt: expectedRespondAt,
     );
   }

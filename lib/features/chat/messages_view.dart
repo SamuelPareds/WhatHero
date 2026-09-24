@@ -805,19 +805,33 @@ class _MessagesViewState extends State<MessagesView> {
   }) async {
     if (!_fitsAttachment(bytes.length)) return;
 
-    final caption = await showDialog<String>(
-      context: context,
-      builder: (_) => _AttachmentPreviewDialog(bytes: bytes, fileName: fileName, kind: kind),
-    );
-    if (caption == null) return; // cancelado
+    // Mientras escribe el caption y sube el archivo (5-30 s) el composer está
+    // vacío, pero el operador SÍ está respondiendo: lo anunciamos, y la IA en
+    // "esperando…" le cede el turno en vez de disparar a mitad del envío.
+    PresenceReporter.instance
+        .setComposing(widget.sessionId, widget.phoneNumber, true);
+    try {
+      final caption = await showDialog<String>(
+        context: context,
+        builder: (_) => _AttachmentPreviewDialog(bytes: bytes, fileName: fileName, kind: kind),
+      );
+      if (caption == null) return; // cancelado
 
-    await _uploadAndSendAttachment(
-      bytes: bytes,
-      fileName: fileName,
-      ext: ext,
-      kind: kind,
-      caption: caption,
-    );
+      await _uploadAndSendAttachment(
+        bytes: bytes,
+        fileName: fileName,
+        ext: ext,
+        kind: kind,
+        caption: caption,
+      );
+    } finally {
+      // Si salió del chat durante la subida, su composer ya no existe.
+      PresenceReporter.instance.setComposing(
+        widget.sessionId,
+        widget.phoneNumber,
+        mounted && _messageController.text.trim().isNotEmpty,
+      );
+    }
   }
 
   Future<void> _uploadAndSendAttachment({

@@ -163,6 +163,17 @@ export class PresenceRegistry {
     return { sessionPhone, viewers };
   }
 
+  /** ¿Alguien tiene texto escrito en ese chat? (la IA en espera le cede el turno) */
+  isComposingIn(accountId: string, sessionPhone: string, chatId: string): boolean {
+    const members = this.byRoom.get(roomFor(accountId, sessionPhone));
+    if (!members) return false;
+    for (const socketId of members) {
+      const e = this.bySocket.get(socketId);
+      if (e && e.chatId === chatId && e.composing) return true;
+    }
+    return false;
+  }
+
   entriesForAccount(accountId: string): PresenceEntry[] {
     return [...this.bySocket.values()].filter((e) => e.accountId === accountId);
   }

@@ -140,6 +140,12 @@ async function handleSet(
   broadcast(changedRooms);
 }
 
+// ¿Un operador tiene texto escrito en ese chat? La IA en "esperando…" no
+// dispara mientras sea así (ver aiBuffer.ts). Sólo memoria: sin lecturas.
+export function isComposingIn(accountId: string, sessionPhone: string, chatId: string): boolean {
+  return registry.isComposingIn(accountId, sessionPhone, chatId);
+}
+
 // Al cambiar los permisos de un miembro: invalida el cache y saca en el acto
 // de cada sala a quien ya no tenga acceso a esa sesión.
 export async function revalidatePresenceAccess(accountId: string): Promise<void> {
