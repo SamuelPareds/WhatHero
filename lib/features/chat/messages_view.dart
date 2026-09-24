@@ -672,11 +672,6 @@ class _MessagesViewState extends State<MessagesView> {
   // La burbuja final la pinta el eco de `messages.upsert` por el mismo
   // pipeline que los mensajes entrantes — no construimos render local.
 
-  // Límites por tipo, alineados con lo que WhatsApp acepta.
-  static const int _maxImageBytes = 16 * 1024 * 1024;
-  static const int _maxVideoBytes = 64 * 1024 * 1024;
-  static const int _maxDocBytes = 100 * 1024 * 1024;
-
   void _showAttachmentMenu() {
     showModalBottomSheet(
       context: context,
@@ -761,13 +756,8 @@ class _MessagesViewState extends State<MessagesView> {
     required String ext,
     required String kind,
   }) async {
-    final limit = kind == 'image'
-        ? _maxImageBytes
-        : kind == 'video'
-            ? _maxVideoBytes
-            : _maxDocBytes;
-    if (bytes.length > limit) {
-      _showAttachmentError('El archivo supera el límite de ${(limit / (1024 * 1024)).round()} MB');
+    if (bytes.length > maxAttachmentBytes) {
+      _showAttachmentError('El archivo supera el límite de $maxAttachmentMegabytes MB');
       return;
     }
 

@@ -1,5 +1,10 @@
 import 'package:flutter/foundation.dart';
 
+/// Límite por archivo para imágenes, videos y documentos subidos desde la app.
+/// La interfaz muestra MB; el peso en bytes conserva el cálculo con base 1024.
+const int maxAttachmentMegabytes = 16;
+const int maxAttachmentBytes = maxAttachmentMegabytes * 1024 * 1024;
+
 /// Get backend URL based on platform and build mode
 /// - Release: Railway production
 /// - Web/iOS/macOS: localhost:3000

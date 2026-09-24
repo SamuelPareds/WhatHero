@@ -74,12 +74,6 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
 
   final ImagePicker _picker = ImagePicker();
 
-  // Topes por tipo. El de video es el límite documentado de WhatsApp para
-  // video; los otros dos venían de antes.
-  static const int _maxImageBytes = 10 * 1024 * 1024;
-  static const int _maxVideoBytes = 16 * 1024 * 1024;
-  static const int _maxDocumentBytes = 10 * 1024 * 1024;
-
   // Búsqueda en la lista
   String _searchQuery = '';
 
@@ -215,10 +209,10 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
   // Rechaza lo que no entra, diciendo cuánto pesa y cuánto cabe: con sólo el
   // límite el operador no sabe si le sobra un poco o si eligió el archivo
   // equivocado.
-  bool _fits(int size, int limit, String what) {
-    if (size <= limit) return true;
+  bool _fits(int size, String what) {
+    if (size <= maxAttachmentBytes) return true;
     _toast('$what pesa ${_megabytes(size)} MB y el límite es '
-        '${limit ~/ (1024 * 1024)} MB');
+        '$maxAttachmentMegabytes MB');
     return false;
   }
 
@@ -314,7 +308,7 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
       final bytes = await picked.readAsBytes();
       // Red de seguridad: el picker recomprime, pero un original enorme puede
       // seguir pasándose.
-      if (!_fits(bytes.length, _maxImageBytes, 'La imagen')) return;
+      if (!_fits(bytes.length, 'La imagen')) return;
 
       _setPicked(QrAttachKind.image, bytes, picked.name);
     } catch (e) {
@@ -334,7 +328,7 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
       if (picked == null) return;
 
       final bytes = await picked.readAsBytes();
-      if (!_fits(bytes.length, _maxVideoBytes, 'El video')) return;
+      if (!_fits(bytes.length, 'El video')) return;
 
       _setPicked(QrAttachKind.video, bytes, picked.name);
     } catch (e) {
@@ -354,7 +348,7 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
       if (f == null) return;
 
       final bytes = await f.readAsBytes();
-      if (!_fits(bytes.length, _maxDocumentBytes, 'El documento')) return;
+      if (!_fits(bytes.length, 'El documento')) return;
 
       final ext = fileExtension(f.name);
       if (!_isSafeFileType(ext)) {
@@ -987,8 +981,8 @@ class _QuickResponsesPanelState extends State<QuickResponsesPanel> {
           child: Text(
             // El video es el único que se manda tal cual, y conviene decirlo:
             // es lo que hace que llegue en la calidad original.
-            'Imagen y documento hasta 10 MB · Video hasta 16 MB, '
-            'se envía sin recomprimir',
+            'Imagen, video y documento hasta $maxAttachmentMegabytes MB · '
+            'El video se envía sin recomprimir',
             style: TextStyle(color: lightText.withValues(alpha: 0.5), fontSize: 11),
           ),
         ),

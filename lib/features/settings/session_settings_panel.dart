@@ -1508,11 +1508,6 @@ class _KeywordRuleEditorSheet extends StatefulWidget {
 }
 
 class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
-  // Tope de seguridad para la imagen subida (image_picker ya recomprime).
-  static const int _maxImageBytes = 10 * 1024 * 1024;
-  // Tope para documentos PDF (WhatsApp acepta hasta ~100 MB; somos conservadores).
-  static const int _maxDocBytes = 20 * 1024 * 1024;
-
   final ImagePicker _picker = ImagePicker();
 
   late final TextEditingController _keywordController;
@@ -1593,10 +1588,10 @@ class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
       if (picked == null) return;
 
       final bytes = await picked.readAsBytes();
-      if (bytes.length > _maxImageBytes) {
+      if (bytes.length > maxAttachmentBytes) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('La imagen supera el límite de 10 MB')),
+            const SnackBar(content: Text('La imagen supera el límite de $maxAttachmentMegabytes MB')),
           );
         }
         return;
@@ -1630,10 +1625,10 @@ class _KeywordRuleEditorSheetState extends State<_KeywordRuleEditorSheet> {
       // readAsBytes: necesitamos los bytes para subirlos a Storage.
       final bytes = await file.readAsBytes();
 
-      if (bytes.length > _maxDocBytes) {
+      if (bytes.length > maxAttachmentBytes) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('El documento supera el límite de 20 MB')),
+            const SnackBar(content: Text('El documento supera el límite de $maxAttachmentMegabytes MB')),
           );
         }
         return;
