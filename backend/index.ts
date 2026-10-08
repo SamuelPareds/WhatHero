@@ -60,7 +60,7 @@ import { probeVideo } from './src/utils/videoProbe';
 import { resolveHumanSender, BOT_SENDER, invalidateHumanNameCache } from './src/services/senderResolver';
 import { initPresence, registerPresenceHandlers, revalidatePresenceAccess, isComposingIn } from './src/services/presenceService';
 import { canAccessSession, invalidateMemberAccess } from './src/services/memberAccess';
-import { parseInternalMessageInput, listTeammates, createInternalMessage } from './src/services/internalMessages';
+import { parseInternalMessageInput, parseInternalDeleteInput, listTeammates, createInternalMessage, deleteInternalMessage } from './src/services/internalMessages';
 
 // Ensure auth_info directory exists
 const authInfoDir = 'auth_info';
@@ -1781,6 +1781,32 @@ app.post('/internal-messages', express.json(), verifyHttpAuth(), async (req, res
     console.error('[/internal-messages] Error:', error);
     res.status(500).json({
       error: 'Failed to save internal message',
+      details: (error as any).message,
+    });
+  }
+});
+
+// Borra un interno. Sólo su autor (ver deleteInternalMessage). Repetirlo no
+// falla: si ya no está, el resultado es el mismo que el usuario pidió.
+app.post('/internal-messages/delete', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const { accountId } = req.body;
+    const uid = req.auth!.uid;
+    const parsed = parseInternalDeleteInput(req.body);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    if (!(await canAccessSession(accountId, uid, parsed.sessionId))) {
+      return res.status(403).json({ error: 'Sin acceso a esta sesión' });
+    }
+    const result = await deleteInternalMessage(accountId, uid, parsed.sessionId, parsed.id);
+    if (result === 'forbidden') {
+      return res.status(403).json({ error: 'Sólo quien lo envió puede eliminarlo' });
+    }
+    console.log(`[Interno] ${uid} eliminó ${parsed.id} (${result})`);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[/internal-messages/delete] Error:', error);
+    res.status(500).json({
+      error: 'Failed to delete internal message',
       details: (error as any).message,
     });
   }

@@ -74,6 +74,46 @@ export function parseInternalMessageInput(body: unknown): ParseResult {
   return { ok: true, value: { sessionId, chatId, id, text, recipientUids } };
 }
 
+// Valida el body de POST /internal-messages/delete.
+export function parseInternalDeleteInput(
+  body: unknown,
+): { ok: true; sessionId: string; id: string } | { ok: false; error: string } {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const { sessionId, id } = b;
+  if (typeof sessionId !== 'string' || !SEGMENT_RE.test(sessionId)) {
+    return { ok: false, error: 'sessionId inválido' };
+  }
+  if (typeof id !== 'string' || !ID_RE.test(id)) {
+    return { ok: false, error: 'id inválido' };
+  }
+  return { ok: true, sessionId, id };
+}
+
+// Cómo queda el badge de cada destinatario al borrar un interno: uid → nuevo
+// contador (0 = se borra el campo). Puro, para testearlo sin Firestore.
+//
+// Sólo se le descuenta a quien todavía NO lo vio. El contador cuenta los
+// internos que llegaron después de la última vez que abrió el chat
+// (`internal_seen_at`, lo escribe la app al apagar el badge). A quien ya lo vio
+// no se le toca: descontarle se comería el badge de un interno más nuevo que
+// sí tiene pendiente.
+export function unreadAfterDelete(
+  unread: Record<string, number>,
+  seenAtMs: Record<string, number>,
+  recipientUids: string[],
+  sentAtMs: number,
+): Map<string, number> {
+  const next = new Map<string, number>();
+  for (const uid of recipientUids) {
+    const count = unread[uid] ?? 0;
+    if (count <= 0) continue; // nada pendiente: ya lo vio o nunca se le contó
+    const seen = seenAtMs[uid];
+    if (seen !== undefined && seen >= sentAtMs) continue; // lo vio; lo pendiente es otro
+    next.set(uid, count - 1);
+  }
+  return next;
+}
+
 // A quién se le avisa de verdad: nunca al autor, y sólo a quien ve la sesión.
 // Un push lleva el nombre del cliente y el texto: no puede llegarle a un
 // miembro restringido a otra sesión aunque la app lo pida.
@@ -161,6 +201,79 @@ export async function createInternalMessage(
     recipientUids,
   });
   return 'created';
+}
+
+export type DeleteResult = 'deleted' | 'not_found' | 'forbidden';
+
+// Borra un interno. Sólo su autor puede: ni el destinatario ni el owner (por
+// ahora; los permisos finos vienen después). En una transacción con el doc del
+// chat, para descontar el badge de quien todavía no lo vio sin pisar un
+// interno que llegue al mismo tiempo.
+//
+// El push que ya salió no se puede retirar: si el destinatario no lo abrió,
+// sigue en la bandeja de su teléfono con el texto.
+export async function deleteInternalMessage(
+  accountId: string,
+  requesterUid: string,
+  sessionId: string,
+  id: string,
+): Promise<DeleteResult> {
+  const session = sessionRef(accountId, sessionId);
+  const msgRef = session.collection('internal_messages').doc(id);
+
+  return admin.firestore().runTransaction(async (tx) => {
+    const msg = await tx.get(msgRef);
+    if (!msg.exists) return 'not_found';
+    const data = msg.data() ?? {};
+    if (data.authorUid !== requesterUid) return 'forbidden';
+
+    const recipientUids = Array.isArray(data.recipientUids) ? (data.recipientUids as string[]) : [];
+    const chatId = typeof data.chatId === 'string' ? data.chatId : '';
+    // Todas las lecturas antes de la primera escritura (regla de las transacciones).
+    const chatRef = chatId && recipientUids.length > 0 ? session.collection('chats').doc(chatId) : null;
+    const chat = chatRef ? await tx.get(chatRef) : null;
+
+    if (chatRef && chat?.exists) {
+      const chatData = chat.data() ?? {};
+      const next = unreadAfterDelete(
+        numbersIn(chatData.internal_unread),
+        millisIn(chatData.internal_seen_at),
+        recipientUids,
+        (data.timestamp as admin.firestore.Timestamp | undefined)?.toMillis() ?? 0,
+      );
+      const updates: unknown[] = [];
+      for (const [uid, count] of next) {
+        updates.push(
+          new admin.firestore.FieldPath('internal_unread', uid),
+          count > 0 ? count : admin.firestore.FieldValue.delete(),
+        );
+      }
+      if (updates.length > 0) {
+        const [field, value, ...rest] = updates;
+        tx.update(chatRef, field as admin.firestore.FieldPath, value, ...rest);
+      }
+    }
+    tx.delete(msgRef);
+    return 'deleted';
+  });
+}
+
+function numbersIn(raw: unknown): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (raw && typeof raw === 'object') {
+    for (const [k, v] of Object.entries(raw)) if (typeof v === 'number') out[k] = v;
+  }
+  return out;
+}
+
+function millisIn(raw: unknown): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (raw && typeof raw === 'object') {
+    for (const [k, v] of Object.entries(raw)) {
+      if (v instanceof admin.firestore.Timestamp) out[k] = v.toMillis();
+    }
+  }
+  return out;
 }
 
 // El badge violeta: un contador por destinatario que su app borra al abrir

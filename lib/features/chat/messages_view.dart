@@ -796,6 +796,117 @@ class _MessagesViewState extends State<MessagesView> {
     );
   }
 
+  // Acciones de una tarjeta interna. Si no salió: reintentar o descartar. Si
+  // ya está: copiar, y eliminar sólo si la escribí yo (por ahora ni el
+  // destinatario ni el owner pueden borrar lo de otro).
+  void _showInternalActions(InternalMessage m) {
+    if (m.status == InternalSendStatus.failed) {
+      _showRetrySheet(
+        error: m.error,
+        onRetry: () => InternalMessagesService().retry(m.id),
+        onDiscard: () => InternalMessagesService().discard(m.id),
+      );
+      return;
+    }
+    // Mientras se envía no se puede borrar: el backend todavía podría crearlo
+    // después del borrado y reaparecería.
+    final canDelete =
+        m.authorUid == _myUid && m.status != InternalSendStatus.sending;
+    // Capturado antes: los toasts llegan con la hoja ya cerrada.
+    final messenger = ScaffoldMessenger.of(context);
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: surfaceDark,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (sheetContext) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 40,
+                height: 4,
+                margin: const EdgeInsets.only(bottom: 12),
+                decoration: BoxDecoration(
+                  color: teamViolet.withValues(alpha: 0.3),
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              ListTile(
+                leading: const Icon(Icons.copy, size: 20, color: teamViolet),
+                title: const Text('Copiar', style: TextStyle(color: white)),
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  Clipboard.setData(ClipboardData(text: m.text));
+                  messenger.showSnackBar(const SnackBar(
+                    content: Text('Copiado'),
+                    duration: Duration(seconds: 1),
+                  ));
+                },
+              ),
+              if (canDelete)
+                ListTile(
+                  leading: const Icon(Icons.delete, size: 20, color: Color(0xFFF87171)),
+                  title: const Text('Eliminar', style: TextStyle(color: white)),
+                  subtitle: Text(
+                    'Se borra para todo el equipo',
+                    style: TextStyle(color: lightText.withValues(alpha: 0.7), fontSize: 11),
+                  ),
+                  onTap: () {
+                    Navigator.pop(sheetContext);
+                    _confirmDeleteInternal(m, messenger);
+                  },
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _confirmDeleteInternal(
+      InternalMessage m, ScaffoldMessengerState messenger) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        backgroundColor: surfaceDark,
+        title: const Text('Eliminar mensaje interno', style: TextStyle(color: white)),
+        content: const Text(
+          'Se borra para todo el equipo. Si ya le llegó la notificación a alguien, '
+          'esa no se puede retirar.',
+          style: TextStyle(color: lightText),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: Text('Cancelar', style: TextStyle(color: lightText.withValues(alpha: 0.6))),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFF87171)),
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Eliminar', style: TextStyle(color: white)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    final error = await InternalMessagesService().delete(
+      accountId: widget.accountId,
+      sessionId: widget.sessionId,
+      id: m.id,
+    );
+    if (error != null) {
+      messenger.showSnackBar(SnackBar(
+        content: Text('No se pudo eliminar: $error'),
+        backgroundColor: Colors.red.shade600,
+      ));
+    }
+  }
+
   // Franja del modo interno, sobre el composer: qué estás haciendo (el
   // cliente no lo ve), a quién le llega el aviso y, con el composer vacío,
   // los atajos de frase.
@@ -1959,8 +2070,16 @@ class _MessagesViewState extends State<MessagesView> {
                   final docIds = <String>{for (final d in messages) d.id};
                   final pendings = PendingMessagesService()
                       .visibleForChat(pendingChatKey, docIds);
-                  final internalDocs = internalSnapshot.data?.docs ??
-                      const <QueryDocumentSnapshot>[];
+                  // Un error aquí no se ve en pantalla: el autor sigue viendo su
+                  // copia local y nadie más ve nada. Pasó con los índices sin
+                  // desplegar; el mensaje de Firestore trae el link para crearlo.
+                  if (internalSnapshot.hasError) {
+                    debugPrint('[Interno] No se pudieron leer los internos: ${internalSnapshot.error}');
+                  }
+                  final internalDocs = (internalSnapshot.data?.docs ??
+                          const <QueryDocumentSnapshot>[])
+                      .where((d) => !InternalMessagesService().isDeleting(d.id))
+                      .toList();
                   final internalIds = <String>{for (final d in internalDocs) d.id};
                   final internal = [
                     ...InternalMessagesService().pendingFor(
@@ -2072,11 +2191,7 @@ class _MessagesViewState extends State<MessagesView> {
                           key: ValueKey('internal_${entry.id}'),
                           message: entry,
                           myUid: _myUid,
-                          onFailedTap: () => _showRetrySheet(
-                            error: entry.error,
-                            onRetry: () => InternalMessagesService().retry(entry.id),
-                            onDiscard: () => InternalMessagesService().discard(entry.id),
-                          ),
+                          onPressed: () => _showInternalActions(entry),
                         )
                       : _buildWaBubble(entry as QueryDocumentSnapshot, entryDate);
 

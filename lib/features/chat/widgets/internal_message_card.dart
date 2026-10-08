@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/services/internal_messages_service.dart';
 
@@ -12,13 +11,14 @@ class InternalMessageCard extends StatelessWidget {
   final InternalMessage message;
   final String? myUid;
 
-  /// Tap en uno que no se pudo enviar → reintentar o descartar.
-  final VoidCallback? onFailedTap;
+  /// Tocar o mantener presionado: abre sus acciones (copiar, eliminar si es
+  /// tuyo, reintentar si no salió). Las decide quien la pinta.
+  final VoidCallback? onPressed;
 
   const InternalMessageCard({
     required this.message,
     required this.myUid,
-    this.onFailedTap,
+    this.onPressed,
     super.key,
   });
 
@@ -45,14 +45,8 @@ class InternalMessageCard extends StatelessWidget {
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 520),
         child: GestureDetector(
-          onTap: failed ? onFailedTap : null,
-          onLongPress: () {
-            Clipboard.setData(ClipboardData(text: message.text));
-            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-              content: Text('Copiado'),
-              duration: Duration(seconds: 1),
-            ));
-          },
+          onTap: onPressed,
+          onLongPress: onPressed,
           child: Container(
             width: double.infinity,
             margin: const EdgeInsets.symmetric(vertical: 6),

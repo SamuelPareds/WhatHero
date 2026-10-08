@@ -174,7 +174,7 @@ class InternalMessagesService extends ChangeNotifier {
     final uid = FirebaseAuth.instance.currentUser?.uid ?? '';
     return [
       for (final o in list)
-        if (!presentIds.contains(o.id))
+        if (!presentIds.contains(o.id) && !_deleting.contains(o.id))
           InternalMessage(
             id: o.id,
             chatId: o.chatId,
@@ -237,6 +237,56 @@ class InternalMessagesService extends ChangeNotifier {
       list.removeWhere((o) => o.id == id);
     }
     notifyListeners();
+  }
+
+  // Borrados en vuelo: se esconden ya, sin esperar a que el stream confirme.
+  final Set<String> _deleting = {};
+
+  /// ¿Se está borrando? La conversación lo esconde mientras tanto.
+  bool isDeleting(String id) => _deleting.contains(id);
+
+  /// Borra un interno propio (el backend rechaza los ajenos). Desaparece al
+  /// instante; si el servidor falla vuelve a su lugar y devuelve el motivo.
+  /// null = borrado.
+  Future<String?> delete({
+    required String accountId,
+    required String sessionId,
+    required String id,
+  }) async {
+    _deleting.add(id);
+    notifyListeners();
+    String? error;
+    try {
+      final response = await http
+          .post(
+            Uri.parse('$backendUrl/internal-messages/delete'),
+            headers: await authHeaders(),
+            body: jsonEncode({'accountId': accountId, 'sessionId': sessionId, 'id': id}),
+          )
+          .timeout(const Duration(seconds: 15));
+      if (response.statusCode != 200) {
+        try {
+          error = (jsonDecode(response.body) as Map<String, dynamic>)['error']
+              as String?;
+        } catch (_) {/* cuerpo no-JSON: usamos el status */}
+        error ??= 'Error ${response.statusCode}';
+      }
+    } on TimeoutException {
+      error = 'Sin respuesta del servidor';
+    } catch (_) {
+      error = 'Sin conexión';
+    }
+    if (error == null) {
+      // Si todavía era una tarjeta en vuelo ("enviado" sin confirmar por el
+      // stream), ya no va a llegar nunca: sin esto quedaría pegada.
+      for (final list in _byChat.values) {
+        list.removeWhere((o) => o.id == id);
+      }
+    } else {
+      _deleting.remove(id);
+    }
+    notifyListeners();
+    return error;
   }
 
   Future<void> _transmit(_Outgoing o) async {

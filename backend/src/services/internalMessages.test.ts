@@ -1,6 +1,12 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseInternalMessageInput, pickRecipients, INTERNAL_TEXT_MAX } from './internalMessages';
+import {
+  parseInternalMessageInput,
+  parseInternalDeleteInput,
+  pickRecipients,
+  unreadAfterDelete,
+  INTERNAL_TEXT_MAX,
+} from './internalMessages';
 
 const ID = 'AbCdEfGhIjKlMnOpQrSt'; // autoId de Firestore: 20 alfanuméricos
 const BASE = {
@@ -77,5 +83,56 @@ describe('pickRecipients', () => {
 
   test('descarta a quien no ve la sesión, aunque la app lo pida', () => {
     assert.deepEqual(pickRecipients(['uid-mayra', 'uid-de-otra-sesion'], TEAM, 'uid-owner'), ['uid-mayra']);
+  });
+});
+
+describe('parseInternalDeleteInput', () => {
+  test('acepta sesión e id válidos', () => {
+    assert.deepEqual(parseInternalDeleteInput({ sessionId: BASE.sessionId, id: ID }), {
+      ok: true,
+      sessionId: BASE.sessionId,
+      id: ID,
+    });
+  });
+
+  test('rechaza un id raro o una / en la sesión', () => {
+    assert.equal(parseInternalDeleteInput({ sessionId: BASE.sessionId, id: 'x' }).ok, false);
+    assert.equal(parseInternalDeleteInput({ sessionId: 'a/b', id: ID }).ok, false);
+  });
+});
+
+describe('unreadAfterDelete', () => {
+  const SENT = 1_000;
+
+  test('a quien no lo vio se le descuenta', () => {
+    const next = unreadAfterDelete({ 'uid-mayra': 2 }, {}, ['uid-mayra'], SENT);
+    assert.deepEqual([...next], [['uid-mayra', 1]]);
+  });
+
+  test('si era el único pendiente, el badge se apaga (0 = borrar el campo)', () => {
+    const next = unreadAfterDelete({ 'uid-mayra': 1 }, { 'uid-mayra': SENT - 10 }, ['uid-mayra'], SENT);
+    assert.deepEqual([...next], [['uid-mayra', 0]]);
+  });
+
+  test('a quien ya lo vio no se le toca, aunque tenga otro interno pendiente', () => {
+    // Lo vio (abrió el chat después de que llegó) y luego le llegó otro: ese
+    // otro es su 1 pendiente, y borrar éste no se lo puede comer.
+    const next = unreadAfterDelete({ 'uid-mayra': 1 }, { 'uid-mayra': SENT + 10 }, ['uid-mayra'], SENT);
+    assert.equal(next.size, 0);
+  });
+
+  test('sin contador no hay nada que descontar (nunca baja de 0)', () => {
+    const next = unreadAfterDelete({}, {}, ['uid-mayra', 'uid-ana'], SENT);
+    assert.equal(next.size, 0);
+  });
+
+  test('cada destinatario por su lado', () => {
+    const next = unreadAfterDelete(
+      { 'uid-mayra': 3, 'uid-ana': 1 },
+      { 'uid-ana': SENT + 5 },
+      ['uid-mayra', 'uid-ana'],
+      SENT,
+    );
+    assert.deepEqual([...next], [['uid-mayra', 2]]);
   });
 });

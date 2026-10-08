@@ -533,7 +533,13 @@ class _ChatsScreenState extends State<ChatsScreen> {
             .doc(widget.sessionId)
             .collection('chats')
             .doc(chatId)
-            .update({FieldPath(['internal_unread', uid]): FieldValue.delete()});
+            .update({
+              FieldPath(['internal_unread', uid]): FieldValue.delete(),
+              // Cuándo los vi. Si el autor borra uno, el backend sólo me
+              // descuenta el badge si llegó después de esto: si no, se comería
+              // el de un interno más nuevo (ver unreadAfterDelete).
+              FieldPath(['internal_seen_at', uid]): FieldValue.serverTimestamp(),
+            });
       } catch (e) {
         debugPrint('[Interno] No se pudo limpiar el badge de $chatId: $e');
       } finally {
