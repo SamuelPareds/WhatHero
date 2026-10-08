@@ -633,11 +633,16 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(
+                // Wrap y no Row: en un iPhone de 393pt "Audios y notas de voz"
+                // + la etiqueta ya no caben, y la etiqueta baja de línea en
+                // vez de recortarse.
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 2,
+                  crossAxisAlignment: WrapCrossAlignment.center,
                   children: [
                     Text(label, style: const TextStyle(color: white, fontSize: 13, fontWeight: FontWeight.w600)),
-                    if (comingSoon) ...[
-                      const SizedBox(width: 8),
+                    if (comingSoon)
                       Container(
                         padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
                         decoration: BoxDecoration(
@@ -649,7 +654,6 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
                           style: TextStyle(color: lightText, fontSize: 8, fontWeight: FontWeight.bold, letterSpacing: 0.4),
                         ),
                       ),
-                    ],
                   ],
                 ),
                 if (note != null)
@@ -1002,7 +1006,9 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Text(title, style: const TextStyle(color: white, fontWeight: FontWeight.bold)),
+          // "Marcar como leído al responder" no cabe junto al Switch en un
+          // Android de 360dp: el título se parte en dos líneas.
+          Expanded(child: Text(title, style: const TextStyle(color: white, fontWeight: FontWeight.bold))),
           Switch(value: value, activeThumbColor: primaryAqua, onChanged: onChanged),
         ],
       ),
@@ -1081,7 +1087,15 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
                 children: [
                   Text(m['name']!, style: const TextStyle(color: white)),
                   const SizedBox(width: 8),
-                  Text('(${m['desc']})', style: TextStyle(color: primaryAqua.withValues(alpha: 0.7), fontSize: 11)),
+                  // Lo que se recorta en pantallas angostas es la descripción,
+                  // nunca el nombre del modelo.
+                  Flexible(
+                    child: Text(
+                      '(${m['desc']})',
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(color: primaryAqua.withValues(alpha: 0.7), fontSize: 11),
+                    ),
+                  ),
                 ],
               )
             )).toList(),
