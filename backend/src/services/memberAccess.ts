@@ -82,6 +82,22 @@ export async function canAccessSession(
   return memberHasSessionAccess(members.get(uid), sessionPhone);
 }
 
+// Todos los que ven la sesión: el owner y cada miembro con acceso. Es la
+// lista de a quién se le puede escribir un mensaje interno. null si members/
+// no se pudo leer: para un interno eso es "no sé a quién aviso", y falla.
+export async function sessionTeam(
+  accountId: string,
+  sessionPhone: string,
+): Promise<string[] | null> {
+  const members = await getMembers(accountId);
+  if (!members) return null;
+  const team = [accountId];
+  for (const [uid, access] of members) {
+    if (uid !== accountId && memberHasSessionAccess(access, sessionPhone)) team.push(uid);
+  }
+  return team;
+}
+
 export function invalidateMemberAccess(accountId: string): void {
   cache.delete(accountId);
   epochs.set(accountId, (epochs.get(accountId) ?? 0) + 1);

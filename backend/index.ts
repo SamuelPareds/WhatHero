@@ -59,6 +59,8 @@ import { generateTempPassword } from './src/utils/password';
 import { probeVideo } from './src/utils/videoProbe';
 import { resolveHumanSender, BOT_SENDER, invalidateHumanNameCache } from './src/services/senderResolver';
 import { initPresence, registerPresenceHandlers, revalidatePresenceAccess, isComposingIn } from './src/services/presenceService';
+import { canAccessSession, invalidateMemberAccess } from './src/services/memberAccess';
+import { parseInternalMessageInput, listTeammates, createInternalMessage } from './src/services/internalMessages';
 
 // Ensure auth_info directory exists
 const authInfoDir = 'auth_info';
@@ -1734,6 +1736,72 @@ app.post('/mark-chat-read', express.json(), verifyHttpAuth(), async (req, res) =
   }
 });
 
+// ============================================
+// 🔒 Mensajes internos del equipo (ver src/services/internalMessages.ts).
+// No dependen de la sesión de WhatsApp: funcionan aunque esté reconectando.
+// ============================================
+
+// Con quién puedo hablar en esta sesión (el owner y los miembros que la ven,
+// sin mí). Lo resuelve el backend porque un miembro no puede leer el nombre
+// del owner: users/{uid} es privado.
+app.post('/internal-messages/teammates', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const { accountId, sessionId } = req.body;
+    const uid = req.auth!.uid;
+    if (typeof sessionId !== 'string' || !sessionId) {
+      return res.status(400).json({ error: 'Missing sessionId' });
+    }
+    if (!(await canAccessSession(accountId, uid, sessionId))) {
+      return res.status(403).json({ error: 'Sin acceso a esta sesión' });
+    }
+    const teammates = await listTeammates(accountId, sessionId, uid);
+    if (!teammates) return res.status(503).json({ error: 'No se pudo leer el equipo' });
+    res.json({ teammates });
+  } catch (error) {
+    console.error('[/internal-messages/teammates] Error:', error);
+    res.status(500).json({ error: 'Failed to list teammates' });
+  }
+});
+
+app.post('/internal-messages', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const { accountId } = req.body;
+    const uid = req.auth!.uid;
+    const parsed = parseInternalMessageInput(req.body);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    if (!(await canAccessSession(accountId, uid, parsed.value.sessionId))) {
+      return res.status(403).json({ error: 'Sin acceso a esta sesión' });
+    }
+    const result = await createInternalMessage(accountId, uid, parsed.value);
+    if (result === 'team_unavailable') {
+      return res.status(503).json({ error: 'No se pudo verificar el equipo, reintenta' });
+    }
+    res.json({ success: true, id: parsed.value.id, duplicate: result === 'duplicate' });
+  } catch (error) {
+    console.error('[/internal-messages] Error:', error);
+    res.status(500).json({
+      error: 'Failed to save internal message',
+      details: (error as any).message,
+    });
+  }
+});
+
+// Borra lo que devuelva la consulta, en lotes de 500 (límite de batch de
+// Firestore). Devuelve cuántos docs borró.
+async function deleteInBatches(query: admin.firestore.Query): Promise<number> {
+  let deleted = 0;
+  while (true) {
+    const snap = await query.limit(500).get();
+    if (snap.empty) break;
+    const batch = db.batch();
+    snap.docs.forEach((doc) => batch.delete(doc.ref));
+    await batch.commit();
+    deleted += snap.size;
+    if (snap.size < 500) break;
+  }
+  return deleted;
+}
+
 // Borrado completo de un chat: Storage + mensajes + chat doc.
 // Hard-delete irreversible. La UI exige doble confirmación antes de invocar este endpoint.
 app.post('/delete-chat', express.json(), verifyHttpAuth(), async (req, res) => {
@@ -1773,25 +1841,20 @@ app.post('/delete-chat', express.json(), verifyHttpAuth(), async (req, res) => {
     }
 
     // Paso 2: Mensajes en lotes de 500 (límite de batch de Firestore).
-    const chatRef = db
+    const sessionRef = db
       .collection(ACCOUNTS_COLLECTION)
       .doc(accountId)
       .collection('whatsapp_sessions')
-      .doc(sessionId)
-      .collection('chats')
-      .doc(phoneNumber);
+      .doc(sessionId);
+    const chatRef = sessionRef.collection('chats').doc(phoneNumber);
 
-    const messagesRef = chatRef.collection('messages');
-    let deletedMessages = 0;
-    while (true) {
-      const snap = await messagesRef.limit(500).get();
-      if (snap.empty) break;
-      const batch = db.batch();
-      snap.docs.forEach((doc) => batch.delete(doc.ref));
-      await batch.commit();
-      deletedMessages += snap.size;
-      if (snap.size < 500) break;
-    }
+    const deletedMessages = await deleteInBatches(chatRef.collection('messages'));
+    // Los internos del equipo también. Si el cliente vuelve a escribir, el
+    // chat renace con el mismo id, y sin esto reaparecería "dile que no, es
+    // muy insistente" en una conversación que se suponía borrada.
+    await deleteInBatches(
+      sessionRef.collection('internal_messages').where('chatId', '==', phoneNumber),
+    );
 
     // Paso 3: Chat doc.
     await chatRef.delete();
@@ -1968,6 +2031,9 @@ app.post('/accounts/members', express.json(), verifyHttpAuth(), async (req, res)
     // 7. Cache: si hubiera un cache stale para el owner, da igual; lo del
     //    sub-user ya quedó listo en Firestore + claims.
     invalidateMembershipCache(newUser.uid);
+    // Y el de accesos por sesión: sin esto el miembro nuevo tardaba hasta
+    // 60 s en entrar a la presencia del equipo y en aparecer en "Avisar a".
+    invalidateMemberAccess(accountId);
 
     console.log(
       `[/accounts/members] uid=${requesterUid} creó miembro ${newUser.uid} (${cleanEmail}) en cuenta ${accountId}`,

@@ -1057,6 +1057,30 @@ export async function reconcileContactNames(sessionKey: string, accountId: strin
   console.log(`[Reconcile] Sesión ${sessionId}: ${scanned} chats escaneados, ${updated} nombres actualizados.`);
 }
 
+// Los internos del equipo guardan su chatId. Si se quedaran apuntando al LID,
+// desaparecerían de la conversación consolidada y la bandeja "Para ti"
+// abriría un chat que ya no existe.
+async function repointInternalMessages(
+  accountId: string,
+  sessionId: string,
+  fromChatId: string,
+  toChatId: string,
+): Promise<void> {
+  const snap = await getDb()
+    .collection(ACCOUNTS_COLLECTION)
+    .doc(accountId)
+    .collection('whatsapp_sessions')
+    .doc(sessionId)
+    .collection('internal_messages')
+    .where('chatId', '==', fromChatId)
+    .get();
+  if (snap.empty) return;
+  const batch = getDb().batch();
+  snap.docs.forEach((doc) => batch.update(doc.ref, { chatId: toChatId }));
+  await batch.commit();
+  console.log(`[Consolidate] ${snap.size} mensajes internos movidos de ${fromChatId} a ${toChatId}`);
+}
+
 // Consolidate duplicate chats when LID-to-Phone mapping is discovered
 // If a chat exists under a LID identifier, migrate it to the real phone number
 export async function consolidateLIDChat(
@@ -1119,6 +1143,7 @@ export async function consolidateLIDChat(
       console.log(`[Consolidate] Migrated ${lidMessagesSnapshot.size} messages from LID ${lid} to ${phoneNumber}`);
 
       // Delete LID chat document
+      await repointInternalMessages(accountId, sessionId, lid, phoneNumber);
       await lidChatRef.delete();
       console.log(`[Consolidate] Deleted LID chat document for ${lid}`);
     } else {
@@ -1140,6 +1165,7 @@ export async function consolidateLIDChat(
       await batch.commit();
 
       // Delete LID chat
+      await repointInternalMessages(accountId, sessionId, lid, phoneNumber);
       await lidChatRef.delete();
       console.log(`[Consolidate] Renamed LID chat ${lid} → ${phoneNumber}, migrated ${lidMessagesSnapshot.size} messages`);
     }

@@ -366,6 +366,38 @@ Cubre lo que la presencia no alcanza: dos personas escriben a la vez, una envía
 
 ---
 
+## 🔒 Mensajes internos del equipo (hablar dentro del chat sin que el cliente lo vea)
+
+El equipo se pasaba a WhatsApp para coordinarse ("dile que sí a la promo", "¿me ayudas con este chat?") y después volvía a WhatHero a contestar. Ahora se habla **dentro de la conversación**: el candado 🔒 del composer cambia a modo interno, el mensaje queda como tarjeta violeta centrada en el chat y le llega a quien elijas por push, por un badge en la lista y por la bandeja "Para ti".
+
+### Nunca en `messages/`
+Viven en una colección plana de la sesión: `whatsapp_sessions/{sid}/internal_messages/{id}` con `chatId`. **No se mueven a `chats/{id}/messages`.** Todo lo que lee ahí le habla al cliente o habla de él: el historial de la IA, el discriminador, el agente de seguimiento, el preview y la ✓ de la lista, los pendientes, el buscador, la guarda de choque. Un interno ahí adentro es una fuga esperando su turno: la IA repitiéndole al cliente "dile que no, es muy insistente". Separados, ningún camino tiene que acordarse de filtrarlos. **Plana** para que la bandeja sea una sola consulta (`recipientUids array-contains`) y no una por chat.
+
+- **El backend es el único que escribe** (`POST /internal-messages`, `internalMessages.ts`): fija el autor, sólo avisa a quien ve la sesión (`sessionTeam` en `memberAccess.ts`, la misma regla que la presencia y las notificaciones) y manda el push. **El id lo genera la app**: un reintento choca con el original (`create` → `ALREADY_EXISTS`) en vez de duplicar mensaje y aviso.
+- **Dos índices compuestos** en `firestore.indexes.json` (`chatId + timestamp` para la conversación, `recipientUids + timestamp` para la bandeja). Se despliegan **antes** que el código: sin ellos las dos consultas fallan.
+- **Lo que mueve o borra un chat tiene que mover o borrar sus internos.** `/delete-chat` los borra (si no, al volver a escribir el cliente el chat renace con el mismo id y reaparece la conversación interna) y la consolidación de LID les cambia el `chatId` (`repointInternalMessages`).
+- **El badge es `internal_unread.{uid}` en el doc del chat**: el backend suma por destinatario con `update` (nunca `set`: un chat abierto con "Nuevo chat" todavía no tiene doc y quedaría uno fantasma). La app lo borra desde el stream del chat abierto, así se apaga entre por donde entre (lista, push, flechas, buscador, bandeja). La bandeja no guarda "leído" por mensaje: si un chat tiene N sin ver, son sus N internos más nuevos.
+
+### El composer en modo interno
+- **El modo es pegajoso: después de enviar NO vuelve solo a "responder al cliente".** Volver solo es la falla cara (el siguiente mensaje para el compañero le llega al cliente); quedarse es la barata (lo que era para el cliente sale violeta, a la vista, y no le llega a nadie de afuera). Se sale con la ✕, con el candado o cambiando de chat. Por lo mismo, citar un mensaje en modo interno **no** cambia de modo: avisa.
+- **Escribir un interno no cuenta como "respondiendo"** (`composing` exige `!_internalMode`): el compañero vería "respondiendo…" y se quedaría esperando, y la IA en "esperando…" le cedería el turno a alguien que no le está contestando al cliente. Tampoco pasa por la guarda de choque, no cierra el seguimiento del agente ni toca los pendientes.
+- **"Avisar a" por defecto:** quien está en el chat (presencia). Si no hay nadie y el equipo es de dos, el compañero. Si no, nadie, y la franja lo dice. Sin compañeros con acceso a la sesión el candado ni aparece.
+- En modo interno se esconden el clip, el botón de IA y las respuestas rápidas `/`: v1 es sólo texto.
+
+### La bandeja "Para ti"
+- **Escritorio:** franja de 48 px a la derecha con contador y flechita; desplegada mide 320 px y se recuerda por dispositivo. **Sólo se despliega al lado si el chat conserva ≥420 px** (`_minDetailWidth`); si no, la franja la abre flotando encima. No aplastar el detalle: su AppBar está probado a 360 dp.
+- **Móvil:** ícono con contador en el AppBar de la lista, abre el panel desde la derecha. **Sin gesto de arrastre** (`endDrawerEnableOpenDragGesture: false`): le robaría el deslizamiento "Listo / Pendiente" de los chats.
+- Es **por sesión**: los internos de otra sesión llegan por push, que al tocarse cambia de sesión.
+
+### El push
+`reason: 'internal_message'`, título `🔒 Autor · Contacto`. **Sólo a dispositivos con `uid` de un destinatario** (`requireUid`): al revés que la atención humana, un teléfono legacy sin dueño conocido no lo recibe. **Tag propio** (`whathero:internal:…`, también en el service worker web) para no reemplazar en la bandeja del teléfono un aviso de "atención humana" del mismo chat. El banner en primer plano sale violeta. El `apns-collapse-id` de todos los pushes es un hash del tag: APNs corta en 64 bytes y el tag de un chat mexicano mide 65, así que se perdía el último dígito del chat.
+
+Las reglas viven en `backend/src/services/internalMessages.test.ts` y `test/internal_timeline_test.dart`.
+
+**Fase 2 (no está hecho):** adjuntos, editar o borrar internos, citar un mensaje del cliente dentro de un interno, "pedir ayuda" desde la lista sin abrir el chat, modo interno con la sesión desvinculada (hoy el composer entero se esconde), y que la IA lea instrucciones internas (delicado: necesita su propio diseño).
+
+---
+
 ## 📤 Llevarse la evidencia (copiar y guardar fotos y videos)
 
 Una foto abierta a pantalla completa era un callejón sin salida: los dos visores

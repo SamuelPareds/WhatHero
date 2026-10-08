@@ -12,12 +12,15 @@ import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/utils/media_mime.dart';
 import 'package:crm_whatsapp/core/utils/quick_response_attachment.dart';
 import 'package:crm_whatsapp/core/services/api_client.dart';
+import 'package:crm_whatsapp/core/services/internal_messages_service.dart';
 import 'package:crm_whatsapp/core/services/pending_messages_service.dart';
 import 'package:crm_whatsapp/core/services/presence_reporter.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/core/services/team_presence_service.dart';
 import 'package:crm_whatsapp/features/settings.dart';
+import 'internal_timeline.dart';
 import 'reply_collision.dart';
+import 'widgets/internal_message_card.dart';
 import 'widgets/message_bubble.dart';
 import 'widgets/team_presence_banner.dart';
 
@@ -163,7 +166,48 @@ class _MessagesViewState extends State<MessagesView> {
   bool _collisionAcked = false;
   final String? _myUid = FirebaseAuth.instance.currentUser?.uid;
 
+  // 🔒 Mensajes internos (el cliente no los ve). El modo es pegajoso a
+  // propósito: tras enviar uno NO se vuelve solo a "responder al cliente".
+  // Volver solo es la falla cara: el siguiente mensaje para el compañero
+  // ("dile que no, es muy insistente") le llegaría al cliente. Quedarse es la
+  // barata: lo que era para el cliente sale violeta, a la vista, y no le
+  // llega a nadie de afuera.
+  bool _internalMode = false;
+  // Vacío = estoy solo en la cuenta (o no se pudo leer el equipo): el candado
+  // ni aparece.
+  List<Teammate> _teammates = const [];
+  Set<String> _internalRecipients = {};
+  // Una sola suscripción por chat: creada en build se recrearía con cada
+  // setState.
+  late final Stream<QuerySnapshot> _internalStream = FirebaseFirestore.instance
+      .collection(accountsCollection)
+      .doc(widget.accountId)
+      .collection('whatsapp_sessions')
+      .doc(widget.sessionId)
+      .collection('internal_messages')
+      .where('chatId', isEqualTo: widget.phoneNumber)
+      .orderBy('timestamp', descending: true)
+      .limit(200)
+      .snapshots();
+
+  // Lo que más se piden los compañeros, a un toque. Sólo con el composer
+  // vacío: se insertan para editarlas, no se envían solas.
+  static const _internalQuickPhrases = [
+    '¿Me ayudas con este chat?',
+    '¿Puedes contestarle tú?',
+    'Yo lo atiendo',
+  ];
+
   void _setReplyDraft(ReplyDraft draft) {
+    // Citar es responderle al cliente. No cambiamos de modo por nuestra
+    // cuenta: con texto interno en el composer, eso se lo mandaría al cliente.
+    if (_internalMode) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Para citar un mensaje, vuelve a responder al cliente'),
+        duration: Duration(seconds: 2),
+      ));
+      return;
+    }
     _replyDraft.value = draft;
     _inputFocusNode.requestFocus();
   }
@@ -232,7 +276,10 @@ class _MessagesViewState extends State<MessagesView> {
     // Presencia: texto en el composer = "estoy respondiendo". Cambia unas dos
     // veces por mensaje, no por tecla. En móvil el teclado en pantalla no
     // genera eventos de tecla, así que escribir también cuenta como actividad.
-    final composing = _messageController.text.trim().isNotEmpty;
+    // Un mensaje interno no le responde al cliente: si contara, el compañero
+    // vería "respondiendo…" y se quedaría esperando, y la IA se pausaría.
+    final composing =
+        !_internalMode && _messageController.text.trim().isNotEmpty;
     PresenceReporter.instance
         .setComposing(widget.sessionId, widget.phoneNumber, composing);
     PresenceReporter.instance.noteActivity();
@@ -259,6 +306,12 @@ class _MessagesViewState extends State<MessagesView> {
     }
     // Si el agente de seguimiento dejó un borrador para este chat, lo cargamos.
     _loadFollowupDraft();
+    // Con el equipo ya en cache el candado sale en el primer frame, sin
+    // aparecer después y empujar el texto.
+    _teammates = InternalMessagesService()
+            .cachedTeammates(widget.accountId, widget.sessionId) ??
+        const [];
+    _loadTeammates();
   }
 
   @override
@@ -349,10 +402,14 @@ class _MessagesViewState extends State<MessagesView> {
   // scroll + resalte; si la página está llena (falta cargarlo) → crece; si no,
   // esperamos el siguiente snapshot. Nunca declara "no encontrado" (eso lo
   // resolvió el .get() directo, inmune a la caché vieja del StreamBuilder).
-  void _resolveJump(List<QueryDocumentSnapshot> messages) {
+  // `timeline` es lo que se pinta (con los internos): de ahí sale la posición
+  // para el scroll. Si falta historial lo dice `messages`, que es lo paginado.
+  void _resolveJump(
+      List<QueryDocumentSnapshot> messages, List<Object> timeline) {
     final id = _pendingJumpId;
     if (id == null) return;
-    final idx = messages.indexWhere((d) => d.id == id);
+    final idx = timeline
+        .indexWhere((e) => e is QueryDocumentSnapshot && e.id == id);
     if (idx >= 0) {
       _jumpScrolling = true;
       setState(() {
@@ -370,7 +427,7 @@ class _MessagesViewState extends State<MessagesView> {
           return;
         }
         final max = _scrollController.position.maxScrollExtent;
-        final frac = messages.length <= 1 ? 0.0 : idx / (messages.length - 1);
+        final frac = timeline.length <= 1 ? 0.0 : idx / (timeline.length - 1);
         _scrollController.jumpTo((frac * max).clamp(0.0, max));
         WidgetsBinding.instance.addPostFrameCallback((_) {
           final ctx = _jumpKey.currentContext;
@@ -658,9 +715,233 @@ class _MessagesViewState extends State<MessagesView> {
     );
   }
 
-  // Tap en una burbuja fallida → Reintentar (mismo tempId y payload, la
-  // burbuja vuelve al relojito en su lugar) o Descartar.
-  void _showRetrySheet(PendingMessage p) {
+  // ─── Mensajes internos del equipo ──────────────────────────────────────
+
+  Future<void> _loadTeammates() async {
+    final team = await InternalMessagesService()
+        .teammates(widget.accountId, widget.sessionId);
+    if (mounted && team.isNotEmpty) setState(() => _teammates = team);
+  }
+
+  void _setInternalMode(bool on) {
+    if (on == _internalMode) return;
+    setState(() {
+      _internalMode = on;
+      if (on) _internalRecipients = _defaultRecipients();
+    });
+    if (on) {
+      _clearReplyDraft(); // citar es hablarle al cliente
+      _activeTokenRange = null;
+      _closeQuickResponses();
+    }
+    // El mismo texto cambia de significado: en modo interno no le estás
+    // respondiendo al cliente (la IA no te espera, el equipo no ve
+    // "respondiendo…" y no hay choque que vigilar).
+    _updateHasText();
+    _inputFocusNode.requestFocus();
+  }
+
+  // Quien está en el chat es casi siempre a quien le hablas ("veo que Mayra
+  // lo tiene abierto"). Si no hay nadie y el equipo es de dos, no hay duda.
+  Set<String> _defaultRecipients() {
+    final teamUids = {for (final t in _teammates) t.uid};
+    final here = {
+      for (final v in TeamPresenceService()
+          .othersIn(widget.sessionId, widget.phoneNumber))
+        if (teamUids.contains(v.uid)) v.uid,
+    };
+    if (here.isNotEmpty) return here;
+    if (_teammates.length == 1) return {_teammates.first.uid};
+    return {};
+  }
+
+  void _toggleRecipient(String uid) {
+    setState(() {
+      if (!_internalRecipients.remove(uid)) _internalRecipients.add(uid);
+    });
+  }
+
+  void _insertInternalPhrase(String phrase) {
+    _messageController.text = phrase;
+    _messageController.selection =
+        TextSelection.collapsed(offset: phrase.length);
+    _inputFocusNode.requestFocus();
+  }
+
+  // Al equipo. Optimista igual que al cliente: la tarjeta aparece ya y un
+  // fallo la deja roja con Reintentar. No pasa por la guarda de choque, no
+  // cierra el seguimiento del agente ni toca los pendientes: el cliente no se
+  // enteró de nada.
+  void _sendInternal() {
+    final text = _messageController.text.trim();
+    if (text.isEmpty) return;
+    if (text.length > InternalMessagesService.textMax) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(
+            'Máximo ${InternalMessagesService.textMax} caracteres en un mensaje interno'),
+      ));
+      return;
+    }
+    _messageController.clear();
+    _scrollToNewest();
+    InternalMessagesService().send(
+      accountId: widget.accountId,
+      sessionId: widget.sessionId,
+      chatId: widget.phoneNumber,
+      text: text,
+      recipients: [
+        for (final t in _teammates)
+          if (_internalRecipients.contains(t.uid)) t,
+      ],
+    );
+  }
+
+  // Franja del modo interno, sobre el composer: qué estás haciendo (el
+  // cliente no lo ve), a quién le llega el aviso y, con el composer vacío,
+  // los atajos de frase.
+  Widget _internalStrip() {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.fromLTRB(10, 2, 4, 8),
+      decoration: BoxDecoration(
+        color: teamViolet.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(8),
+        border: const Border(left: BorderSide(color: teamViolet, width: 3)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.lock, size: 14, color: teamViolet),
+              const SizedBox(width: 6),
+              const Expanded(
+                child: Text(
+                  'Mensaje interno · el cliente no lo verá',
+                  style: TextStyle(
+                    color: teamViolet,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              IconButton(
+                icon: const Icon(Icons.close, size: 18),
+                color: lightText,
+                tooltip: 'Volver a responder al cliente',
+                onPressed: () => _setInternalMode(false),
+                splashRadius: 18,
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+              ),
+            ],
+          ),
+          ListenableBuilder(
+            listenable: TeamPresenceService(),
+            builder: (context, _) {
+              final here = {
+                for (final v in TeamPresenceService()
+                    .othersIn(widget.sessionId, widget.phoneNumber))
+                  v.uid,
+              };
+              return SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(
+                  children: [
+                    Text(
+                      'Avisar a',
+                      style: TextStyle(
+                        color: lightText.withValues(alpha: 0.8),
+                        fontSize: 11.5,
+                      ),
+                    ),
+                    for (final t in _teammates)
+                      Padding(
+                        padding: const EdgeInsets.only(left: 6),
+                        child: _InternalChip(
+                          label: t.name,
+                          selected: _internalRecipients.contains(t.uid),
+                          inChat: here.contains(t.uid),
+                          onTap: () => _toggleRecipient(t.uid),
+                        ),
+                      ),
+                  ],
+                ),
+              );
+            },
+          ),
+          if (_internalRecipients.isEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                'Nadie recibe aviso · queda escrito en el chat',
+                style: TextStyle(
+                  color: lightText.withValues(alpha: 0.7),
+                  fontSize: 11,
+                ),
+              ),
+            ),
+          ValueListenableBuilder<bool>(
+            valueListenable: _hasText,
+            builder: (context, hasText, _) {
+              if (hasText) return const SizedBox.shrink();
+              return Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                    children: [
+                      for (final phrase in _internalQuickPhrases)
+                        Padding(
+                          padding: const EdgeInsets.only(right: 6),
+                          child: _InternalChip(
+                            label: phrase,
+                            selected: false,
+                            subtle: true,
+                            onTap: () => _insertInternalPhrase(phrase),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  // El candado del composer: alterna entre responder al cliente y hablarle al
+  // equipo. Va dentro del campo para que no desaparezca al escribir (el clip
+  // de adjuntar sí se esconde) y para no robarle ancho al teléfono.
+  Widget _internalToggle() {
+    return IconButton(
+      icon: Icon(_internalMode ? Icons.lock : Icons.lock_outline, size: 18),
+      color: _internalMode ? teamViolet : lightText.withValues(alpha: 0.6),
+      tooltip: _internalMode
+          ? 'Volver a responder al cliente'
+          : 'Mensaje interno al equipo · el cliente no lo ve',
+      onPressed: () => _setInternalMode(!_internalMode),
+    );
+  }
+
+  OutlineInputBorder _composerBorder({double width = 1}) => OutlineInputBorder(
+        borderRadius: BorderRadius.circular(12),
+        borderSide: _internalMode
+            ? BorderSide(color: teamViolet, width: width)
+            : BorderSide.none,
+      );
+
+  // Tap en una burbuja fallida → Reintentar o Descartar. La comparten los
+  // mensajes al cliente (mismo tempId y payload: la burbuja vuelve al relojito
+  // en su lugar) y los internos (mismo id: el backend no los duplica).
+  void _showRetrySheet({
+    String? error,
+    required VoidCallback onRetry,
+    required VoidCallback onDiscard,
+  }) {
     showModalBottomSheet(
       context: context,
       backgroundColor: surfaceDark,
@@ -674,7 +955,7 @@ class _MessagesViewState extends State<MessagesView> {
             Padding(
               padding: const EdgeInsets.fromLTRB(24, 16, 24, 4),
               child: Text(
-                'No se pudo enviar${p.error != null ? ': ${p.error}' : ''}',
+                'No se pudo enviar${error != null ? ': $error' : ''}',
                 style: TextStyle(color: lightText.withValues(alpha: 0.8), fontSize: 13),
               ),
             ),
@@ -683,8 +964,7 @@ class _MessagesViewState extends State<MessagesView> {
               title: const Text('Reintentar', style: TextStyle(color: white)),
               onTap: () {
                 Navigator.pop(sheetContext);
-                PendingMessagesService().markRetrying(p.tempId);
-                _transmitPending(p.payload);
+                onRetry();
               },
             ),
             ListTile(
@@ -692,7 +972,7 @@ class _MessagesViewState extends State<MessagesView> {
               title: Text('Descartar mensaje', style: TextStyle(color: Colors.red.shade400)),
               onTap: () {
                 Navigator.pop(sheetContext);
-                PendingMessagesService().discard(p.tempId);
+                onDiscard();
               },
             ),
           ],
@@ -1179,6 +1459,8 @@ class _MessagesViewState extends State<MessagesView> {
   }
 
   void _handleQuickResponseInput(String value) {
+    // Las plantillas son para el cliente; con adjunto, además, se envían.
+    if (_internalMode) return;
     final sel = _messageController.selection;
     final cursor = sel.isValid ? sel.baseOffset : value.length;
     final token = _activeSlashToken(value, cursor);
@@ -1519,7 +1801,8 @@ class _MessagesViewState extends State<MessagesView> {
     final hit = _collisionDetector.onSnapshot(
       idsNewestFirst: [for (final d in docs) d.id],
       fromCache: snapshot.metadata.isFromCache,
-      composing: _messageController.text.trim().isNotEmpty,
+      // Escribiéndole al equipo no hay respuesta al cliente que pueda chocar.
+      composing: !_internalMode && _messageController.text.trim().isNotEmpty,
       myUid: _myUid,
       read: (id) {
         final data = docs.firstWhere((d) => d.id == id).data()
@@ -1566,6 +1849,60 @@ class _MessagesViewState extends State<MessagesView> {
     _collisionAcked = false;
   }
 
+  DateTime _waTime(QueryDocumentSnapshot d) =>
+      ((d.data() as Map<String, dynamic>)['timestamp'] as Timestamp).toDate();
+
+  DateTime _entryTime(Object entry) => entry is InternalMessage
+      ? entry.timestamp
+      : _waTime(entry as QueryDocumentSnapshot);
+
+  // Burbuja de un mensaje de WhatsApp (del cliente o nuestro hacia él).
+  Widget _buildWaBubble(QueryDocumentSnapshot msg, DateTime msgDate) {
+    final data = msg.data() as Map<String, dynamic>;
+    // Snapshot para el draft: el preview en la franja del composer
+    // muestra el texto del mensaje (o un fallback si era media sin
+    // caption — usamos el mismo prefijo del backend, ej. "📷 Imagen").
+    final msgText = (data['text'] as String?) ?? '';
+    final msgMediaType = data['mediaType'] as String?;
+    final draftPreview = _previewForDraft(msgText, msgMediaType);
+
+    return MessageBubble(
+      key: ValueKey(msg.id),
+      text: msgText,
+      fromMe: (data['fromMe'] as bool?) ?? false,
+      timestamp: msgDate,
+      messageId: msg.id,
+      chatPhone: widget.phoneNumber,
+      sessionKey: widget.sessionKey,
+      accountId: widget.accountId,
+      sessionPhone: widget.sessionId,
+      senderType: data['senderType'] as String?,
+      senderName: data['senderName'] as String?,
+      mediaType: msgMediaType,
+      mediaThumbBase64: data['mediaThumbBase64'] as String?,
+      mediaWidth: (data['mediaWidth'] as num?)?.toDouble(),
+      mediaHeight: (data['mediaHeight'] as num?)?.toDouble(),
+      mediaUrl: data['mediaUrl'] as String?,
+      mediaStatus: data['mediaStatus'] as String?,
+      mediaFileName: data['mediaFileName'] as String?,
+      mediaSize: (data['mediaSize'] as num?)?.toInt(),
+      mediaIsPtt: data['mediaIsPtt'] as bool?,
+      mediaDuration: (data['mediaDuration'] as num?)?.toInt(),
+      mediaIsGif: data['mediaIsGif'] as bool?,
+      reactions: data['reactions'] as Map<String, dynamic>?,
+      edited: data['edited'] as bool?,
+      revoked: data['revoked'] as bool?,
+      quotedMessageId: data['quotedMessageId'] as String?,
+      quotedText: data['quotedText'] as String?,
+      quotedFromMe: data['quotedFromMe'] as bool?,
+      onReplyTap: () => _setReplyDraft(ReplyDraft(
+        messageId: msg.id,
+        text: draftPreview,
+        fromMe: (data['fromMe'] as bool?) ?? false,
+      )),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Column(
@@ -1604,33 +1941,57 @@ class _MessagesViewState extends State<MessagesView> {
                 _hasMore = false;
               }
 
-              // Salto pendiente: tras pintar este set intentamos localizar el
-              // mensaje objetivo (post-frame para no llamar setState en build).
-              if (_pendingJumpId != null) {
-                WidgetsBinding.instance.addPostFrameCallback((_) {
-                  if (mounted) _resolveJump(messages);
-                });
-              }
-
               // Capa optimista: burbujas locales en vuelo (relojito/fallidas)
               // por encima del stream de Firestore. ListenableBuilder para que
               // los acks (✓✓ / fallo) rebuildeen sin tocar el StreamBuilder.
               final pendingChatKey = PendingMessagesService.chatKey(
                   widget.sessionKey, widget.phoneNumber);
-              return ListenableBuilder(
-                listenable: PendingMessagesService(),
+              // Los internos del equipo van por su propio stream: no viven en
+              // `messages/` (ver backend/src/services/internalMessages.ts). Si
+              // todavía no llegó, la conversación se pinta igual sin ellos.
+              return StreamBuilder<QuerySnapshot>(
+                stream: _internalStream,
+                builder: (context, internalSnapshot) {
+                  return ListenableBuilder(
+                listenable: Listenable.merge(
+                    [PendingMessagesService(), InternalMessagesService()]),
                 builder: (context, _) {
                   final docIds = <String>{for (final d in messages) d.id};
                   final pendings = PendingMessagesService()
                       .visibleForChat(pendingChatKey, docIds);
+                  final internalDocs = internalSnapshot.data?.docs ??
+                      const <QueryDocumentSnapshot>[];
+                  final internalIds = <String>{for (final d in internalDocs) d.id};
+                  final internal = [
+                    ...InternalMessagesService().pendingFor(
+                        widget.sessionId, widget.phoneNumber, internalIds),
+                    ...internalDocs.map(InternalMessage.fromDoc).nonNulls,
+                  ]..sort((a, b) => b.timestamp.compareTo(a.timestamp));
                   // Purga post-frame de burbujas cuyo doc real ya llegó
                   // (mutar el service durante build está prohibido).
                   WidgetsBinding.instance.addPostFrameCallback((_) {
                     PendingMessagesService()
                         .purgeReconciled(pendingChatKey, docIds);
+                    InternalMessagesService().purgeReconciled(
+                        widget.sessionId, widget.phoneNumber, internalIds);
                   });
 
-                  if (messages.isEmpty && pendings.isEmpty) {
+                  final timeline = mergeTimeline<QueryDocumentSnapshot>(
+                    wa: messages,
+                    waTime: _waTime,
+                    internal: internal,
+                    waComplete: !_hasMore,
+                  );
+
+                  // Salto pendiente: tras pintar este set intentamos localizar el
+                  // mensaje objetivo (post-frame para no llamar setState en build).
+                  if (_pendingJumpId != null) {
+                    WidgetsBinding.instance.addPostFrameCallback((_) {
+                      if (mounted) _resolveJump(messages, timeline);
+                    });
+                  }
+
+                  if (timeline.isEmpty && pendings.isEmpty) {
                     return const Center(child: Text('Sin mensajes', style: TextStyle(color: lightText, fontSize: 16)));
                   }
 
@@ -1641,7 +2002,7 @@ class _MessagesViewState extends State<MessagesView> {
                 keyboardDismissBehavior:
                     ScrollViewKeyboardDismissBehavior.onDrag,
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
-                itemCount: pendings.length + messages.length + (_hasMore ? 1 : 0),
+                itemCount: pendings.length + timeline.length + (_hasMore ? 1 : 0),
                 reverse: true, // Importante: el índice 0 es el mensaje más nuevo (abajo)
                 itemBuilder: (context, index) {
                   // Burbujas optimistas primero: con reverse:true el índice 0
@@ -1666,13 +2027,20 @@ class _MessagesViewState extends State<MessagesView> {
                         PendingStatus.sent => 'sent',
                         PendingStatus.failed => 'failed',
                       },
-                      onRetryTap: () => _showRetrySheet(p),
+                      onRetryTap: () => _showRetrySheet(
+                        error: p.error,
+                        onRetry: () {
+                          PendingMessagesService().markRetrying(p.tempId);
+                          _transmitPending(p.payload);
+                        },
+                        onDiscard: () => PendingMessagesService().discard(p.tempId),
+                      ),
                     );
                   }
 
-                  final msgIndex = index - pendings.length;
+                  final entryIndex = index - pendings.length;
                   // Si es el último elemento y hay más, mostrar spinner de carga
-                  if (msgIndex == messages.length) {
+                  if (entryIndex == timeline.length) {
                     return const Center(
                       child: Padding(
                         padding: EdgeInsets.symmetric(vertical: 20),
@@ -1685,65 +2053,32 @@ class _MessagesViewState extends State<MessagesView> {
                     );
                   }
 
-                  final msg = messages[msgIndex];
-                  final data = msg.data() as Map<String, dynamic>;
-                  // Snapshot para el draft: el preview en la franja del composer
-                  // muestra el texto del mensaje (o un fallback si era media sin
-                  // caption — usamos el mismo prefijo del backend, ej. "📷 Imagen").
-                  final msgText = (data['text'] as String?) ?? '';
-                  final msgMediaType = data['mediaType'] as String?;
-                  final draftPreview = _previewForDraft(msgText, msgMediaType);
-                  final msgDate = (data['timestamp'] as Timestamp).toDate();
+                  final entry = timeline[entryIndex];
+                  final entryDate = _entryTime(entry);
 
                   // Separador de día: en lista reverse:true, index mayor = más
-                  // viejo. Mostramos cabecera arriba de este bubble si es el
-                  // mensaje más viejo de su día en el set cargado (older==null)
-                  // o si el mensaje inmediatamente más viejo es de otro día.
-                  final olderDoc = (msgIndex + 1 < messages.length) ? messages[msgIndex + 1] : null;
-                  bool showSeparator = false;
-                  if (olderDoc == null) {
-                    showSeparator = true;
-                  } else {
-                    final olderData = olderDoc.data() as Map<String, dynamic>;
-                    final olderDate = (olderData['timestamp'] as Timestamp).toDate();
-                    showSeparator = !_isSameDay(msgDate, olderDate);
-                  }
+                  // viejo. Mostramos cabecera arriba de este elemento si es el
+                  // más viejo de su día en el set cargado (older==null) o si el
+                  // inmediatamente más viejo es de otro día. Los internos
+                  // cuentan igual que cualquier mensaje.
+                  final older = (entryIndex + 1 < timeline.length)
+                      ? timeline[entryIndex + 1]
+                      : null;
+                  final showSeparator =
+                      older == null || !_isSameDay(entryDate, _entryTime(older));
 
-                  final bubble = MessageBubble(
-                    key: ValueKey(msg.id),
-                    text: msgText,
-                    fromMe: (data['fromMe'] as bool?) ?? false,
-                    timestamp: msgDate,
-                    messageId: msg.id,
-                    chatPhone: widget.phoneNumber,
-                    sessionKey: widget.sessionKey,
-                    accountId: widget.accountId,
-                    sessionPhone: widget.sessionId,
-                    senderType: data['senderType'] as String?,
-                    senderName: data['senderName'] as String?,
-                    mediaType: msgMediaType,
-                    mediaThumbBase64: data['mediaThumbBase64'] as String?,
-                    mediaWidth: (data['mediaWidth'] as num?)?.toDouble(),
-                    mediaHeight: (data['mediaHeight'] as num?)?.toDouble(),
-                    mediaUrl: data['mediaUrl'] as String?,
-                    mediaStatus: data['mediaStatus'] as String?,
-                    mediaFileName: data['mediaFileName'] as String?,
-                    mediaSize: (data['mediaSize'] as num?)?.toInt(),
-                    mediaIsPtt: data['mediaIsPtt'] as bool?,
-                    mediaDuration: (data['mediaDuration'] as num?)?.toInt(),
-                    mediaIsGif: data['mediaIsGif'] as bool?,
-                    reactions: data['reactions'] as Map<String, dynamic>?,
-                    edited: data['edited'] as bool?,
-                    revoked: data['revoked'] as bool?,
-                    quotedMessageId: data['quotedMessageId'] as String?,
-                    quotedText: data['quotedText'] as String?,
-                    quotedFromMe: data['quotedFromMe'] as bool?,
-                    onReplyTap: () => _setReplyDraft(ReplyDraft(
-                      messageId: msg.id,
-                      text: draftPreview,
-                      fromMe: (data['fromMe'] as bool?) ?? false,
-                    )),
-                  );
+                  final Widget content = entry is InternalMessage
+                      ? InternalMessageCard(
+                          key: ValueKey('internal_${entry.id}'),
+                          message: entry,
+                          myUid: _myUid,
+                          onFailedTap: () => _showRetrySheet(
+                            error: entry.error,
+                            onRetry: () => InternalMessagesService().retry(entry.id),
+                            onDiscard: () => InternalMessagesService().discard(entry.id),
+                          ),
+                        )
+                      : _buildWaBubble(entry as QueryDocumentSnapshot, entryDate);
 
                   // El Column NO se reversea internamente — el listview sólo
                   // invierte el orden de items, no su contenido. Por eso el
@@ -1753,18 +2088,20 @@ class _MessagesViewState extends State<MessagesView> {
                       ? Column(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            _DateSeparator(_formatDaySeparator(msgDate)),
-                            bubble,
+                            _DateSeparator(_formatDaySeparator(entryDate)),
+                            content,
                           ],
                         )
-                      : bubble;
+                      : content;
 
                   // Burbuja objetivo del salto: ancla para ensureVisible + tinte
                   // aqua que se desvanece (~2.5s) para señalar el resultado.
-                  if (msg.id == _highlightId) {
+                  if (entry is QueryDocumentSnapshot && entry.id == _highlightId) {
                     return _JumpHighlight(key: _jumpKey, child: item);
                   }
                   return item;
+                },
+              );
                 },
               );
                 },
@@ -1820,6 +2157,9 @@ class _MessagesViewState extends State<MessagesView> {
                         myUid: _myUid,
                       ),
                     ),
+                    // 🔒 Modo interno: a quién se avisa y qué ve el cliente
+                    // (nada).
+                    if (_internalMode) _internalStrip(),
                     // Selector de respuestas rápidas ("/"): arriba de todo,
                     // pegado al composer y navegable con ↑/↓ + Enter.
                     _quickResponsesPanel(),
@@ -1939,7 +2279,8 @@ class _MessagesViewState extends State<MessagesView> {
                             alignment: Alignment.centerLeft,
                             child: FadeTransition(opacity: animation, child: child),
                           ),
-                          child: hasText
+                          // En modo interno tampoco: los internos son sólo texto.
+                          child: (hasText || _internalMode)
                               ? const SizedBox(key: ValueKey('attach-hidden'))
                               : IconButton(
                                   key: const ValueKey('attach-btn'),
@@ -1992,7 +2333,7 @@ class _MessagesViewState extends State<MessagesView> {
                           }
 
                           if (isPress && key == LogicalKeyboardKey.enter && !shift) {
-                            _sendMessage();
+                            _internalMode ? _sendInternal() : _sendMessage();
                             return KeyEventResult.handled;
                           }
                           return KeyEventResult.ignored;
@@ -2010,17 +2351,28 @@ class _MessagesViewState extends State<MessagesView> {
                           style: const TextStyle(color: white, fontSize: 15),
                           onChanged: _handleQuickResponseInput,
                           decoration: InputDecoration(
-                            hintText: '',
+                            hintText: _internalMode ? 'Mensaje interno…' : '',
                             hintStyle: const TextStyle(color: lightText),
-                            border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+                            // Los tres a mano: con sólo `border`, Flutter le
+                            // pone el color del tema y el violeta no se vería.
+                            border: _composerBorder(),
+                            enabledBorder: _composerBorder(),
+                            focusedBorder: _composerBorder(width: 1.5),
                             filled: true,
-                            fillColor: darkBg.withValues(alpha: 0.8),
+                            fillColor: _internalMode
+                                ? teamViolet.withValues(alpha: 0.12)
+                                : darkBg.withValues(alpha: 0.8),
                             contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                            prefixIcon: _teammates.isEmpty ? null : _internalToggle(),
+                            prefixIconConstraints:
+                                const BoxConstraints(minWidth: 40, minHeight: 40),
                           ),
                         ),
                       ),
                     ),
                     const SizedBox(width: 8),
+                    // En modo interno no hay respuesta al cliente que sugerir.
+                    if (!_internalMode)
                     _isGenerating
                         ? const SizedBox(width: 44, height: 44, child: Padding(padding: EdgeInsets.all(8), child: CircularProgressIndicator(strokeWidth: 2, valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF06B6D4)))))
                         : Builder(
@@ -2079,11 +2431,17 @@ class _MessagesViewState extends State<MessagesView> {
                           ),
                     const SizedBox(width: 4),
                     Container(
-                      decoration: BoxDecoration(color: primaryAqua, borderRadius: BorderRadius.circular(12)),
+                      decoration: BoxDecoration(
+                        color: _internalMode ? teamViolet : primaryAqua,
+                        borderRadius: BorderRadius.circular(12),
+                      ),
                       child: IconButton(
                         icon: _isSending ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, valueColor: AlwaysStoppedAnimation<Color>(darkBg))) : const Icon(Icons.send_rounded, size: 20),
-                        color: darkBg,
-                        onPressed: _isSending ? null : _sendMessage,
+                        color: _internalMode ? white : darkBg,
+                        tooltip: _internalMode ? 'Enviar al equipo' : null,
+                        onPressed: _isSending
+                            ? null
+                            : (_internalMode ? _sendInternal : _sendMessage),
                       ),
                     ),
                   ],
@@ -2515,6 +2873,69 @@ class _AttachmentPreviewDialogState extends State<_AttachmentPreviewDialog> {
           child: const Text('Enviar', style: TextStyle(color: darkBg, fontWeight: FontWeight.w600)),
         ),
       ],
+    );
+  }
+}
+
+// Chip de la franja interna: un destinatario de "Avisar a" (seleccionable, con
+// 👁 si está en este chat) o un atajo de frase (`subtle`).
+class _InternalChip extends StatelessWidget {
+  final String label;
+  final bool selected;
+  final bool inChat;
+  final bool subtle;
+  final VoidCallback onTap;
+
+  const _InternalChip({
+    required this.label,
+    required this.selected,
+    required this.onTap,
+    this.inChat = false,
+    this.subtle = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final fg = selected ? white : teamViolet;
+    return InkWell(
+      // Sin foco propio: tocar un chip no debe sacar el foco del composer.
+      canRequestFocus: false,
+      borderRadius: BorderRadius.circular(14),
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        decoration: BoxDecoration(
+          color: selected ? teamViolet : Colors.transparent,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: teamViolet.withValues(alpha: selected ? 1 : (subtle ? 0.3 : 0.6)),
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (selected) ...[
+              const Icon(Icons.check, size: 12, color: white),
+              const SizedBox(width: 4),
+            ],
+            Text(
+              label,
+              style: TextStyle(
+                color: subtle ? lightText : fg,
+                fontSize: 12,
+                fontWeight: subtle ? FontWeight.w500 : FontWeight.w600,
+              ),
+            ),
+            if (inChat) ...[
+              const SizedBox(width: 4),
+              Tooltip(
+                message: 'Está en este chat',
+                child: Icon(Icons.visibility, size: 11, color: fg),
+              ),
+            ],
+          ],
+        ),
+      ),
     );
   }
 }

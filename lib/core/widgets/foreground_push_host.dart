@@ -162,6 +162,10 @@ class _PushBannerState extends State<_PushBanner>
     final mq = MediaQuery.of(context);
     final title = widget.push.title?.trim();
     final body = widget.push.body?.trim();
+    // Un compañero te escribió (mensaje interno): violeta y candado, como todo
+    // lo del equipo, para que no se lea como un mensaje del cliente.
+    final internal = widget.push.isInternalMessage;
+    final accent = internal ? teamViolet : primaryAqua;
 
     return Positioned(
       top: mq.padding.top + 12,
@@ -188,7 +192,7 @@ class _PushBannerState extends State<_PushBanner>
                         color: surfaceDark,
                         borderRadius: BorderRadius.circular(16),
                         border: Border.all(
-                          color: primaryAqua.withValues(alpha: 0.45),
+                          color: accent.withValues(alpha: 0.45),
                           width: 1.2,
                         ),
                         boxShadow: [
@@ -206,12 +210,12 @@ class _PushBannerState extends State<_PushBanner>
                             width: 38,
                             height: 38,
                             decoration: BoxDecoration(
-                              color: primaryAqua.withValues(alpha: 0.18),
+                              color: accent.withValues(alpha: 0.18),
                               borderRadius: BorderRadius.circular(11),
                             ),
-                            child: const Icon(
-                              Icons.support_agent,
-                              color: primaryAqua,
+                            child: Icon(
+                              internal ? Icons.lock : Icons.support_agent,
+                              color: accent,
                               size: 22,
                             ),
                           ),
@@ -223,7 +227,9 @@ class _PushBannerState extends State<_PushBanner>
                                 Text(
                                   (title != null && title.isNotEmpty)
                                       ? title
-                                      : 'Atención humana requerida',
+                                      : (internal
+                                          ? 'Mensaje del equipo'
+                                          : 'Atención humana requerida'),
                                   style: const TextStyle(
                                     color: white,
                                     fontWeight: FontWeight.w700,

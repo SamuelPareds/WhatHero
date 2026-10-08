@@ -43,8 +43,10 @@ messaging.onBackgroundMessage((payload) => {
     badge: '/favicon.png',
     // tag agrupa notificaciones del mismo chat (collapse_key del backend).
     // Sin tag, el browser apila spam si llegan varios mensajes seguidos.
+    // Un mensaje interno lleva tag propio: no debe reemplazar el aviso de
+    // "atención humana" del mismo chat (son dos pendientes distintos).
     tag: payload.data?.chatId
-      ? `whathero:${payload.data.sessionPhone || ''}:${payload.data.chatId}`
+      ? `whathero:${payload.data.reason === 'internal_message' ? 'internal:' : ''}${payload.data.sessionPhone || ''}:${payload.data.chatId}`
       : 'whathero',
     renotify: true,
     data: payload.data || {},

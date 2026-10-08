@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import admin from 'firebase-admin';
 import { ACCOUNTS_COLLECTION } from '../config/env';
 import { memberHasSessionAccess, type MemberAccess } from './memberAccess';
@@ -36,6 +37,19 @@ interface DeviceDoc {
 }
 
 const PREVIEW_MAX = 80;
+// Un interno suele ser una instrucción ("dile que sí, pero sólo hasta el
+// viernes"): le dejamos más largo antes de cortar.
+const INTERNAL_PREVIEW_MAX = 160;
+
+interface Device {
+  deviceId: string;
+  token: string;
+  platform: string;
+}
+
+function truncate(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
 
 // Mapeo de tipo de media → etiqueta humana en español
 const MEDIA_LABEL: Record<string, string> = {
@@ -56,9 +70,7 @@ function buildBody(payload: HumanAttentionPayload): string {
     return MEDIA_LABEL[payload.mediaType] ?? '📎 Adjunto';
   }
   if (!preview) return 'Mensaje nuevo requiere atención';
-  return preview.length > PREVIEW_MAX
-    ? `${preview.slice(0, PREVIEW_MAX - 1)}…`
-    : preview;
+  return truncate(preview, PREVIEW_MAX);
 }
 
 // Lee alias de sesión y nombre del contacto (best-effort: si falla, usamos teléfonos)
@@ -138,11 +150,14 @@ async function computeAllowedUids(
 // Lee tokens FCM activos del usuario. Devuelve también el deviceId para limpieza posterior.
 // Filtra por `allowedUids`: solo notifica a dispositivos de usuarios con acceso
 // a la sesión. Un device sin campo `uid` (legacy) se incluye (fail-open) para
-// no perder avisos de dispositivos viejos sin re-registrar.
+// no perder avisos de dispositivos viejos sin re-registrar, salvo con
+// `requireUid`: un aviso dirigido a una persona no puede ir a un teléfono del
+// que no sabemos el dueño.
 async function fetchDeviceTokens(
   accountId: string,
   allowedUids: Set<string> | null,
-): Promise<{ deviceId: string; token: string; platform: string }[]> {
+  { requireUid = false }: { requireUid?: boolean } = {},
+): Promise<Device[]> {
   try {
     const snap = await getDb()
       .collection(ACCOUNTS_COLLECTION)
@@ -150,10 +165,11 @@ async function fetchDeviceTokens(
       .collection('devices')
       .get();
 
-    const result: { deviceId: string; token: string; platform: string }[] = [];
+    const result: Device[] = [];
     snap.forEach((doc) => {
       const data = doc.data() as DeviceDoc & { uid?: string };
       if (!data?.fcm_token || typeof data.fcm_token !== 'string') return;
+      if (requireUid && !data.uid) return;
       // Si tenemos lista de permitidos y el device tiene uid, filtramos.
       if (allowedUids && data.uid && !allowedUids.has(data.uid)) {
         return;
@@ -204,49 +220,37 @@ async function pruneDeadTokens(
   }
 }
 
-// Punto de entrada único: dispara push FCM a todos los dispositivos del usuario
-// cuando un chat necesita atención humana. Idempotente y silencioso ante errores
-// (no debe romper el flujo principal de mensajes si el push falla).
-export async function sendHumanAttentionNotification(
-  payload: HumanAttentionPayload,
+interface PushContent {
+  title: string;
+  body: string;
+  data: Record<string, string>;
+  // collapse_key/tag: si caen varias notifs del mismo tema antes de que el
+  // usuario abra, el SO las colapsa en una sola en vez de spamear el shade.
+  collapseTag: string;
+}
+
+// APNs acepta hasta 64 bytes de collapse-id. El tag de un chat mexicano mide
+// 65 ('whathero:' + uid de 28 + dos teléfonos de 13), y el `slice(0, 64)` de
+// antes se comía el último dígito del chat: en iPhone, dos clientes cuyo
+// número sólo difiere en ese dígito se pisaban la notificación. El hash mide
+// 40 y no colisiona.
+function apnsCollapseId(tag: string): string {
+  return createHash('sha1').update(tag).digest('hex');
+}
+
+// Arma el multicast, lo envía y limpia los tokens muertos. Único lugar que
+// habla con FCM.
+async function deliverPush(
+  accountId: string,
+  devices: Device[],
+  push: PushContent,
+  logLabel: string,
 ): Promise<void> {
-  // Solo notificamos a quienes tienen acceso a esta sesión (permisos por
-  // sesión). El owner siempre incluido.
-  const allowedUids = await computeAllowedUids(
-    payload.accountId,
-    payload.sessionPhone,
-  );
-
-  const devices = await fetchDeviceTokens(payload.accountId, allowedUids);
-  if (devices.length === 0) {
-    console.log(`[Notify] Sin dispositivos con acceso para ${payload.accountId}/${payload.sessionPhone}, skip push`);
-    return;
-  }
-
-  const { sessionAlias, contactName } = await fetchTitleParts(
-    payload.accountId,
-    payload.sessionPhone,
-    payload.chatId,
-  );
-
-  const title = `${sessionAlias} · ${contactName}`;
-  const body = buildBody(payload);
-
-  // collapse_key/tag por chat: si caen varias notifs antes de que el usuario abra,
-  // el SO las colapsa en una sola en vez de spamear el shade.
-  const collapseTag = `whathero:${payload.accountId}:${payload.sessionPhone}:${payload.chatId}`;
-
+  const { title, body, collapseTag } = push;
   const message: admin.messaging.MulticastMessage = {
     tokens: devices.map((d) => d.token),
     notification: { title, body },
-    data: {
-      accountId: payload.accountId,
-      sessionPhone: payload.sessionPhone,
-      sessionKey: payload.sessionKey,
-      chatId: payload.chatId,
-      reason: payload.reason,
-      ...(payload.mediaType ? { mediaType: payload.mediaType } : {}),
-    },
+    data: push.data,
     android: {
       priority: 'high',
       collapseKey: collapseTag,
@@ -259,7 +263,7 @@ export async function sendHumanAttentionNotification(
     apns: {
       headers: {
         'apns-priority': '10',
-        'apns-collapse-id': collapseTag.slice(0, 64), // APNs limita a 64 chars
+        'apns-collapse-id': apnsCollapseId(collapseTag),
       },
       payload: {
         aps: {
@@ -294,8 +298,7 @@ export async function sendHumanAttentionNotification(
   try {
     const response = await admin.messaging().sendEachForMulticast(message);
     console.log(
-      `[Notify] FCM enviado a ${response.successCount}/${devices.length} dispositivos ` +
-      `(reason=${payload.reason}, chat=${payload.chatId})`
+      `[Notify] FCM enviado a ${response.successCount}/${devices.length} dispositivos (${logLabel})`
     );
 
     if (response.failureCount > 0) {
@@ -308,9 +311,105 @@ export async function sendHumanAttentionNotification(
           dead.push(devices[idx].deviceId);
         }
       });
-      await pruneDeadTokens(payload.accountId, dead);
+      await pruneDeadTokens(accountId, dead);
     }
   } catch (error) {
     console.error('[Notify] Error enviando multicast FCM:', error);
+  }
+}
+
+// Punto de entrada único: dispara push FCM a todos los dispositivos del usuario
+// cuando un chat necesita atención humana. Idempotente y silencioso ante errores
+// (no debe romper el flujo principal de mensajes si el push falla).
+export async function sendHumanAttentionNotification(
+  payload: HumanAttentionPayload,
+): Promise<void> {
+  // Solo notificamos a quienes tienen acceso a esta sesión (permisos por
+  // sesión). El owner siempre incluido.
+  const allowedUids = await computeAllowedUids(
+    payload.accountId,
+    payload.sessionPhone,
+  );
+
+  const devices = await fetchDeviceTokens(payload.accountId, allowedUids);
+  if (devices.length === 0) {
+    console.log(`[Notify] Sin dispositivos con acceso para ${payload.accountId}/${payload.sessionPhone}, skip push`);
+    return;
+  }
+
+  const { sessionAlias, contactName } = await fetchTitleParts(
+    payload.accountId,
+    payload.sessionPhone,
+    payload.chatId,
+  );
+
+  await deliverPush(
+    payload.accountId,
+    devices,
+    {
+      title: `${sessionAlias} · ${contactName}`,
+      body: buildBody(payload),
+      data: {
+        accountId: payload.accountId,
+        sessionPhone: payload.sessionPhone,
+        sessionKey: payload.sessionKey,
+        chatId: payload.chatId,
+        reason: payload.reason,
+        ...(payload.mediaType ? { mediaType: payload.mediaType } : {}),
+      },
+      collapseTag: `whathero:${payload.accountId}:${payload.sessionPhone}:${payload.chatId}`,
+    },
+    `reason=${payload.reason}, chat=${payload.chatId}`,
+  );
+}
+
+export interface InternalMessagePushPayload {
+  accountId: string;
+  sessionPhone: string;
+  chatId: string;
+  contactName: string;
+  authorName: string;
+  text: string;
+  recipientUids: string[];
+}
+
+// Push de un mensaje interno, sólo a los destinatarios. Al revés que la
+// atención humana, un dispositivo legacy sin `uid` NO lo recibe: este aviso
+// va dirigido a una persona y no sabemos de quién es ese teléfono.
+// Nunca lanza: lo llaman sin await.
+export async function sendInternalMessageNotification(
+  payload: InternalMessagePushPayload,
+): Promise<void> {
+  try {
+    const devices = await fetchDeviceTokens(
+      payload.accountId,
+      new Set(payload.recipientUids),
+      { requireUid: true },
+    );
+    if (devices.length === 0) {
+      console.log(`[Notify] Interno sin dispositivos para ${payload.recipientUids.join(',')}, skip push`);
+      return;
+    }
+    await deliverPush(
+      payload.accountId,
+      devices,
+      {
+        // El candado dice "esto no lo escribió el cliente" antes de leer más.
+        title: `🔒 ${payload.authorName} · ${payload.contactName}`,
+        body: truncate(payload.text.replace(/\s+/g, ' ').trim(), INTERNAL_PREVIEW_MAX),
+        data: {
+          accountId: payload.accountId,
+          sessionPhone: payload.sessionPhone,
+          chatId: payload.chatId,
+          reason: 'internal_message',
+        },
+        // Tag propio: no reemplaza en el teléfono un aviso de "atención
+        // humana" del mismo chat. Son dos pendientes distintos.
+        collapseTag: `whathero:internal:${payload.accountId}:${payload.sessionPhone}:${payload.chatId}`,
+      },
+      `reason=internal_message, chat=${payload.chatId}`,
+    );
+  } catch (error) {
+    console.error('[Notify] Error en push de mensaje interno:', error);
   }
 }

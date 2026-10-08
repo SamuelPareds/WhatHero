@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'dart:ui';
@@ -7,10 +8,12 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_slidable/flutter_slidable.dart';
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/services/active_chat_tracker.dart';
 import 'package:crm_whatsapp/core/services/ai_state_service.dart';
 import 'package:crm_whatsapp/core/services/api_client.dart';
+import 'package:crm_whatsapp/core/services/internal_messages_service.dart';
 import 'package:crm_whatsapp/core/services/notification_service.dart';
 import 'package:crm_whatsapp/core/services/presence_reporter.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
@@ -25,6 +28,7 @@ import 'widgets/ai_state_indicator.dart';
 import 'widgets/chat_nav_stepper.dart';
 import 'widgets/message_search_results.dart';
 import 'widgets/new_chat_sheet.dart';
+import 'widgets/team_inbox_panel.dart';
 import 'widgets/team_presence_banner.dart';
 import 'widgets/unread_badge.dart';
 import 'widgets/label_chip.dart';
@@ -114,6 +118,27 @@ class _ChatsScreenState extends State<ChatsScreen> {
   List<String> _navQueue = const [];
   int _navIndex = -1;
 
+  // 🔒 Bandeja del equipo ("Para ti"). Sólo existe si hay con quién hablar:
+  // en una cuenta sin miembros la pantalla queda exactamente como antes.
+  bool _hasTeam = false;
+  // chatId → internos sin ver para mí. Sale del mismo snapshot de la lista
+  // (cero lecturas extra) y alimenta la barra, la bandeja y el ícono móvil.
+  final ValueNotifier<Map<String, int>> _internalUnread = ValueNotifier(const {});
+  // Barra desplegada en escritorio. Se recuerda por dispositivo.
+  bool _inboxExpanded = true;
+  static const _inboxExpandedPref = 'team_inbox_expanded';
+  static const _inboxPanelWidth = 320.0;
+  // Ancho que el detalle conserva con la bandeja desplegada al lado. Por
+  // debajo, la bandeja flota encima en vez de aplastar el chat (su AppBar está
+  // probado a 360 dp; esto deja margen).
+  static const _minDetailWidth = 420.0;
+  // Uno por Scaffold: el de la lista (móvil) y el de escritorio (cuando la
+  // bandeja no cabe al lado). Cada uno abre su propio panel flotante.
+  final GlobalKey<ScaffoldState> _listScaffoldKey = GlobalKey();
+  final GlobalKey<ScaffoldState> _desktopScaffoldKey = GlobalKey();
+  // Chats cuyo badge interno se está limpiando (ver _clearInternalUnread).
+  final Set<String> _clearingInternal = {};
+
   @override
   void initState() {
     super.initState();
@@ -127,6 +152,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
     }
     if (widget.sessionId != null) {
       _subscribeToLabels();
+      _loadTeamInbox();
     }
 
     // Cold-start: la app abrió por un tap a una notificación push.
@@ -234,6 +260,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
     _pendingTap?.removeListener(_onPendingTap);
     _cancelledTimer?.cancel();
     _filterCounts.dispose();
+    _internalUnread.dispose();
     PresenceReporter.instance.unregister(this);
     // Sólo si el rastreador es nuestro: al cambiar de sesión, SessionDispatcher
     // desmonta esta pantalla DESPUÉS de que la nueva ya reportó su chat.
@@ -460,6 +487,145 @@ class _ChatsScreenState extends State<ChatsScreen> {
     _jumpToTimestamp = null;
   }
 
+  // ─── Bandeja del equipo ────────────────────────────────────────────────
+
+  Future<void> _loadTeamInbox() async {
+    final team = await InternalMessagesService()
+        .teammates(widget.accountId, widget.sessionId!);
+    var expanded = true;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      expanded = prefs.getBool(_inboxExpandedPref) ?? true;
+    } catch (_) {/* sin storage: queda desplegada */}
+    if (!mounted) return;
+    setState(() {
+      _hasTeam = team.isNotEmpty && _myUid != null;
+      _inboxExpanded = expanded;
+    });
+  }
+
+  void _setInboxExpanded(bool expanded) {
+    setState(() => _inboxExpanded = expanded);
+    SharedPreferences.getInstance()
+        .then((prefs) => prefs.setBool(_inboxExpandedPref, expanded))
+        .catchError((_) => false);
+  }
+
+  int _internalUnreadIn(Map<String, dynamic>? chatData) {
+    final map = chatData?['internal_unread'];
+    if (map is! Map || _myUid == null) return 0;
+    return (map[_myUid] as num?)?.toInt() ?? 0;
+  }
+
+  // Tener el chat abierto = haber visto sus internos: el badge violeta se
+  // apaga solo. Lo dispara el stream del chat abierto y no `_openChatFromList`,
+  // así cubre todas las formas de entrar (lista, push, flechas, buscador,
+  // bandeja) y también el interno que llega mientras ya lo estás mirando.
+  void _clearInternalUnread(String chatId) {
+    final uid = _myUid;
+    if (uid == null || !_clearingInternal.add(chatId)) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      try {
+        await FirebaseFirestore.instance
+            .collection(accountsCollection)
+            .doc(widget.accountId)
+            .collection('whatsapp_sessions')
+            .doc(widget.sessionId)
+            .collection('chats')
+            .doc(chatId)
+            .update({FieldPath(['internal_unread', uid]): FieldValue.delete()});
+      } catch (e) {
+        debugPrint('[Interno] No se pudo limpiar el badge de $chatId: $e');
+      } finally {
+        _clearingInternal.remove(chatId);
+      }
+    });
+  }
+
+  // Desde la bandeja: abrir el chat del que te hablan. No es una posición en
+  // una secuencia, así que sin flechas (igual que abrir por push).
+  void _openChatFromInbox(String chatId) {
+    _listScaffoldKey.currentState?.closeEndDrawer();
+    _desktopScaffoldKey.currentState?.closeEndDrawer();
+    setState(() {
+      selectedChatPhone = chatId;
+      _clearNavQueue();
+      _clearJumpTarget();
+    });
+  }
+
+  Widget _teamInboxPanel({required VoidCallback onClose, required IconData closeIcon}) {
+    return TeamInboxPanel(
+      accountId: widget.accountId,
+      sessionId: widget.sessionId!,
+      myUid: _myUid!,
+      unreadByChat: _internalUnread,
+      onOpenChat: _openChatFromInbox,
+      onClose: onClose,
+      closeIcon: closeIcon,
+    );
+  }
+
+  // Panel flotante que entra desde la derecha: siempre en móvil, y en
+  // escritorio cuando la bandeja no cabe al lado del chat.
+  Widget _teamInboxDrawer(GlobalKey<ScaffoldState> key) {
+    return Drawer(
+      width: _inboxPanelWidth,
+      backgroundColor: surfaceDark,
+      child: SafeArea(
+        child: _teamInboxPanel(
+          onClose: () => key.currentState?.closeEndDrawer(),
+          closeIcon: Icons.close,
+        ),
+      ),
+    );
+  }
+
+  // Escritorio: desplegada al lado si el chat conserva su ancho; si no, la
+  // franja plegada abre el panel flotante.
+  Widget _buildTeamInboxSide(double screenWidth) {
+    final fits = screenWidth - 400 - _inboxPanelWidth >= _minDetailWidth;
+    if (_inboxExpanded && fits) {
+      return SizedBox(
+        width: _inboxPanelWidth,
+        child: _teamInboxPanel(
+          onClose: () => _setInboxExpanded(false),
+          closeIcon: Icons.chevron_right,
+        ),
+      );
+    }
+    return TeamInboxRail(
+      unreadByChat: _internalUnread,
+      onExpand: fits
+          ? () => _setInboxExpanded(true)
+          : () => _desktopScaffoldKey.currentState?.openEndDrawer(),
+    );
+  }
+
+  // Móvil: el ícono de la lista con el contador; abre el panel flotante.
+  Widget _teamInboxButton() {
+    return ValueListenableBuilder<Map<String, int>>(
+      valueListenable: _internalUnread,
+      builder: (context, unread, _) {
+        final total = unread.values.fold(0, (a, b) => a + b);
+        return IconButton(
+          tooltip: 'Mensajes del equipo para ti',
+          onPressed: () => _listScaffoldKey.currentState?.openEndDrawer(),
+          icon: Badge(
+            isLabelVisible: total > 0,
+            backgroundColor: teamViolet,
+            label: Text('$total'),
+            child: Icon(
+              Icons.forum_outlined,
+              size: 20,
+              color: total > 0 ? teamViolet : null,
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   // Abre un chat desde la lista y congela el orden visible como cola. `order`
   // ya viene con filtro rápido + búsqueda aplicados, así que la secuencia es
   // exactamente la que el operador tenía en pantalla.
@@ -548,6 +714,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
             ],
           )
         : Scaffold(
+            key: _desktopScaffoldKey,
+            endDrawer: _hasTeam ? _teamInboxDrawer(_desktopScaffoldKey) : null,
             body: Row(
               children: [
                 SizedBox(width: 400, child: _buildChatsList()),
@@ -571,6 +739,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                           ),
                         ),
                 ),
+                if (_hasTeam) _buildTeamInboxSide(MediaQuery.of(context).size.width),
               ],
             ),
           );
@@ -675,7 +844,15 @@ class _ChatsScreenState extends State<ChatsScreen> {
       );
     }
 
+    final isMobile = MediaQuery.of(context).size.width < 600;
     return Scaffold(
+      key: _listScaffoldKey,
+      // En escritorio la bandeja vive a la derecha de la pantalla, no dentro
+      // de los 400 px de la lista.
+      endDrawer: (isMobile && _hasTeam) ? _teamInboxDrawer(_listScaffoldKey) : null,
+      // Sólo con el ícono: arrastrar desde el borde derecho le robaría el gesto
+      // al deslizamiento "Listo / Pendiente" de cada chat.
+      endDrawerEnableOpenDragGesture: false,
       appBar: AppBar(
         leading: IconButton(
           icon: const Icon(Icons.manage_accounts_outlined, color: primaryAqua),
@@ -755,6 +932,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 ),
               ]
             : [
+                if (isMobile && _hasTeam) _teamInboxButton(),
                 IconButton(
                   icon: const Icon(Icons.search, size: 20),
                   tooltip: 'Buscar contacto o mensaje',
@@ -820,25 +998,32 @@ class _ChatsScreenState extends State<ChatsScreen> {
           // Un chat cuenta como "pendiente" si tiene mensajes sin responder
           // (contador automático) O si fue marcado a mano (marked_pending).
           // Así el chip y el filtro unifican ambas señales bajo un concepto.
-          final unrespondedTotal = allChats.where((d) {
+          //
+          // Una sola pasada para todos los contadores: `d.data()` reconstruye
+          // el mapa entero del doc en cada llamada, y antes eran tres pasadas.
+          var unrespondedTotal = 0;
+          var notesTotal = 0;
+          // Chats que el agente de seguimiento dejó encolados (con borrador listo).
+          var followupsTotal = 0;
+          // Internos sin ver para mí, por chat (bandeja del equipo).
+          final internalUnread = <String, int>{};
+          for (final d in allChats) {
             final m = d.data() as Map<String, dynamic>?;
             final count = (m?['unresponded_count'] as num?)?.toInt() ?? 0;
             final markedPending = m?['marked_pending'] as bool? ?? false;
-            return count > 0 || markedPending;
-          }).length;
-          final notesTotal = allChats.where((d) {
-            final m = d.data() as Map<String, dynamic>?;
-            return ((m?['note'] as String?) ?? '').trim().isNotEmpty;
-          }).length;
-          // Chats que el agente de seguimiento dejó encolados (con borrador listo).
-          final followupsTotal = allChats.where((d) {
-            final m = d.data() as Map<String, dynamic>?;
-            return (m?['followup_status'] as String?) == 'queued';
-          }).length;
+            if (count > 0 || markedPending) unrespondedTotal++;
+            if (((m?['note'] as String?) ?? '').trim().isNotEmpty) notesTotal++;
+            if ((m?['followup_status'] as String?) == 'queued') followupsTotal++;
+            final mine = _internalUnreadIn(m);
+            if (mine > 0) internalUnread[d.id] = mine;
+          }
           WidgetsBinding.instance.addPostFrameCallback((_) {
             final next = (unresponded: unrespondedTotal, notes: notesTotal, followups: followupsTotal);
             if (mounted && _filterCounts.value != next) {
               _filterCounts.value = next;
+            }
+            if (mounted && !mapEquals(_internalUnread.value, internalUnread)) {
+              _internalUnread.value = internalUnread;
             }
             // Si vaciaron la cola estando en el filtro "Seguimiento", el chip se
             // oculta; degradamos a "Todos" para no dejar al usuario mirando vacío.
@@ -1054,6 +1239,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
         .whereType<String>()
         .toList();
     final note = chatData?['note'] as String? ?? '';
+    // Mensajes internos que me escribieron aquí y no he visto.
+    final internalUnread = _internalUnreadIn(chatData);
 
     final tile = _ChatTile(
       phoneNumber: phoneNumber,
@@ -1064,6 +1251,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
       isSelected: selectedChatPhone == phoneNumber,
       unrespondedCount: unrespondedCount,
       markedPending: markedPending,
+      internalUnread: internalUnread,
       sessionKey: widget.sessionKey,
       sessionPhone: widget.sessionId,
       myUid: _myUid,
@@ -1454,6 +1642,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
                     .whereType<String>()
                     .toList();
             final detailNote = (chatData?['note'] as String? ?? '').trim();
+            if (_internalUnreadIn(chatData) > 0) {
+              _clearInternalUnread(selectedChatPhone!);
+            }
             final displayName = contactName.isNotEmpty
                 ? contactName
                 : (selectedChatPhone ?? 'Chat');
@@ -2369,6 +2560,9 @@ class _ChatTile extends StatelessWidget {
   // Marca manual de seguimiento (sin número). Pinta un punto naranja en el
   // avatar cuando no hay contador automático visible.
   final bool markedPending;
+  // Mensajes internos del equipo para mí, sin ver. Pastilla violeta bajo la
+  // hora: el número es de ESOS mensajes, no del cliente.
+  final int internalUnread;
   // Necesario para consultar AiStateService (clave: sessionKey:contactPhone).
   // Puede ser null si la sesión está desconectada — en ese caso nunca habrá
   // estado de IA activo y el tile cae al render normal con el badge.
@@ -2392,6 +2586,7 @@ class _ChatTile extends StatelessWidget {
     required this.isSelected,
     required this.unrespondedCount,
     required this.markedPending,
+    required this.internalUnread,
     required this.sessionKey,
     required this.sessionPhone,
     required this.myUid,
@@ -2588,6 +2783,40 @@ class _ChatTile extends StatelessWidget {
                                   : FontWeight.w400,
                             ),
                           ),
+                          if (internalUnread > 0)
+                            Padding(
+                              padding: const EdgeInsets.only(top: 4),
+                              child: Tooltip(
+                                message: internalUnread == 1
+                                    ? 'Un mensaje del equipo para ti'
+                                    : '$internalUnread mensajes del equipo para ti',
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 6, vertical: 2),
+                                  decoration: BoxDecoration(
+                                    color: teamViolet,
+                                    borderRadius: BorderRadius.circular(10),
+                                  ),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      const Icon(Icons.lock,
+                                          size: 10, color: Colors.white),
+                                      const SizedBox(width: 3),
+                                      Text(
+                                        '$internalUnread',
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 10,
+                                          fontWeight: FontWeight.w700,
+                                          height: 1,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ),
                           // Indicador de IA solo cuando hay ciclo activo.
                           ListenableBuilder(
                             listenable: AiStateService(),

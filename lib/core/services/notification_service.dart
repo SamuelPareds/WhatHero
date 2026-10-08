@@ -45,6 +45,9 @@ class HumanAttentionPush {
   }
 
   bool get isValid => accountId.isNotEmpty && chatId.isNotEmpty;
+
+  /// Un compañero te escribió en ese chat (mensaje interno), no el cliente.
+  bool get isInternalMessage => reason == 'internal_message';
 }
 
 /// Servicio singleton para FCM. Misma forma que SocketService:
