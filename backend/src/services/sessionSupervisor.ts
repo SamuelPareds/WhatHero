@@ -188,7 +188,7 @@ export function scheduleReconnect(sessionKey: string, session: SessionData, reas
     status: 'reconnecting',
     sessionKey,
     attempt: session.reconnectCount,
-    phoneNumber: session.phoneNumber,
+    phoneNumber: session.sessionId,
     reason,
   });
 }
@@ -258,24 +258,78 @@ export async function retireSession(
   await writeSessionStatus(session, status, { disconnect_reason: reason });
 }
 
+// Cuánto esperamos a que WhatsApp confirme el logout antes de cortar igual.
+const LOGOUT_TIMEOUT_MS = 5_000;
+
 /**
- * Cuando una sesión conecta, retira cualquier OTRA sesión del mismo número.
+ * Cierra la sesión en WhatsApp (best-effort: la saca de "Dispositivos
+ * vinculados" del teléfono), la saca del Map y borra sus credenciales.
+ *
+ * A diferencia de `retireSession`, NO escribe estado: la usan el cambio de
+ * número y el rechazo de una vinculación, donde el doc ya es de otro socket y
+ * un `disconnected` lo pisaría con mentira. Sale del Map ANTES del logout a
+ * propósito: el `close` que dispara encuentra la sesión ausente y no programa
+ * reconexión ni escribe nada.
+ */
+export async function logoutAndForget(sessionKey: string, reason: string): Promise<void> {
+  const { sessions } = requireDeps();
+  const session = sessions.get(sessionKey);
+  if (!session) return;
+
+  console.log(`[Supervisor] Cerrando sesión ${sessionKey} en WhatsApp (motivo: ${reason})`);
+  clearSessionTimers(session);
+  sessions.delete(sessionKey);
+  const sock = session.sock;
+  session.sock = null;
+  session.isReady = false;
+
+  if (sock) {
+    try {
+      await Promise.race([
+        sock.logout(reason),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), LOGOUT_TIMEOUT_MS)),
+      ]);
+    } catch (error) {
+      console.warn(`[Supervisor] Logout de ${sessionKey} no confirmado:`, (error as Error)?.message);
+    }
+    teardownSocket(sock);
+  }
+
+  try {
+    rmSync(`auth_info/${sessionKey}`, { recursive: true, force: true });
+  } catch (error) {
+    console.error(`[Supervisor] No se pudo borrar auth_info/${sessionKey}:`, error);
+  }
+}
+
+/**
+ * Cuando una sesión conecta, retira cualquier OTRA que ocupe su mismo lugar:
+ * mismo doc y mismo rol (y, si es línea anterior, mismo número).
  *
  * Re-vincular una cuenta genera un `sessionKey` nuevo, pero la vieja se quedaba
  * viva en el Map y con su carpeta `auth_info` intacta: peleaba por la misma
  * cuenta de WhatsApp (de ahí buena parte de los cierres 428/409 que se veían en
  * el log) y volvía a resucitar en cada arranque. Un número, una sesión.
+ *
+ * El rol importa desde el cambio de número: el principal y la línea anterior
+ * que quedó recibiendo comparten doc a propósito, y re-vincular uno no puede
+ * tumbar al otro.
  */
 export async function retireDuplicateSessions(liveKey: string, live: SessionData): Promise<void> {
   const { sessions } = requireDeps();
-  if (!live.phoneNumber) return;
+  if (!live.sessionId) return;
 
   const stale = [...sessions.entries()].filter(
-    ([key, s]) => key !== liveKey && s.accountId === live.accountId && s.phoneNumber === live.phoneNumber,
+    ([key, s]) =>
+      key !== liveKey &&
+      s.accountId === live.accountId &&
+      s.sessionId === live.sessionId &&
+      s.role === live.role &&
+      (live.role === 'primary' || s.linkedPhone === live.linkedPhone),
   );
 
   for (const [key] of stale) {
-    console.log(`[Supervisor] ${live.phoneNumber} reconectó con ${liveKey}; retirando duplicada ${key}.`);
+    console.log(`[Supervisor] ${live.sessionId} reconectó con ${liveKey}; retirando duplicada ${key}.`);
     // `status` se omite a propósito: el doc es el mismo y la sesión viva ya lo
     // dejó en `connected`. Escribir `disconnected` acá lo pisaría con mentira.
     const session = sessions.get(key);
@@ -311,7 +365,7 @@ export function projectStatus(session: SessionData, now = Date.now()): SessionSt
 /**
  * Escribe el status en el doc de sesión. Único escritor de ese campo.
  *
- * Sin `phoneNumber` no hay doc que direccionar — pasaba en cada arranque en
+ * Sin `sessionId` no hay doc que direccionar — pasaba en cada arranque en
  * frío, porque el número sólo se conocía tras el primer `open`. Ahora
  * `startSession` lo hidrata desde `meta.json`, así que este caso es residual
  * (sesión nueva que nunca llegó a vincularse) y no hay nada que corregir.
@@ -322,26 +376,37 @@ export async function writeSessionStatus(
   extra: Record<string, unknown> = {},
 ): Promise<void> {
   const { db } = requireDeps();
-  if (!session.phoneNumber) return;
+  if (!session.sessionId) return;
+
+  const ref = db
+    .collection(ACCOUNTS_COLLECTION)
+    .doc(session.accountId)
+    .collection('whatsapp_sessions')
+    .doc(session.sessionId);
+  const now = admin.firestore.Timestamp.now();
 
   try {
-    await db
-      .collection(ACCOUNTS_COLLECTION)
-      .doc(session.accountId)
-      .collection('whatsapp_sessions')
-      .doc(session.phoneNumber)
-      .set(
-        { status, last_sync: admin.firestore.Timestamp.now(), ...extra },
-        { merge: true },
-      );
+    if (session.role === 'previous') {
+      // La línea anterior reporta en su propio casillero. `status` y
+      // `session_key` son del socket principal: pisarlos haría que la app
+      // mande por el socket equivocado. `update` (no `set`) para no resucitar
+      // un doc que ya no existe.
+      if (!session.linkedPhone) return;
+      const line = `previous_lines.${session.linkedPhone}`;
+      const patch: Record<string, unknown> = { [`${line}.status`]: status, [`${line}.last_sync`]: now };
+      for (const [field, value] of Object.entries(extra)) patch[`${line}.${field}`] = value;
+      await ref.update(patch);
+    } else {
+      await ref.set({ status, last_sync: now, ...extra }, { merge: true });
+    }
     session.lastWrittenStatus = status;
   } catch (error) {
-    console.error(`[Supervisor] No se pudo escribir status=${status} para ${session.phoneNumber}:`, error);
+    console.error(`[Supervisor] No se pudo escribir status=${status} para ${session.sessionId}:`, error);
   }
 }
 
 /** Proyecta y escribe sólo si algo cambió. */
-async function syncSessionStatus(sessionKey: string, session: SessionData): Promise<void> {
+export async function syncSessionStatus(sessionKey: string, session: SessionData): Promise<void> {
   const expected = projectStatus(session);
   if (expected === session.lastWrittenStatus) return;
   await writeSessionStatus(session, expected);

@@ -1192,14 +1192,14 @@ export async function processMessageBuffer(
     // vuelve a evaluar toda la conversación) o un humano respondió (y contar
     // pendientes ahora dejaría uno fantasma después de su respuesta).
     if (cycle.cancelled) return;
-    await incrementUnrespondedCount(accountId, session.phoneNumber!, contactPhone, pending);
+    await incrementUnrespondedCount(accountId, session.sessionId!, contactPhone, pending);
 
     try {
       await getDb()
         .collection(ACCOUNTS_COLLECTION)
         .doc(accountId)
         .collection('whatsapp_sessions')
-        .doc(session.phoneNumber!)
+        .doc(session.sessionId!)
         .collection('chats')
         .doc(contactPhone)
         .set(
@@ -1213,14 +1213,14 @@ export async function processMessageBuffer(
     getIO().to(accountId).emit('human_attention_required', {
       sessionKey,
       chatId: contactPhone,
-      phoneNumber: session.phoneNumber,
+      phoneNumber: session.sessionId,
       timestamp: new Date().toISOString(),
       reason,
     });
 
     sendHumanAttentionNotification({
       accountId,
-      sessionPhone: session.phoneNumber!,
+      sessionPhone: session.sessionId!,
       sessionKey,
       chatId: contactPhone,
       reason,
@@ -1243,7 +1243,7 @@ export async function processMessageBuffer(
     try {
       const historyDocs = await getDb()
         .collection(ACCOUNTS_COLLECTION).doc(accountId)
-        .collection('whatsapp_sessions').doc(session.phoneNumber!)
+        .collection('whatsapp_sessions').doc(session.sessionId!)
         .collection('chats').doc(contactPhone)
         .collection('messages')
         .orderBy('timestamp', 'desc')
@@ -1398,7 +1398,7 @@ export async function processMessageBuffer(
 
     console.log(`[Buffer] Auto-responded to ${remoteJid} en ${result.total} chunk(s)`);
     // La IA respondió: cualquier pendiente previo queda cubierto
-    await resetUnrespondedCount(accountId, session.phoneNumber!, contactPhone);
+    await resetUnrespondedCount(accountId, session.sessionId!, contactPhone);
   } catch (error) {
     console.error('[Buffer] Error processing message buffer:', error);
   } finally {

@@ -152,7 +152,8 @@ export class ReminderService {
     sessions: Map<string, SessionData>
   ) {
     const session = sessions.get(sessionKey);
-    if (!session || !session.isReady || !session.sock) {
+    // `role`: una línea anterior (tras un cambio de número) nunca envía.
+    if (!session || !session.isReady || !session.sock || session.role !== 'primary') {
       console.error(`[ReminderService] Session ${sessionKey} not ready for reminders`);
       return { success: false, error: 'Session not ready' };
     }
@@ -238,19 +239,22 @@ export class ReminderService {
     }
 
     for (const [sessionKey, session] of sessions) {
-      if (!session.isReady || !session.phoneNumber) continue;
+      if (!session.isReady || !session.sessionId) continue;
+      // La línea anterior comparte doc con el número nuevo: correrlo también
+      // por ella mandaría todo dos veces, y desde el número viejo.
+      if (session.role !== 'primary') continue;
 
-      const config = await this.getReminderConfig(session.accountId, session.phoneNumber);
+      const config = await this.getReminderConfig(session.accountId, session.sessionId);
       if (!config || !config.enabled) continue;
 
       if (config.scheduledTime === currentTime) {
-        console.log(`[ReminderService] Running scheduled reminders for ${session.phoneNumber} at ${currentTime}`);
-        this.processReminders(session.accountId, session.phoneNumber, sessionKey, sessions)
+        console.log(`[ReminderService] Running scheduled reminders for ${session.sessionId} at ${currentTime}`);
+        this.processReminders(session.accountId, session.sessionId, sessionKey, sessions)
           .then(result => {
-            console.log(`[ReminderService] Scheduled run result for ${session.phoneNumber}:`, result);
+            console.log(`[ReminderService] Scheduled run result for ${session.sessionId}:`, result);
           })
           .catch(err => {
-            console.error(`[ReminderService] Scheduled run failed for ${session.phoneNumber}:`, err);
+            console.error(`[ReminderService] Scheduled run failed for ${session.sessionId}:`, err);
           });
       }
     }

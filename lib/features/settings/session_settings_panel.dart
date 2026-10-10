@@ -1,10 +1,19 @@
+import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:http/http.dart' as http;
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:crm_whatsapp/core.dart';
+import 'package:crm_whatsapp/core/services/account_context_service.dart';
+import 'package:crm_whatsapp/core/services/api_client.dart';
+import 'package:crm_whatsapp/core/utils/phone_input.dart';
+import 'package:crm_whatsapp/core/utils/session_phone.dart';
+import '../accounts/change_number/change_number_flow.dart';
+import '../accounts/link_result.dart';
+import '../chat/number_change_divider.dart';
 import '../chat/widgets/label_editor_dialog.dart';
 
 class SessionSettingsPanel extends StatefulWidget {
@@ -80,6 +89,14 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
 
   // Agente de Seguimiento de Ventas (Re-engagement)
   bool _followupEnabled = false;
+
+  // Número de la sesión. Sólo se muestran: los escribe el backend al cambiar
+  // de número (ver CLAUDE.md, "📲 Cambiar de número").
+  String? _linkedPhone;
+  List<NumberChange> _numberHistory = const [];
+  Map<String, dynamic> _previousLines = const {};
+  List<String> _pausedAutomations = const [];
+  String? _disconnectingLine;
   TimeOfDay _followupScheduledTime = const TimeOfDay(hour: 9, minute: 0);
 
   bool _isSaving = false;
@@ -119,7 +136,16 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
       if (doc.exists) {
         final data = doc.data() ?? {};
         setState(() {
-          _aliasController.text = data['alias'] ?? 'Sucursal - ${widget.sessionId}';
+          _linkedPhone = sessionPhone(data, widget.sessionId);
+          _numberHistory = parseNumberHistory(data['number_history']);
+          _previousLines = data['previous_lines'] is Map
+              ? Map<String, dynamic>.from(data['previous_lines'] as Map)
+              : const {};
+          final change = data['number_change'];
+          _pausedAutomations = change is Map && change['pausedAutomations'] is List
+              ? (change['pausedAutomations'] as List).whereType<String>().toList()
+              : const [];
+          _aliasController.text = data['alias'] ?? 'Sucursal - ${_linkedPhone ?? widget.sessionId}';
           _aiEnabled = data['ai_enabled'] ?? false;
           _selectedProvider = data['ai_provider'] ?? 'gemini';
           _apiKeyController.text = data['ai_api_key'] ?? '';
@@ -394,8 +420,18 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
           const SizedBox(height: 32),
           _sectionTitle('Información de Conexión'),
           const SizedBox(height: 16),
+          _infoTile('Número Vinculado', displayPhone(_linkedPhone ?? widget.sessionId), Icons.chat_bubble_outline),
           _infoTile('ID de Sesión', widget.sessionId, Icons.fingerprint),
-          _infoTile('Número Vinculado', '+${widget.sessionId}', Icons.chat_bubble_outline),
+          if (_numberHistory.isNotEmpty) _buildPreviousNumbers(),
+          if (AccountContextService().isOwner)
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                onPressed: _openChangeNumber,
+                icon: const Icon(Icons.swap_horiz, color: primaryAqua, size: 20),
+                label: const Text('Cambiar a un número nuevo', style: TextStyle(color: primaryAqua)),
+              ),
+            ),
           const SizedBox(height: 32),
           _sectionTitle('Sincronización con WhatsApp'),
           const SizedBox(height: 8),
@@ -407,6 +443,146 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
           ),
           const SizedBox(height: 20),
           _switchTile('Marcar como leído al responder', _markReadOnReply, (v) => setState(() => _markReadOnReply = v)),
+        ],
+      ),
+    );
+  }
+
+  // Números que usó esta sesión antes del actual, del más reciente al más
+  // viejo. El que quedó conectado recibiendo se puede desconectar aquí.
+  Widget _buildPreviousNumbers() {
+    final isOwner = AccountContextService().isOwner;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(color: darkBg.withValues(alpha: 0.2), borderRadius: BorderRadius.circular(12)),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(children: [
+            Icon(Icons.history, color: lightText, size: 20),
+            SizedBox(width: 16),
+            Text('Números anteriores', style: TextStyle(color: lightText, fontSize: 11)),
+          ]),
+          for (final change in _numberHistory.reversed) ...[
+            const SizedBox(height: 10),
+            _previousNumberRow(change, isOwner),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _previousNumberRow(NumberChange change, bool isOwner) {
+    final line = _previousLines[change.phone];
+    final status = line is Map ? line['status'] as String? : null;
+    final live = status != null && status != 'disconnected';
+    final statusLabel = switch (status) {
+      'connected' => 'Recibiendo mensajes',
+      'reconnecting' => 'Reconectando…',
+      'reconnect_failed' => 'Sin conexión',
+      _ => null,
+    };
+
+    return Row(
+      children: [
+        const SizedBox(width: 36),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(displayPhone(change.phone), style: const TextStyle(color: white, fontWeight: FontWeight.bold)),
+              Text(
+                'Hasta el ${shortDate(change.until)}${statusLabel != null ? ' · $statusLabel' : ''}',
+                style: TextStyle(color: status == 'connected' ? accentAqua : lightText, fontSize: 12),
+              ),
+            ],
+          ),
+        ),
+        if (live && isOwner)
+          _disconnectingLine == change.phone
+              ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+              : TextButton(
+                  onPressed: () => _disconnectPreviousLine(change.phone),
+                  child: Text('Desconectar', style: TextStyle(color: Colors.red.shade300)),
+                ),
+      ],
+    );
+  }
+
+  Future<void> _openChangeNumber() async {
+    await showChangeNumberFlow(context, accountId: widget.accountId, sessionId: widget.sessionId);
+    // El cambio reescribe el número, el alias por defecto y los automáticos
+    // que pausa. Sin recargar, el próximo "Guardar" de este panel los volvería
+    // a encender con lo que tenía en memoria.
+    if (mounted) await _loadSettings();
+  }
+
+  Future<void> _disconnectPreviousLine(String phone) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        backgroundColor: surfaceDark,
+        title: Text('¿Desconectar ${displayPhone(phone)}?', style: const TextStyle(color: white)),
+        content: const Text(
+          'Lo que te escriban a ese número ya no llegará a WhatHero. Para volver a recibirlo '
+          'tendrías que escanear un QR con ese teléfono.',
+          style: TextStyle(color: lightText),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('Cancelar')),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: Text('Desconectar', style: TextStyle(color: Colors.red.shade300)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => _disconnectingLine = phone);
+    try {
+      final response = await http
+          .post(
+            Uri.parse('$backendUrl/sessions/previous-line/disconnect'),
+            headers: await authHeaders(),
+            body: jsonEncode({'accountId': widget.accountId, 'sessionId': widget.sessionId, 'phone': phone}),
+          )
+          .timeout(const Duration(seconds: 20));
+      if (response.statusCode != 200) throw Exception('HTTP ${response.statusCode}');
+      messenger.showSnackBar(SnackBar(content: Text('${displayPhone(phone)} desconectado')));
+      if (mounted) await _loadSettings();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('No se pudo desconectar: $e')));
+    } finally {
+      if (mounted) setState(() => _disconnectingLine = null);
+    }
+  }
+
+  // Aviso junto al switch de un automático que se pausó al cambiar de número.
+  // Desaparece en cuanto el operador lo vuelve a encender.
+  Widget _pausedByNumberChange(String automation, bool enabled) {
+    if (enabled || !_pausedAutomations.contains(automation)) return const SizedBox.shrink();
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: collisionAmber.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(Icons.pause_circle_outline, size: 18, color: collisionAmber),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              '${automationLabel(automation)}: en pausa desde el cambio de número, para cuidar '
+              'tu número nuevo de un bloqueo. Reactívalo cuando lleve unos días.',
+              style: const TextStyle(color: white, fontSize: 12.5, height: 1.35),
+            ),
+          ),
         ],
       ),
     );
@@ -496,6 +672,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
             ),
           ),
           const SizedBox(height: 16),
+          _pausedByNumberChange('followups', _followupEnabled),
           _expandableSection(
             'Seguimiento de Ventas',
             Icons.campaign_outlined,
@@ -817,6 +994,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
       padding: const EdgeInsets.all(24),
       child: Column(
         children: [
+          _pausedByNumberChange('reminders', _reminderEnabled),
           Container(
             decoration: BoxDecoration(
               gradient: LinearGradient(colors: [primaryAqua.withValues(alpha: 0.1), Colors.purple.withValues(alpha: 0.1)]),

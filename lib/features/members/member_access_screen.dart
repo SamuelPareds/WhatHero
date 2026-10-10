@@ -6,6 +6,8 @@ import 'package:http/http.dart' as http;
 
 import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/services/api_client.dart';
+import 'package:crm_whatsapp/core/utils/phone_input.dart';
+import 'package:crm_whatsapp/core/utils/session_phone.dart';
 
 import 'edit_member_name_dialog.dart';
 
@@ -46,8 +48,11 @@ class _MemberAccessScreenState extends State<MemberAccessScreen> {
   String? _displayName;
   String _email = '';
 
-  /// Sesiones de la cuenta: [phone, alias].
+  /// Sesiones de la cuenta: [id del doc, alias]. El id es la llave de
+  /// `access.sessions`; el número que se muestra sale de [_sessionPhones]
+  /// (tras un cambio de número no es el id).
   List<MapEntry<String, String>> _sessions = [];
+  Map<String, String> _sessionPhones = {};
 
   @override
   void initState() {
@@ -69,10 +74,14 @@ class _MemberAccessScreenState extends State<MemberAccessScreen> {
       final sessionsSnap = results[0] as QuerySnapshot;
       final memberSnap = results[1] as DocumentSnapshot;
 
+      _sessionPhones = {
+        for (final d in sessionsSnap.docs)
+          d.id: displayPhone(sessionPhone(d.data() as Map<String, dynamic>?, d.id)),
+      };
       _sessions = sessionsSnap.docs.map((d) {
         final data = d.data() as Map<String, dynamic>?;
         final alias = (data?['alias'] as String?)?.trim();
-        return MapEntry(d.id, (alias != null && alias.isNotEmpty) ? alias : d.id);
+        return MapEntry(d.id, (alias != null && alias.isNotEmpty) ? alias : _sessionPhones[d.id]!);
       }).toList()
         ..sort((a, b) => a.value.toLowerCase().compareTo(b.value.toLowerCase()));
 
@@ -320,8 +329,9 @@ class _MemberAccessScreenState extends State<MemberAccessScreen> {
           )
         else
           ..._sessions.map((s) {
-            final phone = s.key;
+            final phone = s.key; // id del doc: la llave del permiso
             final alias = s.value;
+            final shownPhone = _sessionPhones[phone] ?? phone;
             final selected = _allSessions || _granted.contains(phone);
             return SwitchListTile(
               value: selected,
@@ -341,9 +351,9 @@ class _MemberAccessScreenState extends State<MemberAccessScreen> {
                 alias,
                 style: const TextStyle(color: white, fontWeight: FontWeight.w600),
               ),
-              subtitle: alias != phone
+              subtitle: alias != shownPhone
                   ? Text(
-                      phone,
+                      shownPhone,
                       style: const TextStyle(color: lightText, fontSize: 12),
                     )
                   : null,

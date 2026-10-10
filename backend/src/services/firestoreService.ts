@@ -7,6 +7,7 @@ import { decryptSecretMessageEdit, SECRET_ENC_TYPE_MESSAGE_EDIT } from '../utils
 import { ACCOUNTS_COLLECTION } from '../config/env';
 import { extractMediaInfo, processMediaAsync } from './mediaService';
 import { WHATSAPP_SENDER } from './senderResolver';
+import { defaultSessionAlias } from './sessionTarget';
 
 // Lazy evaluation: getDb() is called only after Firebase is initialized
 function getDb() {
@@ -318,21 +319,30 @@ export async function deleteMessageIndexEntry(
   }
 }
 
-// Initialize/update session document in Firestore
-export async function initializeSession(phoneNumber: string, sessionKey: string, accountId: string) {
+// Initialize/update session document in Firestore.
+// `sessionId` es el doc; `linkedPhone`, el número realmente vinculado. Son
+// iguales salvo en una sesión que cambió de número (ver sessionTarget.ts).
+// Devuelve el doc tal como estaba antes de esta escritura (ya lo leemos para
+// el alias): de ahí sale, por ejemplo, la fecha del último cambio de número.
+export async function initializeSession(
+  sessionId: string,
+  linkedPhone: string,
+  sessionKey: string,
+  accountId: string,
+): Promise<Record<string, any> | undefined> {
   try {
     const sessionDocRef = getDb()
       .collection(ACCOUNTS_COLLECTION)
       .doc(accountId)
       .collection('whatsapp_sessions')
-      .doc(phoneNumber);
+      .doc(sessionId);
 
     // Check if document already exists to preserve alias
     const doc = await sessionDocRef.get();
     const existingData = doc.data();
 
     const sessionData: any = {
-      phone_number: phoneNumber,
+      phone_number: linkedPhone,
       status: 'connected',
       last_sync: admin.firestore.Timestamp.now(),
       connected_at: admin.firestore.FieldValue.serverTimestamp(),
@@ -341,13 +351,15 @@ export async function initializeSession(phoneNumber: string, sessionKey: string,
 
     // Only set default alias if it doesn't exist yet
     if (!existingData || !existingData.alias) {
-      sessionData.alias = `Sucursal - ${phoneNumber}`;
+      sessionData.alias = defaultSessionAlias(linkedPhone);
     }
 
     await sessionDocRef.set(sessionData, { merge: true });
-    console.log(`Session initialized for phone: ${phoneNumber} with key: ${sessionKey}`);
+    console.log(`Session initialized: doc ${sessionId}, número ${linkedPhone}, key ${sessionKey}`);
+    return existingData;
   } catch (error) {
     console.error('Error initializing session:', error);
+    return undefined;
   }
 }
 
@@ -430,12 +442,12 @@ export async function saveMessageToFirestore(
     message = unwrapMessageContent(message);
 
     const session = sessions.get(sessionKey);
-    if (!session?.phoneNumber) {
+    if (!session?.sessionId) {
       console.warn('Session phone number not set, cannot save message');
       return;
     }
 
-    const sessionId = session.phoneNumber;
+    const sessionId = session.sessionId;
 
     // Extract clean phone number from the message's remote JID
     const remoteJid = message.key.remoteJid;
@@ -842,6 +854,12 @@ export async function saveMessageToFirestore(
       ? { messageSecret: Buffer.from(rawMessageSecret).toString('base64') }
       : {};
 
+    // Llegó por la línea anterior (sigue conectada tras un cambio de número):
+    // la burbuja lo marca "a tu número anterior" y la cuenta nueva no puede
+    // editarlo, borrarlo para todos ni reaccionarle (no es suyo).
+    const viaPreviousLine = session.role === 'previous' && !!session.linkedPhone;
+    const previousNumberFields = viaPreviousLine ? { previousNumber: session.linkedPhone } : {};
+
     // Save message to messages subcollection
     const msgTimestamp = admin.firestore.Timestamp.fromDate(new Date(messageTimestamp));
     await messagesSubCollectionRef.doc(messageId).set({
@@ -855,6 +873,7 @@ export async function saveMessageToFirestore(
       ...mediaFields,
       ...quoteFields,
       ...secretFields,
+      ...previousNumberFields,
     }, { merge: true });
 
     // Indexar al media_index si aplica (imágenes/videos/docs; no audios ni stickers ni gifs).
@@ -920,7 +939,9 @@ export async function saveMessageToFirestore(
       last_message: lastMessagePreview.substring(0, 100),
       last_message_timestamp: admin.firestore.Timestamp.fromDate(new Date(messageTimestamp)),
       last_chat_id: phoneNumber,
-      last_sync: admin.firestore.Timestamp.now(),
+      // `last_sync` es el latido del socket principal (la app lo cruza con
+      // `status`): un mensaje de la línea anterior no puede hacerlo pasar por vivo.
+      ...(!viaPreviousLine && { last_sync: admin.firestore.Timestamp.now() }),
     });
 
     console.log(`Message saved for ${phoneNumber} (Account: ${accountId}, Session: ${sessionId})`);
@@ -972,7 +993,7 @@ export function cacheContactName(contact: any, sessionKey: string, sessions: Map
 // un mensaje de ese contacto o en la próxima reconciliación.
 export async function applyContactUpdate(contact: any, sessionKey: string, accountId: string, sessions: Map<string, SessionData>) {
   const session = sessions.get(sessionKey);
-  if (!session?.phoneNumber) return;
+  if (!session?.sessionId) return;
 
   const info = extractContactInfo(contact);
   if (!info) return;
@@ -987,7 +1008,7 @@ export async function applyContactUpdate(contact: any, sessionKey: string, accou
       .collection(ACCOUNTS_COLLECTION)
       .doc(accountId)
       .collection('whatsapp_sessions')
-      .doc(session.phoneNumber)
+      .doc(session.sessionId)
       .collection('chats')
       .doc(info.phoneNumber);
 
@@ -1008,10 +1029,10 @@ export async function applyContactUpdate(contact: any, sessionKey: string, accou
 // la tiene (o difiere). O(chatsReales) en lugar de O(agendaCompleta).
 export async function reconcileContactNames(sessionKey: string, accountId: string, sessions: Map<string, SessionData>) {
   const session = sessions.get(sessionKey);
-  if (!session?.phoneNumber) return;
+  if (!session?.sessionId) return;
   if (session.contactNames.size === 0) return;
 
-  const sessionId = session.phoneNumber;
+  const sessionId = session.sessionId;
   const chatsRef = getDb()
     .collection(ACCOUNTS_COLLECTION)
     .doc(accountId)
@@ -1232,7 +1253,7 @@ export async function getAIConfig(session: SessionData, accountId: string) {
   try {
     const sessionDocRef = getDb()
       .collection(ACCOUNTS_COLLECTION).doc(accountId)
-      .collection('whatsapp_sessions').doc(session.phoneNumber!);
+      .collection('whatsapp_sessions').doc(session.sessionId!);
 
     const doc = await sessionDocRef.get();
     const data = doc.data();

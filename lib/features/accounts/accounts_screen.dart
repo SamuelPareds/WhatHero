@@ -1,17 +1,18 @@
-import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:http/http.dart' as http;
 import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/services/account_context_service.dart';
-import 'package:crm_whatsapp/core/services/api_client.dart';
 import 'package:crm_whatsapp/core/services/notification_service.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/core/services/storage_service.dart';
 import 'package:crm_whatsapp/core/services/version_service.dart';
+import 'package:crm_whatsapp/core/utils/phone_input.dart';
+import 'package:crm_whatsapp/core/utils/session_phone.dart';
 import 'package:crm_whatsapp/features/auth.dart';
-import 'package:crm_whatsapp/features/accounts/link_account_screen.dart';
+import 'package:crm_whatsapp/features/accounts/change_number/change_number_flow.dart';
+import 'package:crm_whatsapp/features/accounts/link_result.dart';
+import 'package:crm_whatsapp/features/accounts/session_linking.dart';
 import 'package:crm_whatsapp/features/members/members_screen.dart';
 import 'package:crm_whatsapp/features/settings.dart';
 import 'package:crm_whatsapp/features/chat.dart';
@@ -95,50 +96,184 @@ class _AccountsScreenState extends State<AccountsScreen> {
     }
   }
 
-  Future<void> _startNewSession() async {
-    // Verificar conexión del socket centralizado
-    if (!SocketService().isConnected) {
-      print('[AccountsScreen] Socket no está conectado, esperando...');
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Conectando al servidor... intenta de nuevo')),
-      );
+  // Última foto de la lista, para que el FAB pueda preguntar si el número
+  // nuevo reemplaza a uno de estos sin abrir otra consulta.
+  List<QueryDocumentSnapshot> _sessions = const [];
+
+  /// FAB "Agregar número". Si ya hay sesiones, el owner elige antes del QR si
+  /// el número reemplaza a otro: es el momento natural de quien perdió su
+  /// línea, y si lo vincula suelto y empieza a trabajar ahí, después ya no se
+  /// pueden juntar los dos historiales.
+  Future<void> _onAddNumber() async {
+    if (!AccountContextService().isOwner || _sessions.isEmpty) {
+      await linkWhatsApp(context, accountId: widget.accountId);
       return;
     }
 
-    try {
-      print('[AccountsScreen] POST /start-session con accountId: ${widget.accountId}');
-      final response = await http.post(
-        Uri.parse('$backendUrl/start-session'),
-        headers: await authHeaders(),
-        body: jsonEncode({'accountId': widget.accountId}),
-      ).timeout(const Duration(seconds: 10));
+    final replaced = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: surfaceDark,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (sheetContext) => SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(8, 16, 8, 8),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 16),
+                child: Text(
+                  '¿Este número reemplaza a otro?',
+                  style: TextStyle(color: white, fontSize: 18, fontWeight: FontWeight.w700),
+                ),
+              ),
+              const Padding(
+                padding: EdgeInsets.fromLTRB(16, 6, 16, 12),
+                child: Text(
+                  'Si perdiste o cambiaste un número, el nuevo se queda con sus chats y su configuración.',
+                  style: TextStyle(color: lightText, fontSize: 13),
+                ),
+              ),
+              for (final doc in _sessions)
+                ListTile(
+                  leading: const Icon(Icons.swap_horiz, color: primaryAqua),
+                  title: Text(_aliasOf(doc), style: const TextStyle(color: white)),
+                  subtitle: Text(
+                    'Reemplaza a ${displayPhone(sessionPhone(_dataOf(doc), doc.id))}',
+                    style: const TextStyle(color: lightText, fontSize: 12),
+                  ),
+                  onTap: () => Navigator.pop(sheetContext, doc.id),
+                ),
+              const Divider(color: Colors.white12),
+              ListTile(
+                leading: const Icon(Icons.add, color: lightText),
+                title: const Text('No, es una línea más', style: TextStyle(color: white)),
+                onTap: () => Navigator.pop(sheetContext, ''),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (replaced == null || !mounted) return;
+    if (replaced.isEmpty) {
+      await linkWhatsApp(context, accountId: widget.accountId);
+    } else {
+      await showChangeNumberFlow(context, accountId: widget.accountId, sessionId: replaced);
+    }
+  }
 
-      print('[AccountsScreen] Respuesta POST: ${response.statusCode}');
+  /// Re-vincular una tarjeta desconectada. El owner elige primero si es el
+  /// mismo número o uno nuevo; un miembro del equipo sólo puede reconectar el
+  /// mismo (cambiar el número es decisión del dueño).
+  Future<void> _onRelink(String sessionId, Map<String, dynamic> data) async {
+    final phone = sessionPhone(data, sessionId);
+    final alias = (data['alias'] as String?) ?? displayPhone(phone);
 
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body) as Map<String, dynamic>;
-        final sessionKey = data['sessionKey'] as String;
-        print('[AccountsScreen] sessionKey recibido: $sessionKey');
-
-        if (!mounted) return;
-        Navigator.push(
-          context,
-          MaterialPageRoute(
-            builder: (_) => LinkAccountScreen(
-              sessionKey: sessionKey,
-              accountId: widget.accountId,
+    bool newNumber = false;
+    if (AccountContextService().isOwner) {
+      final choice = await showModalBottomSheet<bool>(
+        context: context,
+        backgroundColor: surfaceDark,
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+        ),
+        builder: (sheetContext) => SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(8, 16, 8, 8),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                  child: Text(
+                    '¿Con qué número reconectas “$alias”?',
+                    style: const TextStyle(color: white, fontSize: 18, fontWeight: FontWeight.w700),
+                  ),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.sync, color: primaryAqua),
+                  title: Text('El mismo: ${displayPhone(phone)}', style: const TextStyle(color: white)),
+                  subtitle: const Text(
+                    'Se desconectó, pero sigues usando ese número',
+                    style: TextStyle(color: lightText, fontSize: 12),
+                  ),
+                  onTap: () => Navigator.pop(sheetContext, false),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.swap_horiz, color: primaryAqua),
+                  title: const Text('Uno nuevo', style: TextStyle(color: white)),
+                  subtitle: const Text(
+                    'Perdiste o cambiaste el número: el nuevo se queda con los chats y la configuración',
+                    style: TextStyle(color: lightText, fontSize: 12),
+                  ),
+                  onTap: () => Navigator.pop(sheetContext, true),
+                ),
+              ],
             ),
           ),
-        );
-      }
-    } catch (e) {
-      print('[AccountsScreen] Error: $e');
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error: ${e.toString()}')),
+        ),
       );
+      if (choice == null || !mounted) return;
+      newNumber = choice;
     }
+
+    if (newNumber) {
+      await showChangeNumberFlow(context, accountId: widget.accountId, sessionId: sessionId);
+      return;
+    }
+
+    final result = await linkWhatsApp(
+      context,
+      accountId: widget.accountId,
+      intoSessionId: sessionId,
+      title: 'Reconectar $alias',
+      hint: 'Escanea con el WhatsApp de ${displayPhone(phone)}',
+    );
+    if (result == null || !result.rejected || !mounted) return;
+    await _explainRejection(result, sessionId);
+  }
+
+  Future<void> _explainRejection(LinkResult result, String sessionId) async {
+    // Escanearon con otro número desde "El mismo": casi siempre es alguien
+    // que cambió de número y no lo sabía decir. Le damos la salida ahí mismo.
+    final offerChange = result.rejectedReason == 'wrong_number' && AccountContextService().isOwner;
+    final change = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        backgroundColor: surfaceDark,
+        title: const Text('No se vinculó', style: TextStyle(color: white)),
+        content: Text(result.rejectionMessage, style: const TextStyle(color: lightText)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Entendido'),
+          ),
+          if (offerChange)
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('Cambiar de número'),
+            ),
+        ],
+      ),
+    );
+    if (change == true && mounted) {
+      await showChangeNumberFlow(context, accountId: widget.accountId, sessionId: sessionId);
+    }
+  }
+
+  static Map<String, dynamic> _dataOf(DocumentSnapshot doc) =>
+      doc.data() as Map<String, dynamic>? ?? const {};
+
+  static String _aliasOf(DocumentSnapshot doc) {
+    final data = _dataOf(doc);
+    final alias = data['alias'];
+    return alias is String && alias.trim().isNotEmpty ? alias : displayPhone(sessionPhone(data, doc.id));
   }
 
   @override
@@ -173,7 +308,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
         ],
       ),
       floatingActionButton: FloatingActionButton(
-        onPressed: _startNewSession,
+        onPressed: _onAddNumber,
         backgroundColor: primaryAqua,
         child: const Icon(Icons.add),
       ),
@@ -213,6 +348,8 @@ class _AccountsScreenState extends State<AccountsScreen> {
               return 0;
             });
 
+          _sessions = sessions;
+
           if (sessions.isEmpty) {
             return Center(
               child: Column(
@@ -238,9 +375,12 @@ class _AccountsScreenState extends State<AccountsScreen> {
             itemCount: sessions.length,
             itemBuilder: (context, index) {
               final sessionDoc = sessions[index];
+              // El id del doc es la sesión; el número que hoy usa vive en
+              // `phone_number` (cambia si la sesión cambió de número).
               final phoneNumber = sessionDoc.id;
               final data = sessionDoc.data() as Map<String, dynamic>? ?? {};
-              final alias = data['alias'] ?? phoneNumber;
+              final alias = _aliasOf(sessionDoc);
+              final previousLines = _livePreviousLines(data);
               final visual = _SessionVisual.from(
                 data['status'] as String?,
                 (data['last_sync'] as Timestamp?)?.toDate(),
@@ -340,12 +480,22 @@ class _AccountsScreenState extends State<AccountsScreen> {
                               ),
                               const SizedBox(height: 4),
                               Text(
-                                phoneNumber,
+                                displayPhone(sessionPhone(data, phoneNumber)),
                                 style: const TextStyle(
                                   fontSize: 13,
                                   color: lightText,
                                 ),
                               ),
+                              // La red de seguridad tras un cambio de número:
+                              // el anterior sigue recibiendo en estos chats.
+                              for (final line in previousLines)
+                                Padding(
+                                  padding: const EdgeInsets.only(top: 2),
+                                  child: Text(
+                                    'Número anterior ${displayPhone(line)} · recibiendo',
+                                    style: TextStyle(fontSize: 11.5, color: lightText.withValues(alpha: 0.75)),
+                                  ),
+                                ),
                             ],
                           ),
                         ),
@@ -391,7 +541,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
                             if (!isConnected)
                               IconButton(
                                 icon: const Icon(Icons.sync, color: primaryAqua, size: 22),
-                                onPressed: _startNewSession,
+                                onPressed: () => _onRelink(phoneNumber, data),
                                 tooltip: 'Re-vincular cuenta',
                               ),
                           ],
@@ -425,6 +575,17 @@ class _AccountsScreenState extends State<AccountsScreen> {
       ),
     );
   }
+}
+
+/// Números anteriores que siguen conectados recibiendo (`previous_lines`). Los
+/// desconectados no se muestran en la tarjeta: viven en Ajustes › Conexión.
+List<String> _livePreviousLines(Map<String, dynamic> data) {
+  final lines = data['previous_lines'];
+  if (lines is! Map) return const [];
+  return [
+    for (final entry in lines.entries)
+      if (entry.value is Map && (entry.value as Map)['status'] != 'disconnected') entry.key as String,
+  ];
 }
 
 /// Cómo se ve una sesión en la lista, derivado de `status` + `last_sync`.

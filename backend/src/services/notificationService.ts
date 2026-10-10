@@ -12,6 +12,8 @@ function getDb() {
 // no enviar media frase. `send_failed`: un chunk no salió ni con reintento, así
 // que la respuesta quedó incompleta en el chat del cliente. `ai_failed`: el
 // proveedor falló o no contestó a tiempo; antes ese mensaje se perdía en silencio.
+// `previous_number`: un cliente le escribió al número anterior de la sesión,
+// que quedó conectado sólo para recibir tras un cambio de número.
 export type HumanAttentionReason =
   | 'discriminator'
   | 'blocked_media'
@@ -19,7 +21,8 @@ export type HumanAttentionReason =
   | 'ai_off'
   | 'ai_truncated'
   | 'send_failed'
-  | 'ai_failed';
+  | 'ai_failed'
+  | 'previous_number';
 
 export interface HumanAttentionPayload {
   accountId: string;          // UID del usuario dueño de la sesión
@@ -62,6 +65,12 @@ const MEDIA_LABEL: Record<string, string> = {
 };
 
 function buildBody(payload: HumanAttentionPayload): string {
+  const body = buildPreview(payload);
+  // Hay que contestarle desde el número nuevo: el aviso lo dice antes que nada.
+  return payload.reason === 'previous_number' ? `📵 A tu número anterior · ${body}` : body;
+}
+
+function buildPreview(payload: HumanAttentionPayload): string {
   const preview = (payload.messagePreview ?? '').replace(/\s+/g, ' ').trim();
   // Si llegó adjunto y no hay texto/caption, mostramos etiqueta amigable.
   // Aplica a blocked_media (siempre sin caption) y a ai_off cuando el

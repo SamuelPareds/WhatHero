@@ -15,7 +15,7 @@ import admin from 'firebase-admin';
 import { rmSync, existsSync, readdirSync, writeFileSync, readFileSync, mkdirSync } from 'fs';
 import { randomUUID } from 'crypto';
 import cron from 'node-cron';
-import { SessionData } from './src/types';
+import { SessionData, SessionRole } from './src/types';
 import { extractPhoneNumber, storeLIDMapping, resolveLIDViaSock, isConversationalJid, waNumberCandidates } from './src/utils/phone';
 import { unwrapMessageContent } from './src/utils/message';
 import { initializeSession, saveMessageToFirestore, getAIConfig, cacheContactName, applyContactUpdate, reconcileContactNames, consolidateLIDChat, incrementUnrespondedCount, resetUnrespondedCount, writeMediaIndexEntry, isIndexableMedia, writeMessageIndexEntry } from './src/services/firestoreService';
@@ -33,7 +33,21 @@ import {
   retireSession,
   retireDuplicateSessions,
   teardownSocket,
+  logoutAndForget,
+  syncSessionStatus,
+  writeSessionStatus,
+  projectStatus,
 } from './src/services/sessionSupervisor';
+import {
+  type LinkIntent,
+  type RejectReason,
+  type TargetDecision,
+  decideSessionTarget,
+  gatherTargetFacts,
+  applyNumberChange,
+  NumberChangeError,
+  lastNumberChangeMs,
+} from './src/services/sessionTarget';
 
 // Mapeo de códigos de AiError → HTTP para el endpoint manual (copiloto). El
 // frontend usa el `code` para mostrar un mensaje claro con acción "Reintentar".
@@ -156,7 +170,7 @@ const aiBuffers = new AiBuffers({
   hasState: hasAiState,
   // La IA cede el turno mientras un operador tiene texto escrito en el chat.
   isComposing: ({ accountId, sessionKey, contactPhone }) => {
-    const sessionPhone = sessions.get(sessionKey)?.phoneNumber;
+    const sessionPhone = sessions.get(sessionKey)?.sessionId;
     return !!sessionPhone && isComposingIn(accountId, sessionPhone, contactPhone);
   },
 });
@@ -268,27 +282,39 @@ initPresence(io);
 
 // `meta.json` es lo único de una sesión que sobrevive a un reinicio del
 // contenedor. Guarda a qué cuenta pertenece y —desde el incidente del
-// 03-sep-2026— qué número tiene vinculado. Sin el número, un arranque en frío
-// no sabía a qué doc de Firestore escribirle el estado (`phoneNumber` sólo se
-// conocía tras el primer `open`), así que una sesión que moría antes de
-// conectar dejaba el doc congelado en lo último que dijera.
+// 03-sep-2026— a qué doc de Firestore le escribe. Sin eso, un arranque en frío
+// no sabía dónde escribir el estado (el doc sólo se conocía tras el primer
+// `open`), así que una sesión que moría antes de conectar dejaba el doc
+// congelado en lo último que dijera.
 interface SessionMeta {
   accountId: string;
-  phoneNumber?: string;
+  // Doc de sesión al que escribe. Se fija en el primer `open` y no cambia más.
+  sessionId?: string;
+  // Número realmente vinculado. Difiere de `sessionId` tras un cambio de número.
+  linkedPhone?: string;
+  role?: SessionRole;
+  // Lo que pidió quien escaneó el QR (asistente de cambio de número o
+  // re-vincular una tarjeta). Vive acá y no en memoria porque `startSession`
+  // se re-ejecuta en cada reintento previo al `open`. Se consume al conectar.
+  linkIntent?: LinkIntent;
 }
 
 function readSessionMeta(sessionKey: string): SessionMeta | null {
   try {
-    const meta = JSON.parse(readFileSync(`auth_info/${sessionKey}/meta.json`, 'utf-8'));
-    return meta?.accountId ? meta : null;
+    const raw = JSON.parse(readFileSync(`auth_info/${sessionKey}/meta.json`, 'utf-8'));
+    if (!raw?.accountId) return null;
+    // Los meta.json escritos antes del 09-oct-2026 guardaban el doc como `phoneNumber`.
+    const { phoneNumber, ...meta } = raw;
+    return { ...meta, sessionId: meta.sessionId ?? phoneNumber };
   } catch {
     return null;
   }
 }
 
 // Merge, nunca overwrite: `startSession` la reescribe en cada reconexión y sin
-// el merge borraría el `phoneNumber` aprendido en la conexión anterior.
-function writeSessionMeta(sessionKey: string, patch: SessionMeta): void {
+// el merge borraría el doc aprendido en la conexión anterior. Un campo en
+// `undefined` se borra (JSON.stringify lo omite).
+function writeSessionMeta(sessionKey: string, patch: Partial<SessionMeta>): void {
   try {
     const current = readSessionMeta(sessionKey) ?? {};
     writeFileSync(`auth_info/${sessionKey}/meta.json`, JSON.stringify({ ...current, ...patch }));
@@ -297,12 +323,163 @@ function writeSessionMeta(sessionKey: string, patch: SessionMeta): void {
   }
 }
 
-async function startSession(sessionKey: string, accountId: string) {
+// --- A qué doc escribe una sesión al conectar (ver services/sessionTarget.ts) ---
+
+interface NumberChangeSummary {
+  numberChangedFrom: string;
+  pausedAutomations: string[];
+  // 'kept' = quedó recibiendo; 'disconnected' = se desconectó; null = no estaba en memoria.
+  previousLine: 'kept' | 'disconnected' | null;
+}
+
+/**
+ * Decide a qué doc escribe una sesión recién conectada y, si es un cambio de
+ * número, lo aplica. null = vinculación rechazada: ya se avisó al cliente y la
+ * sesión quedó cerrada, sin tocar Firestore.
+ */
+async function bindSessionDoc(
+  sessionKey: string,
+  session: SessionData,
+  linked: string,
+): Promise<{ sessionId: string; change?: NumberChangeSummary } | null> {
+  const { accountId } = session;
+  const meta = readSessionMeta(sessionKey);
+  const intent = meta?.linkIntent;
+
+  let decision: TargetDecision;
+  try {
+    decision = decideSessionTarget(await gatherTargetFacts(accountId, linked, meta?.sessionId, intent));
+  } catch (error) {
+    console.error(`[Vincular] No se pudo decidir el doc de ${sessionKey}:`, error);
+    // Sin intent, lo de siempre: el doc del número. Con intent no adivinamos:
+    // un cambio de número a ciegas podría caer en la sesión equivocada.
+    decision = intent
+      ? { kind: 'reject', reason: 'error', sessionId: intent.intoSessionId }
+      : { kind: 'relink', sessionId: linked };
+  }
+
+  let change: NumberChangeSummary | undefined;
+  if (decision.kind === 'number_change') {
+    try {
+      change = await changeSessionNumber(sessionKey, session, decision, linked, !!intent?.keepPrevious);
+    } catch (error) {
+      const reason: RejectReason = error instanceof NumberChangeError ? error.reason : 'error';
+      if (reason === 'error') console.error(`[CambioNúmero] Falló en ${decision.sessionId}:`, error);
+      decision = { kind: 'reject', reason, sessionId: decision.sessionId };
+    }
+  }
+
+  if (decision.kind === 'reject') {
+    console.warn(`[Vincular] ${linked} rechazado para ${decision.sessionId ?? '—'} (${decision.reason}); cerrando ${sessionKey}.`);
+    io.to(accountId).emit('link_rejected', {
+      sessionKey,
+      reason: decision.reason,
+      phoneNumber: linked,
+      sessionId: decision.sessionId,
+    });
+    await logoutAndForget(sessionKey, `link_rejected_${decision.reason}`);
+    return null;
+  }
+
+  session.sessionId = decision.sessionId;
+  // Fijar el doc es lo que hace que las reconexiones (y el próximo arranque en
+  // frío) escriban siempre al mismo, aunque el número no coincida con el id.
+  writeSessionMeta(sessionKey, { sessionId: decision.sessionId, linkedPhone: linked, linkIntent: undefined });
+  return { sessionId: decision.sessionId, change };
+}
+
+/**
+ * El número nuevo entra en el doc existente: no se mueve ni un documento. Los
+ * sockets del número anterior que sigan en memoria (vivos, o reintentando para
+ * siempre como uno bloqueado con 403) se quedan recibiendo o se desconectan,
+ * según eligió el owner.
+ */
+async function changeSessionNumber(
+  sessionKey: string,
+  session: SessionData,
+  decision: Extract<TargetDecision, { kind: 'number_change' }>,
+  linked: string,
+  keepPrevious: boolean,
+): Promise<NumberChangeSummary> {
+  const { accountId } = session;
+  const { sessionId, fromPhone } = decision;
+  const oldLines = [...sessions.entries()].filter(
+    ([key, s]) => key !== sessionKey && s.accountId === accountId && s.sessionId === sessionId && s.role === 'primary',
+  );
+  // Una línea caída hace más de 10 min (p.ej. el número bloqueado, que
+  // reintenta para siempre con 403) no es red de seguridad: se desconecta.
+  const keepers = new Set(
+    keepPrevious ? oldLines.filter(([, s]) => projectStatus(s) !== 'reconnect_failed').map(([key]) => key) : [],
+  );
+  const keep = keepers.size > 0;
+
+  // La transacción va primero: si falla, no se tocó nada.
+  const { pausedAutomations, changedAtMs } = await applyNumberChange(accountId, sessionId, fromPhone, linked, keep);
+  session.numberChangedAt = changedAtMs;
+  console.log(
+    `[CambioNúmero] ${sessionId}: ${fromPhone} → ${linked}. Línea anterior: ` +
+    `${oldLines.length === 0 ? 'no estaba conectada' : keep ? 'sigue recibiendo' : 'se desconecta'}. ` +
+    `Automáticos pausados: ${pausedAutomations.join(', ') || 'ninguno'}.`,
+  );
+
+  for (const [key, old] of oldLines) {
+    if (keepers.has(key)) becomePreviousLine(key, old, fromPhone);
+    else await logoutAndForget(key, 'number_changed');
+  }
+
+  // Volver a un número que había quedado como línea anterior: esa línea sobra,
+  // ahora es la principal.
+  for (const [key, s] of [...sessions.entries()]) {
+    if (key !== sessionKey && s.accountId === accountId && s.sessionId === sessionId && s.role === 'previous' && s.linkedPhone === linked) {
+      await logoutAndForget(key, 'number_back_to_primary');
+    }
+  }
+
+  if (decision.dropEmptyDocOf) await dropEmptySessionDoc(accountId, decision.dropEmptyDocOf);
+
+  return {
+    numberChangedFrom: fromPhone,
+    pausedAutomations,
+    previousLine: oldLines.length === 0 ? null : keep ? 'kept' : 'disconnected',
+  };
+}
+
+// El socket del número anterior se queda recibiendo: cambia de rol y desde
+// ahora reporta su estado en `previous_lines.{tel}`. El rol viaja en meta.json
+// para que un reinicio del backend lo restaure como línea anterior.
+function becomePreviousLine(sessionKey: string, session: SessionData, phone: string): void {
+  session.role = 'previous';
+  session.linkedPhone = session.linkedPhone ?? phone;
+  writeSessionMeta(sessionKey, { role: 'previous', linkedPhone: session.linkedPhone });
+  session.lastWrittenStatus = undefined; // su estado ahora vive en otro campo
+  void syncSessionStatus(sessionKey, session);
+}
+
+// El doc vacío que dejó una vinculación anterior del número nuevo ("Agregar
+// número" y nunca usado). Sin chats no hay nada que perder, y dejarlo mostraría
+// una tarjeta "Desvinculado" de un número que ahora vive en otra sesión. Antes
+// se cierran los sockets que le escriben: su próximo `status` lo resucitaría.
+async function dropEmptySessionDoc(accountId: string, sessionId: string): Promise<void> {
+  for (const [key, s] of [...sessions.entries()]) {
+    if (s.accountId === accountId && s.sessionId === sessionId) await logoutAndForget(key, 'number_moved');
+  }
+  try {
+    await db.recursiveDelete(
+      db.collection(ACCOUNTS_COLLECTION).doc(accountId).collection('whatsapp_sessions').doc(sessionId),
+    );
+    console.log(`[CambioNúmero] Doc vacío ${sessionId} borrado.`);
+  } catch (error) {
+    console.error(`[CambioNúmero] No se pudo borrar el doc vacío ${sessionId}:`, error);
+  }
+}
+
+async function startSession(sessionKey: string, accountId: string, linkIntent?: LinkIntent) {
   const { state, saveCreds } = await useMultiFileAuthState(`auth_info/${sessionKey}`);
   const version = await resolveWaVersion();
   console.log(`[startSession] ${sessionKey} → handshake con WA Web ${version.join('.')}`);
 
-  writeSessionMeta(sessionKey, { accountId });
+  writeSessionMeta(sessionKey, { accountId, ...(linkIntent && { linkIntent }) });
+  const meta = readSessionMeta(sessionKey);
 
   // De aquí al final NO hay awaits: el retiro del socket viejo, la publicación
   // del nuevo y el armado de su deadline ocurren en el mismo tick. Así el
@@ -330,7 +507,10 @@ async function startSession(sessionKey: string, accountId: string) {
     currentQR: undefined,
     // Hidratar desde meta.json es lo que permite reportar el estado de una
     // sesión que muere antes de llegar a `open` en un arranque en frío.
-    phoneNumber: previous?.phoneNumber ?? readSessionMeta(sessionKey)?.phoneNumber,
+    sessionId: previous?.sessionId ?? meta?.sessionId,
+    linkedPhone: previous?.linkedPhone ?? meta?.linkedPhone,
+    role: previous?.role ?? meta?.role ?? 'primary',
+    numberChangedAt: previous?.numberChangedAt,
     reconnectCount: previous?.reconnectCount ?? 0,
     accountId,
     generation,
@@ -410,8 +590,8 @@ async function startSession(sessionKey: string, accountId: string) {
 
     // Consolidate any duplicate chats created under the LID identifier
     const session = sessions.get(sessionKey);
-    if (session?.phoneNumber) {
-      await consolidateLIDChat(accountId, session.phoneNumber, lidNum, pnNum);
+    if (session?.sessionId) {
+      await consolidateLIDChat(accountId, session.sessionId, lidNum, pnNum);
     }
   });
 
@@ -447,22 +627,39 @@ async function startSession(sessionKey: string, accountId: string) {
       console.log(`[startSession] Conexión abierta para sessionKey: ${sessionKey}`);
 
       if (sock.user?.id) {
-        const phoneNumber = extractPhoneNumber(sock.user.id);
-        current.phoneNumber = phoneNumber;
-        // Persistir el número es lo que permite que el próximo arranque en frío
-        // sepa a qué doc escribirle aunque el socket muera antes de conectar.
-        writeSessionMeta(sessionKey, { accountId: current.accountId, phoneNumber });
-        console.log(`[startSession] WhatsApp conectado como: ${phoneNumber} (session: ${sessionKey})`);
+        const linked = extractPhoneNumber(sock.user.id);
+        current.linkedPhone = linked;
+        console.log(`[startSession] WhatsApp conectado como: ${linked} (session: ${sessionKey}, rol: ${current.role})`);
 
-        await initializeSession(phoneNumber, sessionKey, current.accountId);
+        // La línea anterior sólo reporta que sigue viva: el doc, su `status` y
+        // su `session_key` son del número nuevo. Sin `ready`: nadie espera un QR.
+        if (current.role === 'previous') {
+          await writeSessionStatus(current, 'connected');
+          return;
+        }
+
+        const bound = await bindSessionDoc(sessionKey, current, linked);
+        if (!bound) return; // rechazada: ya se avisó y se cerró
+
+        const sessionDoc = await initializeSession(bound.sessionId, linked, sessionKey, current.accountId);
+        current.numberChangedAt = lastNumberChangeMs(sessionDoc);
         current.lastWrittenStatus = 'connected';
 
         // Un número, una sesión: re-vincular crea un sessionKey nuevo y el
         // anterior se quedaba peleando por la misma cuenta de WhatsApp.
         await retireDuplicateSessions(sessionKey, current);
+
+        io.to(current.accountId).emit('ready', {
+          phoneNumber: linked,
+          sessionId: bound.sessionId,
+          sessionKey,
+          ...bound.change,
+        });
+        console.log(`[startSession] READY emitido para ${sessionKey}`);
+        return;
       }
 
-      io.to(current.accountId).emit('ready', { phoneNumber: current.phoneNumber, sessionKey });
+      io.to(current.accountId).emit('ready', { phoneNumber: current.sessionId, sessionId: current.sessionId, sessionKey });
       console.log(`[startSession] READY emitido para ${sessionKey}`);
       return;
     }
@@ -481,7 +678,7 @@ async function startSession(sessionKey: string, accountId: string) {
         const motivo = statusCode === 401 ? 'SESIÓN INVÁLIDA O NO AUTORIZADA' : 'LOGOUT DESDE EL TELÉFONO';
         console.log(`[ALERTA] WhatsApp cerró la sesión ${sessionKey}. Motivo: ${motivo}. Limpiando credenciales.`);
         const accountId = current.accountId;
-        const phoneNumber = current.phoneNumber;
+        const phoneNumber = current.sessionId;
         await retireSession(sessionKey, statusCode === 401 ? 'unauthorized' : 'logged_out', { wipeAuth: true });
         io.to(accountId).emit('status_update', { status: 'logged_out', sessionKey, phoneNumber });
         return;
@@ -490,7 +687,7 @@ async function startSession(sessionKey: string, accountId: string) {
       if (statusCode === 409) {
         console.log(`[ALERTA] Conflicto multidispositivo en ${sessionKey}: se inició sesión en otro lugar.`);
         const accountId = current.accountId;
-        const phoneNumber = current.phoneNumber;
+        const phoneNumber = current.sessionId;
         await retireSession(sessionKey, 'conflict_409', { wipeAuth: true });
         io.to(accountId).emit('status_update', { status: 'logged_out', sessionKey, phoneNumber });
         return;
@@ -501,7 +698,7 @@ async function startSession(sessionKey: string, accountId: string) {
       // `session.phoneNumber` estuviera vacío — y en un arranque en frío TODA
       // sesión restaurada lo tiene vacío, así que un 408 al bootear borraba
       // credenciales perfectamente válidas y exigía re-escanear el QR.
-      if (statusCode === DisconnectReason.timedOut && !current.phoneNumber && !readSessionMeta(sessionKey)?.phoneNumber) {
+      if (statusCode === DisconnectReason.timedOut && !current.sessionId && !readSessionMeta(sessionKey)?.sessionId) {
         console.log(`[startSession] QR expirado en ${sessionKey} (nunca se vinculó). Limpiando.`);
         const accountId = current.accountId;
         await retireSession(sessionKey, 'qr_timeout', { wipeAuth: true });
@@ -518,6 +715,54 @@ async function startSession(sessionKey: string, accountId: string) {
       scheduleReconnect(sessionKey, current, `close_${statusCode ?? 'unknown'}`);
     }
   });
+
+  // Lo que llega por la línea anterior ya quedó guardado (con `previousNumber`)
+  // en el mismo chat de siempre. Acá sólo se avisa: queda pendiente y sale un
+  // push para que alguien le conteste desde el número nuevo.
+  const handlePreviousLineMessage = async (message: any, upsertType: string, outgoingContact?: string) => {
+    const session = sessions.get(sessionKey);
+    if (!session?.sessionId) return;
+    const sessionId = session.sessionId;
+
+    // Alguien contestó desde otro dispositivo todavía vinculado al número
+    // anterior (un WhatsApp Web, por ejemplo): cuenta como respuesta.
+    if (message.key.fromMe) {
+      if (outgoingContact) await resetUnrespondedCount(accountId, sessionId, outgoingContact);
+      return;
+    }
+
+    const remoteJid = message.key.remoteJid;
+    if (!remoteJid || remoteJid.endsWith('@g.us')) return;
+    let contactPhone = extractPhoneNumber(remoteJid);
+    if (!contactPhone) return;
+    if (remoteJid.includes('@lid')) {
+      const resolved = await resolveLIDViaSock(contactPhone, sock);
+      if (resolved) contactPhone = resolved;
+    }
+
+    await incrementUnrespondedCount(accountId, sessionId, contactPhone, 1);
+
+    // El backlog que llega al reconectar queda pendiente sin push: avisar de
+    // mensajes de hace horas como si fueran nuevos sería ruido.
+    const ageMs = messageAgeMs(message);
+    if (upsertType === 'prepend' || (ageMs !== null && ageMs > AI_FRESH_WINDOW_MS)) return;
+
+    const mediaInfo = extractMediaInfo(message);
+    sendHumanAttentionNotification({
+      accountId,
+      sessionPhone: sessionId,
+      sessionKey,
+      chatId: contactPhone,
+      reason: 'previous_number',
+      messagePreview:
+        message.message?.conversation ||
+        message.message?.extendedTextMessage?.text ||
+        message.message?.imageMessage?.caption ||
+        message.message?.videoMessage?.caption ||
+        undefined,
+      mediaType: mediaInfo?.type,
+    }).catch((err) => console.error('[Notify] previous_number push falló:', err));
+  };
 
   // Procesa UN mensaje del lote. Vive como closure de startSession para
   // conservar `sock`, `sessionKey` y `accountId` sin arrastrarlos por firma.
@@ -617,6 +862,15 @@ async function startSession(sessionKey: string, accountId: string) {
 
     await saveMessageToFirestore(message, sessionKey, accountId, sessions, sock.user?.id, sock);
 
+    // Línea anterior (sigue conectada tras un cambio de número): sólo recibe.
+    // Nada de IA, reglas ni recibos de lectura: todo eso respondería desde el
+    // número viejo, y lo que buscamos es que el humano siga la conversación
+    // desde el nuevo.
+    if (sessions.get(sessionKey)?.role === 'previous') {
+      await handlePreviousLineMessage(message, upsertType, contactPhoneForCancel);
+      return;
+    }
+
     // AI auto-response: only for incoming messages (not from self)
     if (message.key.fromMe) {
       // El dueño respondió (CRM web o celular físico): resetear contador,
@@ -626,8 +880,8 @@ async function startSession(sessionKey: string, accountId: string) {
         if (contactPhoneForCancel) {
           // Reset contador: el humano (o IA via CRM) acaba de responder
           const sessionForReset = sessions.get(sessionKey);
-          if (!isOwnAiChunk && sessionForReset?.phoneNumber) {
-            await resetUnrespondedCount(accountId, sessionForReset.phoneNumber, contactPhoneForCancel);
+          if (!isOwnAiChunk && sessionForReset?.sessionId) {
+            await resetUnrespondedCount(accountId, sessionForReset.sessionId, contactPhoneForCancel);
           }
 
           // Le respondimos a este chat → confirmamos lectura de lo que tenía
@@ -652,7 +906,7 @@ async function startSession(sessionKey: string, accountId: string) {
               || message.message?.extendedTextMessage?.text
               || message.message?.imageMessage?.caption
               || '';
-            if (outgoingText.trim() && sessionForReset?.phoneNumber) {
+            if (outgoingText.trim() && sessionForReset?.sessionId) {
               const aiConfig = await getAIConfig(sessionForReset, accountId);
               for (const rule of aiConfig.keywordRules) {
                 const trigger = rule.trigger ?? 'incoming';
@@ -700,7 +954,7 @@ async function startSession(sessionKey: string, accountId: string) {
 
     // Extract contact phone number
     const session = sessions.get(sessionKey);
-    if (!session?.phoneNumber) return;
+    if (!session?.sessionId) return;
 
     // Resolvemos contactPhone temprano: lo necesitamos para incrementar el contador
     // de pendientes en cualquier rama donde la IA NO vaya a responder.
@@ -743,7 +997,7 @@ async function startSession(sessionKey: string, accountId: string) {
 
     // Helper local: marca este mensaje como pendiente de respuesta humana
     const markUnresponded = (by: number = 1) =>
-      incrementUnrespondedCount(accountId, session.phoneNumber!, contactPhone, by);
+      incrementUnrespondedCount(accountId, session.sessionId!, contactPhone, by);
 
     // Rancio: ya quedó guardado y visible en el chat. Sólo lo dejamos marcado
     // como pendiente para que el humano lo vea en el filtro y decida.
@@ -770,12 +1024,12 @@ async function startSession(sessionKey: string, accountId: string) {
     if (lowerMsg === 'enviar_recordatorios' || lowerMsg === 'enviar recordatorios') {
       console.log(`[Reminders] Manual trigger detected from ${message.key.remoteJid}`);
       // Run in background
-      ReminderService.processReminders(accountId, session.phoneNumber, sessionKey, sessions)
+      ReminderService.processReminders(accountId, session.sessionId, sessionKey, sessions)
         .then(result => {
-          console.log(`[Reminders] Manual trigger completed for ${session.phoneNumber}`, result);
+          console.log(`[Reminders] Manual trigger completed for ${session.sessionId}`, result);
         })
         .catch(err => {
-          console.error(`[Reminders] Manual trigger failed for ${session.phoneNumber}`, err);
+          console.error(`[Reminders] Manual trigger failed for ${session.sessionId}`, err);
         });
       return; // Comando interno, no cuenta como pendiente
     }
@@ -806,7 +1060,7 @@ async function startSession(sessionKey: string, accountId: string) {
           .collection(ACCOUNTS_COLLECTION)
           .doc(accountId)
           .collection('whatsapp_sessions')
-          .doc(session.phoneNumber)
+          .doc(session.sessionId)
           .collection('chats')
           .doc(contactPhone)
           .get();
@@ -831,14 +1085,14 @@ async function startSession(sessionKey: string, accountId: string) {
       const pendingTexts = aiBuffers.yieldToHuman({ accountId, sessionKey, contactPhone }, 'media bloqueada');
 
       // +1 por el mensaje multimedia que disparó el gate
-      await incrementUnrespondedCount(accountId, session.phoneNumber, contactPhone, pendingTexts + 1);
+      await incrementUnrespondedCount(accountId, session.sessionId, contactPhone, pendingTexts + 1);
 
       try {
         await db
           .collection(ACCOUNTS_COLLECTION)
           .doc(accountId)
           .collection('whatsapp_sessions')
-          .doc(session.phoneNumber)
+          .doc(session.sessionId)
           .collection('chats')
           .doc(contactPhone)
           .set(
@@ -852,7 +1106,7 @@ async function startSession(sessionKey: string, accountId: string) {
       io.to(accountId).emit('human_attention_required', {
         sessionKey,
         chatId: contactPhone,
-        phoneNumber: session.phoneNumber,
+        phoneNumber: session.sessionId,
         timestamp: new Date().toISOString(),
         reason: 'blocked_media',
         mediaType: mediaInfo?.type,
@@ -861,7 +1115,7 @@ async function startSession(sessionKey: string, accountId: string) {
       // Push FCM para media bloqueada. No bloqueamos el flujo principal.
       sendHumanAttentionNotification({
         accountId,
-        sessionPhone: session.phoneNumber,
+        sessionPhone: session.sessionId,
         sessionKey,
         chatId: contactPhone,
         reason: 'blocked_media',
@@ -932,7 +1186,7 @@ async function startSession(sessionKey: string, accountId: string) {
               .collection(ACCOUNTS_COLLECTION)
               .doc(accountId)
               .collection('whatsapp_sessions')
-              .doc(session.phoneNumber)
+              .doc(session.sessionId)
               .collection('chats')
               .doc(contactPhone)
               .get();
@@ -945,7 +1199,7 @@ async function startSession(sessionKey: string, accountId: string) {
         if (prevCount === 0) {
           sendHumanAttentionNotification({
             accountId,
-            sessionPhone: session.phoneNumber,
+            sessionPhone: session.sessionId,
             sessionKey,
             chatId: contactPhone,
             reason: 'ai_off',
@@ -981,9 +1235,17 @@ async function startSession(sessionKey: string, accountId: string) {
         // La sesión viva al disparar, no la capturada acá: tras una reconexión
         // la de este closure tiene el socket muerto y la respuesta no saldría.
         const liveSession = sessions.get(sessionKey);
-        if (!liveSession?.phoneNumber) {
+        if (!liveSession?.sessionId) {
           console.warn(`[Buffer] La sesión ${sessionKey} ya no existe; sin respuesta de IA para ${contactPhone}`);
           emitAiState(accountId, sessionKey, contactPhone, 'idle');
+          return;
+        }
+        // El número cambió durante la espera y este socket quedó como línea
+        // anterior: nunca responde (contestaría desde el número viejo). Lo que
+        // juntó queda pendiente para el humano, que contesta desde el nuevo.
+        if (liveSession.role !== 'primary') {
+          emitAiState(accountId, sessionKey, contactPhone, 'idle');
+          await incrementUnrespondedCount(accountId, liveSession.sessionId, contactPhone, messages.length);
           return;
         }
         console.log(`[Buffer] Timeout expired for ${contactPhone}, processing ${messages.length} message(s)`);
@@ -1059,7 +1321,9 @@ async function performSendMessage(
   senderUid: string,
 ) {
   const session = sessions.get(sessionKey);
-  if (!session?.isReady || !session?.phoneNumber) {
+  // `role`: una línea anterior (tras un cambio de número) sólo recibe. Su
+  // sessionKey nunca llega a la app, pero si llegara no puede enviar.
+  if (!session?.isReady || !session?.sessionId || session.role !== 'primary') {
     throw new Error('Session not ready');
   }
   // El sessionKey viaja en el payload: tiene que ser de la cuenta de quien
@@ -1088,7 +1352,7 @@ async function performSendMessage(
     // No salió: la ráfaga que la IA soltó por este humano quedaría sin
     // respuesta y sin contar. La dejamos pendiente para que alguien la vea.
     if (droppedBurst > 0) {
-      incrementUnrespondedCount(accountId, session.phoneNumber, chatPhone, droppedBurst).catch((e) =>
+      incrementUnrespondedCount(accountId, session.sessionId, chatPhone, droppedBurst).catch((e) =>
         console.error('[performSendMessage] No se pudo contar la ráfaga soltada:', e),
       );
     }
@@ -1110,7 +1374,7 @@ async function sendAsHuman(
       .collection(ACCOUNTS_COLLECTION)
       .doc(accountId)
       .collection('whatsapp_sessions')
-      .doc(session.phoneNumber!)
+      .doc(session.sessionId!)
       .collection('chats')
       .doc(to);
 
@@ -1218,9 +1482,19 @@ async function sendAsHuman(
 }
 
 // REST API endpoint to start a new session
+// Ids de doc de sesión y números: sólo dígitos. Además de validar, impide que
+// un valor con puntos se cuele como ruta de campo en `previous_lines.{tel}`.
+const SESSION_ID_RE = /^\d{6,20}$/;
+
+// El owner de la cuenta (no un miembro del equipo).
+async function isAccountOwner(uid: string, accountId: string): Promise<boolean> {
+  const data = (await db.collection('users').doc(uid).get()).data();
+  return data?.role === 'owner' && data?.ownedAccountId === accountId;
+}
+
 app.post('/start-session', express.json(), verifyHttpAuth(), async (req, res) => {
   try {
-    const { accountId } = req.body;
+    const { accountId, intoSessionId, allowNumberChange, keepPrevious } = req.body;
     console.log('[/start-session] POST recibido con accountId:', accountId);
 
     if (!accountId) {
@@ -1228,17 +1502,82 @@ app.post('/start-session', express.json(), verifyHttpAuth(), async (req, res) =>
       return res.status(400).json({ error: 'Missing accountId in request body' });
     }
 
-    const sessionKey = randomUUID();
-    console.log('[/start-session] Nuevo sessionKey generado:', sessionKey);
-    console.log('[/start-session] Llamando a startSession...');
+    // Re-vincular una tarjeta o cambiarle el número: la intención viaja con la
+    // sesión hasta que conecte, y ahí se decide a qué doc escribe (ver
+    // services/sessionTarget.ts). Sin intención, es "Agregar número".
+    let linkIntent: LinkIntent | undefined;
+    if (intoSessionId !== undefined) {
+      if (typeof intoSessionId !== 'string' || !SESSION_ID_RE.test(intoSessionId)) {
+        return res.status(400).json({ error: 'intoSessionId inválido' });
+      }
+      const wantsChange = allowNumberChange === true;
+      if (wantsChange && !(await isAccountOwner(req.auth!.uid, accountId))) {
+        return res.status(403).json({ error: 'Sólo el owner puede cambiar el número de una sesión' });
+      }
+      const target = await db
+        .collection(ACCOUNTS_COLLECTION)
+        .doc(accountId)
+        .collection('whatsapp_sessions')
+        .doc(intoSessionId)
+        .get();
+      if (!target.exists) {
+        return res.status(404).json({ error: 'La sesión no existe' });
+      }
+      linkIntent = {
+        intoSessionId,
+        allowNumberChange: wantsChange,
+        keepPrevious: wantsChange && keepPrevious === true,
+        expectedPhone: (target.data()?.phone_number as string | undefined) ?? intoSessionId,
+      };
+    }
 
-    await startSession(sessionKey, accountId);
+    const sessionKey = randomUUID();
+    console.log('[/start-session] Nuevo sessionKey generado:', sessionKey, linkIntent ? `(intent: ${JSON.stringify(linkIntent)})` : '');
+
+    await startSession(sessionKey, accountId, linkIntent);
 
     console.log('[/start-session] startSession completado, enviando sessionKey al cliente');
     res.json({ sessionKey });
   } catch (error) {
     console.error('[/start-session] Error:', error);
     res.status(500).json({ error: 'Failed to start session' });
+  }
+});
+
+// Desconectar la línea anterior que quedó recibiendo tras un cambio de número.
+// Cierra su sesión en WhatsApp (sale de "Dispositivos vinculados") y deja la
+// línea en `disconnected`: con la sesión fuera del Map nadie más la escribiría.
+app.post('/sessions/previous-line/disconnect', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const { accountId, sessionId, phone } = req.body;
+    if (!accountId || !SESSION_ID_RE.test(String(sessionId)) || !SESSION_ID_RE.test(String(phone))) {
+      return res.status(400).json({ error: 'Faltan accountId, sessionId o phone' });
+    }
+    if (!(await isAccountOwner(req.auth!.uid, accountId))) {
+      return res.status(403).json({ error: 'Sólo el owner puede desconectar un número' });
+    }
+
+    const line = [...sessions.entries()].find(
+      ([, s]) => s.accountId === accountId && s.sessionId === sessionId && s.role === 'previous' && s.linkedPhone === phone,
+    );
+    if (line) await logoutAndForget(line[0], 'previous_line_disconnected_by_owner');
+
+    await db
+      .collection(ACCOUNTS_COLLECTION)
+      .doc(accountId)
+      .collection('whatsapp_sessions')
+      .doc(sessionId)
+      .update({
+        [`previous_lines.${phone}.status`]: 'disconnected',
+        [`previous_lines.${phone}.last_sync`]: admin.firestore.Timestamp.now(),
+        [`previous_lines.${phone}.disconnect_reason`]: 'disconnected_by_owner',
+      });
+
+    console.log(`[/sessions/previous-line/disconnect] ${sessionId}: línea anterior ${phone} desconectada por el owner`);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[/sessions/previous-line/disconnect] Error:', error);
+    res.status(500).json({ error: 'No se pudo desconectar el número anterior' });
   }
 });
 
@@ -1332,7 +1671,7 @@ app.post('/resolve-contact', express.json(), verifyHttpAuth(), async (req, res) 
     if (!session || session.accountId !== accountId) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
-    if (!session.isReady || !session.sock || !session.phoneNumber) {
+    if (!session.isReady || !session.sock || !session.sessionId) {
       return res.status(503).json({ error: 'session_not_ready' });
     }
 
@@ -1398,7 +1737,7 @@ app.post('/resolve-contact', express.json(), verifyHttpAuth(), async (req, res) 
         .collection(ACCOUNTS_COLLECTION)
         .doc(accountId)
         .collection('whatsapp_sessions')
-        .doc(session.phoneNumber)
+        .doc(session.sessionId)
         .collection('chats')
         .doc(candidate)
         .get();
@@ -1444,7 +1783,7 @@ app.post('/generate-ai-response', express.json(), verifyHttpAuth(), async (req, 
       return res.status(404).json({ error: 'Session not found' });
     }
 
-    const phoneNumber = sessionData.phoneNumber!;
+    const phoneNumber = sessionData.sessionId!;
 
     // Load AI config
     const aiConfig = await getAIConfig(sessionData, accountId);
@@ -1518,6 +1857,36 @@ app.post('/generate-ai-response', express.json(), verifyHttpAuth(), async (req, 
   }
 });
 
+// Un mensaje del número anterior (anterior al último cambio, o llegado por la
+// línea anterior) no es de la cuenta que hoy manda. WhatsApp descarta en
+// silencio editarlo, borrarlo para todos o reaccionarle, pero nuestro eco sí
+// registraría la acción: un "eliminar para todos" borraría el doc mientras el
+// cliente lo conserva. La guarda vive acá porque las apps ya instaladas no
+// traen la restricción de la UI. Sólo lee el doc en sesiones que cambiaron de número.
+async function isPreviousNumberMessage(session: SessionData, chatPhone: string, messageId: string): Promise<boolean> {
+  if (!session.numberChangedAt || !session.sessionId) return false;
+  const snap = await db
+    .collection(ACCOUNTS_COLLECTION)
+    .doc(session.accountId)
+    .collection('whatsapp_sessions')
+    .doc(session.sessionId)
+    .collection('chats')
+    .doc(chatPhone)
+    .collection('messages')
+    .doc(messageId)
+    .get();
+  const data = snap.data();
+  if (!data) return false;
+  if (data.previousNumber) return true;
+  const sentAt = data.timestamp?.toMillis?.();
+  return typeof sentAt === 'number' && sentAt < session.numberChangedAt;
+}
+
+const PREVIOUS_NUMBER_CONFLICT = {
+  error: 'previous_number',
+  message: 'Ese mensaje es del número anterior: desde el número nuevo no se puede modificar.',
+};
+
 // REST API endpoint to edit a message
 app.post('/edit-message', express.json(), verifyHttpAuth(), async (req, res) => {
   try {
@@ -1528,8 +1897,12 @@ app.post('/edit-message', express.json(), verifyHttpAuth(), async (req, res) => 
     }
 
     const session = sessions.get(sessionKey);
-    if (!session?.isReady || !session?.phoneNumber) {
+    if (!session?.isReady || !session?.sessionId) {
       return res.status(503).json({ error: 'Session not ready' });
+    }
+
+    if (await isPreviousNumberMessage(session, chatPhone, messageId)) {
+      return res.status(409).json(PREVIOUS_NUMBER_CONFLICT);
     }
 
     // Get the remoteJid from the chat document
@@ -1539,7 +1912,7 @@ app.post('/edit-message', express.json(), verifyHttpAuth(), async (req, res) => 
         .collection(ACCOUNTS_COLLECTION)
         .doc(accountId)
         .collection('whatsapp_sessions')
-        .doc(session.phoneNumber)
+        .doc(session.sessionId)
         .collection('chats')
         .doc(chatPhone);
 
@@ -1593,8 +1966,12 @@ app.post('/delete-message', express.json(), verifyHttpAuth(), async (req, res) =
     }
 
     const session = sessions.get(sessionKey);
-    if (!session?.isReady || !session?.phoneNumber) {
+    if (!session?.isReady || !session?.sessionId) {
       return res.status(503).json({ error: 'Session not ready' });
+    }
+
+    if (await isPreviousNumberMessage(session, chatPhone, messageId)) {
+      return res.status(409).json(PREVIOUS_NUMBER_CONFLICT);
     }
 
     // Get the remoteJid from the chat document
@@ -1604,7 +1981,7 @@ app.post('/delete-message', express.json(), verifyHttpAuth(), async (req, res) =
         .collection(ACCOUNTS_COLLECTION)
         .doc(accountId)
         .collection('whatsapp_sessions')
-        .doc(session.phoneNumber)
+        .doc(session.sessionId)
         .collection('chats')
         .doc(chatPhone);
 
@@ -1661,8 +2038,12 @@ app.post('/send-reaction', express.json(), verifyHttpAuth(), async (req, res) =>
     }
 
     const session = sessions.get(sessionKey);
-    if (!session?.isReady || !session?.phoneNumber) {
+    if (!session?.isReady || !session?.sessionId) {
       return res.status(503).json({ error: 'Session not ready' });
+    }
+
+    if (await isPreviousNumberMessage(session, chatPhone, messageId)) {
+      return res.status(409).json(PREVIOUS_NUMBER_CONFLICT);
     }
 
     // Resolver remoteJid almacenado (igual que en delete/edit) — soporta LIDs.
@@ -1672,7 +2053,7 @@ app.post('/send-reaction', express.json(), verifyHttpAuth(), async (req, res) =>
         .collection(ACCOUNTS_COLLECTION)
         .doc(accountId)
         .collection('whatsapp_sessions')
-        .doc(session.phoneNumber)
+        .doc(session.sessionId)
         .collection('chats')
         .doc(chatPhone);
       const chatDoc = await chatDocRef.get();
@@ -2570,9 +2951,16 @@ io.on('connection', (socket) => {
     if (session.accountId !== accountId) continue;
     sessionCount++;
 
-    if (session.isReady && session.phoneNumber) {
+    // La línea anterior no tiene QR ni `ready` que reenviar: nadie la espera.
+    if (session.role === 'previous') continue;
+
+    if (session.isReady && session.sessionId) {
       console.log('[Socket.io] Reenviando READY para sessionKey: ' + key);
-      socket.emit('ready', { phoneNumber: session.phoneNumber, sessionKey: key });
+      socket.emit('ready', {
+        phoneNumber: session.linkedPhone ?? session.sessionId,
+        sessionId: session.sessionId,
+        sessionKey: key,
+      });
     } else if (session.currentQR) {
       console.log('[Socket.io] Reenviando QR para sessionKey: ' + key);
       socket.emit('qr', { qr: session.currentQR, sessionKey: key });

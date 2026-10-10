@@ -37,15 +37,19 @@ class NewChatTarget {
 class NewChatSheet extends StatefulWidget {
   final String accountId;
 
-  /// Número de la propia sesión de WhatsApp. De aquí sale el país por defecto:
-  /// un cliente mexicano abre el panel ya en 🇲🇽 y uno colombiano en 🇨🇴.
   final String sessionId;
+
+  /// Número que hoy usa la sesión (`phone_number`). De aquí sale el país por
+  /// defecto: un cliente mexicano abre el panel ya en 🇲🇽 y uno colombiano en
+  /// 🇨🇴. Tras un cambio de número no es el id; null = usar el id.
+  final String? sessionPhone;
   final String? sessionKey;
 
   const NewChatSheet({
     required this.accountId,
     required this.sessionId,
     required this.sessionKey,
+    this.sessionPhone,
     super.key,
   });
 
@@ -72,7 +76,7 @@ class _NewChatSheetState extends State<NewChatSheet> {
   @override
   void initState() {
     super.initState();
-    _country = countryForE164(widget.sessionId) ?? kFallbackCountry;
+    _country = countryForE164(widget.sessionPhone ?? widget.sessionId) ?? kFallbackCountry;
     _controller.addListener(_onChanged);
   }
 

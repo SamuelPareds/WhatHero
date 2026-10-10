@@ -382,3 +382,20 @@ String formatNational(Country c, String national) {
 /// Cómo se le muestra al operador el número al que se va a escribir.
 String formatE164(Country c, String national) =>
     '+${c.dial} ${formatNational(c, national)}'.trimRight();
+
+/// Un número guardado en dígitos pelados, como el id de una sesión o su
+/// `phone_number` (`5215561642726`), tal como se le muestra al operador:
+/// `+52 55 6164 2726`. El prefijo móvil legacy (el `1` mexicano, el `9`
+/// argentino) se quita sólo si sobra para el largo nacional. Sin país
+/// reconocible, `+` y los dígitos tal cual.
+String displayPhone(String digits) {
+  final clean = digits.replaceAll(RegExp(r'\D'), '');
+  final c = countryForE164(clean);
+  if (c == null) return clean.isEmpty ? '' : '+$clean';
+  var national = clean.substring(c.dial.length);
+  final prefix = c.mobilePrefix;
+  if (prefix != null && national.length > c.maxLen && national.startsWith(prefix)) {
+    national = national.substring(prefix.length);
+  }
+  return formatE164(c, national);
+}

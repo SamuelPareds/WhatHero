@@ -188,7 +188,8 @@ export class FollowupService {
     sessions: Map<string, SessionData>
   ) {
     const session = sessions.get(sessionKey);
-    if (!session || !session.isReady) {
+    // `role`: una línea anterior (tras un cambio de número) nunca envía.
+    if (!session || !session.isReady || session.role !== 'primary') {
       return { success: false, error: 'Session not ready' };
     }
 
@@ -303,9 +304,12 @@ export class FollowupService {
    */
   static async checkAndRunScheduledFollowups(sessions: Map<string, SessionData>) {
     for (const [sessionKey, session] of sessions) {
-      if (!session.isReady || !session.phoneNumber) continue;
+      if (!session.isReady || !session.sessionId) continue;
+      // La línea anterior comparte doc con el número nuevo: correrlo también
+      // por ella mandaría todo dos veces, y desde el número viejo.
+      if (session.role !== 'primary') continue;
 
-      const config = await this.getFollowupConfig(session.accountId, session.phoneNumber);
+      const config = await this.getFollowupConfig(session.accountId, session.sessionId);
       if (!config || !config.enabled) continue;
 
       const currentTime = new Intl.DateTimeFormat('en-US', {
@@ -316,10 +320,10 @@ export class FollowupService {
       }).format(new Date());
 
       if (config.scheduledTime === currentTime) {
-        console.log(`[FollowupService] Barrido programado para ${session.phoneNumber} a las ${currentTime}`);
-        this.buildFollowupQueue(session.accountId, session.phoneNumber, sessionKey, sessions)
-          .then(result => console.log(`[FollowupService] Resultado para ${session.phoneNumber}:`, result))
-          .catch(err => console.error(`[FollowupService] Fallo para ${session.phoneNumber}:`, err));
+        console.log(`[FollowupService] Barrido programado para ${session.sessionId} a las ${currentTime}`);
+        this.buildFollowupQueue(session.accountId, session.sessionId, sessionKey, sessions)
+          .then(result => console.log(`[FollowupService] Resultado para ${session.sessionId}:`, result))
+          .catch(err => console.error(`[FollowupService] Fallo para ${session.sessionId}:`, err));
       }
     }
   }

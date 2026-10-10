@@ -105,7 +105,7 @@ export async function markChatAsReadIfEnabled(
   contactPhone: string,
   reason: string,
 ): Promise<number> {
-  if (!session.phoneNumber) return 0;
+  if (!session.sessionId) return 0;
   // Salida temprana antes de tocar la config: la mayoría de los salientes no
   // tienen nada que confirmar (el segundo chunk de la IA, o el operador
   // mandando varios mensajes seguidos al mismo chat).

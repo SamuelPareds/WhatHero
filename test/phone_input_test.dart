@@ -132,4 +132,22 @@ void main() {
       expect(formatNational(mx, '5561'), '55 61');
     });
   });
+
+  group('displayPhone — un número guardado, como lo ve el operador', () {
+    test('el 1 móvil mexicano sobra y se quita', () {
+      expect(displayPhone('5215561642726'), '+52 55 6164 2726');
+    });
+
+    test('un mexicano sin el 1 queda igual', () {
+      expect(displayPhone('525561642726'), '+52 55 6164 2726');
+    });
+
+    test('otro país usa su propio patrón', () {
+      expect(displayPhone('573001234567'), '+57 300 123 4567');
+    });
+
+    test('sin país reconocible: + y los dígitos', () {
+      expect(displayPhone('999123'), '+999123');
+    });
+  });
 }

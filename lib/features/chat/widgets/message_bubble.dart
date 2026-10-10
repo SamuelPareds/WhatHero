@@ -110,11 +110,22 @@ class MessageBubble extends StatefulWidget {
   // existe en WhatsApp, no hay nada que responder/editar/eliminar.
   final String? sendStatus;
   final VoidCallback? onRetryTap;
+  // Mensaje del número anterior de la sesión (antes de un cambio de número, o
+  // llegado por la línea anterior). La cuenta que hoy manda no es su dueña:
+  // WhatsApp descartaría en silencio editarlo, borrarlo para todos o
+  // reaccionarle, así que esas acciones no se ofrecen. Responder sí: la cita
+  // viaja con su texto.
+  final bool fromPreviousNumber;
+  // Entrante que llegó al número anterior, que quedó recibiendo tras el
+  // cambio: la respuesta sale del nuevo y el cliente todavía no lo conoce.
+  final bool viaPreviousLine;
 
   const MessageBubble({
     super.key,
     required this.text,
     required this.fromMe,
+    this.fromPreviousNumber = false,
+    this.viaPreviousLine = false,
     required this.timestamp,
     required this.messageId,
     required this.chatPhone,
@@ -172,6 +183,18 @@ class _MessageBubbleState extends State<MessageBubble> {
     _editController.dispose();
     super.dispose();
   }
+
+  // "📵 a tu número anterior", junto a la hora de un entrante que llegó por la
+  // línea anterior.
+  List<Widget> _viaPreviousLineTag() => [
+        const SizedBox(width: 6),
+        Icon(Icons.phone_disabled_outlined, size: 12, color: lightText.withValues(alpha: 0.7)),
+        const SizedBox(width: 3),
+        Text(
+          'a tu número anterior',
+          style: TextStyle(color: lightText.withValues(alpha: 0.7), fontSize: 11, fontStyle: FontStyle.italic),
+        ),
+      ];
 
   String _formatTime(DateTime dateTime) {
     final hour = dateTime.hour.toString().padLeft(2, '0');
@@ -375,6 +398,7 @@ class _MessageBubbleState extends State<MessageBubble> {
                         fontSize: 12,
                         fontWeight: FontWeight.w400),
                   ),
+                  if (widget.viaPreviousLine) ..._viaPreviousLineTag(),
                   // Mismo ✓ que el resto de los salientes. Los stickers nunca
                   // pasan por burbuja optimista, así que no hay estado en vuelo.
                   if (widget.fromMe) ...[
@@ -917,10 +941,12 @@ class _MessageBubbleState extends State<MessageBubble> {
     // En mensajes con media no tiene sentido editar texto; copiar solo si hay caption.
     final hasMedia = widget.mediaType != null;
     final canCopy = widget.text.isNotEmpty;
-    final canEdit = widget.fromMe && !hasMedia;
+    final canEdit = widget.fromMe && !hasMedia && !widget.fromPreviousNumber;
     // No permitimos reaccionar a stickers/sólo-media sin contenido si el
     // mensaje fue revocado (no tiene sentido reaccionar a evidencia).
-    final canReact = widget.revoked != true;
+    final canReact = widget.revoked != true && !widget.fromPreviousNumber;
+    // Borrar para todos sólo lo propio de la cuenta que hoy manda.
+    final canDeleteForEveryone = widget.fromMe && !widget.fromPreviousNumber;
     // Foto o video ya subidos a Storage: se los puede llevar.
     final canTransfer = canTransferMedia(
       mediaType: widget.mediaType,
@@ -1035,7 +1061,7 @@ class _MessageBubbleState extends State<MessageBubble> {
                   setState(() => _isEditing = true);
                 },
               ),
-            if (widget.fromMe)
+            if (canDeleteForEveryone)
               ListTile(
                 leading: const Icon(Icons.delete, size: 20, color: Color(0xFFF87171)),
                 title: const Text('Eliminar para todos', style: TextStyle(color: white)),
@@ -1656,6 +1682,7 @@ class _MessageBubbleState extends State<MessageBubble> {
                       fontWeight: FontWeight.w400,
                     ),
                   ),
+                  if (widget.viaPreviousLine) ..._viaPreviousLineTag(),
                   // "(editado)" inline al estilo WhatsApp, separado del time
                   // por un espacio. Itálica + opacidad para que quede sutil.
                   if (widget.edited == true) ...[

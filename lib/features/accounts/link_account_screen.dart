@@ -3,14 +3,23 @@ import 'package:flutter/material.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
+import 'link_result.dart';
 
+/// Muestra el QR de una vinculación y se cierra devolviendo un [LinkResult]
+/// (null si el usuario sale antes de escanear).
 class LinkAccountScreen extends StatefulWidget {
   final String sessionKey;
   final String accountId;
+  final String title;
+
+  /// Qué teléfono tiene que escanear (p.ej. "Escanea con tu número NUEVO").
+  final String? hint;
 
   const LinkAccountScreen({
     required this.sessionKey,
     required this.accountId,
+    this.title = 'Vincular Cuenta',
+    this.hint,
     super.key,
   });
 
@@ -22,6 +31,8 @@ class _LinkAccountScreenState extends State<LinkAccountScreen> {
   String? qrCode;
   bool sessionConnected = false;
   String status = 'Iniciando sesión...';
+  // Rechazada por el backend: ya está cerrada, no hay nada que cancelar.
+  bool _finished = false;
   
   // Guardar suscripciones para cancelarlas en dispose
   StreamSubscription? _qrSubscription;
@@ -50,7 +61,7 @@ class _LinkAccountScreenState extends State<LinkAccountScreen> {
       }
     });
 
-    // Escuchar cambios de estado (ready, logged_out)
+    // Escuchar cambios de estado (ready, link_rejected, logged_out)
     _statusSubscription = SocketService().statusStream.listen((event) {
       if (event.sessionKey == widget.sessionKey) {
         if (event.status == 'ready') {
@@ -60,10 +71,17 @@ class _LinkAccountScreenState extends State<LinkAccountScreen> {
               sessionConnected = true;
               status = 'Conectado exitosamente ✅';
             });
+            final result = LinkResult.fromEvent(event);
             Future.delayed(const Duration(milliseconds: 800), () {
-              if (mounted) Navigator.pop(context);
+              if (mounted) Navigator.pop(context, result);
             });
           }
+        } else if (event.status == 'link_rejected') {
+          // El backend ya cerró la vinculación: quien abrió esta pantalla
+          // explica el motivo.
+          print('[LinkAccountScreen] Vinculación rechazada: ${event.data['reason']}');
+          _finished = true;
+          if (mounted) Navigator.pop(context, LinkResult.fromEvent(event));
         } else if (event.status == 'logged_out') {
           print('[LinkAccountScreen] Sesión cerrada, mostrando error y cerrando');
           if (mounted) {
@@ -88,7 +106,7 @@ class _LinkAccountScreenState extends State<LinkAccountScreen> {
       },
       child: Scaffold(
         appBar: AppBar(
-          title: const Text('Vincular Cuenta'),
+          title: Text(widget.title),
           elevation: 0,
         ),
         body: Center(
@@ -123,6 +141,14 @@ class _LinkAccountScreenState extends State<LinkAccountScreen> {
                     color: sessionConnected ? Colors.green.shade400 : white,
                   ),
                 ),
+                if (widget.hint != null && !sessionConnected) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    widget.hint!,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: lightText, fontSize: 14),
+                  ),
+                ],
                 const SizedBox(height: 48),
                 if (qrCode != null && !sessionConnected)
                   Container(
@@ -178,7 +204,7 @@ class _LinkAccountScreenState extends State<LinkAccountScreen> {
 
   void _cancelSession() {
     // Solo cancelar si la sesión NO se conectó exitosamente
-    if (sessionConnected) return;
+    if (sessionConnected || _finished) return;
 
     print('[LinkAccountScreen] Cancelando sesión via SocketService: ${widget.sessionKey}');
     

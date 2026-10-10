@@ -19,10 +19,13 @@ import 'package:crm_whatsapp/core/services/presence_reporter.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/core/services/storage_service.dart';
 import 'package:crm_whatsapp/core/services/team_presence_service.dart';
+import 'package:crm_whatsapp/core/utils/phone_input.dart';
 import 'package:crm_whatsapp/core/utils/phone_search.dart';
+import 'package:crm_whatsapp/core/utils/session_phone.dart';
 import 'package:crm_whatsapp/features/settings.dart';
 import 'package:crm_whatsapp/features/accounts.dart';
 import 'messages_view.dart';
+import 'number_change_divider.dart';
 import 'media_vault_screen.dart';
 import 'widgets/ai_state_indicator.dart';
 import 'widgets/chat_nav_stepper.dart';
@@ -60,6 +63,9 @@ class ChatsScreen extends StatefulWidget {
 
 class _ChatsScreenState extends State<ChatsScreen> {
   String? selectedChatPhone;
+  // Número que hoy usa la sesión (`phone_number`), tomado del stream del
+  // AppBar. Tras un cambio de número no es `widget.sessionId`.
+  String? _sessionPhone;
   // Para rotular "tu usuario en otro dispositivo" en la presencia del equipo.
   final String? _myUid = FirebaseAuth.instance.currentUser?.uid;
   // Salto a un mensaje concreto al abrir un chat desde el buscador. Lo consume
@@ -234,7 +240,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
-                content: Text('Sesión ${widget.sessionId} desconectada'),
+                content: Text('Sesión ${displayPhone(_sessionPhone ?? widget.sessionId ?? '')} desconectada'),
                 backgroundColor: Colors.red,
               ),
             );
@@ -407,6 +413,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
         accountId: widget.accountId,
         sessionId: widget.sessionId!,
         sessionKey: widget.sessionKey,
+        sessionPhone: _sessionPhone,
       ),
     );
     if (target == null || !mounted) return;
@@ -896,8 +903,11 @@ class _ChatsScreenState extends State<ChatsScreen> {
               .snapshots(),
           builder: (context, snapshot) {
             String title = widget.initialAlias ?? 'WhatHero';
+            Map<String, dynamic>? sessionData;
             if (snapshot.hasData && snapshot.data!.exists) {
+              sessionData = snapshot.data!.data() as Map<String, dynamic>?;
               title = snapshot.data!.get('alias') ?? widget.sessionId ?? title;
+              _sessionPhone = sessionPhone(sessionData, widget.sessionId!);
             }
             
             return Column(
@@ -915,7 +925,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
                   overflow: TextOverflow.ellipsis,
                 ),
                 Text(
-                  widget.sessionId!,
+                  // El número que hoy usa la sesión, no su id: tras un
+                  // cambio de número son distintos.
+                  displayPhone(_sessionPhone ?? widget.sessionId!),
                   style: const TextStyle(
                     fontSize: 12,
                     color: lightText,
@@ -1910,6 +1922,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
                       accountId: widget.accountId,
                       sessionAiEnabled: sessionAiEnabled,
                       sessionAiHasCredentials: sessionAiHasCredentials,
+                      sessionPhone: sessionPhone(sessionData, widget.sessionId!),
+                      numberHistory: parseNumberHistory(sessionData?['number_history']),
                       jumpToMessageId: _jumpToMessageId,
                       jumpToTimestamp: _jumpToTimestamp,
                       onJumpConsumed: () {

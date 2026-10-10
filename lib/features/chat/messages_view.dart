@@ -10,6 +10,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:http/http.dart' as http;
 import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/utils/media_mime.dart';
+import 'package:crm_whatsapp/core/utils/phone_input.dart';
 import 'package:crm_whatsapp/core/utils/quick_response_attachment.dart';
 import 'package:crm_whatsapp/core/services/api_client.dart';
 import 'package:crm_whatsapp/core/services/internal_messages_service.dart';
@@ -19,6 +20,7 @@ import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/core/services/team_presence_service.dart';
 import 'package:crm_whatsapp/features/settings.dart';
 import 'internal_timeline.dart';
+import 'number_change_divider.dart';
 import 'reply_collision.dart';
 import 'widgets/internal_message_card.dart';
 import 'widgets/message_bubble.dart';
@@ -58,6 +60,12 @@ class MessagesView extends StatefulWidget {
   // limpie su estado y un re-toque del mismo resultado vuelva a disparar.
   final VoidCallback? onJumpConsumed;
 
+  // Número que hoy usa la sesión y sus cambios de número (`number_history`).
+  // Con ellos se dibuja la línea "Cambio de número" y se sabe qué mensajes son
+  // del número anterior (ver number_change_divider.dart).
+  final String? sessionPhone;
+  final List<NumberChange> numberHistory;
+
   const MessagesView({
     required this.phoneNumber,
     required this.sessionId,
@@ -68,6 +76,8 @@ class MessagesView extends StatefulWidget {
     this.jumpToMessageId,
     this.jumpToTimestamp,
     this.onJumpConsumed,
+    this.sessionPhone,
+    this.numberHistory = const [],
     super.key,
   });
 
@@ -1976,11 +1986,16 @@ class _MessagesViewState extends State<MessagesView> {
     final msgText = (data['text'] as String?) ?? '';
     final msgMediaType = data['mediaType'] as String?;
     final draftPreview = _previewForDraft(msgText, msgMediaType);
+    final fromMe = (data['fromMe'] as bool?) ?? false;
+    // Llegó por la línea anterior, que quedó recibiendo tras el cambio.
+    final previousNumber = data['previousNumber'] as String?;
 
     return MessageBubble(
       key: ValueKey(msg.id),
       text: msgText,
-      fromMe: (data['fromMe'] as bool?) ?? false,
+      fromMe: fromMe,
+      fromPreviousNumber: isFromPreviousNumber(msgDate, widget.numberHistory, previousNumber: previousNumber),
+      viaPreviousLine: previousNumber != null && !fromMe,
       timestamp: msgDate,
       messageId: msg.id,
       chatPhone: widget.phoneNumber,
@@ -2114,6 +2129,21 @@ class _MessagesViewState extends State<MessagesView> {
                     return const Center(child: Text('Sin mensajes', style: TextStyle(color: lightText, fontSize: 16)));
                   }
 
+                  // Aviso al pie tras un cambio de número: lo último del chat
+                  // es del número anterior, así que el cliente todavía no
+                  // conoce el nuevo. Se decide por el mensaje de WhatsApp más
+                  // nuevo (un interno no le contesta al cliente).
+                  var showNewNumberFooter = false;
+                  if (widget.numberHistory.isNotEmpty && pendings.isEmpty) {
+                    final newestWa = timeline.whereType<QueryDocumentSnapshot>().firstOrNull;
+                    final newestData = newestWa?.data() as Map<String, dynamic>?;
+                    showNewNumberFooter = showNewNumberHint(
+                      newestAt: newestWa == null ? null : _entryTime(newestWa),
+                      newestPreviousNumber: newestData?['previousNumber'] as String?,
+                      changes: widget.numberHistory,
+                    );
+                  }
+
                   return ListView.builder(
                 controller: _scrollController,
                 // Al empezar a deslizar para revisar el historial, baja el
@@ -2185,6 +2215,13 @@ class _MessagesViewState extends State<MessagesView> {
                       : null;
                   final showSeparator =
                       older == null || !_isSameDay(entryDate, _entryTime(older));
+                  // Cambio de número entre este elemento y el anterior. En el
+                  // borde de lo cargado (older == null) no se sabe: aparece al
+                  // cargar la página siguiente, igual que los internos.
+                  final numberChange = older == null || widget.numberHistory.isEmpty
+                      ? null
+                      : numberChangeBetween(_entryTime(older), entryDate, widget.numberHistory);
+                  final footer = showNewNumberFooter && entryIndex == 0;
 
                   final Widget content = entry is InternalMessage
                       ? InternalMessageCard(
@@ -2199,12 +2236,26 @@ class _MessagesViewState extends State<MessagesView> {
                   // invierte el orden de items, no su contenido. Por eso el
                   // separador va como PRIMER hijo: queda visualmente arriba
                   // del primer mensaje del día (igual que en WhatsApp).
-                  final Widget item = showSeparator
+                  // Las marcas de cambio de número viajan en el mismo Column
+                  // que el separador de día: no agregan elementos a la lista,
+                  // así que los índices que usa _resolveJump no se mueven.
+                  final Widget item = showSeparator || numberChange != null || footer
                       ? Column(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            _DateSeparator(_formatDaySeparator(entryDate)),
+                            if (showSeparator) _DateSeparator(_formatDaySeparator(entryDate)),
+                            if (numberChange != null)
+                              _NumberChangeMark(
+                                icon: Icons.swap_horiz,
+                                label: 'Cambio de número · antes ${displayPhone(numberChange.phone)}',
+                              ),
                             content,
+                            if (footer)
+                              _NumberChangeMark(
+                                icon: Icons.info_outline,
+                                label: 'Lo que envíes ahora sale de '
+                                    '${displayPhone(widget.sessionPhone ?? widget.sessionId)}',
+                              ),
                           ],
                         )
                       : content;
@@ -2596,6 +2647,57 @@ class _JumpHighlight extends StatelessWidget {
         child: inner,
       ),
       child: child,
+    );
+  }
+}
+
+// Marca de cambio de número dentro de la conversación: la línea donde termina
+// el historial del número anterior, o el aviso al pie de que lo que se envíe
+// ahora sale del número nuevo.
+class _NumberChangeMark extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  const _NumberChangeMark({required this.icon, required this.label});
+
+  @override
+  Widget build(BuildContext context) {
+    // Gris como el separador de día: en el chat el ámbar ya dice "tu turno"
+    // y "te respondieron mientras escribías".
+    final line = Expanded(child: Divider(color: lightText.withValues(alpha: 0.25), height: 1));
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      child: Row(
+        children: [
+          line,
+          Flexible(
+            flex: 4,
+            child: Container(
+              margin: const EdgeInsets.symmetric(horizontal: 8),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+              decoration: BoxDecoration(
+                color: darkBg.withValues(alpha: 0.85),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: lightText.withValues(alpha: 0.3)),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(icon, size: 14, color: lightText),
+                  const SizedBox(width: 6),
+                  Flexible(
+                    child: Text(
+                      label,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(color: lightText, fontSize: 12, fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          line,
+        ],
+      ),
     );
   }
 }

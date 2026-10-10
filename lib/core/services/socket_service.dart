@@ -15,12 +15,21 @@ class QREvent {
   QREvent({required this.qr, required this.sessionKey});
 }
 
-/// Evento de cambio de estado (ready, logged_out, etc)
+/// Evento de cambio de estado (ready, logged_out, link_rejected, etc)
 class SessionStatusEvent {
   final String status;
   final String sessionKey;
   final String? phoneNumber;
-  SessionStatusEvent({required this.status, required this.sessionKey, this.phoneNumber});
+  /// Payload completo del evento. En `ready` trae `sessionId` y, tras un cambio
+  /// de número, `numberChangedFrom`, `pausedAutomations` y `previousLine`; en
+  /// `link_rejected`, el `reason`.
+  final Map<String, dynamic> data;
+  SessionStatusEvent({
+    required this.status,
+    required this.sessionKey,
+    this.phoneNumber,
+    this.data = const {},
+  });
 }
 
 /// Espera antes del reintento manual N (0, 1, 2…): 2, 4, 8, 16 y luego 30 s.
@@ -148,6 +157,19 @@ class SocketService {
         status: 'ready',
         sessionKey: data['sessionKey'],
         phoneNumber: data['phoneNumber'],
+        data: Map<String, dynamic>.from(data),
+      ));
+    });
+
+    // El backend no aceptó el número escaneado para esa sesión (ver
+    // backend/src/services/sessionTarget.ts). Ya cerró la vinculación.
+    socket.on('link_rejected', (data) {
+      debugPrint('[SocketService] Vinculación rechazada: $data');
+      _statusController.add(SessionStatusEvent(
+        status: 'link_rejected',
+        sessionKey: data['sessionKey'],
+        phoneNumber: data['phoneNumber'],
+        data: Map<String, dynamic>.from(data),
       ));
     });
 

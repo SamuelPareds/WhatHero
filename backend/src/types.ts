@@ -11,6 +11,9 @@ export interface SenderInfo {
   uid?: string;     // sólo cuando type='human' y vino vía app autenticada
 }
 
+/** Rol de un socket dentro de su sesión: el que manda o la línea anterior. */
+export type SessionRole = 'primary' | 'previous';
+
 /** Estados que puede tener el doc de sesión en Firestore. */
 export type SessionStatus =
   | 'connected'
@@ -22,7 +25,22 @@ export interface SessionData {
   sock: any;
   isReady: boolean;
   currentQR: string | undefined;
-  phoneNumber: string | undefined;
+  // Id del doc de sesión en Firestore (`whatsapp_sessions/{sessionId}`). Es el
+  // número con el que se vinculó POR PRIMERA VEZ: tras un cambio de número el
+  // doc conserva su id y el número real vive en el campo `phone_number`. Lo que
+  // necesite el número propio de verdad debe usar `sock.user.id`.
+  sessionId: string | undefined;
+  // Número realmente vinculado (`sock.user.id`). Igual a `sessionId` salvo en
+  // una sesión que cambió de número. Se conoce tras el primer `open`.
+  linkedPhone?: string;
+  // 'previous' = línea anterior que quedó conectada tras un cambio de número:
+  // sólo recibe, nunca envía ni automatiza, y su estado vive en
+  // `previous_lines.{tel}` del doc (ver services/sessionTarget.ts).
+  role: SessionRole;
+  // Epoch ms del último cambio de número de la sesión (`number_history`). Lo
+  // anterior es del número viejo: la cuenta nueva no puede editarlo ni
+  // borrarlo para todos ni reaccionarle.
+  numberChangedAt?: number;
   reconnectCount: number;
   accountId: string;
 

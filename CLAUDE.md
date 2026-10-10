@@ -11,9 +11,10 @@ El proyecto utiliza una estructura jerárquica para permitir que N usuarios gest
 
 ### 1. Estructura de Datos (Firestore)
 La "Fuente de Verdad" sigue un patrón de documentos anidados para optimizar costos y velocidad:
-`{accountsCollection}/{userId}/whatsapp_sessions/{phoneNumber}`
+`{accountsCollection}/{userId}/whatsapp_sessions/{sessionId}`
 - **Colección raíz:** `accounts` en producción, `accounts_dev` en desarrollo (ver sección *Separación de Entornos*).
-- **Atributos de Sesión:** `alias`, `phone_number`, `status`, `session_key`.
+- **`sessionId` es el número con el que la sesión se vinculó POR PRIMERA VEZ.** Casi siempre coincide con el número actual, pero tras un cambio de número el doc conserva su id y el número real vive en `phone_number` (ver *📲 Cambiar de número*). Para mostrar el número o deducir el país: `sessionPhone()` en Flutter, nunca el id.
+- **Atributos de Sesión:** `alias`, `phone_number`, `status`, `session_key`, y tras un cambio de número `number_history`, `previous_lines`, `number_change`.
 - **Sub-colección de Mensajes:** `chats/{chatId}/messages/{messageId}`.
 
 ### 2. El Orquestador de Sesiones (/backend)
@@ -570,21 +571,70 @@ Se escribía sólo desde `connection.update`, así que cuando el evento no lleg�
 - Mientras el estado es `reconnecting` se refresca `last_sync` cada barrido aunque nada cambie. Ese **heartbeat es lo que le permite a la app distinguir "el backend sigue intentando" de "el doc lleva horas congelado"**. Late sólo en esa ventana de 10 min para que una sesión muerta durante días no cueste una escritura cada dos minutos.
 - `sweepFirestoreGhosts()` (cada 15 min y al bootear, **después** de restaurar sesiones) es lo único que paga reads: corrige docs que afirman tener sesión viva cuando en memoria no hay ninguna. Reemplaza al viejo HealthCheck, que sólo miraba `status == 'connected'` y por eso era ciego a los atascados en `reconnecting`.
 
-### Un socket por sesión, un número por sesión
+### Un socket principal por sesión
 
 - **Teardown antes de reemplazar.** Antes no se hacía en ningún lado: cada reconexión apilaba un socket zombi con sus listeners intactos, capaz de escribir sobre el estado del socket sano. El orden importa — primero `ev.removeAllListeners()`, después `end()`.
 - **`generation`**: cada socket nace con un número y su handler captura el suyo. Un socket viejo que emite tarde se descarta comparando, en vez de programar una reconexión que mataría a su reemplazo.
-- **`retireDuplicateSessions`**: re-vincular genera un `sessionKey` nuevo, y el anterior se quedaba vivo peleando por la misma cuenta de WhatsApp *y* resucitando en cada arranque desde su `auth_info`. Al conectar, toda otra sesión del mismo número se retira con sus credenciales.
+- **`retireDuplicateSessions`**: re-vincular genera un `sessionKey` nuevo, y el anterior se quedaba vivo peleando por la misma cuenta de WhatsApp *y* resucitando en cada arranque desde su `auth_info`. Al conectar, toda otra sesión del mismo doc **y el mismo rol** se retira con sus credenciales. El rol existe desde el cambio de número: la línea anterior que quedó recibiendo comparte doc con el principal a propósito, y re-vincular uno no puede tumbar al otro.
 
-### `meta.json` guarda el número, no sólo la cuenta
+### `meta.json` guarda el doc, no sólo la cuenta
 
-`phoneNumber` sólo se conocía tras el primer `open`, y **todas** las escrituras de estado colgaban de `if (session.phoneNumber)`. En un arranque en frío eso significaba que una sesión que moría antes de conectar no podía ni reportar su propia caída. Ahora se persiste al conectar y se hidrata al arrancar.
+El doc de la sesión (`sessionId`; los `meta.json` previos al 09-oct-2026 lo llaman `phoneNumber` y se leen igual) sólo se conocía tras el primer `open`, y **todas** las escrituras de estado colgaban de `if (session.sessionId)`. En un arranque en frío eso significaba que una sesión que moría antes de conectar no podía ni reportar su propia caída. Ahora se persiste al conectar y se hidrata al arrancar.
 
-Eso además desactiva una bomba: la rama `408 && !session.phoneNumber` borraba `auth_info` tratándolo como "QR abandonado" — y en un arranque en frío **toda** sesión restaurada tenía el número vacío, así que un timeout al bootear **destruía credenciales válidas**. Ahora la condición mira también `meta.json`: sólo se limpia lo que nunca llegó a vincularse.
+Eso además desactiva una bomba: la rama `408 && !session.sessionId` borraba `auth_info` tratándolo como "QR abandonado" — y en un arranque en frío **toda** sesión restaurada tenía el número vacío, así que un timeout al bootear **destruía credenciales válidas**. Ahora la condición mira también `meta.json`: sólo se limpia lo que nunca llegó a vincularse.
 
 ### En la app: el botón de re-vincular no se esconde nunca
 
 `_SessionVisual` (`accounts_screen.dart`) deriva el chip de `status` **cruzado con `last_sync`**: si dice `reconnecting` pero no late hace más de 5 min, el spinner deja de prometer algo que nadie está intentando y pasa a "Sin respuesta". Y el botón de re-vincular aparece en **cualquier** estado que no sea conectado. Esconderlo durante `reconnecting` fue lo que dejó al cliente sin salida: la única acción que arreglaba el problema era justo la que la UI ocultaba.
+
+---
+
+## 📲 Cambiar de número (la sesión se queda, el número cambia)
+
+Un cliente pierde su línea (en México por no registrarla, por bloqueo de WhatsApp, por robo) y consigue otra. Antes, vincular la nueva abría una sesión vacía y la vieja se quedaba "Desvinculada" con todo el historial, y la configuración había que rehacerla. Ahora **el número nuevo entra en la misma sesión**: chats, mensajes, notas, etiquetas, respuestas rápidas, asistente, reglas y permisos del equipo siguen ahí.
+
+### No se copia nada: el doc conserva su id
+
+`phone_number` pasa a decir el número nuevo y `number_history: [{phone, until}]` guarda el anterior. **No se mueve ni un documento.** Reglas, `access.sessions` de los miembros, salas de presencia, pushes, Storage, índices y `last_session_id` siguen apuntando al mismo id y funcionan sin tocarlos. Es instantáneo y no tiene estado intermedio que reanudar.
+
+**Copiar todo a `{nuevo}` y borrar el viejo se descartó** tras una revisión contra el código. Cada paso perdía datos de una forma distinta: carreras con los mensajes que entran en vivo, la consolidación LID borrando un chat a media copia, escrituras en vuelo de la sesión vieja (la subida de media reintenta), un `BulkWriter` sin `catch` que tumba el proceso, reanudar a mitad del borrado, pendientes resueltos que reaparecen. Copiar tampoco permitía la línea anterior en el mismo chat (abajo).
+
+**El precio:** el id del doc deja de ser siempre el número real. En el backend `SessionData.sessionId` es el doc y `linkedPhone` el número; lo que necesite el número propio de verdad usa `sock.user.id`. En Flutter, `sessionPhone(data, id)` (`lib/core/utils/session_phone.dart`) y `displayPhone()` para mostrarlo.
+
+### A qué doc escribe una sesión al conectar (`backend/src/services/sessionTarget.ts`)
+
+La decisión es pura (`decideSessionTarget`) y sus reglas viven en `sessionTarget.test.ts`:
+
+1. **Reconexión:** el doc quedó fijado en `meta.json` en el primer `open` → ese doc, sin leer nada.
+2. **Con intención** (`/start-session {intoSessionId, allowNumberChange?, keepPrevious?}`, persistida en `meta.json` porque `startSession` se re-ejecuta en cada reintento previo al `open`):
+   - mismo número → relink;
+   - otro número **sin** `allowNumberChange` → rechazo `wrong_number`. **Un QR leído con el teléfono equivocado nunca cambia el número de una sesión.**
+   - otro número con `allowNumberChange` (sólo el owner) → cambio, salvo `stale` (el número del doc cambió mientras se escaneaba), `in_use` (ya es el número de otra sesión) o `has_history` (el número nuevo ya trabajó por su cuenta: juntar dos historiales es fase 2). Si existía un doc `{nuevo}` vacío, se borra.
+3. **Vinculación normal ("Agregar número"):** si el número vive en una sesión migrada, vuelve a ella (`where phone_number ==`); si es un número reemplazado, `number_replaced` (su id está ocupado por la sesión que hoy usa otro número).
+
+Un rechazo emite `link_rejected`, hace `logout()` (sale de "Dispositivos vinculados" del teléfono escaneado) y **no toca Firestore**.
+
+### La línea anterior "sólo recibe"
+
+Si el WhatsApp anterior sigue vivo (perdió la SIM pero no la cuenta), el owner elige dejarlo **recibiendo** (default) o desconectarlo. Su socket pasa a `role: 'previous'` (persistido en `meta.json`):
+
+- **Lo que llega cae en el mismo chat** con `previousNumber`, la burbuja lo marca "📵 a tu número anterior", suma pendiente y manda push `previous_number`. **Nunca lo contesta la IA ni una regla:** responderían desde el número viejo.
+- **Nunca envía:** el cron de recordatorios y seguimientos, `performSendMessage` y el disparo del buffer de IA exigen `role === 'primary'`. Sin ese corte, con dos sockets en el mismo doc los recordatorios salían **dos veces**.
+- **Su estado vive en `previous_lines.{tel}`**, nunca en `status`/`session_key` (son del principal: pisarlos haría que la app mande por el socket equivocado). `writeSessionStatus` sigue siendo el único escritor y decide según el rol.
+- **Es temporal por naturaleza:** WhatsApp desvincula los dispositivos vinculados si el teléfono principal pasa ~14 días sin conectarse, o cuando alguien registra ese número. Una línea caída hace más de 10 min al momento del cambio (el número bloqueado reintentando con 403) no se conserva. Ajustes › Perfil la muestra y la desconecta (`POST /sessions/previous-line/disconnect`).
+
+### Lo que se pausa y lo que se bloquea
+
+- **Seguimientos y recordatorios quedan apagados** al cambiar (`number_change.pausedAutomations`, con aviso en Ajustes). Un número recién estrenado que manda decenas de mensajes a gente que no lo tiene guardado es lo que WhatsApp castiga con un bloqueo. **No volver a encenderlos solos.**
+- **Editar, borrar para todos y reaccionar** a un mensaje del número anterior (antes del último `until`, o llegado por la línea anterior) no se ofrecen en la burbuja **y el backend responde 409** (`isPreviousNumberMessage`): la cuenta nueva no es su dueña, WhatsApp descarta la acción en silencio, pero nuestro eco sí la registraba (un "eliminar para todos" borraba el doc mientras el cliente lo conservaba). La guarda va en el backend porque las apps ya instaladas no traen la de la UI. Responder sí se puede: la cita viaja con su texto.
+
+### En la app
+
+- **Puntos de entrada (sólo el owner):** re-vincular una tarjeta pregunta "¿el mismo o uno nuevo?"; el FAB pregunta "¿Este número reemplaza a otro?" **antes** del QR (es el momento natural de quien perdió su línea, y evita llegar a `has_history`); Ajustes › Perfil › "Cambiar a un número nuevo". Todo pasa por `linkWhatsApp()` (`session_linking.dart`) y el asistente `change_number_flow.dart`, que explica todo **antes** del QR porque el cambio ocurre solo al conectar.
+- **La línea "Cambio de número"** (`number_change_divider.dart`, tests en `test/number_change_divider_test.dart`) va **por tiempo**, no por etiqueta: así no hubo que tocar un solo mensaje. Viaja en el mismo `Column` que el separador de día, sin agregar elementos a la lista (los índices de `_resolveJump` no se mueven). Si lo último del chat es del número anterior, abajo aparece "Lo que envíes ahora sale de +…": el cliente todavía no conoce el número nuevo.
+- **Tras el asistente, Ajustes recarga.** El panel lee el doc una sola vez; sin recargar, su próximo "Guardar" volvía a encender los automáticos que el cambio pausó.
+
+**Fase 2 (no está hecho):** juntar dos historiales (`has_history`), volver a vincular el número viejo como línea aparte (`number_replaced`, necesita ids de sesión opacos), promover la línea anterior a principal sin QR, y que `AccountsScreen` empuje `ChatsScreen` con el `session_key` en vivo (pendiente que ya existía; tras un cambio de número se nota más).
 
 ---
 
