@@ -567,7 +567,8 @@ Toda la lógica vive en `backend/src/services/sessionSupervisor.ts`. **Ninguna r
 Se escribía sólo desde `connection.update`, así que cuando el evento no llegó quedó congelado en `reconnecting` para siempre. Ahora `projectStatus()` lo **deriva del estado en memoria** y el barrido lo recalcula cada 2 minutos: no puede desincronizarse.
 
 - `connected` ⟺ `isReady` · `reconnecting` ⟺ caída hace <10 min · `reconnect_failed` ⟺ caída hace >10 min (el backend **sigue** intentando) · `disconnected` ⟺ no está en el Map.
-- **`writeSessionStatus()` es el único escritor de ese campo.** No escribir `status` desde ningún otro lado.
+- **`writeSessionStatus()` es el único escritor de ese campo** (más la lápida de `markSessionDeleting`, en el mismo archivo). No escribir `status` desde ningún otro lado.
+- **Siempre `update`, nunca `set(merge)`.** El status no crea el doc: lo crea `initializeSession` al conectar. Con `set(merge)` una escritura en vuelo resucitaba como tarjeta fantasma una sesión recién eliminada.
 - Mientras el estado es `reconnecting` se refresca `last_sync` cada barrido aunque nada cambie. Ese **heartbeat es lo que le permite a la app distinguir "el backend sigue intentando" de "el doc lleva horas congelado"**. Late sólo en esa ventana de 10 min para que una sesión muerta durante días no cueste una escritura cada dos minutos.
 - `sweepFirestoreGhosts()` (cada 15 min y al bootear, **después** de restaurar sesiones) es lo único que paga reads: corrige docs que afirman tener sesión viva cuando en memoria no hay ninguna. Reemplaza al viejo HealthCheck, que sólo miraba `status == 'connected'` y por eso era ciego a los atascados en `reconnecting`.
 
@@ -635,6 +636,45 @@ Si el WhatsApp anterior sigue vivo (perdió la SIM pero no la cuenta), el owner 
 - **Tras el asistente, Ajustes recarga.** El panel lee el doc una sola vez; sin recargar, su próximo "Guardar" volvía a encender los automáticos que el cambio pausó.
 
 **Fase 2 (no está hecho):** juntar dos historiales (`has_history`), volver a vincular el número viejo como línea aparte (`number_replaced`, necesita ids de sesión opacos), promover la línea anterior a principal sin QR, y que `AccountsScreen` empuje `ChatsScreen` con el `session_key` en vivo (pendiente que ya existía; tras un cambio de número se nota más).
+
+---
+
+## 🗑️ Eliminar una sesión (sólo el owner)
+
+Ajustes › Perfil › *Zona de peligro*. Borra la sesión con **todo** lo suyo y no deja nada en WhatHero: chats, mensajes, media, internos, etiquetas, respuestas rápidas, el asistente de IA con sus API keys, reglas, recordatorios, seguimientos, permisos del equipo y credenciales. También cierra WhatHero en el WhatsApp del teléfono. El owner confirma tecleando los últimos 4 dígitos del número: con varias sucursales, el error caro es borrar la equivocada.
+
+### Borrar es fácil; que no resucite, no
+
+Todo vive bajo un doc (`whatsapp_sessions/{sid}` y subcolecciones) y un prefijo de Storage. El problema es cuántas cosas escriben ahí con `set(merge)`: el status y su heartbeat, reintentos a mitad de `startSession`, carpetas de `auth_info` que el arranque restaura, media que termina de subir, ciclos de IA que al quedarse sin socket escalan a humano, lotes de seguimiento con llamadas LLM de segundos, backfills, `PATCH access` y vistas abiertas en otros dispositivos. Cualquiera recreaba el doc o dejaba huérfanos que **reaparecían enteros al revincular el número** (el id del doc es el número).
+
+### El doc es la lápida (`backend/src/services/sessionDeletion.ts`)
+
+1. **`POST /sessions/delete`** marca el doc: `deleting_at`, `deleting_by`, `status: 'deleting'` (para las apps viejas, cuyo dispatcher sólo abre `connected`). La marca que manda es `deleting_at`.
+2. **Corta todo lo que escribe:** cancela los ciclos de IA **antes** del socket, hace `logoutAndForget` de cada llave (principal, línea anterior y QR pendiente para re-vincularla, que recibe `link_rejected {reason:'deleting'}`) y borra las carpetas de disco que no estén en memoria. Responde `202 {loggedOut}`.
+3. **Job en segundo plano**, tras 2 min de gracia para que termine lo que estaba en vuelo: Storage, luego cada subcolección, luego **verifica que no quede nada** (hasta 3 pasadas), revoca `members/*.access.sessions.{sid}` y **recién ahí** borra el doc.
+4. **Si el proceso muere a mitad, se retoma solo.** Al bootear, las lápidas se cargan **antes** de `startExistingSessions` (que salta sus carpetas) y el barrido de fantasmas las retoma cada 15 min.
+
+Reglas que no se pueden romper:
+- **Nunca `recursiveDelete(doc)`.** Borra el padre aunque fallen los descendientes y se llevaría la lápida, que es lo único que permite reanudar. Se borra cada subcolección (`listCollections()`, que también ve las que sólo tienen huérfanos) y el doc al final.
+- **El prefijo de Storage termina en `/`.** Sin la barra, `…/52155` también abarca `…/521551234…` y borraría los archivos de otra sesión.
+- **Nunca purgar un doc sin `deleting_at`.** El job lo comprueba antes de cada pasada.
+- **Una llave retirada no vuelve a arrancar** (`forgetKey`/`wasForgotten`). `useMultiFileAuthState` recrea la carpeta borrada: un reintento que estaba a mitad de `startSession` arrancaba con las credenciales en memoria y, si conectaba, creaba un doc nuevo; si no, su `saveCreds` fallaba sin `catch` y tumbaba el proceso.
+- **`initializeSession` es el único que crea docs de sesión** y es transaccional: sobre una lápida no escribe nada. `decideSessionTarget` rechaza con `deleting` si cualquier doc en juego es una lápida (re-vincular, cambiar de número o "Agregar número" con ese mismo número).
+- **`isSessionGone(aid, sid)`** es la guarda en memoria para los escritores que no leen el doc: status, media, internos (410), backfills, seguimientos. Se limpia cuando el número se revincula y `initializeSession` escribe un doc vivo.
+- **`loggedOut` es honesto:** sólo es `true` si había socket abierto y salió el logout. Con la sesión caída no hay por dónde avisarle a WhatsApp, y la app le pide al owner cerrar "WhatHero" en *Dispositivos vinculados*.
+
+### Reglas de Firestore
+- **El subárbol va con `match /{collection}/{document=**}`, no con `/{document=**}`.** En rules v2 el comodín recursivo acepta también cero segmentos, o sea, matcheaba el doc de la sesión misma; como las reglas se suman con OR, anulaba toda restricción sobre él (cualquier miembro con acceso podía borrar la sesión entera desde el cliente).
+- El doc de sesión: `create`/`delete` sólo el backend; `update` nunca sobre una lápida ni para plantarla (el backend purga cualquier doc con `deleting_at`).
+- El subárbol sólo se **escribe** en una sesión viva (`sessionAlive`, +1 lectura por escritura del cliente). Las lecturas no lo exigen: los listeners tienen que poder ver el borrado.
+
+### En la app
+- La tarjeta muestra "Eliminando…" sin acciones, el dispatcher salta lápidas y una `ChatsScreen` empujada sobre esa sesión se cierra sola (la raíz la cambia el dispatcher).
+- `PATCH access` ahora **reemplaza** `access` con `update`. Con `set(merge)` los mapas se mezclaban en profundidad y quitarle una sesión a un miembro **no se la quitaba** (seguía en las reglas y en los pushes; sólo salía de su lista). Además filtra los grants a sesiones vivas: la pantalla de permisos reenvía lo que leyó.
+
+**Lo que queda fuera de nuestro alcance:** pushes ya entregados, logs de Railway, backups/PITR de Firestore, la caché offline de otros dispositivos hasta que sus listeners vean el borrado, y una subida de Storage desde una vista vieja que llegue **después** del job (las reglas de Storage no miran Firestore; cerrarlo exige reglas cruzadas con permiso IAM).
+
+**Fase 2 (no está hecho):** exportar el historial antes de borrar.
 
 ---
 

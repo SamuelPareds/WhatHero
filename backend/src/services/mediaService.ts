@@ -10,11 +10,14 @@ import { pino } from 'pino';
 import { randomUUID } from 'crypto';
 import { ACCOUNTS_COLLECTION } from '../config/env';
 import { updateMediaIndexEntry } from './firestoreService';
+import { isSessionGone } from './sessionSupervisor';
 
 const mediaLogger = pino({ level: 'warn' }).child({ module: 'media' });
 
 const MAX_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 2000;
+// Código gRPC de Firestore para "el doc no existe".
+const FIRESTORE_NOT_FOUND = 5;
 
 export type MediaType = 'image' | 'sticker' | 'document' | 'audio' | 'video';
 
@@ -239,6 +242,8 @@ export async function processMediaAsync(
     .collection('messages').doc(messageId);
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    // La sesión se está eliminando: no hay a dónde subir esto.
+    if (isSessionGone(accountId, sessionId)) return;
     try {
       const buffer = (await downloadMediaMessage(
         message,
@@ -274,7 +279,17 @@ export async function processMediaAsync(
         mediaSize: buffer.length,
         mediaStatus: 'ready' as const,
       };
-      await messageRef.set(readyPatch, { merge: true });
+      // `update` y no `set(merge)`: si el mensaje desapareció mientras
+      // subíamos (chat borrado, sesión eliminada), el `set` lo recreaba como
+      // huérfano. Así falla con NOT_FOUND y el archivo se borra abajo.
+      try {
+        await messageRef.update(readyPatch);
+      } catch (error: any) {
+        if (error?.code !== FIRESTORE_NOT_FOUND) throw error;
+        console.warn(`[Media] ${messageId} ya no existe; se borra el archivo recién subido.`);
+        await file.delete({ ignoreNotFound: true }).catch(() => { /* best-effort */ });
+        return;
+      }
 
       // Sincronizar el media_index (no-op si este media no estaba indexado).
       await updateMediaIndexEntry({
@@ -292,7 +307,7 @@ export async function processMediaAsync(
 
       if (attempt === MAX_RETRIES) {
         try {
-          await messageRef.set({ mediaStatus: 'failed' }, { merge: true });
+          await messageRef.update({ mediaStatus: 'failed' });
           await updateMediaIndexEntry({
             accountId,
             sessionId,

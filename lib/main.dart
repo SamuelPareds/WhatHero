@@ -12,6 +12,7 @@ import 'core/services/socket_service.dart';
 import 'core/services/notification_service.dart';
 import 'core/services/presence_reporter.dart';
 import 'core/services/storage_service.dart';
+import 'core/utils/session_deletion.dart';
 import 'core/widgets/foreground_push_host.dart';
 import 'features/auth.dart';
 import 'features/chat.dart';
@@ -218,7 +219,12 @@ class _SessionDispatcherState extends State<SessionDispatcher> {
               );
             }
 
-            final docs = snapshot.data?.docs ?? [];
+            // Una lápida (sesión que se está eliminando) ya no dice
+            // `connected`, pero un status que estaba en vuelo puede pisarlo
+            // un instante: no se abre aunque lo diga.
+            final docs = (snapshot.data?.docs ?? [])
+                .where((d) => !isSessionDeleting(d.data() as Map<String, dynamic>?))
+                .toList();
 
             if (docs.isNotEmpty) {
               // Preferencia de sesión: el deep-link de una notificación manda
@@ -246,8 +252,10 @@ class _SessionDispatcherState extends State<SessionDispatcher> {
               targetDoc ??= docs.first;
 
               final sessionId = targetDoc.id;
-              final sessionKey = targetDoc['session_key'] as String?;
-              final alias = targetDoc['alias'] as String?;
+              // Null-safe: `doc['campo']` lanza StateError si el campo falta.
+              final targetData = targetDoc.data() as Map<String, dynamic>?;
+              final sessionKey = targetData?['session_key'] as String?;
+              final alias = targetData?['alias'] as String?;
 
               if (sessionKey != null) {
                 return ChatsScreen(

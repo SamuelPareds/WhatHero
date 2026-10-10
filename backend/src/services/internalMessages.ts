@@ -21,6 +21,7 @@ import { ACCOUNTS_COLLECTION } from '../config/env';
 import { sessionTeam } from './memberAccess';
 import { resolveHumanSender } from './senderResolver';
 import { sendInternalMessageNotification } from './notificationService';
+import { isSessionGone } from './sessionSupervisor';
 
 export const INTERNAL_TEXT_MAX = 2000;
 const RECIPIENTS_MAX = 20;
@@ -147,13 +148,17 @@ export async function listTeammates(
   return withNames(team.filter((uid) => uid !== requesterUid));
 }
 
-export type CreateResult = 'created' | 'duplicate' | 'team_unavailable';
+export type CreateResult = 'created' | 'duplicate' | 'team_unavailable' | 'session_gone';
 
 export async function createInternalMessage(
   accountId: string,
   authorUid: string,
   input: InternalMessageInput,
 ): Promise<CreateResult> {
+  // La sesión se está eliminando: el `create` dejaría un huérfano y el push
+  // avisaría al equipo de un chat que ya no existe.
+  if (isSessionGone(accountId, input.sessionId)) return 'session_gone';
+
   // Sin saber quién ve la sesión no sabemos a quién avisar. Mejor que la app
   // muestre "no se envió" que guardar un aviso que no le llega a nadie.
   const team = await sessionTeam(accountId, input.sessionId);

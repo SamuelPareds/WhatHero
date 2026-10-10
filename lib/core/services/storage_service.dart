@@ -21,6 +21,15 @@ class StorageService {
     return sessionId;
   }
 
+  /// Olvida la última sesión sólo si es [sessionId]. La usa la eliminación de
+  /// una sesión: la sesión preferida de este dispositivo ya no existe.
+  Future<void> clearLastSessionIdIf(String sessionId) async {
+    final prefs = await SharedPreferences.getInstance();
+    if (prefs.getString(_keyLastSessionId) == sessionId) {
+      await prefs.remove(_keyLastSessionId);
+    }
+  }
+
   Future<void> clearLastSessionId() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_keyLastSessionId);

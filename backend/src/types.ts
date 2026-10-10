@@ -19,7 +19,10 @@ export type SessionStatus =
   | 'connected'
   | 'reconnecting'
   | 'reconnect_failed'
-  | 'disconnected';
+  | 'disconnected'
+  // El owner pidió eliminarla. Lo escribe sólo la lápida (markSessionDeleting);
+  // la marca que manda es `deleting_at`.
+  | 'deleting';
 
 export interface SessionData {
   sock: any;

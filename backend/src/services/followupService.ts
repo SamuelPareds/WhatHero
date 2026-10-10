@@ -2,6 +2,7 @@ import admin from 'firebase-admin';
 import { SessionData } from '../types';
 import { ACCOUNTS_COLLECTION } from '../config/env';
 import { getAIConfig } from './firestoreService';
+import { isSessionGone } from './sessionSupervisor';
 import {
   normalizeHistory,
   classifyFollowupCandidate,
@@ -214,6 +215,10 @@ export class FollowupService {
     const results: { chatId: string; decision: string; reason: string; draftPreview?: string }[] = [];
 
     for (const { chatId, data } of candidates) {
+      // Si la sesión se está eliminando, se corta. Cada vuelta tarda segundos
+      // (hasta dos llamadas al LLM), así que se re-chequea también antes de
+      // escribir: si no, el lote seguiría recreando chats que ya se borraron.
+      if (isSessionGone(accountId, sessionId)) break;
       const history = await this.fetchHistory(accountId, sessionId, chatId, config.timezone);
       if (history.length === 0) {
         skipped++;
@@ -231,6 +236,7 @@ export class FollowupService {
         aiConfig.deepseekApiKey,
         config.timezone
       );
+      if (isSessionGone(accountId, sessionId)) break;
 
       const chatRef = this.db
         .collection(ACCOUNTS_COLLECTION).doc(accountId)
@@ -258,6 +264,8 @@ export class FollowupService {
         aiConfig.deepseekApiKey,
         config.timezone
       );
+
+      if (isSessionGone(accountId, sessionId)) break;
 
       if (!draft || !draft.trim()) {
         // La IA no produjo texto: no encolamos basura. Lo marcamos como skip

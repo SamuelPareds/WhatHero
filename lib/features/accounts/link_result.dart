@@ -69,6 +69,8 @@ class LinkResult {
         return 'El número de esta sesión cambió mientras escaneabas. Vuelve a intentarlo.';
       case 'not_found':
         return 'Esa sesión ya no existe.';
+      case 'deleting':
+        return 'Esa sesión se está eliminando. Espera unos minutos y vuelve a vincular el número.';
       default:
         return 'No pudimos completar la vinculación. Vuelve a intentarlo.';
     }

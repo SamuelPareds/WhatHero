@@ -98,6 +98,47 @@ function requireDeps(): SupervisorDeps {
 }
 
 // ---------------------------------------------------------------------------
+// Sesiones eliminadas y llaves retiradas
+// ---------------------------------------------------------------------------
+
+// Docs de sesión que el owner mandó eliminar (ver sessionDeletion.ts). Mientras
+// estén acá nadie les escribe: ni el status, ni la media que termina de subir,
+// ni un interno del equipo. Se llena al pedir el borrado y al bootear (desde las
+// lápidas de Firestore), y se vacía cuando el número se vuelve a vincular y
+// `initializeSession` escribe un doc vivo con ese id.
+const goneSessions = new Set<string>();
+const goneId = (accountId: string, sessionId: string) => `${accountId}/${sessionId}`;
+
+export function markSessionGone(accountId: string, sessionId: string): void {
+  goneSessions.add(goneId(accountId, sessionId));
+}
+
+export function isSessionGone(accountId: string, sessionId: string | undefined): boolean {
+  return !!sessionId && goneSessions.has(goneId(accountId, sessionId));
+}
+
+export function clearSessionGone(accountId: string, sessionId: string): void {
+  goneSessions.delete(goneId(accountId, sessionId));
+}
+
+// Llaves (`sessionKey`) que ya se retiraron junto con sus credenciales. Una
+// llave retirada no vuelve a arrancar: un reintento que estaba a mitad de
+// `startSession` cuando se retiró NO puede seguir. `useMultiFileAuthState`
+// recrea la carpeta borrada y el socket arrancaría con las credenciales que ya
+// tenía en memoria: si conecta, crea un doc nuevo con ese número; si no, su
+// `saveCreds` falla sin catch y tumba el proceso. Las llaves son UUID y nunca se
+// reusan, así que el set vive lo que vive el proceso (crece unas pocas por día).
+const forgottenKeys = new Set<string>();
+
+export function forgetKey(sessionKey: string): void {
+  forgottenKeys.add(sessionKey);
+}
+
+export function wasForgotten(sessionKey: string): boolean {
+  return forgottenKeys.has(sessionKey);
+}
+
+// ---------------------------------------------------------------------------
 // Ciclo de vida del socket
 // ---------------------------------------------------------------------------
 
@@ -248,6 +289,7 @@ export async function retireSession(
   sessions.delete(sessionKey);
 
   if (wipeAuth) {
+    forgetKey(sessionKey);
     try {
       rmSync(`auth_info/${sessionKey}`, { recursive: true, force: true });
     } catch (error) {
@@ -270,11 +312,16 @@ const LOGOUT_TIMEOUT_MS = 5_000;
  * un `disconnected` lo pisaría con mentira. Sale del Map ANTES del logout a
  * propósito: el `close` que dispara encuentra la sesión ausente y no programa
  * reconexión ni escribe nada.
+ *
+ * Devuelve si el logout salió hacia WhatsApp. Con el socket caído (o
+ * reconectando) no hay por dónde mandarlo: las credenciales se borran igual,
+ * pero el teléfono sigue mostrando "WhatHero" en Dispositivos vinculados.
  */
-export async function logoutAndForget(sessionKey: string, reason: string): Promise<void> {
+export async function logoutAndForget(sessionKey: string, reason: string): Promise<boolean> {
   const { sessions } = requireDeps();
+  forgetKey(sessionKey);
   const session = sessions.get(sessionKey);
-  if (!session) return;
+  if (!session) return false;
 
   console.log(`[Supervisor] Cerrando sesión ${sessionKey} en WhatsApp (motivo: ${reason})`);
   clearSessionTimers(session);
@@ -283,12 +330,14 @@ export async function logoutAndForget(sessionKey: string, reason: string): Promi
   session.sock = null;
   session.isReady = false;
 
+  let loggedOut = false;
   if (sock) {
     try {
       await Promise.race([
         sock.logout(reason),
         new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), LOGOUT_TIMEOUT_MS)),
       ]);
+      loggedOut = true;
     } catch (error) {
       console.warn(`[Supervisor] Logout de ${sessionKey} no confirmado:`, (error as Error)?.message);
     }
@@ -300,6 +349,7 @@ export async function logoutAndForget(sessionKey: string, reason: string): Promi
   } catch (error) {
     console.error(`[Supervisor] No se pudo borrar auth_info/${sessionKey}:`, error);
   }
+  return loggedOut;
 }
 
 /**
@@ -337,6 +387,7 @@ export async function retireDuplicateSessions(liveKey: string, live: SessionData
     clearSessionTimers(session);
     teardownSocket(session.sock);
     sessions.delete(key);
+    forgetKey(key);
     try {
       rmSync(`auth_info/${key}`, { recursive: true, force: true });
     } catch (error) {
@@ -362,13 +413,22 @@ export function projectStatus(session: SessionData, now = Date.now()): SessionSt
   return now - downSince > RECONNECT_ALERT_MS ? 'reconnect_failed' : 'reconnecting';
 }
 
+// Código gRPC de Firestore para "el doc no existe".
+const NOT_FOUND = 5;
+
 /**
- * Escribe el status en el doc de sesión. Único escritor de ese campo.
+ * Escribe el status en el doc de sesión. Único escritor de ese campo, junto con
+ * `markSessionDeleting` (la lápida), que vive en este mismo archivo.
  *
  * Sin `sessionId` no hay doc que direccionar — pasaba en cada arranque en
  * frío, porque el número sólo se conocía tras el primer `open`. Ahora
  * `startSession` lo hidrata desde `meta.json`, así que este caso es residual
  * (sesión nueva que nunca llegó a vincularse) y no hay nada que corregir.
+ *
+ * Siempre `update`, nunca `set`: el status NO crea el doc (eso lo hace
+ * `initializeSession` al conectar). Con `set(merge)` cualquier escritura en
+ * vuelo resucitaba como tarjeta fantasma una sesión que el owner acababa de
+ * eliminar, y el heartbeat la repetía cada dos minutos.
  */
 export async function writeSessionStatus(
   session: SessionData,
@@ -377,6 +437,7 @@ export async function writeSessionStatus(
 ): Promise<void> {
   const { db } = requireDeps();
   if (!session.sessionId) return;
+  if (isSessionGone(session.accountId, session.sessionId)) return;
 
   const ref = db
     .collection(ACCOUNTS_COLLECTION)
@@ -389,20 +450,58 @@ export async function writeSessionStatus(
     if (session.role === 'previous') {
       // La línea anterior reporta en su propio casillero. `status` y
       // `session_key` son del socket principal: pisarlos haría que la app
-      // mande por el socket equivocado. `update` (no `set`) para no resucitar
-      // un doc que ya no existe.
+      // mande por el socket equivocado.
       if (!session.linkedPhone) return;
       const line = `previous_lines.${session.linkedPhone}`;
       const patch: Record<string, unknown> = { [`${line}.status`]: status, [`${line}.last_sync`]: now };
       for (const [field, value] of Object.entries(extra)) patch[`${line}.${field}`] = value;
       await ref.update(patch);
     } else {
-      await ref.set({ status, last_sync: now, ...extra }, { merge: true });
+      await ref.update({ status, last_sync: now, ...extra });
     }
     session.lastWrittenStatus = status;
   } catch (error) {
+    if ((error as any)?.code === NOT_FOUND) {
+      console.warn(`[Supervisor] status=${status} no se escribió: el doc ${session.sessionId} ya no existe.`);
+      return;
+    }
     console.error(`[Supervisor] No se pudo escribir status=${status} para ${session.sessionId}:`, error);
   }
+}
+
+/**
+ * Convierte el doc de sesión en lápida: el owner pidió eliminarlo. El doc se
+ * queda hasta que el borrado termina (ver sessionDeletion.ts) para que un
+ * reinicio pueda retomarlo y todo el equipo vea "Eliminando…". `status:
+ * 'deleting'` es para las apps viejas: su dispatcher sólo abre sesiones
+ * `connected` y la suelta sin cambiar una línea. La marca que manda es
+ * `deleting_at`. Va en una transacción para no pisar un borrado ya en curso.
+ *
+ * Devuelve `'already'` si ya era lápida y `'missing'` si el doc no existe.
+ */
+export async function markSessionDeleting(
+  accountId: string,
+  sessionId: string,
+  byUid: string,
+): Promise<'marked' | 'already' | 'missing'> {
+  const { db } = requireDeps();
+  const ref = db
+    .collection(ACCOUNTS_COLLECTION)
+    .doc(accountId)
+    .collection('whatsapp_sessions')
+    .doc(sessionId);
+
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    if (!snap.exists) return 'missing';
+    if (snap.data()?.deleting_at) return 'already';
+    tx.update(ref, {
+      deleting_at: admin.firestore.Timestamp.now(),
+      deleting_by: byUid,
+      status: 'deleting' satisfies SessionStatus,
+    });
+    return 'marked';
+  });
 }
 
 /** Proyecta y escribe sólo si algo cambió. */
@@ -472,28 +571,34 @@ export async function sweepFirestoreGhosts(): Promise<number> {
   let cleaned = 0;
 
   try {
-    const accounts = await db.collection(ACCOUNTS_COLLECTION).get();
+    // `listDocuments` y no `get`: incluye las cuentas sin doc propio (owners
+    // anteriores a `register_screen`), que con `get` eran invisibles.
+    const accounts = await db.collection(ACCOUNTS_COLLECTION).listDocuments();
 
-    for (const account of accounts.docs) {
-      const docs = await account.ref
-        .collection('whatsapp_sessions')
-        .where('status', 'in', LIVE_STATUSES)
-        .get();
+    for (const account of accounts) {
+      // Un error en una cuenta no puede dejar sin barrer a las que siguen.
+      try {
+        const docs = await account
+          .collection('whatsapp_sessions')
+          .where('status', 'in', LIVE_STATUSES)
+          .get();
 
-      for (const doc of docs.docs) {
-        const sessionKey = doc.data().session_key;
-        if (sessionKey && liveKeys.has(sessionKey)) continue;
+        for (const doc of docs.docs) {
+          const sessionKey = doc.data().session_key;
+          if (sessionKey && liveKeys.has(sessionKey)) continue;
+          if (doc.data().deleting_at) continue; // lápida: la cierra sessionDeletion
 
-        console.log(`[GhostSweep] ${doc.id} (cuenta ${account.id}) dice "${doc.data().status}" sin sesión viva. Corrigiendo.`);
-        await doc.ref.set(
-          {
+          console.log(`[GhostSweep] ${doc.id} (cuenta ${account.id}) dice "${doc.data().status}" sin sesión viva. Corrigiendo.`);
+          await doc.ref.update({
             status: 'disconnected',
             disconnect_reason: sessionKey ? 'ghost_no_session_in_memory' : 'ghost_no_session_key',
             last_sync: admin.firestore.Timestamp.now(),
-          },
-          { merge: true },
-        );
-        cleaned++;
+          });
+          cleaned++;
+        }
+      } catch (error) {
+        if ((error as any)?.code === NOT_FOUND) continue; // se borró mientras barríamos
+        console.error(`[GhostSweep] Error barriendo la cuenta ${account.id}:`, error);
       }
     }
 
@@ -505,8 +610,12 @@ export async function sweepFirestoreGhosts(): Promise<number> {
   return cleaned;
 }
 
-/** Arranca los dos barridos periódicos. Se llama una vez, al levantar el server. */
-export function startSupervisorLoops(): void {
+/**
+ * Arranca los barridos periódicos. Se llama una vez, al levantar el server.
+ * `everyGhostSweep` corre en el mismo tick que el barrido de fantasmas: lo usa
+ * sessionDeletion para retomar borrados que un reinicio dejó a medias.
+ */
+export function startSupervisorLoops(everyGhostSweep?: () => Promise<unknown>): void {
   requireDeps();
   setInterval(() => {
     try {
@@ -518,6 +627,7 @@ export function startSupervisorLoops(): void {
 
   setInterval(() => {
     void sweepFirestoreGhosts();
+    everyGhostSweep?.().catch((error) => console.error('[Supervisor] Error en el barrido periódico:', error));
   }, GHOST_SWEEP_INTERVAL_MS);
 
   console.log(

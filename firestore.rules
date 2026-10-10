@@ -71,6 +71,16 @@ service cloud.firestore {
       );
     }
 
+    // ¿La sesión existe y no se está eliminando? El subárbol sólo se escribe en
+    // una sesión viva: una vista abierta en otro dispositivo hacía `set(merge)`
+    // sobre chats de una sesión ya borrada y dejaba huérfanos que reaparecían
+    // si el número se volvía a vincular (el id del doc es el número). Las
+    // lecturas no lo exigen: los listeners tienen que poder ver el borrado.
+    function sessionAlive(root, accountId, sessionId) {
+      let path = /databases/$(database)/documents/$(root)/$(accountId)/whatsapp_sessions/$(sessionId);
+      return exists(path) && get(path).data.get('deleting_at', null) == null;
+    }
+
     // users/{uid}: cada quien lee solo el suyo. Auto-bootstrap controlado.
     match /users/{uid} {
       allow read: if request.auth != null && request.auth.uid == uid;
@@ -112,18 +122,32 @@ service cloud.firestore {
       // `allowedUids` para que un miembro restringido pueda LISTAR solo sus
       // sesiones (query `where('allowedUids', arrayContains: uid)`).
       match /whatsapp_sessions/{sessionId} {
-        allow read: if isMember(accountId) && (
+        allow get: if canAccessSession('accounts', accountId, sessionId) || (
+          isMember(accountId) && request.auth.uid in resource.data.allowedUids
+        );
+        allow list: if isMember(accountId) && (
           isOwner(accountId) ||
           memberAllSessions('accounts', accountId) ||
           request.auth.uid in resource.data.allowedUids
         );
-        allow write: if canAccessSession('accounts', accountId, sessionId);
+        // Crear y borrar el doc es del backend (al vincular y al eliminar la
+        // sesión, sólo el owner). Nadie edita una lápida ni la planta: el
+        // backend retoma solo cualquier doc con `deleting_at` y lo purga.
+        allow update: if canAccessSession('accounts', accountId, sessionId)
+          && resource.data.get('deleting_at', null) == null
+          && request.resource.data.get('deleting_at', null) == null;
 
         // Subárbol de la sesión (chats, messages, labels, quick_responses,
         // media_index, message_index, followup_queue, ...): sessionId fijo en
         // el path → usamos el check por get() del member doc.
-        match /{document=**} {
-          allow read, write: if canAccessSession('accounts', accountId, sessionId);
+        // `{collection}/` delante es obligatorio: en rules v2 `{document=**}`
+        // acepta también CERO segmentos, o sea, matcheaba el doc de la sesión
+        // misma, y como las reglas se suman con OR, anulaba todo lo de arriba
+        // (cualquier miembro con acceso podía borrar la sesión entera).
+        match /{collection}/{document=**} {
+          allow read: if canAccessSession('accounts', accountId, sessionId);
+          allow write: if canAccessSession('accounts', accountId, sessionId)
+            && sessionAlive('accounts', accountId, sessionId);
         }
       }
 
@@ -144,15 +168,22 @@ service cloud.firestore {
       allow read, write: if isMember(accountId);
 
       match /whatsapp_sessions/{sessionId} {
-        allow read: if isMember(accountId) && (
+        allow get: if canAccessSession('accounts_dev', accountId, sessionId) || (
+          isMember(accountId) && request.auth.uid in resource.data.allowedUids
+        );
+        allow list: if isMember(accountId) && (
           isOwner(accountId) ||
           memberAllSessions('accounts_dev', accountId) ||
           request.auth.uid in resource.data.allowedUids
         );
-        allow write: if canAccessSession('accounts_dev', accountId, sessionId);
+        allow update: if canAccessSession('accounts_dev', accountId, sessionId)
+          && resource.data.get('deleting_at', null) == null
+          && request.resource.data.get('deleting_at', null) == null;
 
-        match /{document=**} {
-          allow read, write: if canAccessSession('accounts_dev', accountId, sessionId);
+        match /{collection}/{document=**} {
+          allow read: if canAccessSession('accounts_dev', accountId, sessionId);
+          allow write: if canAccessSession('accounts_dev', accountId, sessionId)
+            && sessionAlive('accounts_dev', accountId, sessionId);
         }
       }
 

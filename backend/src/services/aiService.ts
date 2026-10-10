@@ -183,6 +183,22 @@ export function cancelAiCycle(sessionKey: string, contactPhone: string): boolean
   return true;
 }
 
+// Corta todos los ciclos en vuelo de una sesión. Lo usa la eliminación de una
+// sesión ANTES de cerrar su socket: un ciclo vivo que se queda sin socket falla
+// al enviar y escala a humano, o sea, escribe el chat y manda un push sobre
+// una sesión que ya no existe. Uno cancelado no escala.
+export function cancelAiCyclesForSession(sessionKey: string): number {
+  const prefix = cycleKey(sessionKey, '');
+  let cancelled = 0;
+  for (const [key, cycle] of activeAiCycles) {
+    if (key.startsWith(prefix) && !cycle.cancelled) {
+      cycle.cancelled = true;
+      cancelled++;
+    }
+  }
+  return cancelled;
+}
+
 // IDs de los mensajes que envió la propia IA. La rama `fromMe` de
 // `messages.upsert` los consulta para no confundir un chunk del asistente con
 // "el humano tomó el control": esa confusión cancelaba el buffer que el cliente

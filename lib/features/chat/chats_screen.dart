@@ -21,6 +21,7 @@ import 'package:crm_whatsapp/core/services/storage_service.dart';
 import 'package:crm_whatsapp/core/services/team_presence_service.dart';
 import 'package:crm_whatsapp/core/utils/phone_input.dart';
 import 'package:crm_whatsapp/core/utils/phone_search.dart';
+import 'package:crm_whatsapp/core/utils/session_deletion.dart';
 import 'package:crm_whatsapp/core/utils/session_phone.dart';
 import 'package:crm_whatsapp/features/settings.dart';
 import 'package:crm_whatsapp/features/accounts.dart';
@@ -93,6 +94,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
   StreamSubscription? _statusSubscription;
   StreamSubscription? _humanAttentionSubscription;
   StreamSubscription? _labelsSubscription;
+  StreamSubscription? _sessionGoneSubscription;
+  bool _leftDeletedSession = false;
   // Intención de deep-link compartida con SessionDispatcher. Esta pantalla solo
   // abre chats de SU sesión; el cambio de sesión lo orquesta el dispatcher.
   ValueNotifier<HumanAttentionPush?>? _pendingTap;
@@ -159,6 +162,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
     if (widget.sessionId != null) {
       _subscribeToLabels();
       _loadTeamInbox();
+      _watchSessionGone();
     }
 
     // Cold-start: la app abrió por un tap a una notificación push.
@@ -230,6 +234,46 @@ class _ChatsScreenState extends State<ChatsScreen> {
     });
   }
 
+  // La sesión se está eliminando (o ya no existe). La ChatsScreen raíz la
+  // cambia el SessionDispatcher, que deja de verla entre las conectadas. Ésta
+  // sólo se cierra sola si fue empujada desde la lista de sesiones: nadie más
+  // la cerraría y se quedaría mostrando una sesión vacía.
+  void _watchSessionGone() {
+    _sessionGoneSubscription = FirebaseFirestore.instance
+        .collection(accountsCollection)
+        .doc(widget.accountId)
+        .collection('whatsapp_sessions')
+        .doc(widget.sessionId)
+        .snapshots()
+        .listen(
+      (snap) {
+        // Un "no existe" del cache puede ser sólo que no estaba cacheado.
+        if (!snap.exists && snap.metadata.isFromCache) return;
+        if (snap.exists && !isSessionDeleting(snap.data())) return;
+        _leaveDeletedSession();
+      },
+      // Sin permiso para leerla: el borrado terminó y revocó el acceso.
+      onError: (_) => _leaveDeletedSession(),
+    );
+  }
+
+  void _leaveDeletedSession() {
+    if (_leftDeletedSession || !mounted) return;
+    final route = ModalRoute.of(context);
+    if (route == null || route.isFirst) return;
+    _leftDeletedSession = true;
+    _sessionGoneSubscription?.cancel();
+    final messenger = ScaffoldMessenger.of(context);
+    final navigator = Navigator.of(context);
+    // Primero lo que esté encima (hoja de ajustes, diálogos), luego esta pantalla.
+    navigator.popUntil((r) => r == route);
+    navigator.pop();
+    messenger.showSnackBar(const SnackBar(
+      content: Text('Esta sesión se está eliminando.'),
+      duration: Duration(seconds: 3),
+    ));
+  }
+
   void _setupSocketListeners() {
     if (widget.sessionKey == null) return;
     
@@ -263,6 +307,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
     _statusSubscription?.cancel();
     _humanAttentionSubscription?.cancel();
     _labelsSubscription?.cancel();
+    _sessionGoneSubscription?.cancel();
     _pendingTap?.removeListener(_onPendingTap);
     _cancelledTimer?.cancel();
     _filterCounts.dispose();

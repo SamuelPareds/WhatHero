@@ -8,6 +8,7 @@ import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/core/services/storage_service.dart';
 import 'package:crm_whatsapp/core/services/version_service.dart';
 import 'package:crm_whatsapp/core/utils/phone_input.dart';
+import 'package:crm_whatsapp/core/utils/session_deletion.dart';
 import 'package:crm_whatsapp/core/utils/session_phone.dart';
 import 'package:crm_whatsapp/features/auth.dart';
 import 'package:crm_whatsapp/features/accounts/change_number/change_number_flow.dart';
@@ -348,7 +349,8 @@ class _AccountsScreenState extends State<AccountsScreen> {
               return 0;
             });
 
-          _sessions = sessions;
+          // Una sesión que se está eliminando no puede recibir el número nuevo.
+          _sessions = sessions.where((d) => !isSessionDeleting(_dataOf(d))).toList();
 
           if (sessions.isEmpty) {
             return Center(
@@ -381,9 +383,11 @@ class _AccountsScreenState extends State<AccountsScreen> {
               final data = sessionDoc.data() as Map<String, dynamic>? ?? {};
               final alias = _aliasOf(sessionDoc);
               final previousLines = _livePreviousLines(data);
+              final deleting = isSessionDeleting(data);
               final visual = _SessionVisual.from(
                 data['status'] as String?,
                 (data['last_sync'] as Timestamp?)?.toDate(),
+                deleting: deleting,
               );
               final isConnected = visual.isConnected;
 
@@ -395,8 +399,9 @@ class _AccountsScreenState extends State<AccountsScreen> {
                   border: Border.all(color: visual.color.withValues(alpha: 0.2)),
                 ),
                 child: InkWell(
-                  onTap: () {
-                    final sessionKey = sessionDoc['session_key'] as String?;
+                  // Eliminándose: no se abre ni se toca. Desaparece sola al terminar.
+                  onTap: deleting ? null : () {
+                    final sessionKey = data['session_key'] as String?;
                     // Permitimos entrar aunque no haya sessionKey (será modo lectura)
                     Navigator.push(
                       context,
@@ -538,7 +543,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
                             // dejó a un cliente 26 horas sin salida cuando el estado
                             // se congeló ahí: la única acción que lo arreglaba era
                             // justo la que la UI ocultaba.
-                            if (!isConnected)
+                            if (!isConnected && !deleting)
                               IconButton(
                                 icon: const Icon(Icons.sync, color: primaryAqua, size: 22),
                                 onPressed: () => _onRelink(phoneNumber, data),
@@ -547,23 +552,24 @@ class _AccountsScreenState extends State<AccountsScreen> {
                           ],
                         ),
                         const SizedBox(width: 4),
-                        IconButton(
-                          icon: const Icon(Icons.settings_outlined, color: lightText, size: 20),
-                          onPressed: () {
-                            showModalBottomSheet(
-                              context: context,
-                              backgroundColor: surfaceDark,
-                              isScrollControlled: true,
-                              shape: const RoundedRectangleBorder(
-                                borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-                              ),
-                              builder: (_) => SessionSettingsPanel(
-                                sessionId: phoneNumber,
-                                accountId: widget.accountId,
-                              ),
-                            );
-                          },
-                        ),
+                        if (!deleting)
+                          IconButton(
+                            icon: const Icon(Icons.settings_outlined, color: lightText, size: 20),
+                            onPressed: () {
+                              showModalBottomSheet(
+                                context: context,
+                                backgroundColor: surfaceDark,
+                                isScrollControlled: true,
+                                shape: const RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+                                ),
+                                builder: (_) => SessionSettingsPanel(
+                                  sessionId: phoneNumber,
+                                  accountId: widget.accountId,
+                                ),
+                              );
+                            },
+                          ),
                       ],
                     ),
                   ),
@@ -617,7 +623,13 @@ class _SessionVisual {
   /// un mal minuto.
   static const _staleAfter = Duration(minutes: 5);
 
-  factory _SessionVisual.from(String? status, DateTime? lastSync) {
+  factory _SessionVisual.from(String? status, DateTime? lastSync, {bool deleting = false}) {
+    // Gana sobre cualquier status: el owner la mandó eliminar y el backend
+    // está borrando todo lo suyo. La tarjeta desaparece sola al terminar.
+    if (deleting) {
+      return const _SessionVisual(label: 'Eliminando…', color: lightText, showSpinner: true);
+    }
+
     if (status == 'connected') {
       return const _SessionVisual(label: 'Conectado', color: accentAqua, isConnected: true);
     }

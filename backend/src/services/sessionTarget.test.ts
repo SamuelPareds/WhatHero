@@ -133,6 +133,45 @@ test('volver al número anterior: el doc conserva su id y no se borra nada', () 
   assert.deepEqual(d, { kind: 'number_change', sessionId: A, fromPhone: B, dropEmptyDocOf: null });
 });
 
+// --- Sesión que se está eliminando ---
+
+test('volver a vincular el número de una sesión que se está eliminando se rechaza', () => {
+  const d = decideSessionTarget(facts({ ownDoc: { exists: true, phone: B }, deleting: [B] }));
+  assert.deepEqual(d, { kind: 'reject', reason: 'deleting', sessionId: B });
+});
+
+test('el número nuevo de una sesión migrada que se está eliminando no vuelve a ella', () => {
+  const d = decideSessionTarget(facts({ adoptedBy: [A], deleting: [A] }));
+  assert.deepEqual(d, { kind: 'reject', reason: 'deleting', sessionId: A });
+});
+
+test('re-vincular una tarjeta que se está eliminando se rechaza aunque sea el mismo número', () => {
+  const d = decideSessionTarget(facts({
+    linked: A,
+    intent: intent({ allowNumberChange: false }),
+    intoDoc: { exists: true, phone: A },
+    ownDoc: { exists: true, phone: A },
+    deleting: [A],
+  }));
+  assert.deepEqual(d, { kind: 'reject', reason: 'deleting', sessionId: A });
+});
+
+test('cambiar de número hacia uno cuya sesión se está eliminando gana sobre has_history e in_use', () => {
+  const d = decideSessionTarget(facts({
+    intent: intent(),
+    intoDoc: { exists: true, phone: A },
+    ownDoc: { exists: true, phone: B, hasChats: true },
+    adoptedBy: [C],
+    deleting: [B],
+  }));
+  assert.deepEqual(d, { kind: 'reject', reason: 'deleting', sessionId: B });
+});
+
+test('una reconexión no mira lápidas: no lee nada', () => {
+  const d = decideSessionTarget(facts({ pinnedSessionId: A, deleting: [A] }));
+  assert.deepEqual(d, { kind: 'relink', sessionId: A });
+});
+
 // --- Parche del cambio ---
 
 test('el parche apunta al número nuevo y agrega el anterior a la historia', () => {

@@ -9,12 +9,14 @@ import 'package:file_picker/file_picker.dart';
 import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/services/account_context_service.dart';
 import 'package:crm_whatsapp/core/services/api_client.dart';
+import 'package:crm_whatsapp/core/services/storage_service.dart';
 import 'package:crm_whatsapp/core/utils/phone_input.dart';
 import 'package:crm_whatsapp/core/utils/session_phone.dart';
 import '../accounts/change_number/change_number_flow.dart';
 import '../accounts/link_result.dart';
 import '../chat/number_change_divider.dart';
 import '../chat/widgets/label_editor_dialog.dart';
+import 'delete_session_dialog.dart';
 
 class SessionSettingsPanel extends StatefulWidget {
   final String sessionId;
@@ -443,9 +445,69 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
           ),
           const SizedBox(height: 20),
           _switchTile('Marcar como leído al responder', _markReadOnReply, (v) => setState(() => _markReadOnReply = v)),
+          if (AccountContextService().isOwner) ..._buildDangerZone(),
         ],
       ),
     );
+  }
+
+  // Eliminar la sesión con todo lo suyo. Sólo el owner (el backend también lo
+  // exige). Ver delete_session_dialog.dart.
+  List<Widget> _buildDangerZone() {
+    return [
+      const SizedBox(height: 40),
+      const Text('Zona de peligro', style: TextStyle(color: Color(0xFFF87171), fontSize: 18, fontWeight: FontWeight.bold)),
+      const SizedBox(height: 8),
+      const Text(
+        'Si ya no trabajas con este número, elimina la sesión y todo lo suyo: chats, mensajes, '
+        'archivos, configuración y permisos del equipo. No queda nada en WhatHero.',
+        style: TextStyle(color: lightText, fontSize: 13),
+      ),
+      const SizedBox(height: 16),
+      SizedBox(
+        width: double.infinity,
+        child: OutlinedButton.icon(
+          onPressed: _deleteSession,
+          icon: const Icon(Icons.delete_forever_outlined, color: Colors.red, size: 20),
+          label: const Text('Eliminar esta sesión', style: TextStyle(color: Colors.red, fontWeight: FontWeight.w600)),
+          style: OutlinedButton.styleFrom(
+            padding: const EdgeInsets.symmetric(vertical: 14),
+            side: BorderSide(color: Colors.red.withValues(alpha: 0.4)),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          ),
+        ),
+      ),
+    ];
+  }
+
+  Future<void> _deleteSession() async {
+    final phone = _linkedPhone ?? widget.sessionId;
+    final alias = _aliasController.text.trim();
+    final loggedOut = await showDeleteSessionDialog(
+      context,
+      accountId: widget.accountId,
+      sessionId: widget.sessionId,
+      alias: alias.isEmpty ? displayPhone(phone) : alias,
+      phone: phone,
+    );
+    if (loggedOut == null || !mounted) return;
+
+    final messenger = ScaffoldMessenger.of(context);
+    await StorageService().clearLastSessionIdIf(widget.sessionId);
+    if (!mounted) return;
+    // Sólo se cierra el panel: lo demás reacciona solo a la lápida (la lista
+    // muestra "Eliminando…", el dispatcher cambia de sesión y una ChatsScreen
+    // abierta sobre esta sesión se cierra).
+    Navigator.pop(context);
+    messenger.showSnackBar(SnackBar(
+      duration: const Duration(seconds: 8),
+      content: Text(
+        loggedOut
+            ? 'Eliminando la sesión. WhatHero también se cerró en el WhatsApp del teléfono.'
+            : 'Eliminando la sesión. Si en el teléfono sigue apareciendo WhatHero en '
+                'Dispositivos vinculados, ciérralo desde ahí.',
+      ),
+    ));
   }
 
   // Números que usó esta sesión antes del actual, del más reciente al más

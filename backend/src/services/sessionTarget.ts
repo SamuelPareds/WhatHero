@@ -26,6 +26,7 @@ export type RejectReason =
   | 'has_history'     // el número nuevo ya tiene chats propios en WhatHero
   | 'in_use'          // el número nuevo ya es el de otra sesión
   | 'number_replaced' // ese número fue reemplazado en una sesión: no vuelve como línea aparte
+  | 'deleting'        // alguno de los docs en juego se está eliminando (ver sessionDeletion.ts)
   | 'error';
 
 export type TargetDecision =
@@ -53,6 +54,7 @@ export interface TargetFacts {
   intoDoc?: DocFacts;        // doc del intent
   ownDoc: DocFacts;          // doc cuyo id es `linked`
   adoptedBy: string[];       // otros docs (id ≠ linked) cuyo phone_number es `linked`
+  deleting?: string[];       // de los docs leídos, los que son lápida (`deleting_at`)
 }
 
 export function defaultSessionAlias(phone: string): string {
@@ -72,6 +74,14 @@ export function defaultSessionAlias(phone: string): string {
  */
 export function decideSessionTarget(f: TargetFacts): TargetDecision {
   if (f.pinnedSessionId) return { kind: 'relink', sessionId: f.pinnedSessionId };
+
+  // Si cualquiera de los docs en juego se está eliminando, no se decide nada
+  // hasta que termine: ni re-vincular, ni cambiar de número, ni "Agregar
+  // número" con ese mismo número. Escribirle sería pelear con el borrado, que
+  // se llevaría la sesión recién conectada.
+  if (f.deleting && f.deleting.length > 0) {
+    return { kind: 'reject', reason: 'deleting', sessionId: f.deleting[0] };
+  }
 
   // El doc `{linked}` es "suyo" si sigue usando ese número. Si dice otro, es
   // una sesión que cambió de número y sólo conserva el id.
@@ -198,6 +208,9 @@ export async function gatherTargetFacts(
   ]);
 
   const ownPhone = ownSnap.data()?.phone_number as string | undefined;
+  const deleting = [ownSnap, ...byPhone.docs, ...(intoSnap ? [intoSnap] : [])]
+    .filter((snap) => snap.exists && snap.data()?.deleting_at)
+    .map((snap) => snap.id);
   let hasChats = false;
   if (intent && ownSnap.exists && (ownPhone ?? linked) === linked) {
     hasChats = !(await ownSnap.ref.collection('chats').limit(1).get()).empty;
@@ -211,6 +224,7 @@ export async function gatherTargetFacts(
       : undefined,
     ownDoc: { exists: ownSnap.exists, phone: ownPhone, hasChats },
     adoptedBy: byPhone.docs.map((d) => d.id).filter((id) => id !== linked),
+    deleting: [...new Set(deleting)],
   };
 }
 
@@ -237,6 +251,7 @@ export async function applyNumberChange(
     const snap = await tx.get(ref);
     if (!snap.exists) throw new NumberChangeError('not_found');
     const data = snap.data()!;
+    if (data.deleting_at) throw new NumberChangeError('deleting');
     if ((data.phone_number ?? sessionId) !== fromPhone) throw new NumberChangeError('stale');
 
     const at = admin.firestore.Timestamp.now();

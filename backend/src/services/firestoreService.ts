@@ -8,6 +8,7 @@ import { ACCOUNTS_COLLECTION } from '../config/env';
 import { extractMediaInfo, processMediaAsync } from './mediaService';
 import { WHATSAPP_SENDER } from './senderResolver';
 import { defaultSessionAlias } from './sessionTarget';
+import { clearSessionGone } from './sessionSupervisor';
 
 // Lazy evaluation: getDb() is called only after Firebase is initialized
 function getDb() {
@@ -226,13 +227,12 @@ export async function updateMediaIndexEntry(params: {
       .doc(params.sessionId)
       .collection('media_index')
       .doc(params.messageId);
-    // Si el doc no existe (mensaje no indexable, ej. audio/sticker), set merge
-    // crearía basura. Verificamos primero — barato porque el upload pipeline
-    // ya hace varias I/O.
-    const snap = await ref.get();
-    if (!snap.exists) return;
-    await ref.set(params.patch, { merge: true });
+    // `update` y no `set(merge)`: si el doc no existe (mensaje no indexable,
+    // ej. audio/sticker, o una sesión que se acaba de eliminar) no creamos
+    // basura, y nos ahorramos el read que antes lo comprobaba.
+    await ref.update(params.patch);
   } catch (err) {
+    if ((err as any)?.code === 5) return; // NOT_FOUND: no estaba indexado
     console.warn(`[MediaIndex] No se pudo actualizar ${params.messageId}:`, err);
   }
 }
@@ -322,14 +322,19 @@ export async function deleteMessageIndexEntry(
 // Initialize/update session document in Firestore.
 // `sessionId` es el doc; `linkedPhone`, el número realmente vinculado. Son
 // iguales salvo en una sesión que cambió de número (ver sessionTarget.ts).
-// Devuelve el doc tal como estaba antes de esta escritura (ya lo leemos para
-// el alias): de ahí sale, por ejemplo, la fecha del último cambio de número.
+// `previous` es el doc tal como estaba antes de esta escritura (ya lo leemos
+// para el alias): de ahí sale, por ejemplo, la fecha del último cambio de número.
+//
+// Es el único lugar que crea docs de sesión, por eso aquí vive la última
+// guarda del borrado: si el doc es una lápida (`deleting_at`) no se escribe
+// nada y se devuelve `deleting`. Va en transacción para que un borrado que
+// arranca entre la lectura y la escritura no quede pisado.
 export async function initializeSession(
   sessionId: string,
   linkedPhone: string,
   sessionKey: string,
   accountId: string,
-): Promise<Record<string, any> | undefined> {
+): Promise<{ previous?: Record<string, any>; deleting?: true }> {
   try {
     const sessionDocRef = getDb()
       .collection(ACCOUNTS_COLLECTION)
@@ -337,29 +342,40 @@ export async function initializeSession(
       .collection('whatsapp_sessions')
       .doc(sessionId);
 
-    // Check if document already exists to preserve alias
-    const doc = await sessionDocRef.get();
-    const existingData = doc.data();
+    const result = await getDb().runTransaction(async (tx) => {
+      const doc = await tx.get(sessionDocRef);
+      const existingData = doc.data();
+      if (existingData?.deleting_at) return { deleting: true as const };
 
-    const sessionData: any = {
-      phone_number: linkedPhone,
-      status: 'connected',
-      last_sync: admin.firestore.Timestamp.now(),
-      connected_at: admin.firestore.FieldValue.serverTimestamp(),
-      session_key: sessionKey,
-    };
+      const sessionData: any = {
+        phone_number: linkedPhone,
+        status: 'connected',
+        last_sync: admin.firestore.Timestamp.now(),
+        connected_at: admin.firestore.FieldValue.serverTimestamp(),
+        session_key: sessionKey,
+      };
 
-    // Only set default alias if it doesn't exist yet
-    if (!existingData || !existingData.alias) {
-      sessionData.alias = defaultSessionAlias(linkedPhone);
+      // Only set default alias if it doesn't exist yet
+      if (!existingData || !existingData.alias) {
+        sessionData.alias = defaultSessionAlias(linkedPhone);
+      }
+
+      tx.set(sessionDocRef, sessionData, { merge: true });
+      return { previous: existingData };
+    });
+
+    if (result.deleting) {
+      console.warn(`[initializeSession] doc ${sessionId} se está eliminando; no se escribe.`);
+      return result;
     }
-
-    await sessionDocRef.set(sessionData, { merge: true });
+    // El doc vuelve a estar vivo (p. ej. el número se revinculó después de
+    // eliminar su sesión): ya no hay nada que bloquearle.
+    clearSessionGone(accountId, sessionId);
     console.log(`Session initialized: doc ${sessionId}, número ${linkedPhone}, key ${sessionKey}`);
-    return existingData;
+    return result;
   } catch (error) {
     console.error('Error initializing session:', error);
-    return undefined;
+    return {};
   }
 }
 

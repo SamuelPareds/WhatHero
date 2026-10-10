@@ -186,6 +186,9 @@ export class ReminderService {
       const failedNumbers: string[] = [];
 
       for (const appointment of sortedAppointments) {
+        // La sesión se retiró a mitad del lote (eliminada, o cerrada desde el
+        // teléfono): ya no hay socket por el cual mandar el resto.
+        if (!sessions.has(sessionKey)) break;
         const success = await this.sendAppointmentReminder(
           appointment,
           session,

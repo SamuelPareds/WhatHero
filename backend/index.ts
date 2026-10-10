@@ -37,7 +37,16 @@ import {
   syncSessionStatus,
   writeSessionStatus,
   projectStatus,
+  wasForgotten,
+  forgetKey,
+  isSessionGone,
 } from './src/services/sessionSupervisor';
+import {
+  initSessionDeletion,
+  requestSessionDeletion,
+  loadTombstones,
+  resumeSessionDeletions,
+} from './src/services/sessionDeletion';
 import {
   type LinkIntent,
   type RejectReason,
@@ -474,8 +483,17 @@ async function dropEmptySessionDoc(accountId: string, sessionId: string): Promis
 }
 
 async function startSession(sessionKey: string, accountId: string, linkIntent?: LinkIntent) {
+  // Una llave retirada no vuelve a arrancar (ver `forgetKey` en sessionSupervisor.ts).
+  if (wasForgotten(sessionKey)) return;
   const { state, saveCreds } = await useMultiFileAuthState(`auth_info/${sessionKey}`);
   const version = await resolveWaVersion();
+  if (wasForgotten(sessionKey)) {
+    // Se retiró (p. ej. el owner eliminó la sesión) mientras esperábamos.
+    // `useMultiFileAuthState` ya recreó la carpeta borrada: se va de nuevo.
+    console.warn(`[startSession] ${sessionKey} se retiró durante el arranque; no se reconecta.`);
+    rmSync(`auth_info/${sessionKey}`, { recursive: true, force: true });
+    return;
+  }
   console.log(`[startSession] ${sessionKey} → handshake con WA Web ${version.join('.')}`);
 
   writeSessionMeta(sessionKey, { accountId, ...(linkIntent && { linkIntent }) });
@@ -640,9 +658,24 @@ async function startSession(sessionKey: string, accountId: string, linkIntent?: 
 
         const bound = await bindSessionDoc(sessionKey, current, linked);
         if (!bound) return; // rechazada: ya se avisó y se cerró
+        // Retirada mientras decidíamos (p. ej. el owner eliminó la sesión).
+        if (sessions.get(sessionKey) !== current) return;
 
-        const sessionDoc = await initializeSession(bound.sessionId, linked, sessionKey, current.accountId);
-        current.numberChangedAt = lastNumberChangeMs(sessionDoc);
+        const init = await initializeSession(bound.sessionId, linked, sessionKey, current.accountId);
+        if (init.deleting) {
+          // El borrado empezó entre la decisión y la escritura: esta conexión
+          // no puede quedarse escribiendo en una sesión que se está eliminando.
+          io.to(current.accountId).emit('link_rejected', {
+            sessionKey,
+            reason: 'deleting' satisfies RejectReason,
+            phoneNumber: linked,
+            sessionId: bound.sessionId,
+          });
+          await logoutAndForget(sessionKey, 'session_deleting');
+          return;
+        }
+        if (sessions.get(sessionKey) !== current) return;
+        current.numberChangedAt = lastNumberChangeMs(init.previous);
         current.lastWrittenStatus = 'connected';
 
         // Un número, una sesión: re-vincular crea un sessionKey nuevo y el
@@ -1523,6 +1556,9 @@ app.post('/start-session', express.json(), verifyHttpAuth(), async (req, res) =>
       if (!target.exists) {
         return res.status(404).json({ error: 'La sesión no existe' });
       }
+      if (target.data()?.deleting_at) {
+        return res.status(409).json({ error: 'Esa sesión se está eliminando', reason: 'deleting' });
+      }
       linkIntent = {
         intoSessionId,
         allowNumberChange: wantsChange,
@@ -1578,6 +1614,31 @@ app.post('/sessions/previous-line/disconnect', express.json(), verifyHttpAuth(),
   } catch (error) {
     console.error('[/sessions/previous-line/disconnect] Error:', error);
     res.status(500).json({ error: 'No se pudo desconectar el número anterior' });
+  }
+});
+
+// Eliminar una sesión con todo lo suyo: chats, mensajes, media, internos,
+// configuración, permisos del equipo y sus credenciales. Sólo el owner.
+// Responde 202: el corte (sockets, logout ante WhatsApp, IA) ya ocurrió, y la
+// purga corre en segundo plano sobre la lápida. Ver services/sessionDeletion.ts.
+app.post('/sessions/delete', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const { accountId, sessionId } = req.body;
+    if (!accountId || !SESSION_ID_RE.test(String(sessionId))) {
+      return res.status(400).json({ error: 'Faltan accountId o sessionId' });
+    }
+    if (!(await isAccountOwner(req.auth!.uid, accountId))) {
+      return res.status(403).json({ error: 'Sólo el owner puede eliminar una sesión' });
+    }
+
+    const result = await requestSessionDeletion(accountId, sessionId, req.auth!.uid);
+    if (result === 'missing') {
+      return res.status(404).json({ error: 'La sesión no existe' });
+    }
+    res.status(202).json({ success: true, ...result });
+  } catch (error) {
+    console.error('[/sessions/delete] Error:', error);
+    res.status(500).json({ error: 'No se pudo eliminar la sesión' });
   }
 });
 
@@ -2157,6 +2218,9 @@ app.post('/internal-messages', express.json(), verifyHttpAuth(), async (req, res
     if (result === 'team_unavailable') {
       return res.status(503).json({ error: 'No se pudo verificar el equipo, reintenta' });
     }
+    if (result === 'session_gone') {
+      return res.status(410).json({ error: 'Esta sesión se está eliminando' });
+    }
     res.json({ success: true, id: parsed.value.id, duplicate: result === 'duplicate' });
   } catch (error) {
     console.error('[/internal-messages] Error:', error);
@@ -2406,9 +2470,11 @@ app.post('/accounts/members', express.json(), verifyHttpAuth(), async (req, res)
       .collection('whatsapp_sessions')
       .get();
 
+    // Una sesión que se está eliminando no cuenta (ni para "hay una sola").
+    const liveSessions = sessionsSnap.docs.filter((d) => !d.data().deleting_at);
     const defaultSessions: Record<string, { allChats: boolean }> = {};
-    if (sessionsSnap.size === 1) {
-      defaultSessions[sessionsSnap.docs[0].id] = { allChats: true };
+    if (liveSessions.length === 1) {
+      defaultSessions[liveSessions[0].id] = { allChats: true };
     }
     const defaultAccess = { allSessions: false, sessions: defaultSessions };
 
@@ -2428,11 +2494,13 @@ app.post('/accounts/members', express.json(), verifyHttpAuth(), async (req, res)
       });
 
     // 6. Denormalizar allowedUids en las sesiones con grant inicial.
-    if (sessionsSnap.size === 1) {
-      await sessionsSnap.docs[0].ref.set(
-        { allowedUids: admin.firestore.FieldValue.arrayUnion(newUser.uid) },
-        { merge: true },
-      );
+    //    `update`: si la sesión se borró en este instante, no la resucitamos.
+    if (liveSessions.length === 1) {
+      await liveSessions[0].ref
+        .update({ allowedUids: admin.firestore.FieldValue.arrayUnion(newUser.uid) })
+        .catch((error) => {
+          if (error?.code !== 5) throw error; // NOT_FOUND
+        });
     }
 
     // 7. Cache: si hubiera un cache stale para el owner, da igual; lo del
@@ -2633,35 +2701,44 @@ app.patch('/accounts/members/:uid/access', express.json(), verifyHttpAuth(), asy
       return res.status(404).json({ error: 'El miembro no pertenece a esta cuenta' });
     }
 
+    const sessionsSnap = await db
+      .collection(ACCOUNTS_COLLECTION)
+      .doc(accountId)
+      .collection('whatsapp_sessions')
+      .get();
+    // Sólo sesiones vivas. La pantalla de permisos reenvía todo lo que leyó, y
+    // un grant a una sesión eliminada (o que se está eliminando) no es
+    // inofensivo: si el número se revincula, el doc vuelve con el mismo id y el
+    // miembro heredaría el acceso en silencio.
+    const liveSessions = sessionsSnap.docs.filter((d) => !d.data().deleting_at);
+    const liveIds = new Set(liveSessions.map((d) => d.id));
+    access.sessions = Object.fromEntries(Object.entries(access.sessions).filter(([id]) => liveIds.has(id)));
+
     // Conjunto de sesiones a las que el miembro tiene grant explícito.
     // Si allSessions, no necesita estar en ningún allowedUids (consulta libre).
     const grantedPhones = access.allSessions
       ? new Set<string>()
       : new Set<string>(Object.keys(access.sessions));
 
-    // 1. Persistir access en el member doc.
+    // 1. Persistir access en el member doc. `update` reemplaza el campo entero.
+    //    Con `set(merge)` los mapas se mezclaban en profundidad y quitarle una
+    //    sesión a un miembro NO se la quitaba: `access.sessions.{vieja}`
+    //    sobrevivía, y con ella el acceso en las reglas y los pushes. Sólo
+    //    desaparecía de su lista (`allowedUids`).
     const batch = db.batch();
-    batch.set(memberRef, { access }, { merge: true });
+    batch.update(memberRef, { access });
 
-    // 2. Recomputar allowedUids en TODAS las sesiones de la cuenta para este uid.
-    const sessionsSnap = await db
-      .collection(ACCOUNTS_COLLECTION)
-      .doc(accountId)
-      .collection('whatsapp_sessions')
-      .get();
-
-    for (const sessionDoc of sessionsSnap.docs) {
+    // 2. Recomputar allowedUids en TODAS las sesiones de la cuenta para este
+    //    uid. `update`: un doc que se borró entre la lectura y el commit hace
+    //    fallar el lote en vez de renacer como tarjeta fantasma.
+    for (const sessionDoc of liveSessions) {
       const phone = sessionDoc.id;
       const shouldHaveAccess = grantedPhones.has(phone);
-      batch.set(
-        sessionDoc.ref,
-        {
-          allowedUids: shouldHaveAccess
-            ? admin.firestore.FieldValue.arrayUnion(targetUid)
-            : admin.firestore.FieldValue.arrayRemove(targetUid),
-        },
-        { merge: true },
-      );
+      batch.update(sessionDoc.ref, {
+        allowedUids: shouldHaveAccess
+          ? admin.firestore.FieldValue.arrayUnion(targetUid)
+          : admin.firestore.FieldValue.arrayRemove(targetUid),
+      });
     }
 
     await batch.commit();
@@ -2705,6 +2782,9 @@ app.post('/backfill-media-index', express.json(), verifyHttpAuth(), async (req, 
       return res.status(400).json({ error: 'Missing accountId or sessionId' });
     }
     // verifyHttpAuth ya validó que el requester es miembro de accountId.
+    if (isSessionGone(accountId, sessionId)) {
+      return res.status(409).json({ error: 'Esta sesión se está eliminando' });
+    }
 
     const db = admin.firestore();
     const sessionRef = db
@@ -2719,6 +2799,8 @@ app.post('/backfill-media-index', express.json(), verifyHttpAuth(), async (req, 
     let skippedCount = 0;
 
     for (const chatDoc of chatsSnap.docs) {
+      // Corre minutos: si eliminan la sesión a mitad, no se reescribe su índice.
+      if (isSessionGone(accountId, sessionId)) break;
       scannedChats++;
       const chatId = chatDoc.id;
       const chatData = chatDoc.data();
@@ -2802,6 +2884,9 @@ app.post('/backfill-message-index', express.json(), verifyHttpAuth(), async (req
       return res.status(400).json({ error: 'Missing accountId or sessionId' });
     }
     // verifyHttpAuth ya validó que el requester es miembro de accountId.
+    if (isSessionGone(accountId, sessionId)) {
+      return res.status(409).json({ error: 'Esta sesión se está eliminando' });
+    }
 
     const db = admin.firestore();
     const sessionRef = db
@@ -2816,6 +2901,8 @@ app.post('/backfill-message-index', express.json(), verifyHttpAuth(), async (req
     let skippedCount = 0;
 
     for (const chatDoc of chatsSnap.docs) {
+      // Corre minutos: si eliminan la sesión a mitad, no se reescribe su índice.
+      if (isSessionGone(accountId, sessionId)) break;
       scannedChats++;
       const chatId = chatDoc.id;
       const chatData = chatDoc.data();
@@ -2862,10 +2949,11 @@ app.post('/backfill-message-index', express.json(), verifyHttpAuth(), async (req
     // Marcamos la sesión como ya indexada: a partir de aquí los mensajes nuevos
     // se indexan solos al guardarse, así que el frontend puede ocultar el botón
     // de backfill (no tiene sentido re-correrlo el histórico completo).
-    await sessionRef.set(
-      { message_index_backfilled_at: admin.firestore.FieldValue.serverTimestamp() },
-      { merge: true },
-    );
+    // `update`: la marca no puede recrear una sesión que se eliminó a mitad.
+    if (isSessionGone(accountId, sessionId)) {
+      return res.status(409).json({ error: 'Esta sesión se está eliminando' });
+    }
+    await sessionRef.update({ message_index_backfilled_at: admin.firestore.FieldValue.serverTimestamp() });
 
     console.log(`[Backfill] message_index para ${accountId}/${sessionId}: chats=${scannedChats}, indexed=${indexedCount}, skipped=${skippedCount}`);
     res.json({ success: true, scannedChats, indexedCount, skippedCount });
@@ -3062,6 +3150,17 @@ async function startExistingSessions() {
       console.warn(`Skipping session ${sessionKey}: meta.json ausente o sin accountId`);
       continue;
     }
+    // Credenciales de una sesión que el owner mandó eliminar (un reinicio la
+    // agarró a mitad del borrado): no se restaura, se termina de borrar.
+    if (
+      isSessionGone(meta.accountId, meta.sessionId) ||
+      isSessionGone(meta.accountId, meta.linkIntent?.intoSessionId)
+    ) {
+      console.log(`[Eliminar] ${sessionKey} es de una sesión que se está eliminando; no se restaura.`);
+      forgetKey(sessionKey);
+      rmSync(`auth_info/${sessionKey}`, { recursive: true, force: true });
+      continue;
+    }
 
     try {
       await startSession(sessionKey, meta.accountId);
@@ -3082,6 +3181,19 @@ httpServer.listen(PORT, async () => {
   console.log(`[Env] ${envLabel} | NODE_ENV=${process.env.NODE_ENV ?? 'undefined'} | Firestore collection: "${ACCOUNTS_COLLECTION}"`);
 
   initSessionSupervisor({ sessions, db, io, startSession });
+  initSessionDeletion({
+    sessions,
+    db,
+    io,
+    readKeyOwner: (sessionKey) => {
+      const meta = readSessionMeta(sessionKey);
+      return meta && {
+        accountId: meta.accountId,
+        sessionId: meta.sessionId,
+        intoSessionId: meta.linkIntent?.intoSessionId,
+      };
+    },
+  });
 
   // Latido de los estados de IA: re-emite los vivos cada 30 s y apaga los que
   // ya no son verdad. "Vivo" lo decide la realidad, no el reloj: una espera
@@ -3091,6 +3203,13 @@ httpServer.listen(PORT, async () => {
     state === 'buffering' ? aiBuffers.has(key) : isAiCycleLive(key),
   );
 
+  // Las lápidas van ANTES de restaurar: una sesión que se estaba eliminando
+  // cuando el proceso murió no puede volver a arrancar desde su carpeta.
+  const tombstones = await loadTombstones().catch((error) => {
+    console.error('[Eliminar] No se pudieron cargar las lápidas al bootear:', error);
+    return undefined;
+  });
+
   await startExistingSessions();
 
   // El barrido de fantasmas va DESPUÉS de restaurar las sesiones: si corriera
@@ -3098,7 +3217,11 @@ httpServer.listen(PORT, async () => {
   // al viejo HealthCheck, que sólo miraba `status == 'connected'` y por eso no
   // veía los docs atascados en `reconnecting`.
   await sweepFirestoreGhosts();
-  startSupervisorLoops();
+  // Retoma los borrados que un reinicio dejó a medias, ahora y en cada barrido.
+  void resumeSessionDeletions(tombstones).catch((error) => {
+    console.error('[Eliminar] No se pudieron retomar los borrados pendientes:', error);
+  });
+  startSupervisorLoops(() => resumeSessionDeletions());
 
   // Setup cron for reminders (checks every minute)
   cron.schedule('* * * * *', () => {
