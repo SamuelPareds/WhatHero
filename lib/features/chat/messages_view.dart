@@ -20,6 +20,7 @@ import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/core/services/team_presence_service.dart';
 import 'package:crm_whatsapp/features/settings.dart';
 import 'internal_timeline.dart';
+import 'jump_to_message.dart';
 import 'number_change_divider.dart';
 import 'reply_collision.dart';
 import 'widgets/internal_message_card.dart';
@@ -97,20 +98,37 @@ class _MessagesViewState extends State<MessagesView> {
   // usuario se aleja del fondo revisando el historial.
   bool _showScrollToBottom = false;
 
-  // 🎯 Salto a un mensaje (deep-link desde el buscador).
-  // _pendingJumpId: objetivo aún no localizado en la lista cargada.
-  // _highlightId: burbuja resaltándose ahora (tinte aqua que se desvanece).
-  // _jumpKey: ancla para Scrollable.ensureVisible sobre la burbuja objetivo.
-  // _jumpPreparing: evita relanzar el count() mientras una preparación corre.
+  // 🎯 Ir a un mensaje: una cita tocada o un resultado del buscador. Todo
+  // entra por _goToMessage (ver "Ir al mensaje citado" en CLAUDE.md).
+  // _jumpSeq: cada salto lo incrementa y lo async de un salto que ya no es el
+  //   vigente se descarta. Antes un "no encontrado" del salto anterior
+  //   cancelaba el nuevo.
+  // _pendingJumpId: objetivo que todavía no está en la lista cargada.
+  // _jumpTargetId: objetivo ya cargado; lleva el ancla (_jumpKey) mientras
+  //   revealListItem lo alcanza.
+  // _highlightId: burbuja resaltándose; empieza cuando ya está en pantalla.
+  // _jumpPreparing: el count() del salto vigente sigue en vuelo; mientras
+  //   tanto _resolveJump no pagina por su cuenta.
+  int _jumpSeq = 0;
   String? _pendingJumpId;
+  String? _jumpTargetId;
   String? _highlightId;
   final GlobalKey _jumpKey = GlobalKey();
+  final BuiltIndexTracker _builtItems = BuiltIndexTracker();
   bool _jumpPreparing = false;
-  // Verdadero mientras hacemos el scroll programático hacia el objetivo, para
-  // que _scrollListener no confunda el salto con "el usuario llegó arriba" y
-  // dispare paginación de más.
-  bool _jumpScrolling = false;
+  // Salto cuyo recorrido está en curso. Mientras tanto _scrollListener no
+  // pagina: el recorrido pasa cerca del tope y lo confundiría con "el usuario
+  // llegó arriba".
+  int? _revealingSeq;
+  bool get _jumpScrolling => _revealingSeq != null;
   Timer? _highlightTimer;
+  // Desde qué mensaje se tocó cada cita: la flecha de bajar regresa ahí paso a
+  // paso antes de ir al fondo, como WhatsApp.
+  final List<String> _returnStack = [];
+  // Lo pintado en el último build. De ahí sale la posición de un mensaje
+  // para el atajo sin lecturas y para el recorrido.
+  List<Object> _timeline = const [];
+  int _pendingCount = 0;
 
   bool _isSending = false;
   bool _isGenerating = false;
@@ -311,8 +329,7 @@ class _MessagesViewState extends State<MessagesView> {
     // Si entramos directo a un mensaje (deep-link del buscador), preparamos el
     // salto: cargar suficiente historial para incluirlo.
     if (widget.jumpToMessageId != null) {
-      _pendingJumpId = widget.jumpToMessageId;
-      _prepareJump(widget.jumpToMessageId!, widget.jumpToTimestamp);
+      _startJump(widget.jumpToMessageId!, ts: widget.jumpToTimestamp);
     }
     // Si el agente de seguimiento dejó un borrador para este chat, lo cargamos.
     _loadFollowupDraft();
@@ -331,8 +348,7 @@ class _MessagesViewState extends State<MessagesView> {
     // otro resultado del buscador en el mismo contacto).
     if (widget.jumpToMessageId != null &&
         widget.jumpToMessageId != old.jumpToMessageId) {
-      _pendingJumpId = widget.jumpToMessageId;
-      _prepareJump(widget.jumpToMessageId!, widget.jumpToTimestamp);
+      _startJump(widget.jumpToMessageId!, ts: widget.jumpToTimestamp);
     }
   }
 
@@ -355,6 +371,43 @@ class _MessagesViewState extends State<MessagesView> {
     super.dispose();
   }
 
+  // Punto único de entrada para ir a un mensaje (cita, buscador, volver a la
+  // respuesta). Desde initState y didUpdateWidget se llama a _startJump
+  // directo: ahí el build viene igual.
+  //   returnTo: mensaje desde el que se tocó la cita; la flecha de bajar
+  //             regresa ahí.
+  //   fromQuote: cambia el aviso de "no encontrado".
+  void _goToMessage(String id,
+      {DateTime? ts, String? returnTo, bool fromQuote = false}) {
+    setState(() =>
+        _startJump(id, ts: ts, returnTo: returnTo, fromQuote: fromQuote));
+  }
+
+  void _startJump(String id,
+      {DateTime? ts, String? returnTo, bool fromQuote = false}) {
+    final seq = ++_jumpSeq;
+    _pendingJumpId = id;
+    _jumpTargetId = null;
+    _highlightId = null;
+    _highlightTimer?.cancel();
+    // Si había un count() en vuelo, era de otro salto.
+    _jumpPreparing = false;
+    if (returnTo != null) _returnStack.add(returnTo);
+    // Ya está cargado (lo normal con una cita): ni .get() ni count(). Lo
+    // resuelve _resolveJump con el build que sigue.
+    if (_indexOfEntry(id) != null) return;
+    _prepareJump(seq, id, ts,
+        fromQuote: fromQuote, pushedReturn: returnTo != null);
+  }
+
+  // Posición en la lista (con las burbujas optimistas delante) del mensaje de
+  // WhatsApp `id` según el último build, o null si no está cargado.
+  int? _indexOfEntry(String id) {
+    final i = _timeline
+        .indexWhere((e) => e is QueryDocumentSnapshot && e.id == id);
+    return i < 0 ? null : _pendingCount + i;
+  }
+
   // Prepara el salto en dos pasos, ambos independientes del stream paginado
   // (que reentrega caché vieja al cambiar el límite y daría falsos negativos):
   //   1. `.get()` directo al doc → autoridad sobre si el mensaje existe. Si no,
@@ -362,37 +415,38 @@ class _MessagesViewState extends State<MessagesView> {
   //   2. `count()` de cuántos mensajes hay MÁS NUEVOS que él → su posición desde
   //      arriba (orden desc); subimos el límite a ese número + buffer para que
   //      entre en la ventana cargada de una sola vez.
-  Future<void> _prepareJump(String messageId, DateTime? ts) async {
-    if (_jumpPreparing) return;
+  // Una cita no trae la hora del original: sale del mismo doc del paso 1.
+  Future<void> _prepareJump(int seq, String messageId, DateTime? ts,
+      {required bool fromQuote, required bool pushedReturn}) async {
     _jumpPreparing = true;
-    final messagesRef = FirebaseFirestore.instance
-        .collection(accountsCollection)
-        .doc(widget.accountId)
-        .collection('whatsapp_sessions')
-        .doc(widget.sessionId)
-        .collection('chats')
-        .doc(widget.phoneNumber)
-        .collection('messages');
     try {
       // 1. ¿Existe? (resuelve el "no encontrado" sin depender del stream).
-      final doc = await messagesRef.doc(messageId).get();
-      if (!mounted) return;
+      final doc = await _messagesRef.doc(messageId).get();
+      if (!mounted || seq != _jumpSeq) return;
       if (!doc.exists) {
-        _pendingJumpId = null;
+        // No hubo salto: no hay a dónde volver.
+        if (pushedReturn && _returnStack.isNotEmpty) _returnStack.removeLast();
+        setState(() => _pendingJumpId = null);
         widget.onJumpConsumed?.call();
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('No se encontró el mensaje en este chat'),
+        // Una cita apunta a algo que pudo llegar antes de vincular WhatHero o
+        // haberse borrado del historial; el buscador, a un hit que ya no está.
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(fromQuote
+              ? 'Ese mensaje no está en el historial de WhatHero'
+              : 'No se encontró el mensaje en este chat'),
         ));
         return;
       }
+      ts ??= (doc.data()?['timestamp'] as Timestamp?)?.toDate();
       // 2. ¿Cuánto historial cargar para incluirlo?
       if (ts != null) {
-        final agg = await messagesRef
+        final agg = await _messagesRef
             .where('timestamp', isGreaterThan: Timestamp.fromDate(ts))
             .count()
             .get();
+        if (!mounted || seq != _jumpSeq) return;
         final needed = (agg.count ?? 0) + 5; // buffer por timestamps empatados
-        if (mounted && needed > _messageLimit) {
+        if (needed > _messageLimit) {
           setState(() {
             _messageLimit = needed;
             _hasMore = true;
@@ -403,60 +457,30 @@ class _MessagesViewState extends State<MessagesView> {
       // Si falla el count, no abortamos: _resolveJump aún puede localizar el
       // mensaje en lo cargado y, si falta, crecer por paginación.
     } finally {
-      _jumpPreparing = false;
+      if (seq == _jumpSeq) _jumpPreparing = false;
     }
   }
 
   // Llamado tras cada snapshot mientras hay un salto pendiente. El mensaje YA se
-  // confirmó existente en _prepareJump, así que aquí solo: si está cargado →
-  // scroll + resalte; si la página está llena (falta cargarlo) → crece; si no,
-  // esperamos el siguiente snapshot. Nunca declara "no encontrado" (eso lo
-  // resolvió el .get() directo, inmune a la caché vieja del StreamBuilder).
-  // `timeline` es lo que se pinta (con los internos): de ahí sale la posición
-  // para el scroll. Si falta historial lo dice `messages`, que es lo paginado.
+  // confirmó existente (en _prepareJump o porque estaba cargado), así que aquí
+  // solo: si está cargado → recorrido + resalte; si la página está llena
+  // (falta cargarlo) → crece; si no, esperamos el siguiente snapshot. Nunca
+  // declara "no encontrado" (eso lo resolvió el .get() directo, inmune a la
+  // caché vieja del StreamBuilder). Si falta historial lo dice `messages`, que
+  // es lo paginado; `timeline` es lo que se pinta (con los internos).
   void _resolveJump(
       List<QueryDocumentSnapshot> messages, List<Object> timeline) {
     final id = _pendingJumpId;
     if (id == null) return;
-    final idx = timeline
-        .indexWhere((e) => e is QueryDocumentSnapshot && e.id == id);
-    if (idx >= 0) {
-      _jumpScrolling = true;
+    final found =
+        timeline.any((e) => e is QueryDocumentSnapshot && e.id == id);
+    if (found) {
       setState(() {
-        _highlightId = id;
         _pendingJumpId = null;
+        _jumpTargetId = id;
       });
       widget.onJumpConsumed?.call();
-      // Tras pintar la burbuja resaltada, llevamos el scroll hasta ella. Como
-      // los ítems fuera del viewport no se construyen, primero saltamos a la
-      // región del objetivo (offset proporcional a su índice en la lista
-      // reverse) para forzar su build, y luego ensureVisible lo centra.
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted || !_scrollController.hasClients) {
-          _jumpScrolling = false;
-          return;
-        }
-        final max = _scrollController.position.maxScrollExtent;
-        final frac = timeline.length <= 1 ? 0.0 : idx / (timeline.length - 1);
-        _scrollController.jumpTo((frac * max).clamp(0.0, max));
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          final ctx = _jumpKey.currentContext;
-          if (ctx != null) {
-            Scrollable.ensureVisible(ctx,
-                alignment: 0.4,
-                duration: const Duration(milliseconds: 400),
-                curve: Curves.easeInOut);
-          }
-          // Libera el guard tras la animación de ensureVisible (~400ms).
-          Future.delayed(const Duration(milliseconds: 500), () {
-            if (mounted) _jumpScrolling = false;
-          });
-          _highlightTimer?.cancel();
-          _highlightTimer = Timer(const Duration(milliseconds: 2500), () {
-            if (mounted) setState(() => _highlightId = null);
-          });
-        });
-      });
+      _revealTarget(_jumpSeq, id);
     } else if (messages.length >= _messageLimit && !_jumpPreparing) {
       // Página llena y el objetivo no está aún → hay más historial arriba:
       // crece y reintenta en el próximo snapshot. (Un snapshot viejo nunca está
@@ -465,8 +489,41 @@ class _MessagesViewState extends State<MessagesView> {
     }
     // else: página incompleta → es el snapshot viejo aún sin reflejar el límite
     // nuevo, o el fin del historial. En ambos casos esperamos: como el mensaje
-    // existe (confirmado en _prepareJump), un snapshot mayor terminará por
-    // traerlo. No avisamos aquí para no producir falsos "no encontrado".
+    // existe, un snapshot mayor terminará por traerlo. No avisamos aquí para no
+    // producir falsos "no encontrado".
+  }
+
+  // Lleva la lista hasta el destino (ya cargado) y lo resalta al llegar. El
+  // cálculo de dónde está vive en jump_to_message.dart.
+  Future<void> _revealTarget(int seq, String id) async {
+    _revealingSeq = seq;
+    try {
+      // Un frame para que el ancla quede puesta en el ítem destino.
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted || seq != _jumpSeq) return;
+      final arrived = await revealListItem(
+        controller: _scrollController,
+        anchor: _jumpKey,
+        built: _builtItems,
+        indexOf: () => _indexOfEntry(id),
+        stillWanted: () => mounted && seq == _jumpSeq,
+      );
+      if (!mounted || seq != _jumpSeq) return;
+      if (!arrived) debugPrint('[Salto] No se pudo llegar al mensaje $id');
+      setState(() {
+        _jumpTargetId = null;
+        _highlightId = arrived ? id : null;
+      });
+      if (arrived) {
+        _highlightTimer?.cancel();
+        _highlightTimer = Timer(const Duration(milliseconds: 1600), () {
+          if (mounted) setState(() => _highlightId = null);
+        });
+      }
+    } finally {
+      // Un salto más nuevo ya puso el suyo: no se lo quitamos.
+      if (_revealingSeq == seq) _revealingSeq = null;
+    }
   }
 
   void _scrollListener() {
@@ -478,6 +535,11 @@ class _MessagesViewState extends State<MessagesView> {
     final shouldShow = pixels > 300;
     if (shouldShow != _showScrollToBottom) {
       setState(() => _showScrollToBottom = shouldShow);
+    }
+    // De vuelta abajo ya no hay respuesta a la que regresar. Durante un salto
+    // no: el recorrido arranca justo desde aquí.
+    if (!shouldShow && _pendingJumpId == null && !_jumpScrolling) {
+      _returnStack.clear();
     }
 
     // Durante un salto programático no paginamos: el jumpTo puede aterrizar
@@ -501,6 +563,20 @@ class _MessagesViewState extends State<MessagesView> {
     );
   }
 
+  // Flecha de bajar: si llegaste aquí tocando una cita, primero te regresa a
+  // la respuesta (como WhatsApp); sin nada pendiente, al fondo.
+  void _onScrollDownPressed() {
+    while (_returnStack.isNotEmpty) {
+      final back = _returnStack.removeLast();
+      // Borrado mientras tanto: probamos el anterior.
+      if (_indexOfEntry(back) != null) {
+        _goToMessage(back);
+        return;
+      }
+    }
+    _scrollToBottom();
+  }
+
   // Flecha flotante, sutil, abajo-derecha. Aparece/desaparece con un fade+scale
   // y queda inerte (IgnorePointer) cuando está oculta para no robar taps.
   Widget _scrollToBottomButton() {
@@ -519,13 +595,18 @@ class _MessagesViewState extends State<MessagesView> {
             shape: CircleBorder(
               side: BorderSide(color: primaryAqua.withValues(alpha: 0.3)),
             ),
-            child: InkWell(
-              customBorder: const CircleBorder(),
-              onTap: _scrollToBottom,
-              child: const Padding(
-                padding: EdgeInsets.all(7),
-                child: Icon(Icons.keyboard_arrow_down,
-                    color: primaryAqua, size: 24),
+            child: Tooltip(
+              message: _returnStack.isNotEmpty
+                  ? 'Volver a la respuesta'
+                  : 'Ir al último mensaje',
+              child: InkWell(
+                customBorder: const CircleBorder(),
+                onTap: _onScrollDownPressed,
+                child: const Padding(
+                  padding: EdgeInsets.all(7),
+                  child: Icon(Icons.keyboard_arrow_down,
+                      color: primaryAqua, size: 24),
+                ),
               ),
             ),
           ),
@@ -560,6 +641,9 @@ class _MessagesViewState extends State<MessagesView> {
           .doc(widget.sessionId)
           .collection('chats')
           .doc(widget.phoneNumber);
+
+  CollectionReference<Map<String, dynamic>> get _messagesRef =>
+      _chatDocRef.collection('messages');
 
   // Doc de la cola de seguimiento de este chat (id = phoneNumber del contacto).
   DocumentReference<Map<String, dynamic>> get _followupQueueRef =>
@@ -729,6 +813,8 @@ class _MessagesViewState extends State<MessagesView> {
 
   // Con reverse:true el offset 0 es el fondo (mensaje más nuevo).
   void _scrollToNewest() {
+    // Enviaste: la revisión del historial terminó.
+    _returnStack.clear();
     if (!_scrollController.hasClients) return;
     _scrollController.animateTo(
       0,
@@ -2020,6 +2106,7 @@ class _MessagesViewState extends State<MessagesView> {
     final fromMe = (data['fromMe'] as bool?) ?? false;
     // Llegó por la línea anterior, que quedó recibiendo tras el cambio.
     final previousNumber = data['previousNumber'] as String?;
+    final quotedId = data['quotedMessageId'] as String?;
 
     return MessageBubble(
       key: ValueKey(msg.id),
@@ -2049,9 +2136,12 @@ class _MessagesViewState extends State<MessagesView> {
       reactions: data['reactions'] as Map<String, dynamic>?,
       edited: data['edited'] as bool?,
       revoked: data['revoked'] as bool?,
-      quotedMessageId: data['quotedMessageId'] as String?,
+      quotedMessageId: quotedId,
       quotedText: data['quotedText'] as String?,
       quotedFromMe: data['quotedFromMe'] as bool?,
+      onQuoteTap: quotedId == null
+          ? null
+          : () => _goToMessage(quotedId, returnTo: msg.id, fromQuote: true),
       onReplyTap: () => _setReplyDraft(ReplyDraft(
         messageId: msg.id,
         text: draftPreview,
@@ -2160,6 +2250,8 @@ class _MessagesViewState extends State<MessagesView> {
                     internal: internal,
                     waComplete: !_hasMore,
                   );
+                  _timeline = timeline;
+                  _pendingCount = pendings.length;
 
                   // Salto pendiente: tras pintar este set intentamos localizar el
                   // mensaje objetivo (post-frame para no llamar setState en build).
@@ -2202,29 +2294,39 @@ class _MessagesViewState extends State<MessagesView> {
                   // queda abajo, y lo pendiente es siempre lo más nuevo.
                   if (index < pendings.length) {
                     final p = pendings[pendings.length - 1 - index];
-                    return MessageBubble(
-                      key: ValueKey(p.tempId),
-                      text: p.text,
-                      fromMe: true,
-                      timestamp: p.timestamp,
-                      messageId: p.tempId,
-                      chatPhone: widget.phoneNumber,
-                      sessionKey: widget.sessionKey,
-                      accountId: widget.accountId,
-                      sessionPhone: widget.sessionId,
-                      quotedMessageId: p.payload['quotedMessageId'] as String?,
-                      quotedText: p.payload['quotedText'] as String?,
-                      quotedFromMe: p.payload['quotedFromMe'] as bool?,
-                      sendStatus: switch (p.status) {
-                        PendingStatus.sending => 'pending',
-                        PendingStatus.sent => 'sent',
-                        PendingStatus.failed => 'failed',
-                      },
-                      onFailedActions: () => _showFailedSendSheet(
-                        error: p.error,
+                    final quotedId = p.payload['quotedMessageId'] as String?;
+                    return IndexProbe(
+                      index: index,
+                      tracker: _builtItems,
+                      child: MessageBubble(
+                        key: ValueKey(p.tempId),
                         text: p.text,
-                        onRetry: () => _retryPending(p),
-                        onDiscard: () => PendingMessagesService().discard(p.tempId),
+                        fromMe: true,
+                        timestamp: p.timestamp,
+                        messageId: p.tempId,
+                        chatPhone: widget.phoneNumber,
+                        sessionKey: widget.sessionKey,
+                        accountId: widget.accountId,
+                        sessionPhone: widget.sessionId,
+                        quotedMessageId: quotedId,
+                        quotedText: p.payload['quotedText'] as String?,
+                        quotedFromMe: p.payload['quotedFromMe'] as bool?,
+                        // Sin returnTo: la burbuja en vuelo está al fondo, y la
+                        // flecha de bajar ya lleva ahí.
+                        onQuoteTap: quotedId == null
+                            ? null
+                            : () => _goToMessage(quotedId, fromQuote: true),
+                        sendStatus: switch (p.status) {
+                          PendingStatus.sending => 'pending',
+                          PendingStatus.sent => 'sent',
+                          PendingStatus.failed => 'failed',
+                        },
+                        onFailedActions: () => _showFailedSendSheet(
+                          error: p.error,
+                          text: p.text,
+                          onRetry: () => _retryPending(p),
+                          onDiscard: () => PendingMessagesService().discard(p.tempId),
+                        ),
                       ),
                     );
                   }
@@ -2232,13 +2334,17 @@ class _MessagesViewState extends State<MessagesView> {
                   final entryIndex = index - pendings.length;
                   // Si es el último elemento y hay más, mostrar spinner de carga
                   if (entryIndex == timeline.length) {
-                    return const Center(
-                      child: Padding(
-                        padding: EdgeInsets.symmetric(vertical: 20),
-                        child: SizedBox(
-                          width: 20,
-                          height: 20,
-                          child: CircularProgressIndicator(strokeWidth: 2, valueColor: AlwaysStoppedAnimation<Color>(primaryAqua)),
+                    return IndexProbe(
+                      index: index,
+                      tracker: _builtItems,
+                      child: const Center(
+                        child: Padding(
+                          padding: EdgeInsets.symmetric(vertical: 20),
+                          child: SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2, valueColor: AlwaysStoppedAnimation<Color>(primaryAqua)),
+                          ),
                         ),
                       ),
                     );
@@ -2272,7 +2378,13 @@ class _MessagesViewState extends State<MessagesView> {
                           myUid: _myUid,
                           onPressed: () => _showInternalActions(entry),
                         )
-                      : _buildWaBubble(entry as QueryDocumentSnapshot, entryDate);
+                      // Siempre envuelta, no sólo cuando es destino: así el
+                      // resalte no recrea la burbuja (ver JumpTarget).
+                      : JumpTarget(
+                          highlighted: (entry as QueryDocumentSnapshot).id == _highlightId,
+                          anchorKey: entry.id == _jumpTargetId ? _jumpKey : null,
+                          child: _buildWaBubble(entry, entryDate),
+                        );
 
                   // El Column NO se reversea internamente — el listview sólo
                   // invierte el orden de items, no su contenido. Por eso el
@@ -2280,7 +2392,7 @@ class _MessagesViewState extends State<MessagesView> {
                   // del primer mensaje del día (igual que en WhatsApp).
                   // Las marcas de cambio de número viajan en el mismo Column
                   // que el separador de día: no agregan elementos a la lista,
-                  // así que los índices que usa _resolveJump no se mueven.
+                  // así que los índices que usa el salto no se mueven.
                   final Widget item = showSeparator || numberChange != null || footer
                       ? Column(
                           mainAxisSize: MainAxisSize.min,
@@ -2302,12 +2414,13 @@ class _MessagesViewState extends State<MessagesView> {
                         )
                       : content;
 
-                  // Burbuja objetivo del salto: ancla para ensureVisible + tinte
-                  // aqua que se desvanece (~2.5s) para señalar el resultado.
-                  if (entry is QueryDocumentSnapshot && entry.id == _highlightId) {
-                    return _JumpHighlight(key: _jumpKey, child: item);
-                  }
-                  return item;
+                  // El salto necesita saber qué índices están construidos para
+                  // decidir hacia dónde seguir (ver jump_to_message.dart).
+                  return IndexProbe(
+                    index: index,
+                    tracker: _builtItems,
+                    child: item,
+                  );
                 },
               );
                 },
@@ -2665,34 +2778,6 @@ class _MessagesViewState extends State<MessagesView> {
   }
 }
 
-// Chip centrado de cabecera de día, estilo WhatsApp/Apple dark. Translúcido
-// sobre el fondo del chat con borde aqua sutil para que respire sin gritar.
-// Resalte temporal de la burbuja a la que saltó el buscador: un tinte aqua que
-// aparece y se desvanece en ~2.5s (TweenAnimationBuilder de 1→0). El padre
-// retira el wrapper al terminar limpiando `_highlightId`. La GlobalKey vive en
-// el wrapper externo para que Scrollable.ensureVisible tenga el ancla.
-class _JumpHighlight extends StatelessWidget {
-  final Widget child;
-  const _JumpHighlight({required this.child, super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return TweenAnimationBuilder<double>(
-      tween: Tween(begin: 1.0, end: 0.0),
-      duration: const Duration(milliseconds: 2500),
-      curve: Curves.easeOut,
-      builder: (_, t, inner) => Container(
-        decoration: BoxDecoration(
-          color: primaryAqua.withValues(alpha: 0.22 * t),
-          borderRadius: BorderRadius.circular(12),
-        ),
-        child: inner,
-      ),
-      child: child,
-    );
-  }
-}
-
 // Marca de cambio de número dentro de la conversación: la línea donde termina
 // el historial del número anterior, o el aviso al pie de que lo que se envíe
 // ahora sale del número nuevo.
@@ -2744,6 +2829,8 @@ class _NumberChangeMark extends StatelessWidget {
   }
 }
 
+// Chip centrado de cabecera de día, estilo WhatsApp/Apple dark. Translúcido
+// sobre el fondo del chat con borde aqua sutil para que respire sin gritar.
 class _DateSeparator extends StatelessWidget {
   final String label;
   const _DateSeparator(this.label);

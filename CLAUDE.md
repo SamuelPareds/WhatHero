@@ -358,6 +358,38 @@ Por eso el stepper del AppBar (`ChatNavStepper`, ↑ 4/12 ↓) **no camina la li
 
 ---
 
+## ↩️ Ir al mensaje citado (tocar la cita de una respuesta)
+
+Tocar la franja "Cliente / hola" de una respuesta lleva al mensaje original y lo resalta, aunque esté a cientos de mensajes, como en WhatsApp. No hizo falta tocar el backend: `quotedMessageId` es `contextInfo.stanzaId`, el `key.id` del original, que es justo el id de su doc en `messages/`.
+
+**Un solo camino para saltar: `_goToMessage`** (`messages_view.dart`). Lo usan la cita, el buscador (`jumpToMessageId`) y la flecha de volver. Hacer el recorrido por fuera dejaría afuera las tres defensas de abajo.
+
+- **`_jumpSeq`: gana el último salto.** Cada salto lo incrementa y todo lo async de un salto viejo se descarta. Antes un guard (`_jumpPreparing`) descartaba en silencio el segundo `_prepareJump`, y si el primero terminaba en "no encontrado" ponía `_pendingJumpId = null` y mataba al segundo.
+- **Ya cargado = cero lecturas.** Si el original está en lo pintado (`_timeline`, el caso normal porque casi siempre se cita algo reciente), no hay `.get()` ni `count()` y el salto es inmediato. Si no está, el `.get()` del doc decide si existe y su `timestamp` alimenta el `count()` que sube `_messageLimit`: la cita no guarda la hora del original y no hace falta.
+- **No encontrado** (llegó antes de vincular WhatHero, se borró del historial): toast "Ese mensaje no está en el historial de WhatHero".
+- **Costo conocido:** una cita de hace 1 500 mensajes sube el límite a 1 505 y paga esas lecturas una vez, igual que un resultado viejo del buscador. Bajarlo exige una ventana paginada en los dos sentidos, que reescribe la lista.
+
+### Llegar de verdad (`jump_to_message.dart`, tests en `test/jump_to_message_test.dart`)
+**No volver a `jumpTo(índice / total × maxScrollExtent)` + `ensureVisible`.** El `maxScrollExtent` de un `ListView.builder` es una **estimación**: el promedio de lo que ya construyó por la cantidad de ítems. En un chat con fotos (~300 px) entre textos (~70 px) ese cálculo cae pantallas lejos: el destino no se construye, `ensureVisible` no tiene contexto y el operador aterriza en otra parte **sin ningún aviso**. Con alturas de chat real fallaba a 150, 300 y 550 mensajes de distancia.
+
+`revealListItem` usa lo único exacto: al hacer `jumpTo`, `RenderSliverList` acomoda uno por uno los hijos que atraviesa, así que la posición donde cae es real. Cada paso mira qué índices quedaron construidos (`IndexProbe` envuelve **cada** ítem y los anota en un `BuiltIndexTracker`), decide hacia dónde está el destino y corrige con la altura media de lo construido. Acota por bisección, así que no puede oscilar. Llega en 4 a 8 frames.
+- **Un ítem nuevo de la lista va envuelto en `IndexProbe`**, con el mismo `index` que recibe el `itemBuilder`. Sin él, el recorrido cree que ese índice no existe.
+- `indexOf` se vuelve a calcular en cada paso: un mensaje que entra a mitad del salto corre los índices.
+- `_revealingSeq` apaga la paginación de `_scrollListener` durante todo el recorrido, no sólo la animación, y sólo lo libera el salto que lo puso.
+
+### El resalte no recrea la burbuja
+`JumpTarget` envuelve **siempre** a toda burbuja de WhatsApp, no sólo al destino. El resalte anterior envolvía el ítem sólo mientras duraba; al cambiar el padre, Flutter destruía y recreaba la `MessageBubble`, y las fotos y los videos (destino típico: "📷 Imagen") parpadeaban al empezar y al terminar. Ahora sólo cambian un color y un hermano del hijo: el ancla (`Positioned.fill`) existe sólo en el destino, y el resalte empieza **al llegar**, no antes.
+
+### La cita en la burbuja (`message_bubble.dart`, tests en `test/message_bubble_quote_test.dart`)
+- **El long-press no se intercepta:** sobre la cita sigue abriendo el menú del mensaje.
+- **En una burbuja `failed` la cita no salta.** Ahí todo toque abre Reintentar / Copiar / Eliminar (ver *Mensajes que no salieron*). En `pending`/`sent` sí salta, porque el original existe.
+- **Los stickers muestran su cita** (`onBubble: false`, colores del entrante porque van sobre el fondo del chat). Antes la respuesta con sticker perdía a qué respondía.
+
+### Volver a la respuesta
+Cada cita tocada apila el mensaje desde el que se tocó (`_returnStack`). Mientras haya algo, la flecha de bajar regresa ahí, paso a paso en citas encadenadas, y recién después va al fondo. Se vacía al volver abajo, al enviar y al cambiar de chat. La burbuja en vuelo no apila: ya está al fondo.
+
+---
+
 ## 👥 Presencia del equipo (quién está en un chat y quién está respondiendo)
 
 Dos operadores abrían el mismo chat sin saberlo y el cliente recibía dos respuestas. Ahora cada uno ve, en la lista y sobre el composer, si un compañero **está en ese chat** o **está respondiendo**, y un choque real ("te respondieron mientras escribías") lo frena antes de enviar.

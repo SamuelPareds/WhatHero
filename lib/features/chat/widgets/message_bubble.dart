@@ -94,11 +94,15 @@ class MessageBubble extends StatefulWidget {
   final bool? edited;
   final bool? revoked;
   // Cita ("reply"): si este mensaje responde a otro, snapshot mínimo persistido
-  // por el backend. quotedText es un preview con icono (📷 Imagen, etc.). El
-  // id se conserva por si en el futuro queremos scrollear al original.
+  // por el backend. quotedText es un preview con icono (📷 Imagen, etc.).
+  // quotedMessageId es el id del doc del original en `messages/`.
   final String? quotedMessageId;
   final String? quotedText;
   final bool? quotedFromMe;
+  // Tocar la cita lleva al original (lo resuelve MessagesView). En una burbuja
+  // que no salió no se ofrece: ahí todo toque abre Reintentar / Copiar /
+  // Eliminar, y un salto se lo robaría a la mitad de la burbuja.
+  final VoidCallback? onQuoteTap;
   // Callback que dispara el item "Responder" del long-press menu. Lo provee
   // MessagesView (que mantiene el ReplyDraft) — el bubble solo notifica.
   final VoidCallback? onReplyTap;
@@ -156,6 +160,7 @@ class MessageBubble extends StatefulWidget {
     this.quotedMessageId,
     this.quotedText,
     this.quotedFromMe,
+    this.onQuoteTap,
     this.onReplyTap,
     this.sendStatus,
     this.onFailedActions,
@@ -349,6 +354,13 @@ class _MessageBubbleState extends State<MessageBubble> {
               widget.fromMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
           children: [
             _buildSenderLabel(),
+            // Un sticker también responde a mensajes (el backend guarda la
+            // cita de `stickerMessage`); sin esto la respuesta perdía a qué.
+            if (_buildQuotedPreview(onBubble: false) case final quote?)
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 220),
+                child: quote,
+              ),
             GestureDetector(
               onLongPress: _showMessageOptions,
               onTap: isReady
@@ -1251,7 +1263,9 @@ class _MessageBubbleState extends State<MessageBubble> {
   // saturado si fue al cliente), texto en 2 líneas con ellipsis. Devuelve
   // null si el mensaje no es una respuesta — así el caller no agrega un
   // SizedBox vacío encima del contenido.
-  Widget? _buildQuotedPreview() {
+  // onBubble: false para el sticker, que no tiene burbuja: la cita va sobre
+  // el fondo del chat y necesita los colores del entrante para leerse.
+  Widget? _buildQuotedPreview({bool onBubble = true}) {
     final quoteText = widget.quotedText;
     if (widget.quotedMessageId == null || quoteText == null) return null;
 
@@ -1265,14 +1279,17 @@ class _MessageBubbleState extends State<MessageBubble> {
     // El bubble fromMe es aqua sólido → el preview necesita un fondo oscuro
     // para legibilidad. El bubble entrante es surfaceDark → preview con fondo
     // ligeramente más oscuro (darkBg) genera contraste suficiente.
-    final bgColor = widget.fromMe
+    final onAqua = onBubble && widget.fromMe;
+    final bgColor = onAqua
         ? darkBg.withValues(alpha: 0.25)
-        : darkBg.withValues(alpha: 0.55);
+        : onBubble
+            ? darkBg.withValues(alpha: 0.55)
+            : surfaceDark.withValues(alpha: 0.9);
 
-    final textColor = widget.fromMe ? darkBg : white;
-    final labelColor = widget.fromMe ? darkBg.withValues(alpha: 0.7) : lightText;
+    final textColor = onAqua ? darkBg : white;
+    final labelColor = onAqua ? darkBg.withValues(alpha: 0.7) : lightText;
 
-    return Container(
+    final preview = Container(
       margin: const EdgeInsets.only(bottom: 6),
       padding: const EdgeInsets.fromLTRB(8, 6, 8, 6),
       decoration: BoxDecoration(
@@ -1304,6 +1321,20 @@ class _MessageBubbleState extends State<MessageBubble> {
             ),
           ),
         ],
+      ),
+    );
+
+    // Sin onTap el toque sigue de largo al GestureDetector de la burbuja: en
+    // una fallida, el que abre Reintentar. El long-press nunca se intercepta:
+    // el menú del mensaje sale igual sobre la cita.
+    final onTap = widget.sendStatus == 'failed' ? null : widget.onQuoteTap;
+    if (onTap == null) return preview;
+    return Semantics(
+      button: true,
+      label: 'Ir al mensaje citado',
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        child: GestureDetector(onTap: onTap, child: preview),
       ),
     );
   }
