@@ -1,0 +1,13 @@
+{
+  "name": "whathero-rules-tests",
+  "private": true,
+  "type": "module",
+  "description": "Tests de firestore.rules contra el emulador de Firestore. Ver CLAUDE.md.",
+  "scripts": {
+    "test": "firebase emulators:exec --only firestore --project demo-whathero \"node --test\""
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^6.0.0",
+    "firebase": "^13.0.0"
+  }
+}

@@ -57,6 +57,23 @@ Para evitar que el backend local y Railway se pisen entre sí (por ejemplo, el `
 
 ---
 
+## 🔐 Listar sesiones: las reglas no son filtros
+
+Cada vez que abrían la app, los miembros del equipo caían en "Bienvenido a WhatHero" en vez de en su última sesión. Al owner nunca le pasó. `SessionDispatcher` buscaba la sesión con `where('status', isEqualTo: 'connected')` a secas, y Firestore rechaza **entera** una consulta que no puede probar para todos sus resultados: un miembro con sesiones específicas sólo puede listar con `allowedUids arrayContains uid`. El `PERMISSION_DENIED` caía a la bienvenida sin un solo log. Fallaba así desde *Permisos por sesiones* (29-jun): con las reglas anteriores a la eliminación de sesiones el emulador también rechaza esa consulta. Se notó cuando los miembros pasaron a tener sesiones específicas, que es como nace todo miembro nuevo.
+
+- **Toda consulta a la colección `whatsapp_sessions` pasa por `AccountContextService().visibleSessionsQuery(accountId)`.** Owner y acceso total: la colección entera. Restringido: `allowedUids arrayContains uid`. La usan `SessionDispatcher` y `AccountsScreen`, que antes tenían cada uno su copia de la regla y sólo uno sabía de permisos. Leer un doc por id no la necesita: `get` se evalúa doc por doc.
+- **Sin más filtros ni `orderBy` en esa consulta:** combinarlos con `arrayContains` puede exigir un índice compuesto. Quien llama filtra (`status`, lápidas) y ordena en memoria, porque son pocas sesiones.
+- **Un error al leer las sesiones se loguea** (`[SessionDispatcher]` / `[AccountsScreen] No se pudieron leer las sesiones`). Un `permission-denied` ahí es esta trampa.
+- **Una pantalla que consulta una colección se prueba con un miembro restringido, no con el owner.** Para el owner todo pasa: `isOwner` corta los OR de las reglas.
+
+### Tests de reglas (`rules-tests/`)
+`cd rules-tests && npm test` levanta el emulador de Firestore y prueba `firestore.rules` con cinco tipos de usuario: owner, restringido, acceso total, legacy sin `access` y alguien de otra cuenta. Todo corre en `accounts` **y** `accounts_dev`, para que las dos copias de las reglas no se separen. **Es obligatorio al tocar `firestore.rules` o al agregar una consulta de colección en la app.** También cubre las reglas de la eliminación de sesiones: con las reglas previas a ella fallan 6 casos, que son los huecos que se cerraron ahí.
+- Es un paquete aparte y no vive dentro de `backend/`: el Dockerfile instala devDependencies, y el SDK web de `firebase` engordaría cada imagen de Railway.
+- Usa el proyecto `demo-whathero`, así que el emulador nunca toca el proyecto real.
+- Requiere JDK ≥ 21: `brew install openjdk` y `/opt/homebrew/opt/openjdk/bin` primero en el `PATH` (el `java` que trae macOS es un stub que falla).
+
+---
+
 ## 🌉 El Puente: Socket.io con Rooms
 Para garantizar que la data llegue al usuario correcto, implementamos **Rooms**:
 - El socket del cliente se une a la sala de su cuenta, `accountId` (el UID del owner; un miembro del equipo entra a la del owner).

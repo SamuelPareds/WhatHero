@@ -8,6 +8,7 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'firebase_options.dart';
 import 'core.dart';
+import 'core/services/account_context_service.dart';
 import 'core/services/socket_service.dart';
 import 'core/services/notification_service.dart';
 import 'core/services/presence_reporter.dart';
@@ -78,6 +79,11 @@ class _SessionDispatcherState extends State<SessionDispatcher> {
   // por deep-link reconstruiría el FutureBuilder y parpadearía el spinner).
   late final Future<String?> _lastSessionFuture =
       StorageService().getLastSessionId();
+
+  // Cacheado por lo mismo: recreado en cada build, el StreamBuilder volvía a
+  // `waiting` con cada deep-link y desmontaba la ChatsScreen raíz.
+  late final Stream<QuerySnapshot<Map<String, dynamic>>> _sessionsStream =
+      AccountContextService().visibleSessionsQuery(widget.accountId).snapshots();
 
   // Intención de deep-link compartida con ChatsScreen. Aquí solo decidimos la
   // SESIÓN; la apertura del chat la hace ChatsScreen.
@@ -203,13 +209,8 @@ class _SessionDispatcherState extends State<SessionDispatcher> {
 
         final lastSessionId = lastSessionSnapshot.data;
 
-        return StreamBuilder<QuerySnapshot>(
-          stream: FirebaseFirestore.instance
-              .collection(accountsCollection)
-              .doc(widget.accountId)
-              .collection('whatsapp_sessions')
-              .where('status', isEqualTo: 'connected')
-              .snapshots(),
+        return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+          stream: _sessionsStream,
           builder: (context, snapshot) {
             if (snapshot.connectionState == ConnectionState.waiting) {
               return const Scaffold(
@@ -219,12 +220,18 @@ class _SessionDispatcherState extends State<SessionDispatcher> {
               );
             }
 
-            // Una lápida (sesión que se está eliminando) ya no dice
-            // `connected`, pero un status que estaba en vuelo puede pisarlo
-            // un instante: no se abre aunque lo diga.
-            final docs = (snapshot.data?.docs ?? [])
-                .where((d) => !isSessionDeleting(d.data() as Map<String, dynamic>?))
-                .toList();
+            // Sin esto el fallo era mudo: caía a la bienvenida sin rastro.
+            if (snapshot.hasError) {
+              debugPrint('[SessionDispatcher] No se pudieron leer las sesiones: ${snapshot.error}');
+            }
+
+            // Sólo las conectadas. Una lápida (sesión que se está eliminando)
+            // ya no dice `connected`, pero un status que estaba en vuelo puede
+            // pisarlo un instante: no se abre aunque lo diga.
+            final docs = (snapshot.data?.docs ?? []).where((d) {
+              final data = d.data();
+              return data['status'] == 'connected' && !isSessionDeleting(data);
+            }).toList();
 
             if (docs.isNotEmpty) {
               // Preferencia de sesión: el deep-link de una notificación manda

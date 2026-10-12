@@ -54,6 +54,29 @@ class AccountContextService extends ChangeNotifier {
   /// Solo relevante cuando [hasAllSessionsAccess] es false.
   Set<String> get grantedSessions => _grantedSessions;
 
+  /// Las sesiones que este usuario puede LISTAR. Toda consulta a la colección
+  /// `whatsapp_sessions` pasa por aquí.
+  ///
+  /// Las reglas no son filtros: Firestore rechaza ENTERA una consulta que no
+  /// pueda probar para todos sus resultados, y un miembro restringido sólo
+  /// puede listar con `allowedUids arrayContains uid`. El dispatcher consultaba
+  /// `status == connected` a secas: al owner le pasaba y a cada miembro
+  /// restringido le fallaba en silencio (pantalla de bienvenida en cada
+  /// arranque). Lo fijan los tests de `rules-tests/`.
+  ///
+  /// Sin más filtros ni `orderBy` a propósito: combinarlos con `arrayContains`
+  /// puede exigir un índice compuesto. Son pocas sesiones: quien llama filtra
+  /// y ordena en memoria.
+  Query<Map<String, dynamic>> visibleSessionsQuery(String accountId) {
+    final sessions = FirebaseFirestore.instance
+        .collection(accountsCollection)
+        .doc(accountId)
+        .collection('whatsapp_sessions');
+    if (hasAllSessionsAccess) return sessions;
+    final uid = _currentUid ?? FirebaseAuth.instance.currentUser?.uid ?? '';
+    return sessions.where('allowedUids', arrayContains: uid);
+  }
+
   /// Resuelve el contexto para un usuario Firebase recién logueado.
   /// Idempotente: si ya estamos resueltos para este uid, no hace nada.
   /// Retorna `true` si la resolución fue exitosa, `false` si falló (y la UI

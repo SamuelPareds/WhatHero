@@ -52,3 +52,6 @@ backend/.env
 backend/serviceAccountKey.json
 backend/oculotserviceAccountKey.json
 .env
+
+# Tests de reglas de Firestore (emulador)
+rules-tests/node_modules/

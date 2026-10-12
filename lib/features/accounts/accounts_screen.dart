@@ -41,24 +41,10 @@ class _AccountsScreenState extends State<AccountsScreen> {
     _loadVersion();
   }
 
-  /// Stream de sesiones segun los permisos del usuario.
-  /// - Owner / acceso total: todas las sesiones de la cuenta.
-  /// - Sub-user restringido: solo las sesiones cuyo `allowedUids` lo incluye
-  ///   (query filtrable que las rules aprueban; sin orderBy para no exigir
-  ///   índice compuesto — el orden se aplica en memoria en el builder).
-  Stream<QuerySnapshot> _sessionsStream() {
-    final col = FirebaseFirestore.instance
-        .collection(accountsCollection)
-        .doc(widget.accountId)
-        .collection('whatsapp_sessions');
-
-    final ctx = AccountContextService();
-    if (ctx.hasAllSessionsAccess) {
-      return col.orderBy('connected_at', descending: true).snapshots();
-    }
-    final uid = ctx.currentUid ?? FirebaseAuth.instance.currentUser?.uid ?? '';
-    return col.where('allowedUids', arrayContains: uid).snapshots();
-  }
+  /// Stream de sesiones según los permisos del usuario (ver
+  /// `visibleSessionsQuery`). El orden se aplica en memoria en el builder.
+  Stream<QuerySnapshot> _sessionsStream() =>
+      AccountContextService().visibleSessionsQuery(widget.accountId).snapshots();
 
   Future<void> _loadVersion() async {
     final version = await VersionService.getVersion();
@@ -329,6 +315,9 @@ class _AccountsScreenState extends State<AccountsScreen> {
       body: StreamBuilder<QuerySnapshot>(
         stream: _sessionsStream(),
         builder: (context, snapshot) {
+          if (snapshot.hasError) {
+            debugPrint('[AccountsScreen] No se pudieron leer las sesiones: ${snapshot.error}');
+          }
           if (!snapshot.hasData) {
             return const Center(child: CircularProgressIndicator());
           }
