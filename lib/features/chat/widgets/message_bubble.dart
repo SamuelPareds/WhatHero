@@ -104,12 +104,17 @@ class MessageBubble extends StatefulWidget {
   final VoidCallback? onReplyTap;
   // Burbujas optimistas (envío en vuelo). null = mensaje real de Firestore.
   //   'pending' → relojito 🕓 (esperando ack del backend)
-  //   'sent'    → ✓✓ (ack ok, esperando el doc real por el stream)
-  //   'failed'  → icono rojo; tap dispara onRetryTap (Reintentar/Descartar)
-  // Con sendStatus != null el long-press menu se desactiva: el mensaje aún no
-  // existe en WhatsApp, no hay nada que responder/editar/eliminar.
+  //   'sent'    → ✓ (ack ok, esperando el doc real por el stream)
+  //   'failed'  → "No se envió"; tap Y long-press disparan onFailedActions
+  //               (Reintentar / Copiar / Eliminar, lo arma la vista)
+  // En vuelo no hay menú: el mensaje aún no existe en WhatsApp, no hay nada
+  // que responder/editar/eliminar.
+  //
+  // Ojo: el tap tiene que vivir en el GestureDetector de la burbuja de TEXTO.
+  // Del 9-jul al 12-oct estuvo en el de audio, y como las burbujas optimistas
+  // son siempre de texto, un mensaje fallido no tenía ninguna salida.
   final String? sendStatus;
-  final VoidCallback? onRetryTap;
+  final VoidCallback? onFailedActions;
   // Mensaje del número anterior de la sesión (antes de un cambio de número, o
   // llegado por la línea anterior). La cuenta que hoy manda no es su dueña:
   // WhatsApp descartaría en silencio editarlo, borrarlo para todos o
@@ -153,7 +158,7 @@ class MessageBubble extends StatefulWidget {
     this.quotedFromMe,
     this.onReplyTap,
     this.sendStatus,
-    this.onRetryTap,
+    this.onFailedActions,
   });
 
   @override
@@ -648,8 +653,6 @@ class _MessageBubbleState extends State<MessageBubble> {
 
     return GestureDetector(
       onLongPress: _showMessageOptions,
-      // Burbuja fallida: tap abre Reintentar/Descartar (provisto por la vista).
-      onTap: widget.sendStatus == 'failed' ? widget.onRetryTap : null,
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
         child: content,
@@ -935,8 +938,13 @@ class _MessageBubbleState extends State<MessageBubble> {
   }
 
   void _showMessageOptions() {
-    // Burbuja optimista: el mensaje aún no existe en WhatsApp — no hay nada
-    // que responder/editar/eliminar. El fallo se maneja con tap (onRetryTap).
+    // No salió: sus acciones son otras (Reintentar / Copiar / Eliminar).
+    if (widget.sendStatus == 'failed') {
+      widget.onFailedActions?.call();
+      return;
+    }
+    // En vuelo: el mensaje aún no existe en WhatsApp — no hay nada que
+    // responder/editar/eliminar.
     if (widget.sendStatus != null) return;
     // En mensajes con media no tiene sentido editar texto; copiar solo si hay caption.
     final hasMedia = widget.mediaType != null;
@@ -1512,6 +1520,7 @@ class _MessageBubbleState extends State<MessageBubble> {
               children: [
                 GestureDetector(
               onLongPress: _showMessageOptions,
+              onTap: widget.sendStatus == 'failed' ? widget.onFailedActions : null,
               child: Container(
                 constraints: BoxConstraints(
                   maxWidth: MediaQuery.of(context).size.width * 0.7,
@@ -1698,7 +1707,8 @@ class _MessageBubbleState extends State<MessageBubble> {
                   ],
                   // Estado de envío al estilo WhatsApp, solo en salientes:
                   //   🕓 relojito  → en vuelo (burbuja optimista 'pending')
-                  //   ✕ rojo      → falló; el tap en la burbuja abre reintentar
+                  //   ⓘ rojo      → falló; dice qué hacer, porque un ícono
+                  //                 solo no avisa que la burbuja tiene acciones
                   //   ✓ gris      → salió ('sent' o mensaje real de Firestore:
                   //                 si está en la DB es que WhatsApp lo aceptó)
                   //
@@ -1712,10 +1722,23 @@ class _MessageBubbleState extends State<MessageBubble> {
                     if (widget.sendStatus == 'pending')
                       Icon(Icons.schedule,
                           size: 13, color: lightText.withValues(alpha: 0.7))
-                    else if (widget.sendStatus == 'failed')
+                    else if (widget.sendStatus == 'failed') ...[
                       const Icon(Icons.error_outline,
-                          size: 14, color: Color(0xFFF87171))
-                    else
+                          size: 14, color: Color(0xFFF87171)),
+                      const SizedBox(width: 4),
+                      const Flexible(
+                        child: Text(
+                          'No se envió · toca para ver opciones',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: Color(0xFFF87171),
+                            fontSize: 11,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ),
+                    ] else
                       Icon(Icons.done,
                           size: 14, color: lightText.withValues(alpha: 0.7)),
                   ],

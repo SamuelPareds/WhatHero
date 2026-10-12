@@ -629,9 +629,11 @@ class _MessagesViewState extends State<MessagesView> {
 
   // Envío optimista (estilo WhatsApp): la burbuja aparece YA con relojito y
   // el composer se limpia YA. El texto nunca se pierde: si el backend falla
-  // (o no responde en 25s), la burbuja pasa a "fallida" con Reintentar.
-  // Ciclo: 🕓 sending → ack ok → ✓✓ sent → llega el doc real por el stream →
-  // la burbuja local se purga sola (misma posición, cero flicker).
+  // (o no responde en 25s), la burbuja pasa a "No se envió" con Reintentar /
+  // Copiar / Eliminar.
+  // Ciclo: 🕓 sending → ack ok → ✓ sent → llega el doc real por el stream →
+  // la burbuja local se purga sola (misma posición, cero flicker). El eco trae
+  // el tempId (`clientTempId`), así que también se purga si el ack se perdió.
   Future<void> _sendMessage() async {
     final text = _messageController.text.trim();
     if (text.isEmpty) return;
@@ -713,6 +715,16 @@ class _MessagesViewState extends State<MessagesView> {
     } catch (e) {
       service.onSendError(tempId, e.toString());
     }
+  }
+
+  // "Reintentar" de una burbuja que no salió: mismo tempId y payload, así que
+  // vuelve al relojito en su lugar y el backend no la manda dos veces si la
+  // primera sí había salido (ver backend/src/services/sendDedupe.ts). Es un
+  // envío al cliente como cualquier otro: pasa por la guarda de choque.
+  Future<void> _retryPending(PendingMessage p) async {
+    if (!await _confirmIfCollision()) return;
+    PendingMessagesService().markRetrying(p.tempId);
+    await _transmitPending(p.payload);
   }
 
   // Con reverse:true el offset 0 es el fondo (mensaje más nuevo).
@@ -811,8 +823,9 @@ class _MessagesViewState extends State<MessagesView> {
   // destinatario ni el owner pueden borrar lo de otro).
   void _showInternalActions(InternalMessage m) {
     if (m.status == InternalSendStatus.failed) {
-      _showRetrySheet(
+      _showFailedSendSheet(
         error: m.error,
+        text: m.text,
         onRetry: () => InternalMessagesService().retry(m.id),
         onDiscard: () => InternalMessagesService().discard(m.id),
       );
@@ -1055,14 +1068,19 @@ class _MessagesViewState extends State<MessagesView> {
             : BorderSide.none,
       );
 
-  // Tap en una burbuja fallida → Reintentar o Descartar. La comparten los
-  // mensajes al cliente (mismo tempId y payload: la burbuja vuelve al relojito
-  // en su lugar) y los internos (mismo id: el backend no los duplica).
-  void _showRetrySheet({
+  // Una burbuja que no salió (tap o long-press) → Reintentar / Copiar /
+  // Eliminar. La comparten los mensajes al cliente (mismo tempId y payload: la
+  // burbuja vuelve al relojito en su lugar) y los internos (mismo id: el
+  // backend no los duplica). Copiar existe porque a veces conviene mandarlo
+  // por otro lado, o retocarlo antes de reenviarlo.
+  void _showFailedSendSheet({
     String? error,
+    required String text,
     required VoidCallback onRetry,
     required VoidCallback onDiscard,
   }) {
+    // Capturado antes: el toast llega con la hoja ya cerrada.
+    final messenger = ScaffoldMessenger.of(context);
     showModalBottomSheet(
       context: context,
       backgroundColor: surfaceDark,
@@ -1076,7 +1094,7 @@ class _MessagesViewState extends State<MessagesView> {
             Padding(
               padding: const EdgeInsets.fromLTRB(24, 16, 24, 4),
               child: Text(
-                'No se pudo enviar${error != null ? ': $error' : ''}',
+                'No se pudo enviar · ${describeSendError(error)}',
                 style: TextStyle(color: lightText.withValues(alpha: 0.8), fontSize: 13),
               ),
             ),
@@ -1088,9 +1106,26 @@ class _MessagesViewState extends State<MessagesView> {
                 onRetry();
               },
             ),
+            if (text.isNotEmpty)
+              ListTile(
+                leading: const Icon(Icons.copy, color: primaryAqua),
+                title: const Text('Copiar texto', style: TextStyle(color: white)),
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  Clipboard.setData(ClipboardData(text: text));
+                  messenger.showSnackBar(const SnackBar(
+                    content: Text('Copiado'),
+                    duration: Duration(seconds: 1),
+                  ));
+                },
+              ),
             ListTile(
               leading: Icon(Icons.delete_outline, color: Colors.red.shade400),
-              title: Text('Descartar mensaje', style: TextStyle(color: Colors.red.shade400)),
+              title: Text('Eliminar', style: TextStyle(color: Colors.red.shade400)),
+              subtitle: Text(
+                'No se envió: sólo se borra de aquí',
+                style: TextStyle(color: lightText.withValues(alpha: 0.7), fontSize: 11),
+              ),
               onTap: () {
                 Navigator.pop(sheetContext);
                 onDiscard();
@@ -1273,18 +1308,7 @@ class _MessagesViewState extends State<MessagesView> {
       }
 
       _collisionDetector.noteLocalSend();
-      if (SocketService().isConnected) {
-        SocketService().sendMessage(messageData);
-      } else {
-        final response = await http
-            .post(
-              Uri.parse('$backendUrl/send-message'),
-              headers: await authHeaders(),
-              body: jsonEncode(messageData),
-            )
-            .timeout(const Duration(seconds: 30));
-        if (response.statusCode != 200) throw Exception(response.body);
-      }
+      await _sendMediaOverHttp(messageData);
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -1321,10 +1345,34 @@ class _MessagesViewState extends State<MessagesView> {
         },
       );
 
+  // Los adjuntos van SIEMPRE por HTTP: la respuesta es la confirmación. Por
+  // socket el toast "✓ enviado" salía apenas se emitía, y si el backend
+  // fallaba el error llegaba sin tempId y se descartaba: el operador creía que
+  // el cliente tenía el archivo y nunca le llegó. Sin burbuja optimista para
+  // adjuntos, el socket no aportaba nada más.
+  //
+  // 30 s porque un video de 16 MB se descarga y se mide antes de salir: con
+  // 10 s daba error mientras el backend lo mandaba igual.
+  Future<void> _sendMediaOverHttp(Map<String, dynamic> messageData) async {
+    final response = await http
+        .post(
+          Uri.parse('$backendUrl/send-message'),
+          headers: await authHeaders(),
+          body: jsonEncode(messageData),
+        )
+        .timeout(const Duration(seconds: 30));
+    if (response.statusCode != 200) throw Exception(response.body);
+  }
+
   void _showAttachmentError(Object e) {
     if (!mounted) return;
+    // Un timeout es el único fallo ambiguo: el backend pudo haberlo mandado
+    // igual. Reenviar a ciegas se lo duplicaría al cliente.
+    final text = e is TimeoutException
+        ? 'No sabemos si salió: revisa el chat antes de reenviarlo'
+        : 'Error: $e';
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red.shade600),
+      SnackBar(content: Text(text), backgroundColor: Colors.red.shade600),
     );
   }
 
@@ -1883,31 +1931,14 @@ class _MessagesViewState extends State<MessagesView> {
       };
 
       _collisionDetector.noteLocalSend();
-      if (SocketService().isConnected) {
-        SocketService().sendMessage(messageData);
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('✓ Respuesta enviada'), duration: Duration(seconds: 2), backgroundColor: Color(0xFF06B6D4)),
-          );
-        }
-      } else {
-        // Mismo plazo que los adjuntos del composer. Con 10 s, un video de
-        // 16 MB podía dar "Error al enviar" mientras el backend lo mandaba
-        // igual, y el reintento del operador le llegaría duplicado al cliente.
-        final response = await http.post(
-          Uri.parse('$backendUrl/send-message'),
-          headers: await authHeaders(),
-          body: jsonEncode(messageData),
-        ).timeout(const Duration(seconds: 30));
-
-        if (response.statusCode != 200) throw Exception(response.body);
-      }
-    } catch (e) {
+      await _sendMediaOverHttp(messageData);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error al enviar: ${e.toString()}'), backgroundColor: Colors.red.shade600),
+          const SnackBar(content: Text('✓ Respuesta enviada'), duration: Duration(seconds: 2), backgroundColor: Color(0xFF06B6D4)),
         );
       }
+    } catch (e) {
+      _showAttachmentError(e);
     } finally {
       if (mounted) setState(() => _isSending = false);
     }
@@ -2069,7 +2100,7 @@ class _MessagesViewState extends State<MessagesView> {
 
               // Capa optimista: burbujas locales en vuelo (relojito/fallidas)
               // por encima del stream de Firestore. ListenableBuilder para que
-              // los acks (✓✓ / fallo) rebuildeen sin tocar el StreamBuilder.
+              // los acks (✓ / fallo) rebuildeen sin tocar el StreamBuilder.
               final pendingChatKey = PendingMessagesService.chatKey(
                   widget.sessionKey, widget.phoneNumber);
               // Los internos del equipo van por su propio stream: no viven en
@@ -2083,8 +2114,20 @@ class _MessagesViewState extends State<MessagesView> {
                     [PendingMessagesService(), InternalMessagesService()]),
                 builder: (context, _) {
                   final docIds = <String>{for (final d in messages) d.id};
-                  final pendings = PendingMessagesService()
-                      .visibleForChat(pendingChatKey, docIds);
+                  // El eco de un envío del CRM trae el tempId de su burbuja:
+                  // la reconcilia aunque el ack se haya perdido. Sólo se junta
+                  // con algo en vuelo, y no cuesta deserializar: _waTime ya lo
+                  // hace con cada doc para mergeTimeline.
+                  final tempIds = <String>{
+                    if (PendingMessagesService().hasPendingFor(pendingChatKey))
+                      for (final d in messages)
+                        if ((d.data() as Map<String, dynamic>)['clientTempId']
+                            case final String id)
+                          id,
+                  };
+                  final pendings = PendingMessagesService().visibleForChat(
+                      pendingChatKey, docIds,
+                      presentTempIds: tempIds);
                   // Un error aquí no se ve en pantalla: el autor sigue viendo su
                   // copia local y nadie más ve nada. Pasó con los índices sin
                   // desplegar; el mensaje de Firestore trae el link para crearlo.
@@ -2104,8 +2147,9 @@ class _MessagesViewState extends State<MessagesView> {
                   // Purga post-frame de burbujas cuyo doc real ya llegó
                   // (mutar el service durante build está prohibido).
                   WidgetsBinding.instance.addPostFrameCallback((_) {
-                    PendingMessagesService()
-                        .purgeReconciled(pendingChatKey, docIds);
+                    PendingMessagesService().purgeReconciled(
+                        pendingChatKey, docIds,
+                        presentTempIds: tempIds);
                     InternalMessagesService().purgeReconciled(
                         widget.sessionId, widget.phoneNumber, internalIds);
                   });
@@ -2176,12 +2220,10 @@ class _MessagesViewState extends State<MessagesView> {
                         PendingStatus.sent => 'sent',
                         PendingStatus.failed => 'failed',
                       },
-                      onRetryTap: () => _showRetrySheet(
+                      onFailedActions: () => _showFailedSendSheet(
                         error: p.error,
-                        onRetry: () {
-                          PendingMessagesService().markRetrying(p.tempId);
-                          _transmitPending(p.payload);
-                        },
+                        text: p.text,
+                        onRetry: () => _retryPending(p),
                         onDiscard: () => PendingMessagesService().discard(p.tempId),
                       ),
                     );

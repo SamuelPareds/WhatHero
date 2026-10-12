@@ -12,9 +12,28 @@ enum PendingStatus {
   /// retira sola cuando el doc real aparece (cero flicker, cero duplicados).
   sent,
 
-  /// El backend reportó error o pasó el timeout sin ack → icono rojo + tap
-  /// para reintentar/descartar. El texto NUNCA se pierde.
+  /// El backend reportó error o pasó el timeout sin ack → "No se envió"; tap o
+  /// long-press abren Reintentar / Copiar / Eliminar. El texto NUNCA se pierde.
   failed,
+}
+
+/// El motivo de un envío fallido, en palabras del operador. Lo crudo (el
+/// mensaje del backend o la excepción de red) no le dice qué hacer.
+String describeSendError(String? raw) {
+  if (raw == null || raw.isEmpty) return 'Error desconocido';
+  // 'Connection Closed' lo lanza Baileys cuando el socket de WhatsApp se cayó
+  // a mitad del envío.
+  if (raw.contains('Session not ready') || raw.contains('Connection Closed')) {
+    return 'WhatsApp no está conectado';
+  }
+  if (RegExp(r'^HTTP 5\d\d').hasMatch(raw)) return 'Error del servidor';
+  if (raw.contains('SocketException') ||
+      raw.contains('ClientException') ||
+      raw.contains('TimeoutException') ||
+      raw.contains('Failed to fetch')) {
+    return 'Sin conexión con el servidor';
+  }
+  return raw;
 }
 
 class PendingMessage {
@@ -66,13 +85,21 @@ class PendingMessagesService extends ChangeNotifier {
   /// tempId único sin dependencia de uuid: reloj en µs + secuencia local.
   String newTempId() => 'tmp-${DateTime.now().microsecondsSinceEpoch}-${_seq++}';
 
+  /// ¿Hay burbujas locales en este chat? Sin ninguna, la vista no necesita
+  /// juntar los `clientTempId` del snapshot.
+  bool hasPendingFor(String key) => _byChat[key]?.isNotEmpty ?? false;
+
   /// Pendientes a renderizar: excluye los ya reconciliados (su doc real está
   /// presente en el snapshot actual del stream).
-  List<PendingMessage> visibleForChat(String key, Set<String> presentDocIds) {
+  List<PendingMessage> visibleForChat(
+    String key,
+    Set<String> presentDocIds, {
+    Set<String> presentTempIds = const {},
+  }) {
     final list = _byChat[key];
     if (list == null || list.isEmpty) return const [];
     return list
-        .where((p) => p.realMessageId == null || !presentDocIds.contains(p.realMessageId))
+        .where((p) => !_isReconciled(p, presentDocIds, presentTempIds))
         .toList(growable: false);
   }
 
@@ -124,17 +151,35 @@ class PendingMessagesService extends ChangeNotifier {
 
   /// Purga los pendientes cuyo doc real ya está en el stream. Llamar
   /// post-frame desde el builder de la lista (nunca durante build).
-  void purgeReconciled(String key, Set<String> presentDocIds) {
+  void purgeReconciled(
+    String key,
+    Set<String> presentDocIds, {
+    Set<String> presentTempIds = const {},
+  }) {
     final list = _byChat[key];
     if (list == null || list.isEmpty) return;
     final before = list.length;
     list.removeWhere((p) {
-      final done = p.realMessageId != null && presentDocIds.contains(p.realMessageId);
+      final done = _isReconciled(p, presentDocIds, presentTempIds);
       if (done) _timeouts.remove(p.tempId)?.cancel();
       return done;
     });
     if (list.length != before) notifyListeners();
   }
+
+  // Su doc real ya está en el snapshot: por el id que trajo el ack, o por el
+  // `clientTempId` que el backend guarda en el eco. El segundo es el que
+  // importa cuando el ack se pierde (socket caído entre el envío y la
+  // respuesta): el mensaje salió, y sin él la burbuja pasaba a "No se envió"
+  // a los 25 s, al lado del mensaje real. Reintentarla lo duplicaba.
+  // Encontrarla aquí también cancela su timeout.
+  bool _isReconciled(
+    PendingMessage p,
+    Set<String> presentDocIds,
+    Set<String> presentTempIds,
+  ) =>
+      (p.realMessageId != null && presentDocIds.contains(p.realMessageId)) ||
+      presentTempIds.contains(p.tempId);
 
   void _armTimeout(PendingMessage p) {
     _timeouts.remove(p.tempId)?.cancel();

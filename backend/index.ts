@@ -21,6 +21,7 @@ import { unwrapMessageContent } from './src/utils/message';
 import { initializeSession, saveMessageToFirestore, getAIConfig, cacheContactName, applyContactUpdate, reconcileContactNames, consolidateLIDChat, incrementUnrespondedCount, resetUnrespondedCount, writeMediaIndexEntry, isIndexableMedia, writeMessageIndexEntry } from './src/services/firestoreService';
 import { isWithinActiveHours, generateAIResponse, normalizeHistory, processMessageBuffer, emitAiState, getSessionTimezone, AiError, cancelAiCycle, isAiSentMessage, hasAiState, aiStateSnapshot, isAiCycleLive, startAiStateHeartbeat } from './src/services/aiService';
 import { AiBuffers } from './src/services/aiBuffer';
+import { sendDedupe, sendDedupeKey, validTempId } from './src/services/sendDedupe';
 import { trackUnreadMessage, markChatAsReadIfEnabled, forgetChatUnread } from './src/services/readReceiptService';
 import {
   initSessionSupervisor,
@@ -1350,7 +1351,7 @@ async function cancelSession(sessionKey: string) {
  * que respondió (etiqueta visible en cada mensaje saliente).
  */
 async function performSendMessage(
-  { to, text, imageUrl, documentUrl, documentName, videoUrl, audioUrl, mimetype, isPtt, cleanupAfterSend, sessionKey, accountId, quotedMessageId, quotedText, quotedFromMe }: any,
+  { to, text, imageUrl, documentUrl, documentName, videoUrl, audioUrl, mimetype, isPtt, cleanupAfterSend, sessionKey, accountId, quotedMessageId, quotedText, quotedFromMe, tempId }: any,
   senderUid: string,
 ) {
   const session = sessions.get(sessionKey);
@@ -1379,7 +1380,7 @@ async function performSendMessage(
   try {
     return await sendAsHuman(session, senderUid, {
       to, text, imageUrl, documentUrl, documentName, videoUrl, audioUrl, mimetype, isPtt,
-      cleanupAfterSend, accountId, quotedMessageId, quotedText, quotedFromMe,
+      cleanupAfterSend, accountId, quotedMessageId, quotedText, quotedFromMe, tempId,
     });
   } catch (error) {
     // No salió: la ráfaga que la IA soltó por este humano quedaría sin
@@ -1397,7 +1398,7 @@ async function performSendMessage(
 async function sendAsHuman(
   session: SessionData,
   senderUid: string,
-  { to, text, imageUrl, documentUrl, documentName, videoUrl, audioUrl, mimetype, isPtt, cleanupAfterSend, accountId, quotedMessageId, quotedText, quotedFromMe }: any,
+  { to, text, imageUrl, documentUrl, documentName, videoUrl, audioUrl, mimetype, isPtt, cleanupAfterSend, accountId, quotedMessageId, quotedText, quotedFromMe, tempId }: any,
 ) {
   // Try to get the stored remoteJid from the chat document
   let jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
@@ -1488,9 +1489,14 @@ async function sendAsHuman(
   // en esa carrera una lectura de users/{uid} con el cache frío: si perdía, el
   // mensaje del operador quedaba como "WhatsApp", sin senderUid, y la guarda
   // de choque del cliente lo tomaba por un compañero.
+  //
+  // El tempId de la burbuja local viaja en la misma etiqueta y queda en el doc
+  // como `clientTempId`: con él la app reconoce su mensaje aunque el ack se
+  // haya perdido, en vez de marcarlo "no se envió" con el mensaje ya afuera.
   const senderInfo = await resolveHumanSender(senderUid);
+  const clientTempId = validTempId(tempId);
   const messageId = generateMessageIDV2(session.sock.user?.id);
-  session.pendingSenders.set(messageId, senderInfo);
+  session.pendingSenders.set(messageId, clientTempId ? { ...senderInfo, tempId: clientTempId } : senderInfo);
 
   let message;
   try {
@@ -1672,7 +1678,10 @@ app.post('/cancel-session', express.json(), verifyHttpAuth(), async (req, res) =
 // REST API endpoint to send messages (now uses common logic)
 app.post('/send-message', express.json(), verifyHttpAuth(), async (req, res) => {
   try {
-    const result = await performSendMessage(req.body, req.auth!.uid);
+    const uid = req.auth!.uid;
+    const result = await sendDedupe.run(sendDedupeKey(uid, req.body?.tempId), () =>
+      performSendMessage(req.body, uid),
+    );
     res.json(result);
   } catch (error) {
     console.error('Error sending message (HTTP):', error);
@@ -3089,7 +3098,10 @@ io.on('connection', (socket) => {
         throw new Error('Unauthorized accountId');
       }
 
-      const result = await performSendMessage(data, uid);
+      // Un reintento del mismo tempId no vuelve a enviar (ver sendDedupe.ts).
+      const result = await sendDedupe.run(sendDedupeKey(uid, data.tempId), () =>
+        performSendMessage(data, uid),
+      );
 
       // Emit success back to the specific client
       socket.emit('message_sent_success', {

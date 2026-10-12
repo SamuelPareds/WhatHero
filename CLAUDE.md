@@ -239,10 +239,33 @@ El operador tiene que poder distinguir de un vistazo lo que **salió** de lo que
 
 - **Es `Icons.done` (✓), NUNCA `Icons.done_all` (✓✓).** No rastreamos acks: no hay listener de `messages.update` ni de `message-receipt.update` en el backend, así que lo único que sabemos de un saliente es que WhatsApp lo aceptó — que es exactamente lo que significa una palomita sola. Un ✓✓ prometería "entregado al dispositivo del cliente" y sería mentira. **Si alguien lo "arregla" a ✓✓ para parecerse más a WhatsApp, está reintroduciendo el bug.**
 - **Dos lugares, un solo significado:** la burbuja saliente (`message_bubble.dart`, junto al timestamp — incluye stickers) y el preview de la lista de chats (`_ChatTile` en `chats_screen.dart`). La sección "Chats" del buscador lo hereda porque reusa `_buildChatTile`.
-- **En la burbuja el ✓ convive con dos estados en vuelo** que vienen de `PendingMessagesService`: 🕓 `pending` (emitido, sin ack del backend) y ✕ rojo `failed` (tap → reintentar). El ✓ es el estado confirmado; un mensaje que ya está en Firestore siempre lo tiene.
+- **En la burbuja el ✓ convive con dos estados en vuelo** que vienen de `PendingMessagesService`: 🕓 `pending` (emitido, sin ack del backend) y ⓘ rojo `failed` ("No se envió"; tap o long-press → Reintentar / Copiar / Eliminar, ver *🔁 Mensajes que no salieron*). El ✓ es el estado confirmado; un mensaje que ya está en Firestore siempre lo tiene.
 - **La lista lee `lastMessageFromMe`** del chat doc, escrito por `saveMessageToFirestore` dentro del `set` que ya hacía (cero writes extra) y recalculado por `recalcChatLastMessage` cuando se borra el último mensaje. **Es `bool?`: `null` en chats sin mensajes nuevos desde que existe el campo** → no se pinta nada y se auto-repara con el siguiente mensaje. No se hizo backfill a propósito: un chat sin actividad es un chat que nadie está mirando.
 
 **Palomitas reales (entregado / leído) son Fase 2 y no están hechas.** Costo real: listener de `messages.update` + `message-receipt.update` (este último obligatorio para grupos, hay que agregar por participante), campo `status` con guarda monotónica (los acks llegan desordenados y un `delivered` tardío no puede pisar un `read`), +2 writes por saliente sobre los 3 actuales —multiplicado por chunk, y la IA manda 2-3 por respuesta— y +2 reads por cliente conectado. Se difiere hasta que un operador pregunte "¿le llegó?", no antes.
+
+---
+
+## 🔁 Mensajes que no salieron (Reintentar · Copiar · Eliminar, sin duplicar)
+
+Un texto del operador se pinta como burbuja local (`PendingMessagesService`) con un `tempId` y pasa a "No se envió" si el backend devuelve error o no hay ack en 25 s. **Tap y long-press** sobre ella abren la misma hoja (`_showFailedSendSheet` en `messages_view.dart`, compartida con los internos): Reintentar, Copiar texto, Eliminar.
+
+**Del 9-jul al 12-oct esa hoja no se podía abrir.** El `onTap` de reintentar quedó en el `GestureDetector` de la burbuja de **audio**, y las burbujas optimistas son siempre de texto; el long-press salía de entrada con cualquier `sendStatus`. Un mensaje fallido era un callejón sin salida. `test/failed_message_bubble_test.dart` lo fija: **una burbuja nueva tiene que alcanzar `onFailedActions` desde su propio `GestureDetector`**.
+
+### Hacer alcanzable el reintento destapaba un duplicado
+La burbuja local se reconciliaba **sólo** por el `messageId` del ack. Si el ack se pierde (socket que se cae entre el emit y la respuesta, lo típico en un celular), el mensaje **sí** salió, el eco crea el doc con ✓ y a los 25 s la burbuja local pasa a fallida al lado. Un toque en Reintentar y el cliente lo recibía dos veces. Dos piezas lo cierran:
+
+1. **El eco trae el `tempId`.** `sendAsHuman` lo pone en la etiqueta de `pendingSenders` (la misma que ya iba antes del envío) y `saveMessageToFirestore` lo guarda como `clientTempId` dentro del `set` que ya existía: cero escrituras extra. La app reconcilia por `realMessageId` **o** `clientTempId`, así que la burbuja se va al llegar el eco (≈1 s) aunque el ack nunca llegue, y el timeout de 25 s ni dispara. El operador no ve un falso "No se envió".
+2. **El backend deduplica por `uid:tempId`** (`sendDedupe.ts`, tests en `sendDedupe.test.ts`): un reintento con el primer envío en vuelo recibe la misma promesa; uno de algo que ya salió recibe el mismo `messageId` durante 10 min sin reenviar; uno de algo que falló sí reenvía. El `uid` sale del handshake/middleware, no del payload. **Envuelve a `performSendMessage` completo**: un reintento deduplicado no vuelve a hacer ceder a la IA (mataría el buffer de un mensaje que el cliente mandó después). Vive en memoria; un redeploy a mitad de un envío no queda cubierto.
+
+- **Reintentar pasa por `_confirmIfCollision()`**, como todo envío de la vista. Mismo `tempId` y payload: la burbuja vuelve al relojito en su lugar.
+- **Eliminar no pide confirmación:** es local (el cliente nunca lo recibió) y Copiar está justo arriba.
+- **`describeSendError`** traduce el motivo para el operador ("WhatsApp no está conectado", "Sin conexión con el servidor"); lo desconocido se muestra crudo. Reglas en `test/pending_messages_service_test.dart`.
+
+### Los adjuntos van siempre por HTTP
+Por socket, el toast "✓ Archivo enviado" salía apenas se emitía, y si el backend fallaba el `message_sent_error` llegaba sin `tempId` y se descartaba: el operador creía que el cliente tenía el archivo. Sin burbuja optimista para adjuntos, el socket no aportaba nada. Ahora `_sendMediaOverHttp` (composer y respuestas rápidas con archivo) espera el 200 antes del toast. **Un timeout es el único fallo ambiguo** (el backend pudo mandarlo igual) y lo dice: "No sabemos si salió: revisa el chat antes de reenviarlo".
+
+**Fase 2 (no está hecho):** persistir las fallidas entre reinicios (hoy recargar la pestaña las pierde), burbuja optimista para adjuntos con reintento sin volver a elegir el archivo, y un dedupe que sobreviva a un redeploy.
 
 ---
 

@@ -847,6 +847,9 @@ export async function saveMessageToFirestore(
         senderType: senderInfo.type,
         senderName: senderInfo.name,
         ...(senderInfo.uid && { senderUid: senderInfo.uid }),
+        // La burbuja local de la app se da por enviada al ver este id, aunque
+        // el ack se haya perdido (ver sendDedupe.ts).
+        ...(senderInfo.tempId && { clientTempId: senderInfo.tempId }),
       };
     }
 

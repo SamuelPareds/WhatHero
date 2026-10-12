@@ -9,6 +9,9 @@ export interface SenderInfo {
   type: SenderType;
   name: string;     // snapshot al momento de envío (no se resuelve en lectura)
   uid?: string;     // sólo cuando type='human' y vino vía app autenticada
+  // Id de la burbuja local de la app (sólo envíos del CRM). Se guarda en el doc
+  // como `clientTempId` para reconciliar sin depender del ack.
+  tempId?: string;
 }
 
 /** Rol de un socket dentro de su sesión: el que manda o la línea anterior. */
