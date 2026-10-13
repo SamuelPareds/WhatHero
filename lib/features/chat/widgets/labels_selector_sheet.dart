@@ -160,7 +160,11 @@ class _LabelsSelectorSheetState extends State<LabelsSelectorSheet> {
                       if (labels.isEmpty) {
                         return Padding(
                           padding: const EdgeInsets.all(32),
+                          // min: dentro del Flexible, un Column normal se
+                          // estira a toda la altura que le da la hoja
+                          // (isScrollControlled = la pantalla entera).
                           child: Column(
+                            mainAxisSize: MainAxisSize.min,
                             children: [
                               Icon(Icons.label_off_outlined,
                                   size: 48,

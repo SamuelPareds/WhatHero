@@ -141,6 +141,10 @@ class _ChatsScreenState extends State<ChatsScreen> {
   // debajo, la bandeja flota encima en vez de aplastar el chat (su AppBar está
   // probado a 360 dp; esto deja margen).
   static const _minDetailWidth = 420.0;
+  // Info del contacto en escritorio: panel a la derecha del chat (o encima de
+  // él si no cabe al lado). Sigue al chat abierto. En móvil es una hoja.
+  bool _contactInfoOpen = false;
+  static const _contactPanelWidth = 360.0;
   // Uno por Scaffold: el de la lista (móvil) y el de escritorio (cuando la
   // bandeja no cabe al lado). Cada uno abre su propio panel flotante.
   final GlobalKey<ScaffoldState> _listScaffoldKey = GlobalKey();
@@ -641,8 +645,10 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
   // Escritorio: desplegada al lado si el chat conserva su ancho; si no, la
   // franja plegada abre el panel flotante.
-  Widget _buildTeamInboxSide(double screenWidth) {
-    final fits = screenWidth - 400 - _inboxPanelWidth >= _minDetailWidth;
+  // `reserved`: lo que ya ocupa el panel de info del contacto al lado.
+  Widget _buildTeamInboxSide(double screenWidth, {double reserved = 0}) {
+    final fits =
+        screenWidth - 400 - reserved - _inboxPanelWidth >= _minDetailWidth;
     if (_inboxExpanded && fits) {
       return SizedBox(
         width: _inboxPanelWidth,
@@ -755,6 +761,15 @@ class _ChatsScreenState extends State<ChatsScreen> {
       onScreen: onScreen,
     );
 
+    // Info del contacto en escritorio: al lado del chat si éste conserva su
+    // ancho (contando la franja de la bandeja); si no, encima del detalle.
+    final screenWidth = MediaQuery.of(context).size.width;
+    final showContact =
+        !isMobile && _contactInfoOpen && selectedChatPhone != null;
+    final contactBeside = showContact &&
+        screenWidth - 400 - _contactPanelWidth - (_hasTeam ? 48 : 0) >=
+            _minDetailWidth;
+
     final Widget content = isMobile
         // Mantenemos la lista SIEMPRE montada (Offstage cuando hay un chat
         // abierto) en vez de reemplazarla por el detalle. Así el journey
@@ -779,10 +794,22 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 SizedBox(width: 400, child: _buildChatsList()),
                 Expanded(
                   child: selectedChatPhone != null
-                      // En desktop la galería se abre a pantalla completa
-                      // ENCIMA del detalle (capa, no ruta): con ella abierta
-                      // las flechas cambiarían de chat a ciegas.
-                      ? _buildMessageDetail(shortcutsEnabled: !_showMediaVault)
+                      // La galería (a pantalla completa) y la info del
+                      // contacto cuando no cabe al lado tapan el detalle sin
+                      // ser ruta: con ellas encima las flechas cambiarían de
+                      // chat a ciegas. El detalle sigue montado debajo para no
+                      // perder el borrador.
+                      ? Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            _buildMessageDetail(
+                              shortcutsEnabled: !_showMediaVault &&
+                                  !(showContact && !contactBeside),
+                            ),
+                            if (showContact && !contactBeside)
+                              Positioned.fill(child: _contactInfoSide()),
+                          ],
+                        )
                       : Container(
                           color: darkBg,
                           child: const Center(
@@ -797,7 +824,16 @@ class _ChatsScreenState extends State<ChatsScreen> {
                           ),
                         ),
                 ),
-                if (_hasTeam) _buildTeamInboxSide(MediaQuery.of(context).size.width),
+                if (contactBeside)
+                  SizedBox(
+                    width: _contactPanelWidth,
+                    child: _contactInfoSide(),
+                  ),
+                if (_hasTeam)
+                  _buildTeamInboxSide(
+                    screenWidth,
+                    reserved: contactBeside ? _contactPanelWidth : 0,
+                  ),
               ],
             ),
           );
@@ -2334,6 +2370,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
+      // Con muchas etiquetas la hoja crece: que no se meta bajo la barra
+      // de estado.
+      useSafeArea: true,
       backgroundColor: Colors.transparent,
       builder: (_) => LabelsSelectorSheet(
         accountId: widget.accountId,
@@ -2343,18 +2382,40 @@ class _ChatsScreenState extends State<ChatsScreen> {
     );
   }
 
+  // Móvil: hoja a pantalla completa. Hoja y no MaterialPageRoute a propósito:
+  // una ruta opaca apaga TickerMode y para la presencia el operador saldría
+  // del chat (y con él su "respondiendo…", así que la IA en espera dispararía
+  // encima de su borrador). Escritorio: el botón alterna el panel lateral.
   void _showContactInfo(String phoneNumber) {
+    if (MediaQuery.of(context).size.width >= 600) {
+      setState(() => _contactInfoOpen = !_contactInfoOpen);
+      return;
+    }
     showModalBottomSheet(
       context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
       backgroundColor: surfaceDark,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-      ),
-      builder: (context) => ContactInfoPanel(
+      shape: const RoundedRectangleBorder(),
+      builder: (sheetContext) => ContactInfoPanel(
         phoneNumber: phoneNumber,
         sessionId: widget.sessionId!,
         accountId: widget.accountId,
+        closeIcon: Icons.arrow_back,
+        onClose: () => Navigator.of(sheetContext).pop(),
       ),
+    );
+  }
+
+  // Escritorio: sigue al chat abierto, así recorrer con las flechas o abrir
+  // otro chat muestra la info del nuevo sin tocar cada camino de apertura.
+  Widget _contactInfoSide() {
+    return ContactInfoPanel(
+      phoneNumber: selectedChatPhone!,
+      sessionId: widget.sessionId!,
+      accountId: widget.accountId,
+      closeIcon: Icons.close,
+      onClose: () => setState(() => _contactInfoOpen = false),
     );
   }
 }

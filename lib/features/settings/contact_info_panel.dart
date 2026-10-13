@@ -6,195 +6,101 @@ import 'package:crm_whatsapp/features/chat/widgets/label_chip.dart';
 import 'package:crm_whatsapp/features/chat/widgets/labels_selector_sheet.dart';
 import 'package:crm_whatsapp/features/chat/widgets/note_editor_dialog.dart';
 
+// Info del contacto. Ocupa toda la altura: en móvil como hoja a pantalla
+// completa y en escritorio como panel a la derecha del chat (o encima de él si
+// no cabe al lado). Quien lo abre decide cómo se cierra, igual que la bandeja
+// del equipo.
 class ContactInfoPanel extends StatelessWidget {
   final String phoneNumber;
   final String sessionId;
   final String accountId;
+  final VoidCallback onClose;
+  final IconData closeIcon;
 
   const ContactInfoPanel({
     required this.phoneNumber,
     required this.sessionId,
     required this.accountId,
+    required this.onClose,
+    required this.closeIcon,
     super.key,
   });
 
   @override
   Widget build(BuildContext context) {
+    // Scaffold propio para que el aviso "Número copiado" se vea: un SnackBar
+    // sólo se pinta en los Scaffold raíz, y en móvil el de la pantalla del
+    // chat queda tapado por esta hoja a pantalla completa.
     return Scaffold(
       backgroundColor: Colors.transparent,
-      body: StreamBuilder<DocumentSnapshot>(
-        stream: FirebaseFirestore.instance
-            .collection(accountsCollection)
-            .doc(accountId)
-            .collection('whatsapp_sessions')
-            .doc(sessionId)
-            .collection('chats')
-            .doc(phoneNumber)
-            .snapshots(),
-        builder: (context, snapshot) {
-          if (!snapshot.hasData) {
-            return const SizedBox(
-              height: 300,
-              child: Center(child: CircularProgressIndicator()),
-            );
-          }
+      body: Container(
+        decoration: BoxDecoration(
+          color: surfaceDark,
+          border: Border(
+            left: BorderSide(color: primaryAqua.withValues(alpha: 0.1)),
+          ),
+        ),
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(4, 8, 16, 8),
+              child: Row(
+                children: [
+                  IconButton(
+                    icon: Icon(closeIcon, size: 20),
+                    color: lightText,
+                    tooltip: 'Cerrar',
+                    onPressed: onClose,
+                  ),
+                  const SizedBox(width: 4),
+                  const Text(
+                    'Info. del contacto',
+                    style: TextStyle(
+                      color: white,
+                      fontWeight: FontWeight.w700,
+                      fontSize: 16,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Expanded(
+              child: StreamBuilder<DocumentSnapshot>(
+                stream: FirebaseFirestore.instance
+                    .collection(accountsCollection)
+                    .doc(accountId)
+                    .collection('whatsapp_sessions')
+                    .doc(sessionId)
+                    .collection('chats')
+                    .doc(phoneNumber)
+                    .snapshots(),
+                builder: (context, snapshot) {
+                  if (!snapshot.hasData) {
+                    return const Center(child: CircularProgressIndicator());
+                  }
 
-          final chatData = snapshot.data!.data() as Map<String, dynamic>?;
-          final lastMessage = chatData?['lastMessage'] ?? 'Sin mensajes';
-          final lastMessageTime = (chatData?['lastMessageTimestamp'] as Timestamp?)?.toDate();
-          final assignedIds = ((chatData?['labelIds'] as List?) ?? const [])
-              .whereType<String>()
-              .toList();
-          final note = (chatData?['note'] as String? ?? '').trim();
+                  final chatData =
+                      snapshot.data!.data() as Map<String, dynamic>?;
+                  // Nombre de agenda: el backend sólo guarda `contact.name`,
+                  // nunca el pushName. Vacío si no lo tenemos agregado.
+                  final contactName =
+                      (chatData?['contactName'] as String? ?? '').trim();
+                  final assignedIds =
+                      ((chatData?['labelIds'] as List?) ?? const [])
+                          .whereType<String>()
+                          .toList();
+                  final note = (chatData?['note'] as String? ?? '').trim();
 
-          return StreamBuilder<QuerySnapshot>(
-            stream: FirebaseFirestore.instance
-                .collection(accountsCollection)
-                .doc(accountId)
-                .collection('whatsapp_sessions')
-                .doc(sessionId)
-                .collection('chats')
-                .doc(phoneNumber)
-                .collection('messages')
-                .snapshots(),
-            builder: (context, messagesSnapshot) {
-              final messageCount = messagesSnapshot.data?.docs.length ?? 0;
-
-              return SingleChildScrollView(
-                child: Padding(
-                  padding: const EdgeInsets.all(24),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
+                  return ListView(
+                    padding: const EdgeInsets.fromLTRB(24, 8, 24, 32),
                     children: [
-                      // Handle
-                      Center(
-                        child: Container(
-                          width: 40,
-                          height: 4,
-                          decoration: BoxDecoration(
-                            color: lightText.withValues(alpha: 0.3),
-                            borderRadius: BorderRadius.circular(2),
-                          ),
-                        ),
+                      _ContactHeader(
+                        phoneNumber: phoneNumber,
+                        contactName: contactName,
                       ),
                       const SizedBox(height: 32),
-                      // Avatar
-                      Center(
-                        child: Container(
-                          width: 80,
-                          height: 80,
-                          decoration: BoxDecoration(
-                            color: primaryAqua.withValues(alpha: 0.2),
-                            borderRadius: BorderRadius.circular(20),
-                          ),
-                          child: Center(
-                            child: Text(
-                              phoneNumber.substring(0, 1).toUpperCase(),
-                              style: const TextStyle(
-                                color: primaryAqua,
-                                fontWeight: FontWeight.w700,
-                                fontSize: 36,
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 24),
-                      // Phone Number
-                      Center(
-                        child: GestureDetector(
-                          onTap: () {
-                            // Copia solo los últimos 10 dígitos (número local sin
-                            // lada de país ni sufijos de WhatsApp).
-                            final digits = phoneNumber.replaceAll(RegExp(r'\D'), '');
-                            final last10 = digits.length > 10
-                                ? digits.substring(digits.length - 10)
-                                : digits;
-                            Clipboard.setData(ClipboardData(text: last10));
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(
-                                content: const Text(
-                                  'Número copiado al portapapeles',
-                                  style: TextStyle(
-                                    color: white,
-                                    fontSize: 14,
-                                    fontWeight: FontWeight.w500,
-                                  ),
-                                ),
-                                backgroundColor: primaryAqua,
-                                behavior: SnackBarBehavior.floating,
-                                duration: const Duration(seconds: 2),
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(12),
-                                ),
-                                margin: const EdgeInsets.symmetric(
-                                  horizontal: 40,
-                                  vertical: 20,
-                                ),
-                              ),
-                            );
-                          },
-                          child: Column(
-                            children: [
-                              Text(
-                                phoneNumber,
-                                style: const TextStyle(
-                                  fontSize: 20,
-                                  fontWeight: FontWeight.bold,
-                                  color: white,
-                                ),
-                              ),
-                              const SizedBox(height: 8),
-                              const Text(
-                                'Contacto de WhatsApp',
-                                style: TextStyle(
-                                  fontSize: 13,
-                                  color: lightText,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 40),
-                      // Info Section
-                      Container(
-                        decoration: BoxDecoration(
-                          color: darkBg.withValues(alpha: 0.5),
-                          borderRadius: BorderRadius.circular(16),
-                          border: Border.all(
-                            color: primaryAqua.withValues(alpha: 0.1),
-                          ),
-                        ),
-                        padding: const EdgeInsets.all(20),
-                          child: Column(
-                          children: [
-                            _InfoRow(
-                              icon: Icons.message,
-                              label: 'Mensajes',
-                              value: messageCount.toString(),
-                            ),
-                            const Divider(color: Colors.transparent, height: 16),
-                            _InfoRow(
-                              icon: Icons.access_time,
-                              label: 'Último mensaje',
-                              value: lastMessageTime != null
-                                  ? _formatLastMessageTime(lastMessageTime)
-                                  : 'Sin mensajes',
-                            ),
-                            const Divider(color: Colors.transparent, height: 16),
-                            _InfoRow(
-                              icon: Icons.check_circle,
-                              label: 'Estado',
-                              value: 'Conectado',
-                            ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(height: 24),
-                      // Nota del chat. Va antes de las etiquetas para quedar
-                      // visible sin scroll: es lo que se viene a editar aquí
-                      // sin tener que volver a la lista.
+                      // Nota y etiquetas van arriba: es lo que se viene a
+                      // editar aquí sin tener que volver a la lista.
                       _NoteSection(
                         accountId: accountId,
                         sessionId: sessionId,
@@ -210,72 +116,121 @@ class ContactInfoPanel extends StatelessWidget {
                         phoneNumber: phoneNumber,
                         assignedIds: assignedIds,
                       ),
-                      const SizedBox(height: 24),
-                      // Last message preview
-                      Container(
-                        decoration: BoxDecoration(
-                          color: darkBg.withValues(alpha: 0.5),
-                          borderRadius: BorderRadius.circular(16),
-                          border: Border.all(
-                            color: primaryAqua.withValues(alpha: 0.1),
-                          ),
-                        ),
-                        padding: const EdgeInsets.all(16),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const Text(
-                              'Último mensaje',
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: lightText,
-                                fontWeight: FontWeight.w600,
-                              ),
-                            ),
-                            const SizedBox(height: 12),
-                            Text(
-                              lastMessage,
-                              style: const TextStyle(
-                                fontSize: 14,
-                                color: white,
-                                height: 1.5,
-                              ),
-                              maxLines: 3,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(height: 32),
                     ],
-                  ),
-                ),
-              );
-            },
-          );
-        },
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// Avatar + nombre de agenda (si lo hay) + número. Tocar el nombre o el número
+// copia el número.
+class _ContactHeader extends StatelessWidget {
+  final String phoneNumber;
+  final String contactName;
+
+  const _ContactHeader({required this.phoneNumber, required this.contactName});
+
+  void _copyPhone(BuildContext context) {
+    // Copia solo los últimos 10 dígitos (número local sin lada de país ni
+    // sufijos de WhatsApp).
+    final digits = phoneNumber.replaceAll(RegExp(r'\D'), '');
+    final last10 = digits.length > 10
+        ? digits.substring(digits.length - 10)
+        : digits;
+    Clipboard.setData(ClipboardData(text: last10));
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: const Text(
+          'Número copiado al portapapeles',
+          style: TextStyle(
+            color: white,
+            fontSize: 14,
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+        backgroundColor: primaryAqua,
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 2),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        margin: const EdgeInsets.symmetric(horizontal: 40, vertical: 20),
       ),
     );
   }
 
-  String _formatLastMessageTime(DateTime dateTime) {
-    // 'Hace Xd' se calcula por días de calendario, no por bloques de 24h,
-    // para no marcar como "Hace 1d" algo que en calendario fue anteayer.
-    final now = DateTime.now();
-    final today = DateTime(now.year, now.month, now.day);
-    final messageDay = DateTime(dateTime.year, dateTime.month, dateTime.day);
-    final diffDays = today.difference(messageDay).inDays;
+  @override
+  Widget build(BuildContext context) {
+    final hasName = contactName.isNotEmpty;
+    final initial = hasName
+        ? contactName.characters.first.toUpperCase()
+        : (phoneNumber.isEmpty ? '?' : phoneNumber.substring(0, 1));
 
-    if (diffDays <= 0) {
-      final difference = now.difference(dateTime);
-      if (difference.inMinutes < 1) return 'Hace unos segundos';
-      if (difference.inHours < 1) return 'Hace ${difference.inMinutes}m';
-      return 'Hace ${difference.inHours}h';
-    } else if (diffDays < 7) {
-      return 'Hace ${diffDays}d';
-    } else {
-      return '${dateTime.day}/${dateTime.month}/${dateTime.year}';
-    }
+    return Column(
+      children: [
+        Container(
+          width: 80,
+          height: 80,
+          decoration: BoxDecoration(
+            color: primaryAqua.withValues(alpha: 0.2),
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Center(
+            child: Text(
+              initial,
+              style: const TextStyle(
+                color: primaryAqua,
+                fontWeight: FontWeight.w700,
+                fontSize: 36,
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 24),
+        GestureDetector(
+          onTap: () => _copyPhone(context),
+          child: Column(
+            children: [
+              if (hasName) ...[
+                Text(
+                  contactName,
+                  textAlign: TextAlign.center,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
+                    color: white,
+                  ),
+                ),
+                const SizedBox(height: 6),
+              ],
+              Text(
+                phoneNumber,
+                style: hasName
+                    ? const TextStyle(fontSize: 15, color: lightText)
+                    : const TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                        color: white,
+                      ),
+              ),
+              if (!hasName) ...[
+                const SizedBox(height: 8),
+                const Text(
+                  'Contacto de WhatsApp',
+                  style: TextStyle(fontSize: 13, color: lightText),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ],
+    );
   }
 }
 
@@ -408,6 +363,9 @@ class _LabelsSection extends StatelessWidget {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
+      // Con muchas etiquetas la hoja crece: que no se meta bajo la barra
+      // de estado.
+      useSafeArea: true,
       backgroundColor: Colors.transparent,
       builder: (_) => LabelsSelectorSheet(
         accountId: accountId,
@@ -501,52 +459,6 @@ class _LabelsSection extends StatelessWidget {
           ),
         ],
       ),
-    );
-  }
-}
-
-class _InfoRow extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  final String value;
-
-  const _InfoRow({
-    required this.icon,
-    required this.label,
-    required this.value,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      children: [
-        Icon(icon, color: primaryAqua, size: 20),
-        const SizedBox(width: 12),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                label,
-                style: const TextStyle(
-                  fontSize: 12,
-                  color: lightText,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-              const SizedBox(height: 4),
-              Text(
-                value,
-                style: const TextStyle(
-                  fontSize: 14,
-                  color: white,
-                  fontWeight: FontWeight.w500,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ],
     );
   }
 }
