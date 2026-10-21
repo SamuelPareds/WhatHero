@@ -128,6 +128,15 @@ class MessageBubble extends StatefulWidget {
   // Entrante que llegó al número anterior, que quedó recibiendo tras el
   // cambio: la respuesta sale del nuevo y el cliente todavía no lo conoce.
   final bool viaPreviousLine;
+  // Sesión conectada por Meta WhatsApp Cloud API (oculta editar y eliminar
+  // para todos, que Graph API no soporta).
+  final bool isCloudApi;
+  // Plantilla oficial de Meta enviada desde el CRM o vía API.
+  final bool isTemplate;
+  final String? templateName;
+  // Estado de entrega reportado por el webhook de Meta ('sent' | 'delivered' | 'read' | 'failed').
+  final String? deliveryStatus;
+  final String? deliveryError;
 
   const MessageBubble({
     super.key,
@@ -135,6 +144,11 @@ class MessageBubble extends StatefulWidget {
     required this.fromMe,
     this.fromPreviousNumber = false,
     this.viaPreviousLine = false,
+    this.isCloudApi = false,
+    this.isTemplate = false,
+    this.templateName,
+    this.deliveryStatus,
+    this.deliveryError,
     required this.timestamp,
     required this.messageId,
     required this.chatPhone,
@@ -212,23 +226,36 @@ class _MessageBubbleState extends State<MessageBubble> {
     return '$hour:$minute';
   }
 
-  // Etiqueta de autor sobre el bubble (sólo mensajes salientes con senderName).
+  // Etiqueta de autor sobre el bubble (sólo mensajes salientes con senderName
+  // o plantillas oficiales de Meta).
   // 11px, gris claro, alineada a la derecha. Para 'ai' y 'bot' añade un
   // mini-icono distintivo. Para humano (incluye 'WhatsApp') va sin icono
   // para no saturar el chat con respuestas hechas a mano.
   Widget _buildSenderLabel() {
     if (!widget.fromMe) return const SizedBox.shrink();
     final name = widget.senderName;
-    if (name == null || name.isEmpty) return const SizedBox.shrink();
+    if ((name == null || name.isEmpty) && !widget.isTemplate) {
+      return const SizedBox.shrink();
+    }
 
     IconData? icon;
     Color color = lightText.withValues(alpha: 0.65);
-    if (widget.senderType == 'ai') {
+    if (widget.isTemplate) {
+      icon = Icons.verified_outlined;
+      color = primaryAqua.withValues(alpha: 0.85);
+    } else if (widget.senderType == 'ai') {
       icon = Icons.auto_awesome;
       color = primaryAqua.withValues(alpha: 0.75);
     } else if (widget.senderType == 'bot') {
       icon = Icons.smart_toy_outlined;
     }
+
+    final labelText = widget.isTemplate
+        ? [
+            if (name != null && name.isNotEmpty) name,
+            'Plantilla${widget.templateName != null ? ' (${widget.templateName})' : ''}',
+          ].join(' · ')
+        : name!;
 
     return Padding(
       padding: const EdgeInsets.only(right: 12, bottom: 3),
@@ -240,7 +267,7 @@ class _MessageBubbleState extends State<MessageBubble> {
             const SizedBox(width: 3),
           ],
           Text(
-            name,
+            labelText,
             style: TextStyle(
               color: color,
               fontSize: 11,
@@ -254,9 +281,13 @@ class _MessageBubbleState extends State<MessageBubble> {
 
   // Renderiza la imagen del mensaje. El thumbnail base64 (Baileys) actúa como
   // placeholder instantáneo; cuando llega `mediaUrl` desde Storage se monta
-  // el full-res encima sin saltos de layout. Tap → visor con zoom.
+  // el full-res encima sin saltos de layout. En Cloud API no existe thumbnail
+  // base64, por lo que mostramos directo `mediaUrl` con placeholder limpio.
   Widget _buildImageThumb() {
-    final bytes = base64Decode(widget.mediaThumbBase64!);
+    final thumbB64 = widget.mediaThumbBase64;
+    final bytes = (thumbB64 != null && thumbB64.isNotEmpty)
+        ? base64Decode(thumbB64)
+        : null;
     final w = widget.mediaWidth ?? 0;
     final h = widget.mediaHeight ?? 0;
     final aspectRatio = (w > 0 && h > 0) ? (w / h) : 1.0;
@@ -274,12 +305,32 @@ class _MessageBubbleState extends State<MessageBubble> {
             fit: StackFit.expand,
             children: [
               // Placeholder de Fase 1: siempre visible debajo.
-              Image.memory(
-                bytes,
-                fit: BoxFit.cover,
-                gaplessPlayback: true,
-                filterQuality: FilterQuality.medium,
-              ),
+              if (bytes != null)
+                Image.memory(
+                  bytes,
+                  fit: BoxFit.cover,
+                  gaplessPlayback: true,
+                  filterQuality: FilterQuality.medium,
+                )
+              else
+                Container(
+                  color: Colors.black26,
+                  alignment: Alignment.center,
+                  child: !hasFullRes && !isFailed
+                      ? const SizedBox(
+                          width: 22,
+                          height: 22,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            valueColor: AlwaysStoppedAnimation<Color>(primaryAqua),
+                          ),
+                        )
+                      : Icon(
+                          Icons.image_outlined,
+                          size: 28,
+                          color: lightText.withValues(alpha: 0.5),
+                        ),
+                ),
               // Full-res cuando ya está en Storage. Mientras carga, dejamos el
               // thumb visible (loadingBuilder devuelve SizedBox transparente).
               if (hasFullRes)
@@ -958,15 +1009,20 @@ class _MessageBubbleState extends State<MessageBubble> {
     // En vuelo: el mensaje aún no existe en WhatsApp — no hay nada que
     // responder/editar/eliminar.
     if (widget.sendStatus != null) return;
-    // En mensajes con media no tiene sentido editar texto; copiar solo si hay caption.
+    // En mensajes con media, plantillas o Cloud API no tiene sentido editar texto.
     final hasMedia = widget.mediaType != null;
     final canCopy = widget.text.isNotEmpty;
-    final canEdit = widget.fromMe && !hasMedia && !widget.fromPreviousNumber;
+    final canEdit = widget.fromMe &&
+        !hasMedia &&
+        !widget.fromPreviousNumber &&
+        !widget.isCloudApi &&
+        !widget.isTemplate;
     // No permitimos reaccionar a stickers/sólo-media sin contenido si el
     // mensaje fue revocado (no tiene sentido reaccionar a evidencia).
     final canReact = widget.revoked != true && !widget.fromPreviousNumber;
-    // Borrar para todos sólo lo propio de la cuenta que hoy manda.
-    final canDeleteForEveryone = widget.fromMe && !widget.fromPreviousNumber;
+    // Borrar para todos sólo lo propio de la cuenta que hoy manda (y sólo Baileys).
+    final canDeleteForEveryone =
+        widget.fromMe && !widget.fromPreviousNumber && !widget.isCloudApi;
     // Foto o video ya subidos a Storage: se los puede llevar.
     final canTransfer = canTransferMedia(
       mediaType: widget.mediaType,
@@ -1527,7 +1583,10 @@ class _MessageBubbleState extends State<MessageBubble> {
       return _buildStickerBubble();
     }
 
-    final hasImage = widget.mediaType == 'image' && widget.mediaThumbBase64 != null;
+    final hasImage = widget.mediaType == 'image' &&
+        (widget.mediaThumbBase64 != null ||
+            (widget.mediaUrl != null && widget.mediaUrl!.isNotEmpty) ||
+            widget.mediaStatus == 'uploading');
     final isDocument = widget.mediaType == 'document';
     final isAudio = widget.mediaType == 'audio';
     final isVideo = widget.mediaType == 'video';
@@ -1769,7 +1828,30 @@ class _MessageBubbleState extends State<MessageBubble> {
                           ),
                         ),
                       ),
-                    ] else
+                    ] else if (widget.deliveryStatus == 'failed') ...[
+                      const Icon(Icons.error_outline,
+                          size: 14, color: Color(0xFFF87171)),
+                      const SizedBox(width: 4),
+                      Flexible(
+                        child: Text(
+                          widget.deliveryError?.isNotEmpty == true
+                              ? widget.deliveryError!
+                              : 'No entregado por Meta',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Color(0xFFF87171),
+                            fontSize: 11,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ),
+                    ] else if (widget.deliveryStatus == 'read')
+                      const Icon(Icons.done_all, size: 14, color: primaryAqua)
+                    else if (widget.deliveryStatus == 'delivered')
+                      Icon(Icons.done_all,
+                          size: 14, color: lightText.withValues(alpha: 0.7))
+                    else
                       Icon(Icons.done,
                           size: 14, color: lightText.withValues(alpha: 0.7)),
                   ],

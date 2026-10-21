@@ -247,6 +247,13 @@ export async function restartSession(sessionKey: string, accountId: string, reas
   const session = sessions.get(sessionKey);
   if (!session) return; // cancelada mientras esperábamos el timer
 
+  // Las sesiones de Meta Cloud API son HTTP/Webhook puras: no usan archivos
+  // `auth_info` en disco ni socket TCP de Baileys.
+  if (session.provider === 'cloud_api') {
+    session.isReady = true;
+    return;
+  }
+
   // Sin credenciales no hay nada que reconectar: reintentar sólo generaría QRs
   // que nadie va a escanear. Se retira y el estado queda honesto.
   if (!existsSync(`auth_info/${sessionKey}/creds.json`)) {

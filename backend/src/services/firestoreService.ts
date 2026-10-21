@@ -329,12 +329,17 @@ export async function deleteMessageIndexEntry(
 // guarda del borrado: si el doc es una lápida (`deleting_at`) no se escribe
 // nada y se devuelve `deleting`. Va en transacción para que un borrado que
 // arranca entre la lectura y la escritura no quede pisado.
+//
+// `extra` viaja en la misma escritura (Cloud API: `provider`, `cloud_api_*` y el
+// alias que tecleó el owner, que gana sobre el alias por defecto). `failed`
+// dice que no se pudo escribir: quien no puede seguir sin el doc lo mira.
 export async function initializeSession(
   sessionId: string,
   linkedPhone: string,
   sessionKey: string,
   accountId: string,
-): Promise<{ previous?: Record<string, any>; deleting?: true }> {
+  extra: Record<string, unknown> = {},
+): Promise<{ previous?: Record<string, any>; deleting?: true; failed?: true }> {
   try {
     const sessionDocRef = getDb()
       .collection(ACCOUNTS_COLLECTION)
@@ -359,6 +364,7 @@ export async function initializeSession(
       if (!existingData || !existingData.alias) {
         sessionData.alias = defaultSessionAlias(linkedPhone);
       }
+      Object.assign(sessionData, extra);
 
       tx.set(sessionDocRef, sessionData, { merge: true });
       return { previous: existingData };
@@ -375,7 +381,7 @@ export async function initializeSession(
     return result;
   } catch (error) {
     console.error('Error initializing session:', error);
-    return {};
+    return { failed: true };
   }
 }
 
@@ -777,34 +783,43 @@ export async function saveMessageToFirestore(
     // extractMediaInfo() devuelve los campos a persistir si el mensaje contiene
     // image / sticker / document. processMediaAsync() corre fire-and-forget
     // para descargar + subir a Storage + escribir mediaUrl al doc.
+    // En sesiones Cloud API, el adaptador puede adjuntar `__cloudMediaFields`
+    // ya subidos a Storage y `__extraMessageFields` (ej. metadatos de plantilla).
     // ============================================
     const mediaInfo = extractMediaInfo(message);
-    const mediaFields = mediaInfo?.firestoreFields ?? {};
+    const cloudMediaFields: Record<string, any> | undefined = message.__cloudMediaFields;
+    const extraMessageFields: Record<string, any> = message.__extraMessageFields ?? {};
+    const mediaFields: Record<string, any> = {
+      ...(mediaInfo?.firestoreFields ?? {}),
+      ...(cloudMediaFields ?? {}),
+    };
+    const hasAnyMedia = !!mediaInfo || !!cloudMediaFields?.mediaType;
 
     // Guardia anti-burbuja-fantasma: si tras desempaquetar no hay ni texto ni
     // media, el mensaje no tiene nada que renderizar (sobres de sistema, payloads
     // desconocidos, etc.). No escribimos el doc para no crear una burbuja vacía.
     // Las reacciones y protocolos 0/14 ya retornaron antes, así que esto sólo
     // atrapa contenido genuinamente vacío.
-    if (!messageText.trim() && !mediaInfo) {
+    if (!messageText.trim() && !hasAnyMedia) {
       console.log(`[Filter] Mensaje sin contenido renderizable en chat ${phoneNumber}, no se persiste`);
       return;
     }
 
     // Preview que ve el operador en la lista de chats con un icono por tipo.
     const lastMessagePreview = (() => {
-      if (!mediaInfo) return messageText;
-      const isPtt = !!mediaInfo.firestoreFields?.mediaIsPtt;
-      const isGif = !!mediaInfo.firestoreFields?.mediaIsGif;
+      const effectiveMediaType: string | undefined = mediaInfo?.type ?? cloudMediaFields?.mediaType;
+      if (!effectiveMediaType) return messageText;
+      const isPtt = !!(mediaFields.mediaIsPtt);
+      const isGif = !!(mediaFields.mediaIsGif);
       const labels: Record<string, { icon: string; label: string }> = {
         image: { icon: '📷', label: 'Imagen' },
         sticker: { icon: '🏷️', label: 'Sticker' },
-        document: { icon: '📄', label: mediaInfo.fileName ?? 'Documento' },
+        document: { icon: '📄', label: mediaInfo?.fileName ?? cloudMediaFields?.mediaFileName ?? 'Documento' },
         audio: { icon: '🎤', label: isPtt ? 'Nota de voz' : 'Audio' },
         video: { icon: '🎥', label: isGif ? 'GIF' : 'Video' },
       };
-      const { icon, label } = labels[mediaInfo.type];
-      return messageText ? `${icon} ${messageText}` : `${icon} ${label}`;
+      const entry = labels[effectiveMediaType] ?? { icon: '📎', label: 'Archivo' };
+      return messageText ? `${entry.icon} ${messageText}` : `${entry.icon} ${entry.label}`;
     })();
 
     // Use toNumber() to handle potential Long type from protobuf
@@ -887,12 +902,13 @@ export async function saveMessageToFirestore(
       timestamp: msgTimestamp,
       from: message.key.fromMe ? (botJid || 'bot') : phoneNumber,
       fromMe: message.key.fromMe,
-      isMedia: !!mediaInfo,
+      isMedia: hasAnyMedia,
       ...senderFields,
       ...mediaFields,
       ...quoteFields,
       ...secretFields,
       ...previousNumberFields,
+      ...extraMessageFields,
     }, { merge: true });
 
     // Indexar al media_index si aplica (imágenes/videos/docs; no audios ni stickers ni gifs).
@@ -940,6 +956,9 @@ export async function saveMessageToFirestore(
       // preview cuando salió de nosotros (estilo WhatsApp). Viaja en este mismo
       // write, así que no cuesta un write extra.
       lastMessageFromMe: !!message.key.fromMe,
+      // Registro del último mensaje entrante del cliente para calcular con
+      // exactitud la ventana de atención de 24h de Meta Cloud API.
+      ...(!message.key.fromMe && { lastIncomingTimestamp: msgTimestamp }),
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     };
     if (cachedNameForIndex) {
@@ -968,7 +987,9 @@ export async function saveMessageToFirestore(
     // Fase 2/3a: dispara descarga + upload del archivo completo en segundo plano.
     // El mensaje ya quedó visible para el operador (con thumbnail si aplica);
     // el full-res aparece apenas termine el upload (vía Firestore stream).
-    if (mediaInfo && sock) {
+    // En Cloud API (`provider === 'cloud_api'` o `__cloudMediaFields`), el
+    // archivo se sube por la vía de Graph API, no con `downloadMediaMessage` de Baileys.
+    if (mediaInfo && sock && !cloudMediaFields && session.provider !== 'cloud_api') {
       processMediaAsync(message, mediaInfo, sock, accountId, sessionId, phoneNumber, messageId)
         .catch(err => console.error(`[Media] Error en upload de ${mediaInfo.type} ${messageId}:`, err));
     }

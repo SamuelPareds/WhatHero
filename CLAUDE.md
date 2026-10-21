@@ -242,7 +242,9 @@ El operador tiene que poder distinguir de un vistazo lo que **salió** de lo que
 - **En la burbuja el ✓ convive con dos estados en vuelo** que vienen de `PendingMessagesService`: 🕓 `pending` (emitido, sin ack del backend) y ⓘ rojo `failed` ("No se envió"; tap o long-press → Reintentar / Copiar / Eliminar, ver *🔁 Mensajes que no salieron*). El ✓ es el estado confirmado; un mensaje que ya está en Firestore siempre lo tiene.
 - **La lista lee `lastMessageFromMe`** del chat doc, escrito por `saveMessageToFirestore` dentro del `set` que ya hacía (cero writes extra) y recalculado por `recalcChatLastMessage` cuando se borra el último mensaje. **Es `bool?`: `null` en chats sin mensajes nuevos desde que existe el campo** → no se pinta nada y se auto-repara con el siguiente mensaje. No se hizo backfill a propósito: un chat sin actividad es un chat que nadie está mirando.
 
-**Palomitas reales (entregado / leído) son Fase 2 y no están hechas.** Costo real: listener de `messages.update` + `message-receipt.update` (este último obligatorio para grupos, hay que agregar por participante), campo `status` con guarda monotónica (los acks llegan desordenados y un `delivered` tardío no puede pisar un `read`), +2 writes por saliente sobre los 3 actuales —multiplicado por chunk, y la IA manda 2-3 por respuesta— y +2 reads por cliente conectado. Se difiere hasta que un operador pregunte "¿le llegó?", no antes.
+**Excepción: sesiones Cloud API.** Ahí Meta sí manda los acuses por webhook (`deliveryStatus`), así que la burbuja muestra ✓✓ gris al entregarse, ✓✓ aqua al leerse y el error si falló. La guarda monotónica que pide el párrafo de abajo existe (`isDeliveryStatusAdvance`, en una transacción): un `delivered` tardío no pisa un `read`. Para Baileys sigue siendo ✓ sola.
+
+**Palomitas reales (entregado / leído) en Baileys son Fase 2 y no están hechas.** Costo real: listener de `messages.update` + `message-receipt.update` (este último obligatorio para grupos, hay que agregar por participante), campo `status` con guarda monotónica (los acks llegan desordenados y un `delivered` tardío no puede pisar un `read`), +2 writes por saliente sobre los 3 actuales —multiplicado por chunk, y la IA manda 2-3 por respuesta— y +2 reads por cliente conectado. Se difiere hasta que un operador pregunte "¿le llegó?", no antes.
 
 ---
 
@@ -747,6 +749,46 @@ Reglas que no se pueden romper:
 **Lo que queda fuera de nuestro alcance:** pushes ya entregados, logs de Railway, backups/PITR de Firestore, la caché offline de otros dispositivos hasta que sus listeners vean el borrado, y una subida de Storage desde una vista vieja que llegue **después** del job (las reglas de Storage no miran Firestore; cerrarlo exige reglas cruzadas con permiso IAM).
 
 **Fase 2 (no está hecho):** exportar el historial antes de borrar.
+
+---
+
+## ☁️ WhatsApp Cloud API (Meta oficial)
+
+**Ver guía:** `CLOUD_API_GUIDE.md` (probar en dev con túnel, dar de alta un número real, diagnóstico paso a paso).
+
+Una sesión puede ir por QR (Baileys) o por la API oficial de Meta: `provider: 'cloud_api'` en el doc de sesión. Para el resto del backend es una sesión más: `createCloudApiSocket` (`cloudApiService.ts`) imita la forma del socket de Baileys y los mensajes entrantes entran por `POST /webhook/meta` hasta el mismo `handleSessionUpsertedMessage`. El `sessionKey` es `{accountId}_{sessionId}`, no un UUID.
+
+- **Cada cliente trae su propia app de Meta.** Al conectar da Phone Number ID, WABA ID, Access Token y **App Secret**. Una sola app de WhatHero (Tech Provider + Embedded Signup) sería mejor experiencia, pero exige la verificación del negocio y la revisión de Meta. Queda para después.
+- **El access token y el App Secret nunca están en `whatsapp_sessions`.** Viven en `{accounts}/{aid}/cloud_api_secrets/{sid}`, que no tiene regla en `firestore.rules`: ningún cliente los lee, ni el owner (lo fija `rules-tests/`). La app sólo ve `cloud_api_token_hint`. El job de eliminación también los borra.
+
+### El webhook está firmado, y se verifica por sesión
+Antes cualquiera podía mandarle un POST al webhook con el número público de un cliente y meterle mensajes falsos en el CRM, con push y respuesta de la IA incluidos.
+- **`X-Hub-Signature-256`** es el HMAC-SHA256 del cuerpo **crudo** con la clave secreta de la app que manda el webhook. La ruta guarda los bytes con el `verify` de `express.json`: re-serializar el JSON parseado no da los mismos.
+- **La firma se verifica por cambio, con el App Secret de la sesión a la que va** (`isSignedBySessionApp`), no una vez por request con un secreto global. Cada cliente firma con la clave de su app, y conocer la propia no le sirve para meter cambios en el número de otro (lo fija un test).
+- **La ruta responde 200 siempre** y lo no firmado se descarta al procesar, con un warn por sesión cada 10 min (`¿El App Secret guardado es el de la app que manda el webhook?`).
+- **El alta valida el App Secret con `appsecret_proof`**: Graph rechaza la consulta si la clave no es la de la app que emitió el token. Un App Secret mal copiado falla en la hoja, y no después con los webhooks de esa sesión descartados en silencio. "Actualizar credenciales" puede dejarlo vacío para conservar el guardado.
+- **`META_APP_SECRET` es opcional:** sirve de respaldo para sesiones sin clave propia (la futura app de WhatHero). **Sin ninguna clave, producción descarta los webhooks de esa sesión** y lo avisa al hidratarla. En desarrollo los acepta con un aviso, para probar con un túnel.
+- **El webhook se asigna sólo por `phone_number_id`.** Nunca por `display_phone_number`: es público y puede coincidir con una sesión de otra cuenta.
+- **Para probar en dev hace falta un túnel.** Meta no llega a `localhost`, y la URL de Railway es producción: no conoce las sesiones de `accounts_dev`. Se abre con `cloudflared tunnel --url http://localhost:3000` y se pega `https://<túnel>/webhook/meta` en Meta. La hoja de conexión muestra la URL si la app corre con `--dart-define=WEBHOOK_PUBLIC_URL=https://<túnel>`. Con la app de Meta sin publicar, sólo llegan los webhooks de prueba del panel.
+
+### El alta no escribe a ciegas (`decideCloudApiTarget`, tests en `cloudApiService.test.ts`)
+`connectCloudApiSession` escribía `set(merge)` sobre `{dígitos}` sin mirar qué había ahí: pisaba lápidas, convertía en Cloud API una sesión QR viva del mismo número y dejaba conectar el mismo `phone_number_id` en dos cuentas (el webhook entregaba los mensajes de una empresa en el CRM de la otra). Ahora: verificar con Meta → decidir → suscribir la app al WABA → secreto → doc.
+- Rechaza (409, con `reason` y un mensaje para la hoja) `wrong_number`, `deleting`, `phone_number_id_in_use`, `in_use`, `number_replaced` y `qr_session_exists`. Son las mismas reglas que el QR (ver *📲 Cambiar de número*).
+- **"Actualizar credenciales" manda `intoSessionId`.** Las credenciales de otro número se rechazan (`wrong_number`) en vez de abrir una segunda sesión.
+- **Las plantillas mandan `tempId`** (uno por plantilla elegida, el mismo en cada reintento): si el envío vence por timeout pero salió, `sendDedupe` devuelve ese mensaje en vez de mandarle (y cobrarle) la plantilla dos veces al cliente. `/send-template` exige `languageCode` (no adivina `en_US`) y acceso a la sesión.
+- **El alta suscribe la app del cliente a su WABA** (`subscribeAppToWaba`: `POST /{waba}/subscribed_apps`, idempotente). Meta sólo entrega los eventos de un WABA a las apps suscritas a él. En la primera prueba (21-oct-2026) todo estaba en verde, enviar funcionaba y no llegaba ni un mensaje del cliente. Antes de suscribir comprueba que el Phone Number ID sea de ese WABA: con un WABA equivocado la sesión quedaría igual de muda. Si Meta no deja (token sin `whatsapp_business_management`), el alta falla con la explicación en vez de quedar "conectada" sin recibir. **El campo `messages` del webhook lo sigue activando el cliente** en su app: es configuración de la app, no del WABA.
+- **El doc lo escribe `initializeSession`** (con `extra` para los campos `cloud_api_*`): no escribe sobre una lápida, pone `connected_at` (por ahí ordena "Mis Cuentas") y levanta `isSessionGone`. El secreto va **antes** que el doc, para que el doc nunca diga "connected" sin un token con el que hidratarlo.
+
+### Hidratación (`loadCloudApiSessionsOnBoot`)
+Al arrancar se cargan en memoria todas las sesiones Cloud API (`listDocuments`, para incluir cuentas sin doc propio).
+- **Salta lápidas** (`deleting_at` / `isSessionGone`). Miraba un campo `deleting` que no existe: una sesión eliminada volvía a la vida y sus mensajes recreaban el subárbol que el job estaba borrando.
+- **No recrea las que ya están en memoria** (perderían `contactNames`, `pendingSenders`, `aiConfig`). El `status` lo escribe `writeSessionStatus`, como a todas.
+- **Un `phone_number_id` desconocido recarga a lo sumo una vez cada 5 min.** Antes cada webhook desconocido releía todas las cuentas. Pasa todo el tiempo: el número de prueba conectado en dev con el webhook de Meta apuntando a Railway.
+
+### Pendiente: un miembro restringido crea sesiones que no puede ver
+21-oct-2026: un miembro con sesiones específicas agregó un número por Cloud API, el backend respondió OK y el número no apareció en su "Mis Cuentas". Una sesión nueva nace sin `allowedUids` y sin grant en `members/{uid}.access.sessions`, así que `visibleSessionsQuery` no se la devuelve. **Con QR pasa lo mismo desde antes.** Falta decidir quién puede agregar números: sólo owner y acceso total, o que quien lo agrega reciba acceso. Mientras tanto, si alguien dice "lo conecté y no aparece", lo primero es preguntar con qué usuario entró.
+
+**Fase 2 (no está hecho):** una app de WhatHero con Embedded Signup (Tech Provider), pasar una sesión QR a Cloud API conservando el historial (`qr_session_exists`), mandar `appsecret_proof` en todas las llamadas a Graph (hoy sólo en el alta: un cliente con "Exigir clave secreta de la app" activado no podría enviar), chequeo de acceso por sesión en `/send-message` (`/send-template` ya lo tiene) y un `logout` en el adaptador (hoy, al eliminar una sesión Cloud API, la app pide cerrar WhatHero en *Dispositivos vinculados*, que no aplica).
 
 ---
 

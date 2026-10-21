@@ -26,6 +26,22 @@ String describeSendError(String? raw) {
   if (raw.contains('Session not ready') || raw.contains('Connection Closed')) {
     return 'WhatsApp no está conectado';
   }
+  // Errores frecuentes de Meta WhatsApp Cloud API traducidos para el operador:
+  if (raw.contains('131047') || raw.toLowerCase().contains('re-engagement')) {
+    return 'Pasaron más de 24 h desde el último mensaje del cliente. Envía una plantilla aprobada para reabrir la conversación.';
+  }
+  if (raw.contains('131030') || raw.toLowerCase().contains('not in allowed list')) {
+    return 'El número destino no está en la lista de números de prueba permitidos en Meta Developers (en México/Argentina verifica también el prefijo 521/52).';
+  }
+  if (raw.contains('131026')) {
+    return 'El número destino no tiene WhatsApp activo o no puede recibir este mensaje.';
+  }
+  if (raw.contains('[Meta #190]') || raw.toLowerCase().contains('access token')) {
+    return 'El Access Token de Meta expiró o es inválido. Actualízalo en Ajustes de la sesión.';
+  }
+  if (raw.contains('132000') || raw.contains('132001')) {
+    return 'La plantilla o sus variables no coinciden con la configuración aprobada en Meta.';
+  }
   if (RegExp(r'^HTTP 5\d\d').hasMatch(raw)) return 'Error del servidor';
   if (raw.contains('SocketException') ||
       raw.contains('ClientException') ||

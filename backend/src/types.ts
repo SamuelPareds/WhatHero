@@ -49,6 +49,18 @@ export interface SessionData {
   numberChangedAt?: number;
   reconnectCount: number;
   accountId: string;
+  // Proveedor del transporte de WhatsApp: 'baileys' (QR Web) por defecto o
+  // 'cloud_api' (Meta WhatsApp Cloud API oficial).
+  provider?: 'baileys' | 'cloud_api';
+  cloudApi?: {
+    phoneNumberId: string;
+    wabaId: string;
+    accessToken: string;
+    // Clave secreta de la app de Meta del cliente: firma sus webhooks. Cada
+    // cliente trae su propia app, así que no hay un secreto global.
+    appSecret?: string;
+    verifiedName?: string;
+  };
 
   // --- Supervisión de la conexión (ver services/sessionSupervisor.ts) ---
   // Contador monotónico de sockets creados para esta sessionKey. Cada

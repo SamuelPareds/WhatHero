@@ -257,6 +257,16 @@ async function runDeletionJob(accountId: string, sessionId: string, deletingAtMs
   }
 
   await revokeMemberGrants(accountId, sessionId);
+  // Limpiar también el secreto de Cloud API (si existía) guardado fuera de whatsapp_sessions.
+  await requireDeps()
+    .db.collection(ACCOUNTS_COLLECTION)
+    .doc(accountId)
+    .collection('cloud_api_secrets')
+    .doc(sessionId)
+    .delete()
+    .catch((err) => {
+      console.warn(`[Eliminar] ${sessionId}: no se pudo borrar cloud_api_secrets:`, err);
+    });
   await ref.delete();
 
   console.log(`[Eliminar] ✅ ${sessionId} (cuenta ${accountId}) eliminada por completo.`);

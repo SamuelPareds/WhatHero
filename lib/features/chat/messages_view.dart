@@ -23,6 +23,7 @@ import 'internal_timeline.dart';
 import 'jump_to_message.dart';
 import 'number_change_divider.dart';
 import 'reply_collision.dart';
+import 'widgets/cloud_api_template_sheet.dart';
 import 'widgets/internal_message_card.dart';
 import 'widgets/message_bubble.dart';
 import 'widgets/team_presence_banner.dart';
@@ -52,6 +53,9 @@ class MessagesView extends StatefulWidget {
   // esté apagado. Si es false, el botón queda en estado "sin config" y guía
   // al usuario a SessionSettingsPanel.
   final bool sessionAiHasCredentials;
+  // Sesión conectada mediante Meta WhatsApp Cloud API (habilita plantillas
+  // oficiales de Meta y el indicador de ventana de atención de 24h).
+  final bool isCloudApi;
 
   // Salto a un mensaje concreto (deep-link desde el buscador). Con el timestamp
   // se calcula cuánto historial cargar para incluirlo; null = abrir normal.
@@ -74,6 +78,7 @@ class MessagesView extends StatefulWidget {
     required this.accountId,
     required this.sessionAiEnabled,
     required this.sessionAiHasCredentials,
+    this.isCloudApi = false,
     this.jumpToMessageId,
     this.jumpToTimestamp,
     this.onJumpConsumed,
@@ -89,6 +94,9 @@ class MessagesView extends StatefulWidget {
 class _MessagesViewState extends State<MessagesView> {
   final TextEditingController _messageController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
+  // En sesiones Cloud API, indica si el cliente escribió en las últimas 24 horas
+  // (ventana de servicio al cliente de Meta abierta para texto libre).
+  final ValueNotifier<bool> _hasRecentCustomerMessage = ValueNotifier<bool>(false);
   
   // 📌 Paginación / Infinite Scroll
   int _messageLimit = 30;
@@ -367,6 +375,7 @@ class _MessagesViewState extends State<MessagesView> {
     _qrScroll.dispose();
     _replyDraft.dispose();
     _isFollowupChat.dispose();
+    _hasRecentCustomerMessage.dispose();
     _inputFocusNode.dispose();
     super.dispose();
   }
@@ -1242,6 +1251,22 @@ class _MessagesViewState extends State<MessagesView> {
           mainAxisSize: MainAxisSize.min,
           children: [
             const SizedBox(height: 8),
+            if (widget.isCloudApi)
+              ListTile(
+                leading: const Icon(Icons.article_outlined, color: primaryAqua),
+                title: const Text(
+                  'Plantilla oficial de WhatsApp (Meta)',
+                  style: TextStyle(color: white, fontWeight: FontWeight.w600),
+                ),
+                subtitle: Text(
+                  'Inicia conversación o envía fuera de la ventana de 24h',
+                  style: TextStyle(color: lightText.withValues(alpha: 0.75), fontSize: 12),
+                ),
+                onTap: () {
+                  Navigator.pop(sheetCtx);
+                  _openTemplateSheet();
+                },
+              ),
             ListTile(
               leading: const Icon(Icons.photo_library_outlined, color: primaryAqua),
               title: const Text('Galería (foto o video)', style: TextStyle(color: white)),
@@ -1262,6 +1287,17 @@ class _MessagesViewState extends State<MessagesView> {
           ],
         ),
       ),
+    );
+  }
+
+  Future<void> _openTemplateSheet() async {
+    final sKey = widget.sessionKey;
+    if (sKey == null || sKey == 'disconnected') return;
+    await showCloudApiTemplateSheet(
+      context,
+      accountId: widget.accountId,
+      sessionId: widget.sessionId,
+      chatPhone: widget.phoneNumber,
     );
   }
 
@@ -2114,6 +2150,11 @@ class _MessagesViewState extends State<MessagesView> {
       fromMe: fromMe,
       fromPreviousNumber: isFromPreviousNumber(msgDate, widget.numberHistory, previousNumber: previousNumber),
       viaPreviousLine: previousNumber != null && !fromMe,
+      isCloudApi: widget.isCloudApi,
+      isTemplate: (data['isTemplate'] as bool?) ?? false,
+      templateName: data['templateName'] as String?,
+      deliveryStatus: data['deliveryStatus'] as String?,
+      deliveryError: data['deliveryError'] as String?,
       timestamp: msgDate,
       messageId: msg.id,
       chatPhone: widget.phoneNumber,
@@ -2182,6 +2223,29 @@ class _MessagesViewState extends State<MessagesView> {
               
               final messages = snapshot.data!.docs;
               _detectCollision(snapshot.data!);
+
+              // En sesiones Cloud API, verificamos si hay al menos un mensaje
+              // entrante del cliente en las últimas 24 horas (ventana de
+              // atención gratuita para responder con texto libre).
+              if (widget.isCloudApi) {
+                final cutoff = DateTime.now().subtract(const Duration(hours: 24));
+                var hasRecentIncoming = false;
+                for (final d in messages) {
+                  final map = d.data() as Map<String, dynamic>;
+                  if (map['fromMe'] == false) {
+                    final ts = (map['timestamp'] as Timestamp?)?.toDate();
+                    if (ts != null && ts.isAfter(cutoff)) {
+                      hasRecentIncoming = true;
+                    }
+                    break; // Vienen ordenados desc por timestamp.
+                  }
+                }
+                if (_hasRecentCustomerMessage.value != hasRecentIncoming) {
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    if (mounted) _hasRecentCustomerMessage.value = hasRecentIncoming;
+                  });
+                }
+              }
               
               // Si nos devuelven menos de lo que pedimos, es que ya no hay más mensajes en el servidor
               if (messages.length < _messageLimit) {
@@ -2302,6 +2366,7 @@ class _MessagesViewState extends State<MessagesView> {
                         key: ValueKey(p.tempId),
                         text: p.text,
                         fromMe: true,
+                        isCloudApi: widget.isCloudApi,
                         timestamp: p.timestamp,
                         messageId: p.tempId,
                         chatPhone: widget.phoneNumber,
@@ -2481,6 +2546,73 @@ class _MessagesViewState extends State<MessagesView> {
                     // 🔒 Modo interno: a quién se avisa y qué ve el cliente
                     // (nada).
                     if (_internalMode) _internalStrip(),
+                    // ☁️ Cloud API: aviso de ventana de atención de 24h cuando
+                    // el cliente aún no ha escrito (o pasaron >24h desde su
+                    // último mensaje). Permite abrir el selector de plantillas
+                    // con un toque sin bloquear el input.
+                    if (widget.isCloudApi && !_internalMode)
+                      ValueListenableBuilder<bool>(
+                        valueListenable: _hasRecentCustomerMessage,
+                        builder: (context, hasRecent, _) {
+                          if (hasRecent) return const SizedBox.shrink();
+                          return Container(
+                            margin: const EdgeInsets.only(bottom: 8),
+                            padding: const EdgeInsets.fromLTRB(10, 7, 6, 7),
+                            decoration: BoxDecoration(
+                              color: primaryAqua.withValues(alpha: 0.08),
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(
+                                color: primaryAqua.withValues(alpha: 0.25),
+                              ),
+                            ),
+                            child: Row(
+                              children: [
+                                const Icon(
+                                  Icons.verified_outlined,
+                                  size: 16,
+                                  color: primaryAqua,
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Text(
+                                    'Ventana de 24h cerrada · Usa una plantilla oficial para iniciar o retomar',
+                                    style: TextStyle(
+                                      color: white.withValues(alpha: 0.9),
+                                      fontSize: 12,
+                                      height: 1.25,
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 6),
+                                TextButton.icon(
+                                  onPressed: _isSending ? null : _openTemplateSheet,
+                                  icon: const Icon(Icons.send_rounded, size: 13),
+                                  label: const Text(
+                                    'Plantilla',
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                  style: TextButton.styleFrom(
+                                    foregroundColor: darkBg,
+                                    backgroundColor: primaryAqua,
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 10,
+                                      vertical: 6,
+                                    ),
+                                    minimumSize: const Size(0, 28),
+                                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(8),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
                     // Selector de respuestas rápidas ("/"): arriba de todo,
                     // pegado al composer y navegable con ↑/↓ + Enter.
                     _quickResponsesPanel(),
@@ -2603,12 +2735,24 @@ class _MessagesViewState extends State<MessagesView> {
                           // En modo interno tampoco: los internos son sólo texto.
                           child: (hasText || _internalMode)
                               ? const SizedBox(key: ValueKey('attach-hidden'))
-                              : IconButton(
+                              : Row(
                                   key: const ValueKey('attach-btn'),
-                                  icon: const Icon(Icons.attach_file_rounded, size: 22),
-                                  color: lightText,
-                                  tooltip: 'Adjuntar archivo',
-                                  onPressed: _isSending ? null : _showAttachmentMenu,
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    IconButton(
+                                      icon: const Icon(Icons.attach_file_rounded, size: 22),
+                                      color: lightText,
+                                      tooltip: 'Adjuntar archivo',
+                                      onPressed: _isSending ? null : _showAttachmentMenu,
+                                    ),
+                                    if (widget.isCloudApi)
+                                      IconButton(
+                                        icon: const Icon(Icons.article_outlined, size: 20),
+                                        color: primaryAqua,
+                                        tooltip: 'Enviar plantilla de Meta',
+                                        onPressed: _isSending ? null : _openTemplateSheet,
+                                      ),
+                                  ],
                                 ),
                         );
                       },

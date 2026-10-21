@@ -2003,6 +2003,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                       accountId: widget.accountId,
                       sessionAiEnabled: sessionAiEnabled,
                       sessionAiHasCredentials: sessionAiHasCredentials,
+                      isCloudApi: sessionData?['provider'] == 'cloud_api',
                       sessionPhone: sessionPhone(sessionData, widget.sessionId!),
                       numberHistory: parseNumberHistory(sessionData?['number_history']),
                       jumpToMessageId: _jumpToMessageId,

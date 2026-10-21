@@ -89,6 +89,7 @@ beforeEach(async () => {
       for (const sid of [S1, S2, TOMB]) {
         await setDoc(doc(db, ...account, 'whatsapp_sessions', sid, 'chats', 'c1'), { name: 'Cliente' });
       }
+      await setDoc(doc(db, ...account, 'cloud_api_secrets', S1), { accessToken: 'EAA-secreto' });
     }
   });
 });
@@ -162,6 +163,20 @@ for (const root of ['accounts', 'accounts_dev']) {
       await assertFails(updateDoc(session(db, TOMB), { alias: 'x' }));
       await assertFails(setDoc(chat(db, TOMB, 'c2'), { name: 'Huérfano' }));
       await assertSucceeds(getDoc(chat(db, TOMB)));
+    });
+  });
+
+  describe(`${root}: secretos de Cloud API (sólo el backend)`, () => {
+    // El access token de Meta manda mensajes en nombre de la empresa: ningún
+    // cliente lo lee, ni el owner. La app sólo ve `cloud_api_token_hint`.
+    it('nadie lee, lista ni escribe cloud_api_secrets desde el cliente', async () => {
+      for (const uid of [OWNER, RESTRICTED, FULL, LEGACY, OUTSIDER]) {
+        const db = dbAs(uid);
+        const secret = doc(db, root, OWNER, 'cloud_api_secrets', S1);
+        await assertFails(getDoc(secret));
+        await assertFails(getDocs(collection(db, root, OWNER, 'cloud_api_secrets')));
+        await assertFails(setDoc(secret, { accessToken: 'robado' }));
+      }
     });
   });
 

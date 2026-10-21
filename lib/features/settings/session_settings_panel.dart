@@ -13,6 +13,7 @@ import 'package:crm_whatsapp/core/services/storage_service.dart';
 import 'package:crm_whatsapp/core/utils/phone_input.dart';
 import 'package:crm_whatsapp/core/utils/session_phone.dart';
 import '../accounts/change_number/change_number_flow.dart';
+import '../accounts/connect_cloud_api_sheet.dart';
 import '../accounts/link_result.dart';
 import '../chat/number_change_divider.dart';
 import '../chat/widgets/label_editor_dialog.dart';
@@ -101,8 +102,30 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
   String? _disconnectingLine;
   TimeOfDay _followupScheduledTime = const TimeOfDay(hour: 9, minute: 0);
 
+  // Metadatos de WhatsApp Cloud API (Meta Oficial)
+  bool _isCloudApi = false;
+  String? _cloudApiPhoneNumberId;
+  String? _cloudApiWabaId;
+  String? _cloudApiVerifiedName;
+  String? _cloudApiTokenHint;
+
   bool _isSaving = false;
   bool _isLoading = true;
+
+  Future<void> _openCloudApiConfig() async {
+    final result = await showConnectCloudApiSheet(
+      context,
+      accountId: widget.accountId,
+      intoSessionId: widget.sessionId,
+      initialPhoneNumberId: _cloudApiPhoneNumberId,
+      initialWabaId: _cloudApiWabaId,
+      initialAlias: _aliasController.text.trim(),
+      tokenHint: _cloudApiTokenHint,
+    );
+    if (result != null && mounted) {
+      await _loadSettings();
+    }
+  }
 
   @override
   void initState() {
@@ -139,6 +162,11 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
         final data = doc.data() ?? {};
         setState(() {
           _linkedPhone = sessionPhone(data, widget.sessionId);
+          _isCloudApi = data['provider'] == 'cloud_api';
+          _cloudApiPhoneNumberId = data['cloud_api_phone_number_id'] as String?;
+          _cloudApiWabaId = data['cloud_api_waba_id'] as String?;
+          _cloudApiVerifiedName = data['cloud_api_verified_name'] as String?;
+          _cloudApiTokenHint = data['cloud_api_token_hint'] as String?;
           _numberHistory = parseNumberHistory(data['number_history']);
           _previousLines = data['previous_lines'] is Map
               ? Map<String, dynamic>.from(data['previous_lines'] as Map)
@@ -147,7 +175,9 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
           _pausedAutomations = change is Map && change['pausedAutomations'] is List
               ? (change['pausedAutomations'] as List).whereType<String>().toList()
               : const [];
-          _aliasController.text = data['alias'] ?? 'Sucursal - ${_linkedPhone ?? widget.sessionId}';
+          _aliasController.text = data['alias'] ??
+              _cloudApiVerifiedName ??
+              'Sucursal - ${_linkedPhone ?? widget.sessionId}';
           _aiEnabled = data['ai_enabled'] ?? false;
           _selectedProvider = data['ai_provider'] ?? 'gemini';
           _apiKeyController.text = data['ai_api_key'] ?? '';
@@ -424,16 +454,40 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
           const SizedBox(height: 16),
           _infoTile('Número Vinculado', displayPhone(_linkedPhone ?? widget.sessionId), Icons.chat_bubble_outline),
           _infoTile('ID de Sesión', widget.sessionId, Icons.fingerprint),
-          if (_numberHistory.isNotEmpty) _buildPreviousNumbers(),
-          if (AccountContextService().isOwner)
+          if (_isCloudApi) ...[
+            _infoTile(
+              'Proveedor',
+              'Meta WhatsApp Cloud API (${_cloudApiVerifiedName ?? 'Oficial'})',
+              Icons.cloud_done_rounded,
+            ),
+            if (_cloudApiPhoneNumberId != null && _cloudApiPhoneNumberId!.isNotEmpty)
+              _infoTile('Phone Number ID', _cloudApiPhoneNumberId!, Icons.pin_outlined),
+            if (_cloudApiWabaId != null && _cloudApiWabaId!.isNotEmpty)
+              _infoTile('WABA ID', _cloudApiWabaId!, Icons.business_outlined),
+            const SizedBox(height: 8),
             Align(
               alignment: Alignment.centerLeft,
               child: TextButton.icon(
-                onPressed: _openChangeNumber,
-                icon: const Icon(Icons.swap_horiz, color: primaryAqua, size: 20),
-                label: const Text('Cambiar a un número nuevo', style: TextStyle(color: primaryAqua)),
+                onPressed: _openCloudApiConfig,
+                icon: const Icon(Icons.key_rounded, color: primaryAqua, size: 20),
+                label: const Text(
+                  'Actualizar Access Token / Ver Webhook de Meta',
+                  style: TextStyle(color: primaryAqua),
+                ),
               ),
             ),
+          ] else ...[
+            if (_numberHistory.isNotEmpty) _buildPreviousNumbers(),
+            if (AccountContextService().isOwner)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  onPressed: _openChangeNumber,
+                  icon: const Icon(Icons.swap_horiz, color: primaryAqua, size: 20),
+                  label: const Text('Cambiar a un número nuevo', style: TextStyle(color: primaryAqua)),
+                ),
+              ),
+          ],
           const SizedBox(height: 32),
           _sectionTitle('Sincronización con WhatsApp'),
           const SizedBox(height: 8),

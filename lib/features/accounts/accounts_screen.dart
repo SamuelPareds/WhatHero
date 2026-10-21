@@ -12,6 +12,7 @@ import 'package:crm_whatsapp/core/utils/session_deletion.dart';
 import 'package:crm_whatsapp/core/utils/session_phone.dart';
 import 'package:crm_whatsapp/features/auth.dart';
 import 'package:crm_whatsapp/features/accounts/change_number/change_number_flow.dart';
+import 'package:crm_whatsapp/features/accounts/connect_cloud_api_sheet.dart';
 import 'package:crm_whatsapp/features/accounts/link_result.dart';
 import 'package:crm_whatsapp/features/accounts/session_linking.dart';
 import 'package:crm_whatsapp/features/members/members_screen.dart';
@@ -87,12 +88,121 @@ class _AccountsScreenState extends State<AccountsScreen> {
   // nuevo reemplaza a uno de estos sin abrir otra consulta.
   List<QueryDocumentSnapshot> _sessions = const [];
 
-  /// FAB "Agregar número". Si ya hay sesiones, el owner elige antes del QR si
-  /// el número reemplaza a otro: es el momento natural de quien perdió su
-  /// línea, y si lo vincula suelto y empieza a trabajar ahí, después ya no se
-  /// pueden juntar los dos historiales.
+  Future<void> _openCloudApiConnect({
+    String? intoSessionId,
+    String? initialPhoneNumberId,
+    String? initialWabaId,
+    String? initialAlias,
+    String? tokenHint,
+  }) async {
+    final result = await showConnectCloudApiSheet(
+      context,
+      accountId: widget.accountId,
+      intoSessionId: intoSessionId,
+      initialPhoneNumberId: initialPhoneNumberId,
+      initialWabaId: initialWabaId,
+      initialAlias: initialAlias,
+      tokenHint: tokenHint,
+    );
+    if (result == null || !mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          '✅ WhatsApp Cloud API conectado: ${result.verifiedName} (${result.displayPhoneNumber})',
+        ),
+        backgroundColor: accentAqua,
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  /// FAB "Agregar número". Primero permite elegir entre vincular por QR
+  /// (WhatsApp Web tradicional) o conectar vía WhatsApp Cloud API (Meta Oficial
+  /// o número de prueba de Meta).
   Future<void> _onAddNumber() async {
-    if (!AccountContextService().isOwner || _sessions.isEmpty) {
+    final mode = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: surfaceDark,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (sheetContext) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 18, 12, 12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 12),
+                child: Text(
+                  'Conectar número de WhatsApp',
+                  style: TextStyle(color: white, fontSize: 18, fontWeight: FontWeight.w700),
+                ),
+              ),
+              const Padding(
+                padding: EdgeInsets.fromLTRB(12, 4, 12, 12),
+                child: Text(
+                  'Elige cómo deseas conectar la línea a WhatHero:',
+                  style: TextStyle(color: lightText, fontSize: 13),
+                ),
+              ),
+              ListTile(
+                leading: Container(
+                  width: 40,
+                  height: 40,
+                  decoration: BoxDecoration(
+                    color: primaryAqua.withValues(alpha: 0.16),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: const Icon(Icons.qr_code_scanner_rounded, color: primaryAqua),
+                ),
+                title: const Text(
+                  'Vincular con código QR (WhatsApp Celular)',
+                  style: TextStyle(color: white, fontWeight: FontWeight.w600),
+                ),
+                subtitle: const Text(
+                  'Escanea desde Dispositivos vinculados en tu celular',
+                  style: TextStyle(color: lightText, fontSize: 12),
+                ),
+                onTap: () => Navigator.pop(sheetContext, 'qr'),
+              ),
+              const Divider(color: Colors.white12),
+              ListTile(
+                leading: Container(
+                  width: 40,
+                  height: 40,
+                  decoration: BoxDecoration(
+                    color: accentAqua.withValues(alpha: 0.16),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: const Icon(Icons.cloud_done_rounded, color: accentAqua),
+                ),
+                title: const Text(
+                  'WhatsApp Cloud API (Meta Oficial / Número de prueba)',
+                  style: TextStyle(color: white, fontWeight: FontWeight.w600),
+                ),
+                subtitle: const Text(
+                  'Conecta con Phone Number ID, WABA ID y Access Token para enviar plantillas y responder sin riesgo de bloqueo',
+                  style: TextStyle(color: lightText, fontSize: 12),
+                ),
+                onTap: () => Navigator.pop(sheetContext, 'cloud_api'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    if (mode == null || !mounted) return;
+    if (mode == 'cloud_api') {
+      await _openCloudApiConnect();
+      return;
+    }
+
+    final baileysSessions = _sessions.where((d) => _dataOf(d)['provider'] != 'cloud_api').toList();
+    if (!AccountContextService().isOwner || baileysSessions.isEmpty) {
       await linkWhatsApp(context, accountId: widget.accountId);
       return;
     }
@@ -125,7 +235,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
                   style: TextStyle(color: lightText, fontSize: 13),
                 ),
               ),
-              for (final doc in _sessions)
+              for (final doc in baileysSessions)
                 ListTile(
                   leading: const Icon(Icons.swap_horiz, color: primaryAqua),
                   title: Text(_aliasOf(doc), style: const TextStyle(color: white)),
@@ -158,6 +268,17 @@ class _AccountsScreenState extends State<AccountsScreen> {
   /// mismo número o uno nuevo; un miembro del equipo sólo puede reconectar el
   /// mismo (cambiar el número es decisión del dueño).
   Future<void> _onRelink(String sessionId, Map<String, dynamic> data) async {
+    if (data['provider'] == 'cloud_api') {
+      await _openCloudApiConnect(
+        intoSessionId: sessionId,
+        initialPhoneNumberId: data['cloud_api_phone_number_id'] as String?,
+        initialWabaId: data['cloud_api_waba_id'] as String?,
+        initialAlias: data['alias'] as String?,
+        tokenHint: data['cloud_api_token_hint'] as String?,
+      );
+      return;
+    }
+
     final phone = sessionPhone(data, sessionId);
     final alias = (data['alias'] as String?) ?? displayPhone(phone);
 
@@ -260,7 +381,10 @@ class _AccountsScreenState extends State<AccountsScreen> {
   static String _aliasOf(DocumentSnapshot doc) {
     final data = _dataOf(doc);
     final alias = data['alias'];
-    return alias is String && alias.trim().isNotEmpty ? alias : displayPhone(sessionPhone(data, doc.id));
+    if (alias is String && alias.trim().isNotEmpty) return alias;
+    final verifiedName = data['cloud_api_verified_name'];
+    if (verifiedName is String && verifiedName.trim().isNotEmpty) return verifiedName;
+    return displayPhone(sessionPhone(data, doc.id));
   }
 
   @override
@@ -464,13 +588,46 @@ class _AccountsScreenState extends State<AccountsScreen> {
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              Text(
-                                alias,
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.w600,
-                                  fontSize: 16,
-                                  color: white,
-                                ),
+                              Row(
+                                children: [
+                                  Flexible(
+                                    child: Text(
+                                      alias,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.w600,
+                                        fontSize: 16,
+                                        color: white,
+                                      ),
+                                    ),
+                                  ),
+                                  if (data['provider'] == 'cloud_api') ...[
+                                    const SizedBox(width: 8),
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                                      decoration: BoxDecoration(
+                                        color: primaryAqua.withValues(alpha: 0.16),
+                                        borderRadius: BorderRadius.circular(6),
+                                        border: Border.all(color: primaryAqua.withValues(alpha: 0.35)),
+                                      ),
+                                      child: const Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Icon(Icons.cloud_done_rounded, size: 12, color: primaryAqua),
+                                          SizedBox(width: 4),
+                                          Text(
+                                            'Cloud API',
+                                            style: TextStyle(
+                                              fontSize: 10.5,
+                                              fontWeight: FontWeight.w700,
+                                              color: primaryAqua,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ],
+                                ],
                               ),
                               const SizedBox(height: 4),
                               Text(

@@ -212,7 +212,7 @@ export function isAiSentMessage(messageId: string): boolean {
   return aiSentMessageIds.has(messageId);
 }
 
-function rememberAiSentMessage(messageId: string): void {
+export function rememberAiSentMessage(messageId: string): void {
   aiSentMessageIds.add(messageId);
   setTimeout(() => aiSentMessageIds.delete(messageId), AI_SENT_ID_TTL_MS);
 }

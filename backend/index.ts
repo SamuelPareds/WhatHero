@@ -85,6 +85,16 @@ import { resolveHumanSender, BOT_SENDER, invalidateHumanNameCache } from './src/
 import { initPresence, registerPresenceHandlers, revalidatePresenceAccess, isComposingIn } from './src/services/presenceService';
 import { canAccessSession, invalidateMemberAccess } from './src/services/memberAccess';
 import { parseInternalMessageInput, parseInternalDeleteInput, listTeammates, createInternalMessage, deleteInternalMessage } from './src/services/internalMessages';
+import {
+  initCloudApiService,
+  getMetaWebhookVerifyToken,
+  connectCloudApiSession,
+  loadCloudApiSessionsOnBoot,
+  listMetaTemplates,
+  sendMetaTemplate,
+  handleMetaWebhookPayload,
+  CloudApiError,
+} from './src/services/cloudApiService';
 
 // Ensure auth_info directory exists
 const authInfoDir = 'auth_info';
@@ -750,57 +760,98 @@ async function startSession(sessionKey: string, accountId: string, linkIntent?: 
     }
   });
 
-  // Lo que llega por la línea anterior ya quedó guardado (con `previousNumber`)
-  // en el mismo chat de siempre. Acá sólo se avisa: queda pendiente y sale un
-  // push para que alguien le conteste desde el número nuevo.
-  const handlePreviousLineMessage = async (message: any, upsertType: string, outgoingContact?: string) => {
-    const session = sessions.get(sessionKey);
-    if (!session?.sessionId) return;
-    const sessionId = session.sessionId;
-
-    // Alguien contestó desde otro dispositivo todavía vinculado al número
-    // anterior (un WhatsApp Web, por ejemplo): cuenta como respuesta.
-    if (message.key.fromMe) {
-      if (outgoingContact) await resetUnrespondedCount(accountId, sessionId, outgoingContact);
-      return;
+  // Un solo `messages.upsert` puede traer VARIOS mensajes. Baileys bufferea los
+  // eventos mientras dura el handshake y los vacía de golpe cuando WhatsApp
+  // avisa que terminó de entregar lo pendiente (`CB:ib,,offline`): TODO el
+  // backlog acumulado durante una caída llega en un único evento con un array.
+  // Leer sólo `m.messages[0]` descartaba el resto en silencio — mensajes que el
+  // cliente veía en su WhatsApp y que nunca existieron para WhatHero.
+  //
+  // Secuencial a propósito: los buffers de IA y los contadores de pendientes
+  // dependen del orden en que llegaron. El try/catch es por mensaje para que
+  // uno que falle no se lleve puesto al resto del lote.
+  sock.ev.on('messages.upsert', async (m) => {
+    const batch = m.messages ?? [];
+    if (batch.length > 1) {
+      console.log(`[Upsert] Lote de ${batch.length} mensajes (type=${m.type})`);
     }
-
-    const remoteJid = message.key.remoteJid;
-    if (!remoteJid || remoteJid.endsWith('@g.us')) return;
-    let contactPhone = extractPhoneNumber(remoteJid);
-    if (!contactPhone) return;
-    if (remoteJid.includes('@lid')) {
-      const resolved = await resolveLIDViaSock(contactPhone, sock);
-      if (resolved) contactPhone = resolved;
+    for (const raw of batch) {
+      if (!raw) continue;
+      try {
+        await handleSessionUpsertedMessage(sessionKey, accountId, sock, raw, m.type);
+      } catch (err) {
+        console.error(`[Upsert] Error procesando ${raw?.key?.id}:`, err);
+      }
     }
+  });
 
-    await incrementUnrespondedCount(accountId, sessionId, contactPhone, 1);
+  // `session.sock` ya quedó asignado arriba, junto al deadline de arranque.
+  return sock;
+}
 
-    // El backlog que llega al reconectar queda pendiente sin push: avisar de
-    // mensajes de hace horas como si fueran nuevos sería ruido.
-    const ageMs = messageAgeMs(message);
-    if (upsertType === 'prepend' || (ageMs !== null && ageMs > AI_FRESH_WINDOW_MS)) return;
+// Lo que llega por la línea anterior ya quedó guardado (con `previousNumber`)
+// en el mismo chat de siempre. Acá sólo se avisa: queda pendiente y sale un
+// push para que alguien le conteste desde el número nuevo.
+async function handlePreviousLineMessage(
+  sessionKey: string,
+  accountId: string,
+  sock: any,
+  message: any,
+  upsertType: string,
+  outgoingContact?: string,
+) {
+  const session = sessions.get(sessionKey);
+  if (!session?.sessionId) return;
+  const sessionId = session.sessionId;
 
-    const mediaInfo = extractMediaInfo(message);
-    sendHumanAttentionNotification({
-      accountId,
-      sessionPhone: sessionId,
-      sessionKey,
-      chatId: contactPhone,
-      reason: 'previous_number',
-      messagePreview:
-        message.message?.conversation ||
-        message.message?.extendedTextMessage?.text ||
-        message.message?.imageMessage?.caption ||
-        message.message?.videoMessage?.caption ||
-        undefined,
-      mediaType: mediaInfo?.type,
-    }).catch((err) => console.error('[Notify] previous_number push falló:', err));
-  };
+  // Alguien contestó desde otro dispositivo todavía vinculado al número
+  // anterior (un WhatsApp Web, por ejemplo): cuenta como respuesta.
+  if (message.key.fromMe) {
+    if (outgoingContact) await resetUnrespondedCount(accountId, sessionId, outgoingContact);
+    return;
+  }
 
-  // Procesa UN mensaje del lote. Vive como closure de startSession para
-  // conservar `sock`, `sessionKey` y `accountId` sin arrastrarlos por firma.
-  const handleUpsertedMessage = async (rawMessage: any, upsertType: string) => {
+  const remoteJid = message.key.remoteJid;
+  if (!remoteJid || remoteJid.endsWith('@g.us')) return;
+  let contactPhone = extractPhoneNumber(remoteJid);
+  if (!contactPhone) return;
+  if (remoteJid.includes('@lid')) {
+    const resolved = await resolveLIDViaSock(contactPhone, sock);
+    if (resolved) contactPhone = resolved;
+  }
+
+  await incrementUnrespondedCount(accountId, sessionId, contactPhone, 1);
+
+  // El backlog que llega al reconectar queda pendiente sin push: avisar de
+  // mensajes de hace horas como si fueran nuevos sería ruido.
+  const ageMs = messageAgeMs(message);
+  if (upsertType === 'prepend' || (ageMs !== null && ageMs > AI_FRESH_WINDOW_MS)) return;
+
+  const mediaInfo = extractMediaInfo(message);
+  sendHumanAttentionNotification({
+    accountId,
+    sessionPhone: sessionId,
+    sessionKey,
+    chatId: contactPhone,
+    reason: 'previous_number',
+    messagePreview:
+      message.message?.conversation ||
+      message.message?.extendedTextMessage?.text ||
+      message.message?.imageMessage?.caption ||
+      message.message?.videoMessage?.caption ||
+      undefined,
+    mediaType: mediaInfo?.type,
+  }).catch((err) => console.error('[Notify] previous_number push falló:', err));
+}
+
+// Procesa UN mensaje (entrante o saliente) tanto de Baileys como de Meta Cloud API.
+async function handleSessionUpsertedMessage(
+  sessionKey: string,
+  accountId: string,
+  sock: any,
+  rawMessage: any,
+  upsertType: string = 'notify',
+) {
     // Baileys emite el mensaje aunque no haya podido descifrarlo (stub
     // CIPHERTEXT, sin contenido) y en paralelo le pide un reintento al emisor.
     // Ingerirlo acá escribiría una burbuja vacía y sumaría un pendiente
@@ -901,7 +952,7 @@ async function startSession(sessionKey: string, accountId: string, linkIntent?: 
     // número viejo, y lo que buscamos es que el humano siga la conversación
     // desde el nuevo.
     if (sessions.get(sessionKey)?.role === 'previous') {
-      await handlePreviousLineMessage(message, upsertType, contactPhoneForCancel);
+      await handlePreviousLineMessage(sessionKey, accountId, sock, message, upsertType, contactPhoneForCancel);
       return;
     }
 
@@ -1295,35 +1346,6 @@ async function startSession(sessionKey: string, accountId: string, linkIntent?: 
         );
       },
     );
-  };
-
-  // Un solo `messages.upsert` puede traer VARIOS mensajes. Baileys bufferea los
-  // eventos mientras dura el handshake y los vacía de golpe cuando WhatsApp
-  // avisa que terminó de entregar lo pendiente (`CB:ib,,offline`): TODO el
-  // backlog acumulado durante una caída llega en un único evento con un array.
-  // Leer sólo `m.messages[0]` descartaba el resto en silencio — mensajes que el
-  // cliente veía en su WhatsApp y que nunca existieron para WhatHero.
-  //
-  // Secuencial a propósito: los buffers de IA y los contadores de pendientes
-  // dependen del orden en que llegaron. El try/catch es por mensaje para que
-  // uno que falle no se lleve puesto al resto del lote.
-  sock.ev.on('messages.upsert', async (m) => {
-    const batch = m.messages ?? [];
-    if (batch.length > 1) {
-      console.log(`[Upsert] Lote de ${batch.length} mensajes (type=${m.type})`);
-    }
-    for (const raw of batch) {
-      if (!raw) continue;
-      try {
-        await handleUpsertedMessage(raw, m.type);
-      } catch (err) {
-        console.error(`[Upsert] Error procesando ${raw?.key?.id}:`, err);
-      }
-    }
-  });
-
-  // `session.sock` ya quedó asignado arriba, junto al deadline de arranque.
-  return sock;
 }
 
 // Cancelación explícita desde la app (cerrar la pantalla del QR, o /cancel-session).
@@ -1750,48 +1772,61 @@ app.post('/resolve-contact', express.json(), verifyHttpAuth(), async (req, res) 
       return res.status(400).json({ error: 'invalid_phone' });
     }
 
-    if (hitResolveContactLimit(sessionKey)) {
-      console.warn(`[/resolve-contact] Rate limit alcanzado en sesión ${sessionKey}`);
-      return res.status(429).json({ error: 'rate_limited' });
-    }
+    let canonicalId: string;
+    let jid: string;
+    if (session.provider === 'cloud_api') {
+      // La API oficial no tiene cómo preguntar si un número tiene WhatsApp (Meta
+      // retiró `/contacts`), ni hace falta cuidarse del baneo por consultas en
+      // masa: no se consulta nada. Se abre con el número tecleado y, si no
+      // existe, Meta lo dice al enviar (estado `failed` en la burbuja). El 52/521
+      // lo cubre la búsqueda del hermano de abajo, igual que en Baileys.
+      canonicalId = digits;
+      jid = `${digits}@s.whatsapp.net`;
+    } else {
+      if (hitResolveContactLimit(sessionKey)) {
+        console.warn(`[/resolve-contact] Rate limit alcanzado en sesión ${sessionKey}`);
+        return res.status(429).json({ error: 'rate_limited' });
+      }
 
-    // `onWhatsApp` es variádico: preguntamos por todas las variantes del número
-    // en UNA sola consulta USync y nos quedamos con la que exista. Así el
-    // '521' mexicano y el '549' argentino dejan de ser una decisión nuestra.
-    const candidates = waNumberCandidates(digits);
-    let results: Array<{ jid: string; exists: boolean }> | undefined;
-    let timeoutTimer: NodeJS.Timeout | undefined;
-    try {
-      // Con techo de tiempo: `onWhatsApp` puede quedarse colgado si el socket
-      // está a medio morir, y un request eterno deja al operador mirando un
-      // spinner. La consulta que pierde la carrera NO queda como unhandled
-      // rejection: `race` le dejó su handler puesto aunque ya haya settleado.
-      results = await Promise.race([
-        session.sock.onWhatsApp(...candidates.map(c => `+${c}`)),
-        new Promise<never>((_, reject) => {
-          timeoutTimer = setTimeout(
-            () => reject(new Error('timeout')),
-            RESOLVE_CONTACT_TIMEOUT_MS,
-          );
-        }),
-      ]);
-    } catch (err) {
-      console.warn(`[/resolve-contact] onWhatsApp falló para ${digits}:`, (err as Error).message);
-      return res.status(502).json({ error: 'lookup_failed' });
-    } finally {
-      if (timeoutTimer) clearTimeout(timeoutTimer);
-    }
+      // `onWhatsApp` es variádico: preguntamos por todas las variantes del número
+      // en UNA sola consulta USync y nos quedamos con la que exista. Así el
+      // '521' mexicano y el '549' argentino dejan de ser una decisión nuestra.
+      const candidates = waNumberCandidates(digits);
+      let results: Array<{ jid: string; exists: boolean }> | undefined;
+      let timeoutTimer: NodeJS.Timeout | undefined;
+      try {
+        // Con techo de tiempo: `onWhatsApp` puede quedarse colgado si el socket
+        // está a medio morir, y un request eterno deja al operador mirando un
+        // spinner. La consulta que pierde la carrera NO queda como unhandled
+        // rejection: `race` le dejó su handler puesto aunque ya haya settleado.
+        results = await Promise.race([
+          session.sock.onWhatsApp(...candidates.map(c => `+${c}`)),
+          new Promise<never>((_, reject) => {
+            timeoutTimer = setTimeout(
+              () => reject(new Error('timeout')),
+              RESOLVE_CONTACT_TIMEOUT_MS,
+            );
+          }),
+        ]);
+      } catch (err) {
+        console.warn(`[/resolve-contact] onWhatsApp falló para ${digits}:`, (err as Error).message);
+        return res.status(502).json({ error: 'lookup_failed' });
+      } finally {
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+      }
 
-    const hit = (results ?? []).find(r => r?.exists && r?.jid);
-    if (!hit) {
-      console.log(`[/resolve-contact] ${digits} no tiene WhatsApp (probadas: ${candidates.join(', ')})`);
-      return res.json({ exists: false });
-    }
+      const hit = (results ?? []).find(r => r?.exists && r?.jid);
+      if (!hit) {
+        console.log(`[/resolve-contact] ${digits} no tiene WhatsApp (probadas: ${candidates.join(', ')})`);
+        return res.json({ exists: false });
+      }
 
-    // El id del chat sale del JID que devolvió WhatsApp, no del que tecleó el
-    // operador: es el mismo que usará `saveMessageToFirestore` al guardar el
-    // eco del saliente, así que la app y Firestore no pueden desincronizarse.
-    const canonicalId = extractPhoneNumber(hit.jid);
+      // El id del chat sale del JID que devolvió WhatsApp, no del que tecleó el
+      // operador: es el mismo que usará `saveMessageToFirestore` al guardar el
+      // eco del saliente, así que la app y Firestore no pueden desincronizarse.
+      canonicalId = extractPhoneNumber(hit.jid);
+      jid = hit.jid;
+    }
 
     // ¿Ya hablábamos con este número? Miramos también el id hermano (52/521):
     // un contacto viejo puede estar guardado bajo la otra forma, y abrir el
@@ -1824,9 +1859,9 @@ app.post('/resolve-contact', express.json(), verifyHttpAuth(), async (req, res) 
     if (!contactName) contactName = session.contactNames?.get(chatId) ?? null;
 
     console.log(
-      `[/resolve-contact] ${digits} → ${hit.jid} (chatId=${chatId}, historial=${hasHistory})`,
+      `[/resolve-contact] ${digits} → ${jid} (chatId=${chatId}, historial=${hasHistory})`,
     );
-    res.json({ exists: true, chatId, jid: hit.jid, hasHistory, contactName });
+    res.json({ exists: true, chatId, jid, hasHistory, contactName });
   } catch (error) {
     console.error('[/resolve-contact] Error:', error);
     res.status(500).json({ error: 'Failed to resolve contact' });
@@ -1971,6 +2006,13 @@ app.post('/edit-message', express.json(), verifyHttpAuth(), async (req, res) => 
       return res.status(503).json({ error: 'Session not ready' });
     }
 
+    if (session.provider === 'cloud_api') {
+      return res.status(409).json({
+        error: 'cloud_api_unsupported',
+        message: 'La API Oficial de Meta no permite editar mensajes ya enviados.',
+      });
+    }
+
     if (await isPreviousNumberMessage(session, chatPhone, messageId)) {
       return res.status(409).json(PREVIOUS_NUMBER_CONFLICT);
     }
@@ -2040,6 +2082,13 @@ app.post('/delete-message', express.json(), verifyHttpAuth(), async (req, res) =
       return res.status(503).json({ error: 'Session not ready' });
     }
 
+    if (session.provider === 'cloud_api') {
+      return res.status(409).json({
+        error: 'cloud_api_unsupported',
+        message: 'La API Oficial de Meta no permite eliminar mensajes para todos una vez enviados.',
+      });
+    }
+
     if (await isPreviousNumberMessage(session, chatPhone, messageId)) {
       return res.status(409).json(PREVIOUS_NUMBER_CONFLICT);
     }
@@ -2090,6 +2139,205 @@ app.post('/delete-message', express.json(), verifyHttpAuth(), async (req, res) =
     res.status(500).json({
       error: 'Failed to delete message',
       details: (error as any).message,
+    });
+  }
+});
+
+// ============================================
+// META WHATSAPP CLOUD API — WEBHOOK & ENDPOINTS
+// ============================================
+
+// Verificación del Webhook de Meta (público: lo invoca Meta al configurar la URL).
+app.get('/webhook/meta', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  if (mode === 'subscribe' && token === getMetaWebhookVerifyToken()) {
+    console.log('[CloudAPI Webhook] ✅ Verificación exitosa de Meta');
+    return res.status(200).send(String(challenge ?? ''));
+  }
+
+  console.warn('[CloudAPI Webhook] ❌ Verificación rechazada (token inválido)');
+  return res.status(403).send('Forbidden');
+});
+
+// Recepción de eventos del Webhook de Meta (mensajes entrantes y estados de entrega).
+// `verify` guarda el cuerpo crudo: la firma de Meta se calcula sobre esos bytes,
+// y re-serializar el JSON ya parseado no da los mismos.
+const metaWebhookJson = express.json({
+  limit: '10mb',
+  verify: (req, _res, buf) => { (req as any).rawBody = buf; },
+});
+
+app.post('/webhook/meta', metaWebhookJson, (req, res) => {
+  // Respondemos 200 de inmediato para que Meta no dé timeout ni reintente en ráfaga.
+  // La firma se verifica al procesar, por sesión: cada cliente trae su propia
+  // app de Meta y cada app firma con su propia clave.
+  res.status(200).send('EVENT_RECEIVED');
+  handleMetaWebhookPayload(req.body, {
+    rawBody: (req as any).rawBody,
+    signature: req.get('x-hub-signature-256'),
+  }).catch((err) => {
+    console.error('[CloudAPI Webhook] Error procesando evento:', err);
+  });
+});
+
+// Vincular o actualizar un número de WhatsApp Cloud API (incluyendo número de prueba de Meta).
+app.post('/sessions/cloud-api/connect', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const { accountId, phoneNumberId, wabaId, accessToken, appSecret, alias, intoSessionId } = req.body || {};
+    if (!accountId || !phoneNumberId || !wabaId || !accessToken) {
+      return res.status(400).json({
+        error: 'Faltan campos requeridos: accountId, phoneNumberId, wabaId, accessToken',
+      });
+    }
+    // "Actualizar credenciales" de una sesión: las credenciales tienen que ser
+    // de ESE número (ver decideCloudApiTarget).
+    if (intoSessionId !== undefined && (typeof intoSessionId !== 'string' || !SESSION_ID_RE.test(intoSessionId))) {
+      return res.status(400).json({ error: 'intoSessionId inválido' });
+    }
+
+    const result = await connectCloudApiSession({
+      accountId: String(accountId),
+      phoneNumberId: String(phoneNumberId),
+      wabaId: String(wabaId),
+      accessToken: String(accessToken),
+      appSecret: typeof appSecret === 'string' ? appSecret : undefined,
+      alias: typeof alias === 'string' ? alias : undefined,
+      intoSessionId,
+    });
+
+    io.to(String(accountId)).emit('ready', {
+      phoneNumber: result.sessionId,
+      sessionId: result.sessionId,
+      sessionKey: result.sessionKey,
+      provider: 'cloud_api',
+    });
+
+    return res.json({
+      success: true,
+      ...result,
+      webhookVerifyToken: getMetaWebhookVerifyToken(),
+    });
+  } catch (error) {
+    console.error('[/sessions/cloud-api/connect] Error:', error);
+    const status = error instanceof CloudApiError ? error.httpStatus : 500;
+    return res.status(status >= 400 && status < 600 ? status : 500).json({
+      error: (error as any)?.message || 'No se pudo conectar la sesión de Cloud API',
+      code: error instanceof CloudApiError ? error.code : undefined,
+      reason: error instanceof CloudApiError ? error.reason : undefined,
+    });
+  }
+});
+
+// Listar plantillas aprobadas de Meta para una sesión Cloud API (ej. `hello_world`).
+// GET: no hay body, así que `verifyHttpAuth()` a secas respondía siempre 400
+// ("Missing accountId in body"). La membresía y el acceso se chequean acá.
+app.get('/sessions/cloud-api/templates', verifyHttpAuth({ requireAccountId: false }), async (req, res) => {
+  try {
+    const accountId = String(req.query.accountId || '').trim();
+    const sessionId = String(req.query.sessionId || '').trim();
+    if (!accountId || !sessionId) {
+      return res.status(400).json({ error: 'Missing required query params: accountId, sessionId' });
+    }
+    if (!req.auth!.memberOfAccounts.includes(accountId)) {
+      return res.status(403).json({ error: 'Not a member of this account' });
+    }
+    if (!(await canAccessSession(accountId, req.auth!.uid, sessionId))) {
+      return res.status(403).json({ error: 'No tienes acceso a esta sesión' });
+    }
+
+    const templates = await listMetaTemplates({ accountId, sessionId });
+    return res.json({
+      success: true,
+      templates,
+      webhookVerifyToken: getMetaWebhookVerifyToken(),
+    });
+  } catch (error) {
+    console.error('[/sessions/cloud-api/templates] Error:', error);
+    const status = error instanceof CloudApiError ? error.httpStatus : 500;
+    return res.status(status >= 400 && status < 600 ? status : 500).json({
+      error: (error as any)?.message || 'No se pudieron obtener las plantillas de Meta',
+      code: error instanceof CloudApiError ? error.code : undefined,
+    });
+  }
+});
+
+// Enviar un mensaje de plantilla aprobada de Meta (abre o retoma conversación fuera de ventana de 24h).
+app.post('/send-template', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const {
+      accountId,
+      sessionId,
+      sessionKey,
+      to,
+      templateName,
+      languageCode,
+      components,
+      renderedPreviewText,
+      tempId,
+    } = req.body || {};
+
+    const resolvedSessionId =
+      String(sessionId || '').trim() ||
+      (typeof sessionKey === 'string' && sessionKey.includes('_')
+        ? sessionKey.split('_').slice(1).join('_')
+        : '');
+
+    // Sin idioma no se adivina: una plantilla aprobada sólo en es_MX mandada como
+    // en_US falla en Meta con un error confuso. La app siempre lo manda.
+    if (!accountId || !resolvedSessionId || !to || !templateName || !languageCode) {
+      return res.status(400).json({
+        error: 'Faltan campos requeridos: accountId, sessionId, to, templateName, languageCode',
+      });
+    }
+    // verifyHttpAuth sólo prueba que es de la cuenta; un miembro restringido no
+    // puede enviar desde una sesión que no ve.
+    if (!(await canAccessSession(accountId, req.auth!.uid, resolvedSessionId))) {
+      return res.status(403).json({ error: 'No tienes acceso a esta sesión' });
+    }
+
+    const effectiveKey = `${accountId}_${resolvedSessionId}`;
+    aiBuffers.yieldToHuman(
+      { accountId, sessionKey: effectiveKey, contactPhone: String(to).replace(/\D/g, '') },
+      'plantilla enviada',
+    );
+
+    const senderInfo = await resolveHumanSender(req.auth!.uid);
+    const clientTempId = validTempId(tempId);
+
+    const runSend = () =>
+      sendMetaTemplate({
+        accountId: String(accountId),
+        sessionId: resolvedSessionId,
+        to: String(to),
+        templateName: String(templateName),
+        languageCode: String(languageCode),
+        components: Array.isArray(components) ? components : undefined,
+        renderedPreviewText: typeof renderedPreviewText === 'string' ? renderedPreviewText : undefined,
+        sender: senderInfo,
+        clientTempId,
+      });
+
+    const result = clientTempId
+      ? await sendDedupe.run(sendDedupeKey(effectiveKey, clientTempId), runSend)
+      : await runSend();
+
+    return res.json({
+      success: true,
+      messageId: result.wamid,
+      chatPhone: result.chatPhone,
+      tempId: clientTempId,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('[/send-template] Error:', error);
+    const status = error instanceof CloudApiError ? error.httpStatus : 500;
+    return res.status(status >= 400 && status < 600 ? status : 500).json({
+      error: (error as any)?.message || 'Error enviando plantilla de WhatsApp',
+      details: (error as any)?.message,
+      code: error instanceof CloudApiError ? error.code : undefined,
     });
   }
 });
@@ -3141,6 +3389,9 @@ io.on('connection', (socket) => {
 });
 
 async function startExistingSessions() {
+  // Primero hidratamos todas las sesiones de Meta Cloud API desde Firestore.
+  await loadCloudApiSessionsOnBoot();
+
   if (!existsSync('auth_info')) {
     console.log('No existing auth_info directory');
     return;
@@ -3151,7 +3402,7 @@ async function startExistingSessions() {
     .map(e => e.name);
 
   if (subdirs.length === 0) {
-    console.log('No existing sessions to reconnect');
+    console.log('No existing Baileys sessions to reconnect');
     return;
   }
 
@@ -3185,6 +3436,20 @@ async function startExistingSessions() {
     }
   }
 }
+
+initCloudApiService({
+  db,
+  sessions,
+  onUpsertedMessage: handleSessionUpsertedMessage,
+  loadAllSessionConfigs: async (sessionKey, accountId) => {
+    const session = sessions.get(sessionKey);
+    if (session) {
+      await getAIConfig(session, accountId).catch((err) =>
+        console.warn(`[CloudAPI] Error precargando aiConfig para ${sessionKey}:`, err),
+      );
+    }
+  },
+});
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 httpServer.listen(PORT, async () => {
