@@ -27,7 +27,7 @@ A diferencia del QR, **no se sincroniza nada más**: sólo existe en WhatHero lo
 | **Access Token** | La llave para enviar. El **temporal** dura 24 h; el **permanente** sale de un Usuario del sistema. | Configuración de la API / Configuración del negocio |
 | **App Secret** | La clave secreta de la app. WhatHero la usa para comprobar que cada webhook viene de Meta. | Configuración de la app → Básica → Clave secreta |
 | **Webhook** | La URL de WhatHero a la que Meta avisa. Se configura con un **token de verificación** y hay que suscribir el campo **`messages`**. | WhatsApp → Configuración → Webhook |
-| **App suscrita al WABA** | Sin esto Meta no entrega los mensajes del WABA a la app. **WhatHero lo hace solo al conectar.** | Sólo por API (ver *Comprobar a mano*) |
+| **App suscrita al WABA** | Sin esto Meta no entrega los mensajes del WABA a la app: se puede enviar, pero no llega nada del cliente. WhatHero la suscribe al conectar, pero **compruébalo**. | Tu app → WhatsApp → *Configuración de producción* → *Registra tu número* → interruptor **"Suscribir webhooks"** junto a la cuenta (debe estar azul) |
 | **Ventana de 24 h** | Puedes mandar texto libre sólo hasta 24 h después del último mensaje del cliente. Fuera de ella, sólo **plantillas** aprobadas. | Banner "Ventana de 24h cerrada" en el chat |
 
 Valores fijos de WhatHero:
@@ -86,7 +86,7 @@ En desarrollo los datos van a `accounts_dev` y el backend corre en tu Mac. Meta 
 3. [ ] **Agregar el número** en la app (Configuración de la API → Agregar número), verificar por SMS o llamada y definir el **PIN de 6 dígitos**. Sin ese registro los envíos fallan con "cuenta no registrada". El **nombre visible** pasa revisión de Meta.
 4. [ ] **Token permanente:** Configuración del negocio → *Usuarios del sistema* → crear uno con rol administrador → *Asignar activos*: la app y la cuenta de WhatsApp → *Generar token* con `whatsapp_business_messaging` y `whatsapp_business_management`. El temporal no sirve en producción.
 5. [ ] **Método de pago** en WhatsApp Manager, para las plantillas que se cobran. Responder dentro de las 24 h es gratis.
-6. [ ] **Webhook de la app:** URL `https://whathero.up.railway.app/webhook/meta`, token `whathero_meta_verify_2026`, campo **`messages`** suscrito.
+6. [ ] **Webhook de la app:** URL `https://whathero.up.railway.app/webhook/meta`, token `whathero_meta_verify_2026`, campo **`messages`** suscrito. Y en *Configuración de producción → Registra tu número*, el interruptor **"Suscribir webhooks"** de la cuenta encendido.
 7. [ ] **Publicar la app** si los mensajes reales no llegan (el panel lo avisa con una franja naranja). Pide una URL de política de privacidad.
 8. [ ] **Conectar en WhatHero** desde la app de producción (release), con el owner: Phone Number ID, WABA ID, **token permanente** y App Secret.
 9. [ ] **Prueba de humo:** escribir al número, responder desde WhatHero y enviar una plantilla.
@@ -105,6 +105,25 @@ En desarrollo los datos van a `accounts_dev` y el backend corre en tu Mac. Meta 
 
 ---
 
+## 📝 Plantillas propias
+
+**Dónde:** Ajustes de la sesión › Perfil › *Plantillas de WhatsApp*, o *Administrar plantillas* en el selector de plantillas de un chat. Sólo el **owner** crea y elimina; el resto del equipo ve el estado y envía las aprobadas.
+
+1. **Nueva plantilla** → nombre, categoría, idioma, mensaje, ejemplos y botones → **Enviar a revisión**.
+2. Meta la revisa: casi siempre en minutos, hasta 24 h. Mientras tanto aparece **En revisión** y el selector del chat avisa cuántas hay pendientes.
+3. Aprobada → aparece al enviar en cualquier chat. Rechazada → la lista dice el motivo.
+
+Para que Meta no la rechace:
+- **Las variables van con nombre:** `{{nombre}}`, `{{fecha_cita}}`. Cada una pide un **ejemplo**: es lo que ve quien revisa. Pon datos realistas, no los de un cliente real.
+- **El mensaje no puede empezar ni terminar con una variable.** "Hola {{nombre}}, …" sí; "{{nombre}}, …" no.
+- **Marketing** = promociones, ofertas, reactivar clientes (se cobra por mensaje entregado). **Utilidad** = avisos de algo que el cliente ya pidió (cita, pedido, pago). Si eliges Utilidad con contenido promocional, **Meta la pasa a Marketing sola** y WhatHero te lo avisa al enviarla.
+- En marketing, un pie como *"Responde BAJA para no recibir promociones"* baja los bloqueos y cuida la calidad del número.
+- Se puede corregir una rechazada creando otra con **otro nombre**. Si eliminas una **aprobada**, Meta no deja reusar ese nombre durante **30 días**.
+
+> **Sólo a quien te dio su número.** Las plantillas sirven para escribirle primero a alguien que aceptó recibir mensajes (te dejó su número en un formulario, una compra, una cita). Escribirle a números que nunca te escribieron trae bloqueos y reportes: Meta baja la calidad, reduce el límite diario y puede restringir el número.
+
+---
+
 ## 🩺 Cuando algo no funciona
 
 Mira primero el **log del backend** (terminal en dev, Railway en producción) y busca `[CloudAPI`.
@@ -112,7 +131,7 @@ Mira primero el **log del backend** (terminal en dev, Railway en producción) y 
 | Síntoma | Causa probable | Qué hacer |
 |---|---|---|
 | Meta: "No se pudo validar la URL de devolución de llamada" | El backend o el túnel no responde en esa URL (o Railway sin desplegar: 404). | Correr el `curl` del checklist. Revisar que el túnel siga abierto y que la URL sea la actual. |
-| Todo en verde, envías bien, pero no llega nada del cliente | Falta el campo `messages`, la app no está suscrita al WABA, o la app sin publicar. | Suscribir `messages`. Hacer *Actualizar credenciales* (vuelve a suscribir la app). Si sigue igual, publicar la app. |
+| Todo en verde, envías bien, pero no llega nada del cliente (y la plantilla nunca pasa a ✓✓) | La app no está suscrita al WABA (lo más común: pasó en el primer número de producción, 23-oct-2026), falta el campo `messages` o la app está sin publicar. | Encender **"Suscribir webhooks"** (ver glosario). Revisar el campo `messages`. Si sigue igual, publicar la app. |
 | Log: `Firma inválida para …` | El App Secret guardado no es el de la app que manda el webhook. | *Actualizar credenciales* con el App Secret correcto. |
 | Log: `No hay sesión conectada para phone_number_id=…` | Llegó un webhook de un número que no está conectado en este entorno. | Normal con el botón "Probar" del panel. Si es tu número, conéctalo en el entorno correcto. |
 | Alta: "El App Secret no corresponde a la app de este Access Token" | App Secret de otra app. | Copiarlo de la misma app que emitió el token. |
@@ -122,13 +141,16 @@ Mira primero el **log del backend** (terminal en dev, Railway en producción) y 
 | Chat: "El Access Token de Meta expiró o es inválido" | Token temporal vencido o revocado. | *Actualizar credenciales* con un token nuevo (en producción, permanente). |
 | Meta: "Application has been deleted" | La app que emitió el token se borró. | Reconectar con el token y el App Secret de una app vigente. |
 | Conecté y no aparece en "Mis Cuentas" | Entraste con un miembro restringido. | Entrar con el owner o darle acceso a esa sesión en *Miembros*. |
+| Plantillas: "no tiene permiso para administrar plantillas" | Token sin `whatsapp_business_management`. | Generar el token con los dos permisos de WhatsApp y *Actualizar credenciales*. |
+| Creé una plantilla y no aparece al enviar | Sigue en revisión, o la rechazaron. | Ajustes › Plantillas de WhatsApp: ver el estado y el motivo. |
+| Una plantilla aprobada sale con 🚫 en el selector | Usa algo que WhatHero todavía no envía (imagen en el encabezado, botón de código, carrusel). | Usar otra, o crear una versión de texto. |
 
 ### Comprobar la configuración de Meta a mano
 Con el **Explorador de la Graph API** (developers.facebook.com/tools/explorer): elige la app arriba a la derecha y genera un token con los dos permisos de WhatsApp.
 
 | Para ver… | Método y ruta | Token |
 |---|---|---|
-| Si la app está suscrita al WABA | `GET {WABA_ID}/subscribed_apps` (con `POST` la suscribe) | De usuario o del sistema |
+| Si la app está suscrita al WABA (lo mismo que el interruptor "Suscribir webhooks") | `GET {WABA_ID}/subscribed_apps` (con `POST` la suscribe) | De usuario o del sistema |
 | Qué números tiene el WABA | `GET {WABA_ID}/phone_numbers` | De usuario o del sistema |
 | URL y campos del webhook de la app | `GET {APP_ID}/subscriptions` | "Token de acceso a la app" |
 

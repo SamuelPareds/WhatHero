@@ -4,118 +4,12 @@ import 'package:http/http.dart' as http;
 import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/services/api_client.dart';
 import 'package:crm_whatsapp/core/services/pending_messages_service.dart';
-
-class MetaTemplateModel {
-  final String id;
-  final String name;
-  final String status;
-  final String category;
-  final String language;
-  final List<Map<String, dynamic>> components;
-
-  const MetaTemplateModel({
-    required this.id,
-    required this.name,
-    required this.status,
-    required this.category,
-    required this.language,
-    required this.components,
-  });
-
-  factory MetaTemplateModel.fromJson(Map<String, dynamic> json) {
-    final rawComponents = (json['components'] as List<dynamic>?) ?? const [];
-    return MetaTemplateModel(
-      id: (json['id'] as String?) ?? '',
-      name: (json['name'] as String?) ?? '',
-      status: (json['status'] as String?) ?? 'APPROVED',
-      category: (json['category'] as String?) ?? 'UTILITY',
-      language: (json['language'] as String?) ?? 'en_US',
-      components: rawComponents
-          .whereType<Map>()
-          .map((e) => Map<String, dynamic>.from(e))
-          .toList(),
-    );
-  }
-
-  String? get headerText {
-    for (final c in components) {
-      if ((c['type'] as String?)?.toUpperCase() == 'HEADER' &&
-          ((c['format'] as String?)?.toUpperCase() == 'TEXT' || c['text'] != null)) {
-        return c['text'] as String?;
-      }
-    }
-    return null;
-  }
-
-  String get bodyText {
-    for (final c in components) {
-      if ((c['type'] as String?)?.toUpperCase() == 'BODY') {
-        return (c['text'] as String?) ?? '';
-      }
-    }
-    return '';
-  }
-
-  String? get footerText {
-    for (final c in components) {
-      if ((c['type'] as String?)?.toUpperCase() == 'FOOTER') {
-        return c['text'] as String?;
-      }
-    }
-    return null;
-  }
-
-  /// Cantidad de variables `{{1}}`, `{{2}}`, ... en el HEADER.
-  int get headerParamCount => _countPlaceholders(headerText ?? '');
-
-  /// Cantidad de variables `{{1}}`, `{{2}}`, ... en el BODY.
-  int get bodyParamCount => _countPlaceholders(bodyText);
-
-  static int _countPlaceholders(String text) {
-    final matches = RegExp(r'\{\{(\d+)\}\}').allMatches(text);
-    int maxIndex = 0;
-    for (final m in matches) {
-      final n = int.tryParse(m.group(1) ?? '') ?? 0;
-      if (n > maxIndex) maxIndex = n;
-    }
-    return maxIndex;
-  }
-
-  String renderPreview({
-    required List<String> headerValues,
-    required List<String> bodyValues,
-  }) {
-    String replaceVars(String input, List<String> values) {
-      var out = input;
-      for (var i = 0; i < values.length; i++) {
-        final v = values[i].trim();
-        out = out.replaceAll('{{${i + 1}}}', v.isEmpty ? '{{${i + 1}}}' : v);
-      }
-      return out;
-    }
-
-    final parts = <String>[];
-    final h = headerText;
-    if (h != null && h.trim().isNotEmpty) {
-      parts.add(replaceVars(h.trim(), headerValues));
-    }
-    final b = bodyText;
-    if (b.trim().isNotEmpty) {
-      parts.add(replaceVars(b.trim(), bodyValues));
-    }
-    final f = footerText;
-    if (f != null && f.trim().isNotEmpty) {
-      parts.add(f.trim());
-    }
-    if (parts.isEmpty) {
-      return '📋 Plantilla: $name ($language)';
-    }
-    return parts.join('\n\n');
-  }
-}
+import 'package:crm_whatsapp/features/templates/meta_template.dart';
+import 'package:crm_whatsapp/features/templates/templates_api.dart';
+import 'package:crm_whatsapp/features/templates/templates_screen.dart';
 
 /// Abre el selector de plantillas aprobadas de Meta Cloud API para enviarlas al
-/// chat actual (ej. `hello_world` o plantillas con parámetros `{{1}}`).
+/// chat actual (`hello_world`, numeradas `{{1}}` o con nombre `{{nombre}}`).
 Future<bool?> showCloudApiTemplateSheet(
   BuildContext context, {
   required String accountId,
@@ -200,9 +94,13 @@ class _CloudApiTemplateSheetContentState
   // mensaje en vez de mandarle al cliente la plantilla dos veces (y cobrarla).
   String? _sendTempId;
   List<MetaTemplateModel> _templates = const [];
+  // Mandadas a revisión que todavía no se pueden usar: sin este aviso, quien
+  // acaba de crear una cree que se perdió.
+  int _inReviewCount = 0;
   MetaTemplateModel? _selectedTemplate;
   final List<TextEditingController> _headerControllers = [];
   final List<TextEditingController> _bodyControllers = [];
+  final List<TextEditingController> _buttonControllers = [];
   final TextEditingController _searchController = TextEditingController();
   String _searchQuery = '';
 
@@ -246,48 +144,60 @@ class _CloudApiTemplateSheetContentState
     for (final c in _bodyControllers) {
       c.dispose();
     }
+    for (final c in _buttonControllers) {
+      c.dispose();
+    }
     _searchController.dispose();
     super.dispose();
   }
 
+  // Nombres de variable que casi siempre son el nombre del cliente.
+  static const _contactNameKeys = {'nombre', 'name', 'first_name', 'nombre_cliente', 'cliente'};
+
   void _selectTemplate(MetaTemplateModel tpl) {
-    for (final c in _headerControllers) {
+    for (final c in [..._headerControllers, ..._bodyControllers, ..._buttonControllers]) {
       c.dispose();
     }
-    for (final c in _bodyControllers) {
-      c.dispose();
+    TextEditingController controller(String initial) {
+      final c = TextEditingController(text: initial);
+      c.addListener(() {
+        if (mounted) setState(() {});
+      });
+      return c;
     }
+
+    final contact = widget.contactName?.trim() ?? '';
+    final hasContactName = contact.isNotEmpty && widget.contactName != widget.chatPhone;
+    // Se pre-llena con el nombre del contacto: {{nombre}} en cualquier parte, o
+    // el {{1}} del mensaje en las numeradas (como siempre fue).
+    String prefill(TemplateParam p, {required bool inBody}) {
+      if (!hasContactName) return '';
+      final isName = p.named ? _contactNameKeys.contains(p.key) : (inBody && p.key == '1');
+      return isName ? contact : '';
+    }
+
     _headerControllers
       ..clear()
-      ..addAll(List.generate(tpl.headerParamCount, (_) {
-        final c = TextEditingController();
-        c.addListener(() {
-          if (mounted) setState(() {});
-        });
-        return c;
-      }));
+      ..addAll(tpl.headerParams.map((p) => controller(prefill(p, inBody: false))));
     _bodyControllers
       ..clear()
-      ..addAll(List.generate(tpl.bodyParamCount, (idx) {
-        // Si es el primer parámetro {{1}} y tenemos nombre del contacto, lo pre-llenamos.
-        final initial = (idx == 0 &&
-                widget.contactName != null &&
-                widget.contactName!.trim().isNotEmpty &&
-                widget.contactName != widget.chatPhone)
-            ? widget.contactName!.trim()
-            : '';
-        final c = TextEditingController(text: initial);
-        c.addListener(() {
-          if (mounted) setState(() {});
-        });
-        return c;
-      }));
+      ..addAll(tpl.bodyParams.map((p) => controller(prefill(p, inBody: true))));
+    _buttonControllers
+      ..clear()
+      ..addAll(tpl.buttonParams.map((_) => controller('')));
 
     setState(() {
       _selectedTemplate = tpl;
       _errorMessage = null;
       _sendTempId = null;
     });
+  }
+
+  Future<void> _openManager() async {
+    await Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => MetaTemplatesScreen(accountId: widget.accountId, sessionId: widget.sessionId),
+    ));
+    if (mounted) _loadTemplates();
   }
 
   Future<void> _loadTemplates() async {
@@ -297,26 +207,12 @@ class _CloudApiTemplateSheetContentState
     });
 
     try {
-      final uri = Uri.parse(
-        '$backendUrl/sessions/cloud-api/templates'
-        '?accountId=${Uri.encodeComponent(widget.accountId)}'
-        '&sessionId=${Uri.encodeComponent(widget.sessionId)}',
+      final all = await fetchMetaTemplates(
+        accountId: widget.accountId,
+        sessionId: widget.sessionId,
       );
-      final response = await http
-          .get(uri, headers: await authHeaders())
-          .timeout(const Duration(seconds: 15));
-
-      final data = jsonDecode(response.body) as Map<String, dynamic>;
-      if (response.statusCode != 200 || data['success'] != true) {
-        throw Exception(data['error'] ?? 'No se pudieron cargar las plantillas');
-      }
-
-      final rawList = (data['templates'] as List<dynamic>?) ?? const [];
-      final parsed = rawList
-          .whereType<Map>()
-          .map((m) => MetaTemplateModel.fromJson(Map<String, dynamic>.from(m)))
-          .where((t) => t.status.toUpperCase() == 'APPROVED')
-          .toList();
+      final parsed = all.where((t) => t.isApproved).toList();
+      _inReviewCount = all.where((t) => t.isInReview).length;
 
       final hasHelloWorld = parsed.any((t) => t.name == 'hello_world');
       final list = hasHelloWorld ? parsed : [_helloWorldFallback, ...parsed];
@@ -346,38 +242,25 @@ class _CloudApiTemplateSheetContentState
     final tpl = _selectedTemplate;
     if (tpl == null) return;
 
+    if (tpl.unsupportedReason != null) return;
+
     final headerValues = _headerControllers.map((c) => c.text.trim()).toList();
     final bodyValues = _bodyControllers.map((c) => c.text.trim()).toList();
+    final buttonValues = _buttonControllers.map((c) => c.text.trim()).toList();
 
-    if (headerValues.any((v) => v.isEmpty) || bodyValues.any((v) => v.isEmpty)) {
+    if ([...headerValues, ...bodyValues, ...buttonValues].any((v) => v.isEmpty)) {
       setState(() {
         _errorMessage = 'Completa todos los campos variables {{...}} de la plantilla antes de enviar.';
       });
       return;
     }
 
-    final components = <Map<String, dynamic>>[];
-    if (headerValues.isNotEmpty) {
-      components.add({
-        'type': 'header',
-        'parameters': headerValues
-            .map((v) => {'type': 'text', 'text': v})
-            .toList(),
-      });
-    }
-    if (bodyValues.isNotEmpty) {
-      components.add({
-        'type': 'body',
-        'parameters': bodyValues
-            .map((v) => {'type': 'text', 'text': v})
-            .toList(),
-      });
-    }
-
-    final previewText = tpl.renderPreview(
-      headerValues: headerValues,
-      bodyValues: bodyValues,
+    final components = tpl.buildComponents(
+      header: headerValues,
+      body: bodyValues,
+      buttons: buttonValues,
     );
+    final previewText = tpl.renderPreview(header: headerValues, body: bodyValues);
 
     _sendTempId ??= 'tpl-${DateTime.now().microsecondsSinceEpoch}';
     setState(() {
@@ -551,15 +434,38 @@ class _CloudApiTemplateSheetContentState
                     const SizedBox(height: 12),
                   ],
 
-                  const Text(
-                    'Selecciona una plantilla aprobada:',
-                    style: TextStyle(
-                      fontSize: 12.5,
-                      fontWeight: FontWeight.w600,
-                      color: white,
-                    ),
+                  Row(
+                    children: [
+                      const Expanded(
+                        child: Text(
+                          'Selecciona una plantilla aprobada:',
+                          style: TextStyle(
+                            fontSize: 12.5,
+                            fontWeight: FontWeight.w600,
+                            color: white,
+                          ),
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: _isSending ? null : _openManager,
+                        child: const Text(
+                          'Administrar plantillas',
+                          style: TextStyle(color: primaryAqua, fontSize: 12),
+                        ),
+                      ),
+                    ],
                   ),
-                  const SizedBox(height: 8),
+                  if (_inReviewCount > 0)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Text(
+                        _inReviewCount == 1
+                            ? '1 plantilla en revisión de Meta: aparecerá aquí cuando la aprueben.'
+                            : '$_inReviewCount plantillas en revisión de Meta: aparecerán aquí cuando las aprueben.',
+                        style: const TextStyle(fontSize: 11.5, color: collisionAmber),
+                      ),
+                    ),
+                  const SizedBox(height: 4),
 
                   // Chips / tarjetas de plantillas disponibles
                   Wrap(
@@ -568,6 +474,7 @@ class _CloudApiTemplateSheetContentState
                     children: filtered.map((tpl) {
                       final isSelected = selected?.name == tpl.name &&
                           selected?.language == tpl.language;
+                      final blocked = tpl.unsupportedReason != null;
                       return ChoiceChip(
                         selected: isSelected,
                         onSelected: (_) => _selectTemplate(tpl),
@@ -580,11 +487,11 @@ class _CloudApiTemplateSheetContentState
                         label: Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            if (tpl.name == 'hello_world') ...[
-                              const Icon(
-                                Icons.science_outlined,
+                            if (tpl.name == 'hello_world' || blocked) ...[
+                              Icon(
+                                blocked ? Icons.block_rounded : Icons.science_outlined,
                                 size: 15,
-                                color: primaryAqua,
+                                color: blocked ? collisionAmber : primaryAqua,
                               ),
                               const SizedBox(width: 5),
                             ],
@@ -594,7 +501,7 @@ class _CloudApiTemplateSheetContentState
                                 fontSize: 12.5,
                                 fontWeight:
                                     isSelected ? FontWeight.w700 : FontWeight.w500,
-                                color: white,
+                                color: blocked ? lightText : white,
                               ),
                             ),
                           ],
@@ -603,11 +510,21 @@ class _CloudApiTemplateSheetContentState
                     }).toList(),
                   ),
 
-                  if (selected != null) ...[
+                  if (selected != null && selected.unsupportedReason != null) ...[
+                    const SizedBox(height: 16),
+                    Text(
+                      selected.unsupportedReason!,
+                      style: const TextStyle(fontSize: 12.5, color: collisionAmber, height: 1.35),
+                    ),
+                  ],
+
+                  if (selected != null && selected.unsupportedReason == null) ...[
                     const SizedBox(height: 16),
 
-                    // Campos de variables si la plantilla tiene {{1}}, {{2}}...
-                    if (_headerControllers.isNotEmpty || _bodyControllers.isNotEmpty) ...[
+                    // Un campo por variable, con su nombre real ({{nombre}} o {{1}}).
+                    if (_headerControllers.isNotEmpty ||
+                        _bodyControllers.isNotEmpty ||
+                        _buttonControllers.isNotEmpty) ...[
                       const Text(
                         'Variables de la plantilla:',
                         style: TextStyle(
@@ -617,40 +534,12 @@ class _CloudApiTemplateSheetContentState
                         ),
                       ),
                       const SizedBox(height: 8),
-                      for (var i = 0; i < _headerControllers.length; i++)
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 10),
-                          child: TextField(
-                            controller: _headerControllers[i],
-                            style: const TextStyle(color: white, fontSize: 13.5),
-                            decoration: InputDecoration(
-                              labelText: 'Encabezado {{${i + 1}}}',
-                              labelStyle: const TextStyle(color: lightText),
-                              filled: true,
-                              fillColor: darkBg,
-                              border: OutlineInputBorder(
-                                borderRadius: BorderRadius.circular(10),
-                              ),
-                            ),
-                          ),
-                        ),
-                      for (var i = 0; i < _bodyControllers.length; i++)
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 10),
-                          child: TextField(
-                            controller: _bodyControllers[i],
-                            style: const TextStyle(color: white, fontSize: 13.5),
-                            decoration: InputDecoration(
-                              labelText: 'Variable del mensaje {{${i + 1}}}',
-                              labelStyle: const TextStyle(color: lightText),
-                              filled: true,
-                              fillColor: darkBg,
-                              border: OutlineInputBorder(
-                                borderRadius: BorderRadius.circular(10),
-                              ),
-                            ),
-                          ),
-                        ),
+                      for (final (i, p) in selected.headerParams.indexed)
+                        _variableField(_headerControllers[i], 'Encabezado ${p.placeholder}'),
+                      for (final (i, p) in selected.bodyParams.indexed)
+                        _variableField(_bodyControllers[i], 'Mensaje ${p.placeholder}'),
+                      for (final (i, b) in selected.buttonParams.indexed)
+                        _variableField(_buttonControllers[i], 'Final del enlace del botón "${b.buttonText}"'),
                     ],
 
                     // Vista previa en vivo estilo burbuja de WhatsApp
@@ -701,12 +590,8 @@ class _CloudApiTemplateSheetContentState
                           const SizedBox(height: 8),
                           Text(
                             selected.renderPreview(
-                              headerValues: _headerControllers
-                                  .map((c) => c.text)
-                                  .toList(),
-                              bodyValues: _bodyControllers
-                                  .map((c) => c.text)
-                                  .toList(),
+                              header: _headerControllers.map((c) => c.text).toList(),
+                              body: _bodyControllers.map((c) => c.text).toList(),
                             ),
                             style: const TextStyle(
                               fontSize: 13.5,
@@ -771,7 +656,10 @@ class _CloudApiTemplateSheetContentState
                 ),
                 const SizedBox(width: 10),
                 ElevatedButton.icon(
-                  onPressed: (_isSending || _isLoading || selected == null)
+                  onPressed: (_isSending ||
+                          _isLoading ||
+                          selected == null ||
+                          selected.unsupportedReason != null)
                       ? null
                       : _sendSelectedTemplate,
                   style: ElevatedButton.styleFrom(
@@ -814,4 +702,23 @@ class _CloudApiTemplateSheetContentState
   }
 
   bool get _isloadingOrSending => _isLoading || _isSending;
+
+  Widget _variableField(TextEditingController controller, String label) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: TextField(
+        controller: controller,
+        style: const TextStyle(color: white, fontSize: 13.5),
+        decoration: InputDecoration(
+          labelText: label,
+          labelStyle: const TextStyle(color: lightText),
+          filled: true,
+          fillColor: darkBg,
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(10),
+          ),
+        ),
+      ),
+    );
+  }
 }

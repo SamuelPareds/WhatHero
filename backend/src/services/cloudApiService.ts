@@ -6,6 +6,7 @@ import { extractPhoneNumber, waNumberCandidates } from '../utils/phone';
 import { isAiSentMessage, rememberAiSentMessage } from './aiService';
 import { initializeSession, updateMediaIndexEntry } from './firestoreService';
 import { isSessionGone, writeSessionStatus } from './sessionSupervisor';
+import { TemplateDraft, buildCreateTemplatePayload, sanitizeTemplateSendComponents } from './metaTemplates';
 
 const GRAPH_API_VERSION = 'v21.0';
 const GRAPH_BASE_URL = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
@@ -1290,6 +1291,9 @@ export interface MetaTemplateSummary {
   status: string;
   category: string;
   language: string;
+  parameter_format?: string;
+  quality_score?: { score?: string; date?: number };
+  rejected_reason?: string;
   components: Array<{
     type: string;
     format?: string;
@@ -1299,24 +1303,37 @@ export interface MetaTemplateSummary {
   }>;
 }
 
-/**
- * Obtiene la lista de plantillas de WhatsApp configuradas en el WABA de la sesión.
- */
-export async function listMetaTemplates(params: {
-  accountId: string;
-  sessionId: string;
-}): Promise<MetaTemplateSummary[]> {
+// Las llamadas de administración de plantillas no pueden colgar un request para
+// siempre si Graph no contesta.
+const TEMPLATE_API_TIMEOUT_MS = 20_000;
+// 100 por página × 10 = 1 000 plantillas. Meta permite hasta 6 000 por WABA
+// verificado; más allá de esto el selector dejaría de ser usable de todos modos.
+const MAX_TEMPLATE_PAGES = 10;
+const TEMPLATE_BASE_FIELDS = 'id,name,status,category,language,components,parameter_format';
+// Si Graph deja de reconocer alguno, se piden sólo los básicos: perder el motivo
+// de rechazo no puede dejar a nadie sin poder enviar.
+const TEMPLATE_EXTRA_FIELDS = 'quality_score,rejected_reason';
+let warnedTemplateExtraFields = false;
+
+/** WABA y token de una sesión Cloud API: de memoria o, si no está cargada, del secreto. */
+async function resolveWabaCredentials(
+  accountId: string,
+  sessionId: string,
+): Promise<{ wabaId: string; accessToken: string }> {
   const { sessions, db } = requireDeps();
-  const sessionKey = `${params.accountId}_${params.sessionId}`;
-  let wabaId = sessions.get(sessionKey)?.cloudApi?.wabaId;
-  let accessToken = sessions.get(sessionKey)?.cloudApi?.accessToken;
+  if (isSessionGone(accountId, sessionId)) {
+    throw new CloudApiError('Esta sesión fue eliminada', { httpStatus: 410 });
+  }
+  const live = sessions.get(`${accountId}_${sessionId}`)?.cloudApi;
+  let wabaId = live?.wabaId;
+  let accessToken = live?.accessToken;
 
   if (!wabaId || !accessToken) {
     const secretSnap = await db
       .collection(ACCOUNTS_COLLECTION)
-      .doc(params.accountId)
+      .doc(accountId)
       .collection('cloud_api_secrets')
-      .doc(params.sessionId)
+      .doc(sessionId)
       .get();
     const secret = secretSnap.data();
     wabaId = secret?.wabaId;
@@ -1328,13 +1345,46 @@ export async function listMetaTemplates(params: {
       httpStatus: 400,
     });
   }
+  return { wabaId, accessToken };
+}
 
-  const res = await graphApiJson<{ data?: MetaTemplateSummary[] }>(
-    `/${wabaId}/message_templates?fields=id,name,status,category,language,components&limit=100`,
-    accessToken,
-  );
+async function fetchAllTemplates(wabaId: string, accessToken: string, fields: string): Promise<MetaTemplateSummary[]> {
+  const all: MetaTemplateSummary[] = [];
+  let next = `/${wabaId}/message_templates?fields=${fields}&limit=100`;
+  for (let page = 0; page < MAX_TEMPLATE_PAGES && next; page++) {
+    const res = await graphApiJson<{ data?: MetaTemplateSummary[]; paging?: { next?: string } }>(next, accessToken, {
+      signal: AbortSignal.timeout(TEMPLATE_API_TIMEOUT_MS),
+    });
+    if (Array.isArray(res?.data)) all.push(...res.data);
+    next = res?.paging?.next || '';
+  }
+  return all;
+}
 
-  const list = Array.isArray(res?.data) ? res.data : [];
+/**
+ * Todas las plantillas del WABA de la sesión, en cualquier estado. Siempre se
+ * leen de Meta, no de una copia: el estado de revisión cambia allá (aprobada,
+ * pausada, recategorizada) y una copia nuestra se desincronizaría.
+ */
+export async function listMetaTemplates(params: {
+  accountId: string;
+  sessionId: string;
+}): Promise<MetaTemplateSummary[]> {
+  const { wabaId, accessToken } = await resolveWabaCredentials(params.accountId, params.sessionId);
+
+  let list: MetaTemplateSummary[];
+  try {
+    list = await fetchAllTemplates(wabaId, accessToken, `${TEMPLATE_BASE_FIELDS},${TEMPLATE_EXTRA_FIELDS}`);
+  } catch (err) {
+    // #100 = "Tried accessing nonexisting field".
+    if (!(err instanceof CloudApiError) || err.code !== 100) throw err;
+    if (!warnedTemplateExtraFields) {
+      warnedTemplateExtraFields = true;
+      console.warn(`[CloudAPI] Graph rechazó ${TEMPLATE_EXTRA_FIELDS} al listar plantillas: se piden sólo los campos básicos.`, err.message);
+    }
+    list = await fetchAllTemplates(wabaId, accessToken, TEMPLATE_BASE_FIELDS);
+  }
+
   // Priorizar plantillas APPROVED y poner `hello_world` primero si está presente para pruebas rápidas.
   return list.sort((a, b) => {
     const aApproved = a.status === 'APPROVED' ? 0 : 1;
@@ -1343,6 +1393,52 @@ export async function listMetaTemplates(params: {
     if (a.name === 'hello_world' && b.name !== 'hello_world') return -1;
     if (b.name === 'hello_world' && a.name !== 'hello_world') return 1;
     return a.name.localeCompare(b.name);
+  });
+}
+
+/**
+ * Manda a revisión una plantilla ya validada (`validateTemplateDraft`). Meta
+ * contesta con la categoría que ELLA le asignó, que puede no ser la pedida: la
+ * reclasificación es automática desde abr-2025.
+ */
+export async function createMetaTemplate(params: {
+  accountId: string;
+  sessionId: string;
+  draft: TemplateDraft;
+}): Promise<{ id: string; status: string; category: string }> {
+  const { wabaId, accessToken } = await resolveWabaCredentials(params.accountId, params.sessionId);
+  const res = await graphApiJson<{ id?: string; status?: string; category?: string }>(
+    `/${wabaId}/message_templates`,
+    accessToken,
+    {
+      method: 'POST',
+      body: JSON.stringify(buildCreateTemplatePayload(params.draft)),
+      signal: AbortSignal.timeout(TEMPLATE_API_TIMEOUT_MS),
+    },
+  );
+  return {
+    id: String(res?.id ?? ''),
+    status: String(res?.status ?? 'PENDING'),
+    category: String(res?.category ?? params.draft.category),
+  };
+}
+
+/**
+ * Borra UNA plantilla (ese idioma). Por `hsm_id` + `name`: con `name` a secas
+ * Meta borra el nombre en todos los idiomas. Si estaba aprobada, Meta no deja
+ * crear otra con ese nombre durante 30 días.
+ */
+export async function deleteMetaTemplate(params: {
+  accountId: string;
+  sessionId: string;
+  templateId: string;
+  name: string;
+}): Promise<void> {
+  const { wabaId, accessToken } = await resolveWabaCredentials(params.accountId, params.sessionId);
+  const query = new URLSearchParams({ hsm_id: params.templateId, name: params.name });
+  await graphApiJson(`/${wabaId}/message_templates?${query.toString()}`, accessToken, {
+    method: 'DELETE',
+    signal: AbortSignal.timeout(TEMPLATE_API_TIMEOUT_MS),
   });
 }
 
@@ -1387,7 +1483,7 @@ export async function sendMetaTemplate(params: {
     },
   };
   if (Array.isArray(params.components) && params.components.length > 0) {
-    templatePayload.components = params.components;
+    templatePayload.components = sanitizeTemplateSendComponents(params.components);
   }
 
   const { wamid } = await sendGraphMessageWithRetry(

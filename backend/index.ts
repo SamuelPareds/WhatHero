@@ -91,10 +91,13 @@ import {
   connectCloudApiSession,
   loadCloudApiSessionsOnBoot,
   listMetaTemplates,
+  createMetaTemplate,
+  deleteMetaTemplate,
   sendMetaTemplate,
   handleMetaWebhookPayload,
   CloudApiError,
 } from './src/services/cloudApiService';
+import { validateTemplateDraft, describeTemplateApiError } from './src/services/metaTemplates';
 
 // Ensure auth_info directory exists
 const authInfoDir = 'auth_info';
@@ -2231,7 +2234,8 @@ app.post('/sessions/cloud-api/connect', express.json(), verifyHttpAuth(), async 
   }
 });
 
-// Listar plantillas aprobadas de Meta para una sesión Cloud API (ej. `hello_world`).
+// Listar las plantillas de Meta de una sesión Cloud API, en cualquier estado: el
+// selector de envío filtra las aprobadas y Ajustes › Plantillas muestra todas.
 // GET: no hay body, así que `verifyHttpAuth()` a secas respondía siempre 400
 // ("Missing accountId in body"). La membresía y el acceso se chequean acá.
 app.get('/sessions/cloud-api/templates', verifyHttpAuth({ requireAccountId: false }), async (req, res) => {
@@ -2256,11 +2260,71 @@ app.get('/sessions/cloud-api/templates', verifyHttpAuth({ requireAccountId: fals
     });
   } catch (error) {
     console.error('[/sessions/cloud-api/templates] Error:', error);
-    const status = error instanceof CloudApiError ? error.httpStatus : 500;
-    return res.status(status >= 400 && status < 600 ? status : 500).json({
-      error: (error as any)?.message || 'No se pudieron obtener las plantillas de Meta',
-      code: error instanceof CloudApiError ? error.code : undefined,
+    return templateApiErrorResponse(res, error, 'No se pudieron obtener las plantillas de Meta');
+  }
+});
+
+// Crear y eliminar plantillas propias: sólo el owner. Viven en la cuenta de Meta
+// del cliente, las de marketing se cobran por mensaje y borrar una aprobada
+// bloquea ese nombre 30 días. Ver CLAUDE.md, "📝 Plantillas propias".
+function templateApiErrorResponse(res: express.Response, error: unknown, fallback: string) {
+  // Un timeout es ambiguo: Meta pudo haber hecho el cambio igual.
+  if ((error as any)?.name === 'TimeoutError') {
+    return res.status(504).json({
+      error: 'Meta no respondió a tiempo. Revisa la lista antes de reintentar: el cambio pudo haberse aplicado.',
     });
+  }
+  if (error instanceof CloudApiError) {
+    const status = error.httpStatus >= 400 && error.httpStatus < 600 ? error.httpStatus : 502;
+    return res.status(status).json({ error: describeTemplateApiError(error), code: error.code, subcode: error.subcode });
+  }
+  return res.status(500).json({ error: fallback });
+}
+
+app.post('/sessions/cloud-api/templates', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const { accountId, sessionId, template } = req.body || {};
+    if (!SESSION_ID_RE.test(String(sessionId))) {
+      return res.status(400).json({ error: 'sessionId inválido' });
+    }
+    if (!(await isAccountOwner(req.auth!.uid, accountId))) {
+      return res.status(403).json({ error: 'Sólo el owner puede crear plantillas' });
+    }
+    const { draft, errors } = validateTemplateDraft(template);
+    if (!draft) {
+      return res.status(400).json({ error: errors[0]?.message || 'Plantilla inválida', errors });
+    }
+
+    const created = await createMetaTemplate({ accountId: String(accountId), sessionId: String(sessionId), draft });
+    console.log(`[Plantillas] ${accountId}/${sessionId} envió a revisión ${draft.name} (${draft.language}) → ${created.status} ${created.category}`);
+    return res.json({ success: true, template: created });
+  } catch (error) {
+    console.error('[POST /sessions/cloud-api/templates] Error:', error);
+    return templateApiErrorResponse(res, error, 'No se pudo enviar la plantilla a revisión');
+  }
+});
+
+app.post('/sessions/cloud-api/templates/delete', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const { accountId, sessionId, templateId, name } = req.body || {};
+    if (!SESSION_ID_RE.test(String(sessionId)) || !/^\d+$/.test(String(templateId)) || !/^[a-z0-9_]+$/.test(String(name))) {
+      return res.status(400).json({ error: 'Faltan sessionId, templateId o name' });
+    }
+    if (!(await isAccountOwner(req.auth!.uid, accountId))) {
+      return res.status(403).json({ error: 'Sólo el owner puede eliminar plantillas' });
+    }
+
+    await deleteMetaTemplate({
+      accountId: String(accountId),
+      sessionId: String(sessionId),
+      templateId: String(templateId),
+      name: String(name),
+    });
+    console.log(`[Plantillas] ${accountId}/${sessionId} eliminó ${name} (${templateId})`);
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('[POST /sessions/cloud-api/templates/delete] Error:', error);
+    return templateApiErrorResponse(res, error, 'No se pudo eliminar la plantilla');
   }
 });
 

@@ -13,8 +13,12 @@ import {
   isDeliveryStatusAdvance,
   decideCloudApiTarget,
   loadCloudApiSessionsOnBoot,
+  listMetaTemplates,
+  createMetaTemplate,
+  deleteMetaTemplate,
   CloudApiTargetFacts,
 } from './cloudApiService';
+import { validateTemplateDraft } from './metaTemplates';
 import { clearSessionGone, initSessionSupervisor, markSessionGone } from './sessionSupervisor';
 import { SessionData } from '../types';
 
@@ -703,5 +707,98 @@ describe('estados de entrega (los acuses de Meta llegan desordenados)', () => {
 
     const doc = fakeDb.updatedDocs.get('whatsapp_sessions/chats/5215599887766/messages/wamid.orden');
     assert.equal(doc.deliveryStatus, 'read');
+  });
+});
+
+describe('plantillas propias contra Graph', () => {
+  const realFetch = globalThis.fetch;
+
+  function setup() {
+    const sessions = new Map<string, SessionData>();
+    sessions.set('acc1_15551234567', makeCloudSession('acc1', '15551234567', 'phone_id_999'));
+    initCloudApiService({ db: makeFakeDb(), sessions, onUpsertedMessage: async () => {}, loadAllSessionConfigs: async () => {} });
+  }
+
+  function stubGraph(handler: (url: URL, init?: RequestInit) => Response) {
+    const calls: Array<{ method: string; url: URL; body?: any }> = [];
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      const parsed = new URL(url);
+      calls.push({ method: init?.method ?? 'GET', url: parsed, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      return handler(parsed, init);
+    }) as any;
+    return calls;
+  }
+
+  it('lee todas las páginas, no sólo las primeras 100', async () => {
+    setup();
+    const calls = stubGraph((url) => url.searchParams.get('after') === 'p2'
+      ? new Response(JSON.stringify({ data: [{ id: '2', name: 'b', status: 'PENDING' }] }))
+      : new Response(JSON.stringify({
+        data: [{ id: '1', name: 'a', status: 'APPROVED' }],
+        paging: { next: 'https://graph.facebook.com/v21.0/waba_test_123/message_templates?after=p2' },
+      })));
+    try {
+      const list = await listMetaTemplates({ accountId: 'acc1', sessionId: '15551234567' });
+      assert.deepEqual(list.map((t) => t.name), ['a', 'b']);
+      assert.equal(calls.length, 2);
+      assert.match(calls[0].url.searchParams.get('fields')!, /rejected_reason/);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it('si Graph no reconoce un campo extra, lista igual con los básicos', async () => {
+    setup();
+    const calls = stubGraph((url) => /rejected_reason/.test(url.searchParams.get('fields') ?? '')
+      ? new Response(JSON.stringify({ error: { code: 100, message: 'Tried accessing nonexisting field (rejected_reason)' } }), { status: 400 })
+      : new Response(JSON.stringify({ data: [{ id: '1', name: 'a', status: 'APPROVED' }] })));
+    try {
+      const list = await listMetaTemplates({ accountId: 'acc1', sessionId: '15551234567' });
+      assert.deepEqual(list.map((t) => t.name), ['a']);
+      assert.equal(calls.length, 2);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it('crear manda el payload al WABA y devuelve la categoría que asignó Meta', async () => {
+    setup();
+    const calls = stubGraph(() => new Response(JSON.stringify({ id: '777', status: 'PENDING', category: 'MARKETING' })));
+    try {
+      const { draft } = validateTemplateDraft({
+        name: 'aviso_pedido', language: 'es_MX', category: 'UTILITY',
+        body: 'Hola {{nombre}}, tu pedido ya salió.', examples: { nombre: 'Ana' },
+      });
+      const created = await createMetaTemplate({ accountId: 'acc1', sessionId: '15551234567', draft: draft! });
+      assert.deepEqual(created, { id: '777', status: 'PENDING', category: 'MARKETING' });
+      assert.equal(calls[0].method, 'POST');
+      assert.match(calls[0].url.pathname, /\/waba_test_123\/message_templates$/);
+      assert.equal(calls[0].body.parameter_format, 'named');
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it('eliminar borra sólo ese idioma: por hsm_id + name, nunca por name a secas', async () => {
+    setup();
+    const calls = stubGraph(() => new Response(JSON.stringify({ success: true })));
+    try {
+      await deleteMetaTemplate({ accountId: 'acc1', sessionId: '15551234567', templateId: '777', name: 'aviso_pedido' });
+      assert.equal(calls[0].method, 'DELETE');
+      assert.equal(calls[0].url.searchParams.get('hsm_id'), '777');
+      assert.equal(calls[0].url.searchParams.get('name'), 'aviso_pedido');
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it('una sesión eliminada no administra plantillas', async () => {
+    setup();
+    markSessionGone('acc1', '15551234567');
+    try {
+      await assert.rejects(listMetaTemplates({ accountId: 'acc1', sessionId: '15551234567' }), (err: any) => err.httpStatus === 410);
+    } finally {
+      clearSessionGone('acc1', '15551234567');
+    }
   });
 });

@@ -792,6 +792,36 @@ Al arrancar se cargan en memoria todas las sesiones Cloud API (`listDocuments`, 
 
 ---
 
+## 📝 Plantillas propias (crear, revisar, enviar)
+
+El owner crea plantillas desde Ajustes de la sesión › Perfil › *Plantillas de WhatsApp* (`lib/features/templates/`) y las manda a revisión de Meta. Las envía cualquiera con acceso a la sesión, desde el selector del chat. Guía operativa: `CLOUD_API_GUIDE.md`, *Plantillas propias*.
+
+- **La fuente de verdad es Meta, no Firestore.** `listMetaTemplates` lee el WABA en cada apertura (paginado, hasta 1 000). El estado cambia allá (aprobada, pausada, recategorizada) y una copia nuestra se desincronizaría. Pide `quality_score` y `rejected_reason` y, si Graph rechaza un campo (#100), repite con los básicos: perder el motivo de rechazo no puede dejar a nadie sin enviar.
+- **Las reglas de formato viven en un solo lugar: `metaTemplates.ts`** (tests en `metaTemplates.test.ts`). Copian lo que Meta rechaza por formato (variable al inicio o al final, #2388299; variables sin ejemplo; llaves sueltas; largos; límites de botones) y devuelven **todos** los errores juntos. La app no valida reglas: sólo limita largos y detecta las variables para pedir sus ejemplos.
+- **Se crean siempre con variables con nombre** (`parameter_format: 'named'`, `{{nombre}}`). Así un disparador podrá llenar `{{nombre}}` con el contacto sin depender del orden de `{{1}}`.
+- **Sólo el owner crea y elimina** (`isAccountOwner`). Viven en la cuenta de Meta del cliente, las de marketing se cobran y **borrar una aprobada bloquea ese nombre 30 días**. Eliminar va por `hsm_id` + `name`: con `name` a secas Meta borra ese nombre en **todos** los idiomas.
+- **Las respuestas rápidas se ordenan solas** antes que los botones de enlace y llamada: Meta rechaza mezclarlas.
+
+### El selector de envío no deja pasar lo que no sabe enviar
+`MetaTemplateModel` (`lib/features/templates/meta_template.dart`, tests en `test/meta_template_test.dart`) sabe qué hay que llenar: variables numeradas o con nombre (con `parameter_name`), y el final de un botón de enlace variable. **Antes sólo contaba `{{1}}`:** una plantilla con `{{nombre}}`, con imagen en el encabezado o con botón variable aparecía como enviable y Meta rechazaba el envío con el operador frente al cliente. Lo que todavía no soporta (encabezado multimedia, botón de código, carrusel, autenticación) sale con 🚫 y su motivo.
+- **El backend colapsa los espacios de cada variable** (`sanitizeTemplateSendComponents`): Meta rechaza saltos de línea, tabuladores y 4+ espacios seguidos, y un nombre de contacto raro no puede tumbar un envío.
+- El selector dice cuántas plantillas siguen **en revisión**: quien acaba de crear una no la ve ahí y creería que se perdió.
+
+### Antes de los envíos automáticos por disparador (Fase 2: leer todo antes de diseñarla)
+1. **Meta deja de aceptar plantillas de marketing por Cloud API el 13-oct-2027** (las cuentas creadas desde el 13-abr-2027 ya no pueden). Pasan a la Marketing Messages API. El envío tiene que elegir el endpoint según la categoría **actual**, en una sola función. Utilidad y autenticación siguen en Cloud API.
+2. **La categoría la decide Meta y puede cambiar** después de aprobada (webhook `template_category_update`). Un disparador lee la categoría al enviar, nunca la que tenía al configurarse: cambia precio y endpoint.
+3. **Opt-in obligatorio.** La política de Meta exige permiso para mensajes que inicia la empresa. Escribir en frío a números que nunca dieron su número trae bloqueos y reportes; Meta baja la calidad y el límite diario, y puede restringir el número del cliente. Cada contacto automatizado necesita su registro de opt-in.
+4. **Idempotencia persistente por evento.** `sendDedupe` vive en memoria 10 min; un disparador necesita un doc por evento creado con `create()` **antes** de enviar, o un redeploy a mitad de un lote cobra y manda dos veces.
+5. **Errores que cortan, no reintentan:** #131050 (el cliente dejó de aceptar marketing: no volver a escribirle), #131049 (Meta limitó el marketing a ese usuario), #132015/#132016 (plantilla pausada o desactivada: apagar el disparador y avisar al owner). #130429 y #131056 son de ritmo: backoff.
+6. **Llenar las variables en el backend.** Hoy las arma la app; con dos llenadores (app y disparador), la app debería mandar valores y el backend armar los `components` desde la definición de la plantilla.
+7. **Webhook `message_template_status_update`**, para avisar "aprobada/rechazada" por push y apagar disparadores al pausarse. Hoy se descarta en silencio: su `value` no trae `messaging_product` ni `phone_number_id`. Se rutea por `entry.id` (el WABA) y hay que suscribir ese campo en la app de Meta de cada cliente.
+
+**Fase 2 (no está hecho):** editar plantillas (Meta deja editar aprobadas 1 vez por día y 10 por mes), encabezado con imagen o video (necesita la Resumable Upload API con el App ID), botón de enlace variable en el editor y apelar desde WhatHero.
+
+**Pendiente aparte:** `GRAPH_API_VERSION` es `v21.0`, que Meta retira el 21-ene-2027. Las llamadas no fallan, pero pasan solas a la versión más vieja disponible y el comportamiento puede cambiar sin aviso. Subirla y probar envío, plantillas y alta antes de esa fecha.
+
+---
+
 
 ## 📦 Dependencias iOS: sólo Swift Package Manager
 

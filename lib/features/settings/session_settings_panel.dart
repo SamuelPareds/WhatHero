@@ -14,6 +14,7 @@ import 'package:crm_whatsapp/core/utils/phone_input.dart';
 import 'package:crm_whatsapp/core/utils/session_phone.dart';
 import '../accounts/change_number/change_number_flow.dart';
 import '../accounts/connect_cloud_api_sheet.dart';
+import '../templates/templates_screen.dart';
 import '../accounts/link_result.dart';
 import '../chat/number_change_divider.dart';
 import '../chat/widgets/label_editor_dialog.dart';
@@ -472,6 +473,23 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
                 icon: const Icon(Icons.key_rounded, color: primaryAqua, size: 20),
                 label: const Text(
                   'Actualizar Access Token / Ver Webhook de Meta',
+                  style: TextStyle(color: primaryAqua),
+                ),
+              ),
+            ),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                onPressed: () => Navigator.of(context).push(MaterialPageRoute(
+                  builder: (_) => MetaTemplatesScreen(
+                    accountId: widget.accountId,
+                    sessionId: widget.sessionId,
+                    sessionPhone: _linkedPhone,
+                  ),
+                )),
+                icon: const Icon(Icons.article_outlined, color: primaryAqua, size: 20),
+                label: const Text(
+                  'Plantillas de WhatsApp (crear y revisar)',
                   style: TextStyle(color: primaryAqua),
                 ),
               ),
