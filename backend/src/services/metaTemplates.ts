@@ -397,14 +397,24 @@ export function describeTemplateApiError(err: { code?: number; subcode?: number;
   if (err.subcode === 2388293) {
     return 'Demasiadas variables para lo corto del mensaje: agrega texto o quita variables.';
   }
+  // Verificado el 23-oct-2026 con el primer número de producción. Meta separa
+  // "Cuentas de WhatsApp" (una por número) de "Cuentas de mensajes" (el WABA,
+  // donde viven las plantillas), y la asignación de una no se hereda a la otra.
+  // Con el usuario del sistema sólo en la de WhatsApp se envía, se listan y se
+  // crean plantillas, pero borrar falla con este #100 sin subcódigo.
+  if (err.code === 100 && /need permission/i.test(`${err.details ?? ''} ${err.message ?? ''}`)) {
+    return 'El usuario del sistema del Access Token no está asignado a la cuenta de mensajes de esta sesión. En Configuración del negocio › Cuentas › Cuentas de mensajes, abre la del WABA ID de esta sesión › Asignar personas › tu usuario del sistema › Control total. Asignarlo sólo en "Cuentas de WhatsApp" no alcanza.';
+  }
   if (err.code === 190) {
     return 'El Access Token de Meta venció o fue revocado (el temporal dura 24 h). Genera uno permanente y actualiza las credenciales de la sesión.';
   }
-  // El token trae el permiso, pero quien lo generó no tiene control sobre ESTE
-  // WABA: con acceso parcial se envía y se listan plantillas, pero no se crean
-  // ni se borran. Meta no le pone subcódigo: se reconoce por el texto.
+  // El token lista plantillas pero no puede administrar las de ESTE WABA. Pasó
+  // en producción con "Control total" ya asignado: el token guardado no lleva
+  // whatsapp_business_management sobre el WABA (generado antes de asignarlo,
+  // sin ese permiso, o de otro usuario). Meta no le pone subcódigo: se
+  // reconoce por el texto.
   if (err.code === 100 && /need permission/i.test(`${err.details ?? ''} ${err.message ?? ''}`)) {
-    return 'El usuario de Meta que generó el Access Token no puede administrar las plantillas de esta cuenta de WhatsApp. En Configuración del negocio › Usuarios del sistema › Asignar activos, dale "Control total" sobre la cuenta de WhatsApp y vuelve a intentar.';
+    return 'El Access Token guardado no puede administrar las plantillas de esta cuenta de WhatsApp. Genera un token nuevo del usuario del sistema (con whatsapp_business_management y la cuenta de WhatsApp con Control total) y pégalo en "Actualizar Access Token".';
   }
   if (err.code === 200 || err.code === 10) {
     return 'El Access Token no tiene permiso para administrar plantillas (whatsapp_business_management). Genera uno con ese permiso y actualiza las credenciales de la sesión.';

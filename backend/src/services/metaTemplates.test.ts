@@ -182,9 +182,10 @@ describe('describeTemplateApiError', () => {
     assert.match(describeTemplateApiError({ code: 100, subcode: 2388299 }), /empieza o termina/);
     assert.match(describeTemplateApiError({ code: 200 }), /whatsapp_business_management/);
     assert.match(describeTemplateApiError({ code: 190 }), /venció/);
+    // El token creaba plantillas, pero el usuario del sistema no estaba en la cuenta de mensajes.
     assert.match(
       describeTemplateApiError({ code: 100, details: '(#100) Need permission on either WhatsApp Business Account or owner/shared business.' }),
-      /Control total/,
+      /Cuentas de mensajes/,
     );
     assert.equal(describeTemplateApiError({ code: 100, details: 'Ya existe contenido en este idioma' }), 'Ya existe contenido en este idioma');
   });

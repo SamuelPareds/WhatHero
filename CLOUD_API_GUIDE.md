@@ -22,7 +22,7 @@ A diferencia del QR, **no se sincroniza nada más**: sólo existe en WhatHero lo
 | Término | Qué es | Dónde se ve |
 |---|---|---|
 | **App de Meta** | El "programa" registrado en Meta for Developers. Cada cliente tiene la suya. | developers.facebook.com → Mis apps |
-| **WABA** (WABA ID) | La cuenta de WhatsApp Business donde viven los números. | WhatsApp → Configuración de la API |
+| **WABA** (WABA ID) = **cuenta de mensajes** | Agrupa los números y guarda las **plantillas**. En la configuración del negocio aparece en *Cuentas › Cuentas de mensajes* (*Messaging accounts*), **aparte** de *Cuentas de WhatsApp*, que tiene una entrada por número. El usuario del sistema tiene que estar asignado **en las dos**. | WhatsApp → Configuración de la API (el ID); Configuración del negocio → Cuentas de mensajes |
 | **Phone Number ID** | El id interno del número (no es el teléfono). | WhatsApp → Configuración de la API |
 | **Access Token** | La llave para enviar. El **temporal** dura 24 h; el **permanente** sale de un Usuario del sistema. | Configuración de la API / Configuración del negocio |
 | **App Secret** | La clave secreta de la app. WhatHero la usa para comprobar que cada webhook viene de Meta. | Configuración de la app → Básica → Clave secreta |
@@ -84,7 +84,8 @@ En desarrollo los datos van a `accounts_dev` y el backend corre en tu Mac. Meta 
 1. [ ] **App de Meta del cliente**, separada de la de pruebas (cada app tiene una sola URL de webhook).
 2. [ ] **Liberar el número:** un número no puede estar a la vez en la app de WhatsApp y en Cloud API. Respaldar los chats y, en el teléfono, Ajustes → Cuenta → **Eliminar cuenta**.
 3. [ ] **Agregar el número** en la app (Configuración de la API → Agregar número), verificar por SMS o llamada y definir el **PIN de 6 dígitos**. Sin ese registro los envíos fallan con "cuenta no registrada". El **nombre visible** pasa revisión de Meta.
-4. [ ] **Token permanente:** Configuración del negocio → *Usuarios del sistema* → crear uno con rol administrador → *Asignar activos*: la app y la cuenta de WhatsApp, las dos con **Control total** (con acceso parcial se envía, pero no se pueden crear ni eliminar plantillas) → *Generar token* con `whatsapp_business_messaging` y `whatsapp_business_management`. El temporal no sirve en producción.
+4. [ ] **Token permanente:** Configuración del negocio → *Usuarios del sistema* → crear uno con rol **Administrador** → *Asignar activos*: la app con **Control total** → *Generar token* con los **tres** permisos que pide Meta: `business_management`, `whatsapp_business_management` y `whatsapp_business_messaging`. El temporal no sirve en producción.
+   - [ ] **Asignar ese usuario del sistema en DOS lugares, los dos con Control total** (Meta no hereda uno del otro). Primero, *Cuentas → Cuentas de WhatsApp* → el número → *Asignar personas*. Después, *Cuentas → **Cuentas de mensajes*** → la que tiene el WABA ID → *Asignar personas*. Sin la segunda se envía y se crean plantillas, pero **no se pueden eliminar** (pasó con el primer número de producción, 23-oct-2026).
 5. [ ] **Método de pago** en WhatsApp Manager, para las plantillas que se cobran. Responder dentro de las 24 h es gratis.
 6. [ ] **Webhook de la app:** URL `https://whathero.up.railway.app/webhook/meta`, token `whathero_meta_verify_2026`, campo **`messages`** suscrito. Y en *Configuración de producción → Registra tu número*, el interruptor **"Suscribir webhooks"** de la cuenta encendido.
 7. [ ] **Publicar la app** si los mensajes reales no llegan (el panel lo avisa con una franja naranja). Pide una URL de política de privacidad.
@@ -142,7 +143,7 @@ Mira primero el **log del backend** (terminal en dev, Railway en producción) y 
 | Meta: "Application has been deleted" | La app que emitió el token se borró. | Reconectar con el token y el App Secret de una app vigente. |
 | Conecté y no aparece en "Mis Cuentas" | Entraste con un miembro restringido. | Entrar con el owner o darle acceso a esa sesión en *Miembros*. |
 | Plantillas: "no tiene permiso para administrar plantillas" | Token sin `whatsapp_business_management`. | Generar el token con los dos permisos de WhatsApp y *Actualizar credenciales*. |
-| Plantillas: "(#100) Need permission on either WhatsApp Business Account…" o "no puede administrar las plantillas de esta cuenta" | El usuario del sistema que generó el token tiene acceso **parcial** a la cuenta de WhatsApp. Pasó con el primer número de producción (23-oct-2026). | Configuración del negocio › Usuarios del sistema › *Asignar activos* › la cuenta de WhatsApp con **Control total**. Si sigue igual, generar un token nuevo y *Actualizar credenciales*. |
+| Plantillas: se crean pero no se eliminan: "no está asignado a la cuenta de mensajes" (Meta: "(#100) Need permission on either WhatsApp Business Account or owner/shared business") | El usuario del sistema está en *Cuentas de WhatsApp* pero no en ***Cuentas de mensajes***. Pasó con el primer número de producción (23-oct-2026): el token, los permisos y el modo de la app estaban bien. | *Cuentas → Cuentas de mensajes* → la del WABA ID → *Asignar personas* → el usuario del sistema con **Control total**. No hace falta regenerar el token. |
 | Creé una plantilla y no aparece al enviar | Sigue en revisión, o la rechazaron. | Ajustes › Plantillas de WhatsApp: ver el estado y el motivo. |
 | Una plantilla aprobada sale con 🚫 en el selector | Usa algo que WhatHero todavía no envía (imagen en el encabezado, botón de código, carrusel). | Usar otra, o crear una versión de texto. |
 
@@ -153,6 +154,7 @@ Con el **Explorador de la Graph API** (developers.facebook.com/tools/explorer): 
 |---|---|---|
 | Si la app está suscrita al WABA (lo mismo que el interruptor "Suscribir webhooks") | `GET {WABA_ID}/subscribed_apps` (con `POST` la suscribe) | De usuario o del sistema |
 | Qué números tiene el WABA | `GET {WABA_ID}/phone_numbers` | De usuario o del sistema |
+| Quién está asignado a la cuenta de mensajes y con qué permiso (`MANAGE` = Control total) | `GET {WABA_ID}/assigned_users?business={BUSINESS_ID}&fields=name,tasks` (el Business ID está en *Información del negocio*) | Del sistema con `business_management` |
 | URL y campos del webhook de la app | `GET {APP_ID}/subscriptions` | "Token de acceso a la app" |
 
 ---

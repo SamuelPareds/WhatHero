@@ -358,7 +358,8 @@ class _ConnectCloudApiFormState extends State<_ConnectCloudApiForm> {
                             '1. Entra a developers.facebook.com → Tu App → WhatsApp → Configuración de la API.\n'
                             '2. En "De" selecciona el número de prueba ("Test number") o tu número oficial.\n'
                             '3. Copia el "Identificador de número de teléfono" (Phone Number ID) y el "Identificador de la cuenta de WhatsApp Business" (WABA ID).\n'
-                            '4. Copia el Token de acceso temporal (dura 24h para pruebas) o un Token permanente de Usuario del Sistema.\n'
+                            '4. Copia el Token de acceso temporal (dura 24h para pruebas) o un Token permanente de Usuario del Sistema. '
+                            'Ese usuario va asignado con Control total en Configuración del negocio › Cuentas de WhatsApp (el número) y también en Cuentas de mensajes (la del WABA ID): sin la segunda no se pueden eliminar plantillas.\n'
                             '5. En Configuración de la app → Básica, copia la "Clave secreta de la app" (App Secret).\n'
                             '6. En "Para" agrega tu número personal de WhatsApp a la lista permitida de Meta para recibir mensajes del número de prueba.',
                             style: TextStyle(
