@@ -84,7 +84,7 @@ En desarrollo los datos van a `accounts_dev` y el backend corre en tu Mac. Meta 
 1. [ ] **App de Meta del cliente**, separada de la de pruebas (cada app tiene una sola URL de webhook).
 2. [ ] **Liberar el número:** un número no puede estar a la vez en la app de WhatsApp y en Cloud API. Respaldar los chats y, en el teléfono, Ajustes → Cuenta → **Eliminar cuenta**.
 3. [ ] **Agregar el número** en la app (Configuración de la API → Agregar número), verificar por SMS o llamada y definir el **PIN de 6 dígitos**. Sin ese registro los envíos fallan con "cuenta no registrada". El **nombre visible** pasa revisión de Meta.
-4. [ ] **Token permanente:** Configuración del negocio → *Usuarios del sistema* → crear uno con rol administrador → *Asignar activos*: la app y la cuenta de WhatsApp → *Generar token* con `whatsapp_business_messaging` y `whatsapp_business_management`. El temporal no sirve en producción.
+4. [ ] **Token permanente:** Configuración del negocio → *Usuarios del sistema* → crear uno con rol administrador → *Asignar activos*: la app y la cuenta de WhatsApp, las dos con **Control total** (con acceso parcial se envía, pero no se pueden crear ni eliminar plantillas) → *Generar token* con `whatsapp_business_messaging` y `whatsapp_business_management`. El temporal no sirve en producción.
 5. [ ] **Método de pago** en WhatsApp Manager, para las plantillas que se cobran. Responder dentro de las 24 h es gratis.
 6. [ ] **Webhook de la app:** URL `https://whathero.up.railway.app/webhook/meta`, token `whathero_meta_verify_2026`, campo **`messages`** suscrito. Y en *Configuración de producción → Registra tu número*, el interruptor **"Suscribir webhooks"** de la cuenta encendido.
 7. [ ] **Publicar la app** si los mensajes reales no llegan (el panel lo avisa con una franja naranja). Pide una URL de política de privacidad.
@@ -142,6 +142,7 @@ Mira primero el **log del backend** (terminal en dev, Railway en producción) y 
 | Meta: "Application has been deleted" | La app que emitió el token se borró. | Reconectar con el token y el App Secret de una app vigente. |
 | Conecté y no aparece en "Mis Cuentas" | Entraste con un miembro restringido. | Entrar con el owner o darle acceso a esa sesión en *Miembros*. |
 | Plantillas: "no tiene permiso para administrar plantillas" | Token sin `whatsapp_business_management`. | Generar el token con los dos permisos de WhatsApp y *Actualizar credenciales*. |
+| Plantillas: "(#100) Need permission on either WhatsApp Business Account…" o "no puede administrar las plantillas de esta cuenta" | El usuario del sistema que generó el token tiene acceso **parcial** a la cuenta de WhatsApp. Pasó con el primer número de producción (23-oct-2026). | Configuración del negocio › Usuarios del sistema › *Asignar activos* › la cuenta de WhatsApp con **Control total**. Si sigue igual, generar un token nuevo y *Actualizar credenciales*. |
 | Creé una plantilla y no aparece al enviar | Sigue en revisión, o la rechazaron. | Ajustes › Plantillas de WhatsApp: ver el estado y el motivo. |
 | Una plantilla aprobada sale con 🚫 en el selector | Usa algo que WhatHero todavía no envía (imagen en el encabezado, botón de código, carrusel). | Usar otra, o crear una versión de texto. |
 

@@ -400,6 +400,12 @@ export function describeTemplateApiError(err: { code?: number; subcode?: number;
   if (err.code === 190) {
     return 'El Access Token de Meta venció o fue revocado (el temporal dura 24 h). Genera uno permanente y actualiza las credenciales de la sesión.';
   }
+  // El token trae el permiso, pero quien lo generó no tiene control sobre ESTE
+  // WABA: con acceso parcial se envía y se listan plantillas, pero no se crean
+  // ni se borran. Meta no le pone subcódigo: se reconoce por el texto.
+  if (err.code === 100 && /need permission/i.test(`${err.details ?? ''} ${err.message ?? ''}`)) {
+    return 'El usuario de Meta que generó el Access Token no puede administrar las plantillas de esta cuenta de WhatsApp. En Configuración del negocio › Usuarios del sistema › Asignar activos, dale "Control total" sobre la cuenta de WhatsApp y vuelve a intentar.';
+  }
   if (err.code === 200 || err.code === 10) {
     return 'El Access Token no tiene permiso para administrar plantillas (whatsapp_business_management). Genera uno con ese permiso y actualiza las credenciales de la sesión.';
   }
