@@ -424,3 +424,191 @@ export function describeTemplateApiError(err: { code?: number; subcode?: number;
   }
   return err.details || err.message || 'Meta rechazó la solicitud.';
 }
+
+// ---------------------------------------------------------------------------
+// Enviar una plantilla aprobada armándola en el backend (API pública)
+// ---------------------------------------------------------------------------
+//
+// Port de `MetaTemplateModel` (lib/features/templates/meta_template.dart): quien
+// llama por API sólo manda los VALORES de las variables y aquí se arman los
+// `components` desde la definición que devuelve Meta. La app todavía arma los
+// suyos; cuando migre, tiene que pasar por aquí (ver CLAUDE.md, "🔑 API pública").
+
+/** Lo mínimo de una plantilla de Meta (`GET /{waba}/message_templates`) para enviarla. */
+export interface TemplateDefinition {
+  name: string;
+  status: string;
+  category: string;
+  language: string;
+  parameter_format?: string;
+  components: Array<{
+    type: string;
+    format?: string;
+    text?: string;
+    buttons?: Array<{ type: string; text?: string; url?: string }>;
+  }>;
+}
+
+export type TemplateBlockCode = 'template_not_approved' | 'template_paused' | 'template_unsupported';
+
+export interface TemplateBlock {
+  code: TemplateBlockCode;
+  message: string;
+  templateStatus?: string;
+}
+
+/** Largo máximo que aceptamos para el valor de una variable. */
+export const TEMPLATE_PARAM_MAX = 1024;
+
+// Igual que en la app: tolera espacios dentro de las llaves.
+const SEND_PLACEHOLDER_RE = /\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g;
+
+function component(t: TemplateDefinition, type: string) {
+  return t.components?.find((c) => String(c?.type).toUpperCase() === type);
+}
+
+function headerFormat(t: TemplateDefinition): string | null {
+  const header = component(t, 'HEADER');
+  if (!header) return null;
+  return header.format ? String(header.format).toUpperCase() : header.text != null ? 'TEXT' : null;
+}
+
+function headerTextOf(t: TemplateDefinition): string {
+  return headerFormat(t) === 'TEXT' ? str(component(t, 'HEADER')?.text) : '';
+}
+
+function placeholderKeys(text: string): string[] {
+  return [...text.matchAll(SEND_PLACEHOLDER_RE)].map((m) => m[1]);
+}
+
+/** Con nombre (`{{nombre}}`) o numeradas (`{{1}}`). Meta lo dice; si no, se deduce. */
+function isNamedTemplate(t: TemplateDefinition): boolean {
+  if (t.parameter_format) return t.parameter_format.toUpperCase() === 'NAMED';
+  return placeholderKeys(`${headerTextOf(t)} ${str(component(t, 'BODY')?.text)}`).some((k) => !/^\d+$/.test(k));
+}
+
+/** Las variables de un texto, en el orden en que Meta las pide. */
+function sendParams(text: string, named: boolean): string[] {
+  const keys = placeholderKeys(text);
+  if (keys.length === 0) return [];
+  if (!named) {
+    // Meta espera {{1}}..{{n}} en orden, aunque el texto las use desordenadas.
+    const last = Math.max(0, ...keys.map((k) => Number.parseInt(k, 10) || 0));
+    return Array.from({ length: last }, (_, i) => String(i + 1));
+  }
+  return [...new Set(keys)];
+}
+
+/**
+ * Por qué no se puede enviar esta plantilla por API, o `null` si se puede. Es
+ * lo que la app marca con 🚫, más dos cosas que el API todavía no llena: el
+ * final variable de un botón de enlace y una variable numerada en el encabezado
+ * (con nombre comparte valores con el cuerpo; numerada chocaría con el `{{1}}`
+ * del cuerpo). Las plantillas creadas desde WhatHero no tienen ninguna de las dos.
+ */
+export function templateSendBlock(t: TemplateDefinition): TemplateBlock | null {
+  const status = String(t.status || '').toUpperCase();
+  if (status === 'PAUSED') {
+    return {
+      code: 'template_paused',
+      message: 'Meta pausó esta plantilla por su calidad. Revísala en WhatHero antes de seguir enviándola.',
+      templateStatus: status,
+    };
+  }
+  if (status !== 'APPROVED') {
+    return {
+      code: 'template_not_approved',
+      message: `La plantilla no está aprobada por Meta (estado: ${status || 'desconocido'}).`,
+      templateStatus: status,
+    };
+  }
+
+  const unsupported = (message: string): TemplateBlock => ({ code: 'template_unsupported', message });
+  if (String(t.category).toUpperCase() === 'AUTHENTICATION') {
+    return unsupported('Es de autenticación (códigos de un solo uso): el API de WhatHero no la envía.');
+  }
+  const format = headerFormat(t);
+  if (format && format !== 'TEXT') {
+    return unsupported(`Lleva ${format.toLowerCase()} en el encabezado: el API todavía no puede enviarla.`);
+  }
+  for (const c of t.components ?? []) {
+    const type = String(c?.type).toUpperCase();
+    if (!['HEADER', 'BODY', 'FOOTER', 'BUTTONS'].includes(type)) {
+      return unsupported(`Usa un formato (${type}) que el API todavía no puede enviar.`);
+    }
+  }
+  for (const b of component(t, 'BUTTONS')?.buttons ?? []) {
+    const type = String(b?.type).toUpperCase();
+    if (!['QUICK_REPLY', 'URL', 'PHONE_NUMBER'].includes(type)) {
+      return unsupported(`Tiene un botón de tipo ${type}: el API todavía no puede enviarla.`);
+    }
+    if (type === 'URL' && /\{\{/.test(str(b.url))) {
+      return unsupported('Tiene un botón de enlace con final variable: el API todavía no lo llena.');
+    }
+  }
+  if (!isNamedTemplate(t) && sendParams(headerTextOf(t), false).length > 0) {
+    return unsupported('Tiene una variable numerada en el encabezado: el API todavía no la llena.');
+  }
+  return null;
+}
+
+export type TemplateSendBuild =
+  | { ok: true; components: any[]; renderedText: string }
+  | { ok: false; code: 'missing_variables' | 'invalid_variable_value'; variables: string[]; message: string };
+
+/**
+ * Los `components` del envío y el texto que queda en la burbuja, a partir de
+ * los valores que mandó quien llama (`{ nombre: 'Ana' }` o `{ '1': 'Ana' }`).
+ * Una variable con nombre llena el encabezado y el cuerpo por igual. Llama
+ * antes a `templateSendBlock`: aquí se asume que la plantilla se puede enviar.
+ */
+export function buildTemplateSend(t: TemplateDefinition, variables: Record<string, unknown>): TemplateSendBuild {
+  const named = isNamedTemplate(t);
+  const header = headerTextOf(t);
+  const body = str(component(t, 'BODY')?.text);
+  const footer = str(component(t, 'FOOTER')?.text);
+  const headerParams = sendParams(header, named);
+  const bodyParams = sendParams(body, named);
+
+  const missing: string[] = [];
+  const invalid: string[] = [];
+  const values = new Map<string, string>();
+  for (const key of [...new Set([...headerParams, ...bodyParams])]) {
+    const raw = variables[key];
+    if (raw === undefined || raw === null) {
+      missing.push(key);
+      continue;
+    }
+    const value = typeof raw === 'string' || typeof raw === 'number' ? sanitizeTemplateParamText(String(raw)) : '';
+    if (!value || value.length > TEMPLATE_PARAM_MAX) invalid.push(key);
+    else values.set(key, value);
+  }
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      code: 'missing_variables',
+      variables: missing,
+      message: `La plantilla pide ${missing.map((k) => `{{${k}}}`).join(', ')} y no vino en "variables".`,
+    };
+  }
+  if (invalid.length > 0) {
+    return {
+      ok: false,
+      code: 'invalid_variable_value',
+      variables: invalid,
+      message: `${invalid.map((k) => `{{${k}}}`).join(', ')} viene vacía o pasa de ${TEMPLATE_PARAM_MAX} caracteres.`,
+    };
+  }
+
+  const param = (key: string) => ({ type: 'text', ...(named && { parameter_name: key }), text: values.get(key)! });
+  const components: any[] = [];
+  if (headerParams.length > 0) components.push({ type: 'header', parameters: headerParams.map(param) });
+  if (bodyParams.length > 0) components.push({ type: 'body', parameters: bodyParams.map(param) });
+
+  // Igual que renderPreview de la app: encabezado, cuerpo y pie con las variables llenas.
+  const fill = (text: string) => text.replace(SEND_PLACEHOLDER_RE, (whole, key) => values.get(key) ?? whole);
+  const parts = [fill(header.trim()), fill(body.trim()), footer.trim()].filter(Boolean);
+  const renderedText = parts.length > 0 ? parts.join('\n\n') : `📋 Plantilla: ${t.name} (${t.language})`;
+
+  return { ok: true, components, renderedText };
+}

@@ -817,9 +817,57 @@ El owner crea plantillas desde Ajustes de la sesión › Perfil › *Plantillas 
 6. **Llenar las variables en el backend.** Hoy las arma la app; con dos llenadores (app y disparador), la app debería mandar valores y el backend armar los `components` desde la definición de la plantilla.
 7. **Webhook `message_template_status_update`**, para avisar "aprobada/rechazada" por push y apagar disparadores al pausarse. Hoy se descarta en silencio: su `value` no trae `messaging_product` ni `phone_number_id`. Se rutea por `entry.id` (el WABA) y hay que suscribir ese campo en la app de Meta de cada cliente.
 
+El API pública (abajo) ya resolvió 2, 4, 5 y 6 para los envíos desde fuera. Un disparador interno tiene que reusar sus piezas (`buildTemplateSend`, el registro de `api_sends`, `mapMetaSendError`, `marketing_opt_out_at`), no hacer las suyas.
+
 **Fase 2 (no está hecho):** editar plantillas (Meta deja editar aprobadas 1 vez por día y 10 por mes), encabezado con imagen o video (necesita la Resumable Upload API con el App ID), botón de enlace variable en el editor y apelar desde WhatHero.
 
 **Pendiente aparte:** `GRAPH_API_VERSION` es `v21.0`, que Meta retira el 21-ene-2027. Las llamadas no fallan, pero pasan solas a la versión más vieja disponible y el comportamiento puede cambiar sin aviso. Subirla y probar envío, plantillas y alta antes de esa fecha.
+
+---
+
+## 🔑 API pública (enviar plantillas desde otro sistema)
+
+Un sistema externo manda plantillas aprobadas desde una sesión **Cloud API** con una llave que el owner crea en *Mis Cuentas › 🔑 Llaves de API*. El primero es AgendaCool (otro proyecto de Firebase): cada mañana manda un seguimiento a quien hizo el onboarding y no compró. Es el primer envío automático de WhatHero y la base del SaaS: cada cliente saca sus llaves.
+
+### El contrato
+`POST /api/v1/messages/template`, `Authorization: Bearer whk_…`, cuerpo `{from, to, template, language, variables, contactName?, idempotencyKey}`. Responde `{id, status: 'accepted', to, replayed}`. Cada error trae un `code` estable y una `action`: **stop** (detén el lote: llave, sesión o plantilla), **skip** (sigue con el siguiente contacto) o **retry** (reintenta éste más tarde con la misma `idempotencyKey`). El catálogo vive en `publicApiErrors.ts`. **Un código publicado no cambia de significado ni de acción**: hay sistemas decidiendo con él. Agregar uno nuevo sí se puede.
+
+- **Sólo Cloud API, nunca QR** (`session_not_cloud_api`). Mandar en lote por QR a gente que no te escribió es justo lo que WhatsApp banea.
+- **Quien llama manda valores, no `components`.** `buildTemplateSend` (`metaTemplates.ts`, port de `MetaTemplateModel`) los arma desde la definición de Meta, que se cachea 5 min por sesión. Si la definición en cache bloquearía el envío (no existe, no aprobada), se reconfirma con Meta: pudo aprobarse hace un minuto. Una variable con nombre llena el encabezado y el cuerpo por igual. Todavía no soporta encabezado con media, botón de enlace con final variable ni variable numerada en el encabezado (`template_unsupported`). La app sigue armando sus propios `components`; cuando migre, tiene que pasar por aquí.
+- **"Número sin WhatsApp" no se sabe al enviar.** Cloud API acepta el mensaje y avisa minutos después por webhook (#131026). Queda como fallido en el chat, y repetir la petición con la misma `idempotencyKey` devuelve `deliveryStatus: "failed"` con el motivo.
+
+### Llaves (`apiKeys.ts`)
+- Formato `whk_<keyId 16 hex>_<secreto>`. Del secreto sólo se guarda el sha256; con 256 bits aleatorios no hace falta un hash lento. Nunca se loguea la llave, sólo el `keyId`.
+- Viven en la raíz `api_keys` / `api_keys_dev` (`API_KEYS_COLLECTION` en `env.ts`): la llave tiene que encontrar su cuenta con una sola lectura por id. **No tienen regla en `firestore.rules`**: ningún cliente las lee, ni el owner (lo fija `rules-tests/`). La app usa `GET /api-keys`, `POST /api-keys` y `POST /api-keys/revoke`, y sólo el owner.
+- Revocar invalida la caché en el acto (proceso único). `last_used_at` se escribe como mucho una vez por minuto.
+- Los límites viven en memoria: 20 de ráfaga + 1/s por llave, y 20 intentos fallidos por minuto por IP **antes** de leer Firestore. La IP es la última de `X-Forwarded-For`, la que agrega Railway: lo de antes lo escribe el cliente. Un redeploy reinicia los contadores.
+- Sin sesiones elegidas, la llave envía desde todas las sesiones Cloud API, también las que se conecten después. Eliminar una sesión la quita de `session_ids` y borra sus `api_sends`.
+
+### Nunca dos veces (`apiSends.ts`)
+Cada envío tiene un registro `{accounts}/{aid}/api_sends/{sha256(idempotencyKey)}`. Está a nivel cuenta y sin regla: si un cliente pudiera borrarlo, podría hacer reenviar algo que ya salió.
+
+1. **Se lee antes de validar.** Lo que ya salió devuelve lo mismo (`replayed: true`), aunque la plantilla se haya pausado después. Si la misma llave llega con otro contenido es `idempotency_conflict`; el fingerprint toma `to` en dígitos tal como vino y no cuenta `contactName`.
+2. **Se valida sin escribir.** Un rechazo (plantilla, variables, opt-out) no consume la llave: corregido el problema, se reenvía.
+3. **Se reclama en una transacción** (`sending`) justo antes de llamar a Meta.
+4. Si Meta respondió OK, el registro pasa a `sent` **antes de pintar la burbuja**; no invertir ese orden. Si Meta respondió un error, pasa a `failed`: no salió, y un reintento sí reenvía. Si Meta **no respondió** (timeout de 30 s, red caída, proceso muerto, `sending` de más de 2 min), queda `in_doubt` → `send_in_doubt`, y **no se reenvía nunca**: pudo haber salido. Es el precio de no duplicar.
+5. **`biz_opaque_callback_data: "whathero_api:<id>"`** viaja en cada envío y vuelve en cada acuse del webhook. `applyApiSendStatus` pasa un `sending`/`in_doubt` a `sent` y, si el proceso murió antes, pinta la burbuja con lo guardado en el registro. `inFlight` evita que la pinte el webhook mientras el request sigue vivo.
+
+Los registros no tienen TTL: se acumulan, pero son pocos por día.
+
+### En el chat
+- **Remitente** `{type: 'bot', name: '<llave> (API)', via: 'api'}` y doc con `sentVia: 'api'`, `apiKeyId`. La burbuja dice "AgendaCool (API) · Plantilla (nombre)" sin tocar Flutter. `bot` lo deja fuera de la guarda de choque, como reglas y recordatorios.
+- **No cuenta como atención** (`isApiSend` en la rama `fromMe` de `handleSessionUpsertedMessage`): no cede la IA, no resetea pendientes, no marca leído en el teléfono ni dispara reglas *outgoing*. Si el lead había escrito, sigue pendiente para un humano, y pendientes y recibos de lectura siguen de acuerdo. Su respuesta entra como cualquier mensaje: IA y discriminador según la configuración de la sesión.
+- **Nombre:** el `contactName` del API se escribe en el chat. En Cloud API, el nombre de perfil de WhatsApp sólo llena un chat **sin nombre**: antes lo pisaba en cada mensaje, y "Ana López" se volvía "Anita 🌸" en cuanto respondía. Se mira primero el cache; si no está, se lee el chat una vez por contacto y por arranque.
+
+### Quien dejó el marketing
+`marketing_opt_out_at` vive en el doc del chat. Lo marca el #131050 o #498 de un acuse fallido (de cualquier plantilla, también las de la app), y también `user_preferences` con `stop`; `resume` lo borra. `marketing_pref_at` ordena los avisos, porque Meta los reintenta durante días y uno viejo no puede pisar uno nuevo. El API rechaza sólo las plantillas **MARKETING** (`recipient_opted_out`): las de utilidad siguen saliendo.
+- Sin chat no se marca nada, para no crear chats fantasma: si algún día se le escribe, Meta lo vuelve a avisar sin costo.
+- `user_preferences` sólo llega si el cliente suscribió ese campo en su app de Meta, y Meta lo está liberando poco a poco. Sin él, el #131050 cubre el "detener" pero nunca el "reanudar".
+- **El opt-in es de quien llama:** WhatHero no guarda consentimiento. AgendaCool sólo le escribe a quien aceptó recibir WhatsApp en el onboarding.
+
+Las reglas viven en `apiKeys.test.ts`, `apiSends.test.ts`, `metaTemplates.test.ts`, `cloudApiService.test.ts` y `rules-tests/`.
+
+**Fase 2 (no está hecho):** avisos de vuelta al sistema externo (webhooks salientes) o un `GET` de estado, documentación pública, "BAJA" automática, cuotas y cobro por plan, la app usando `buildTemplateSend`, ver y limpiar el opt-out desde la app, encabezado con media y botón de enlace variable, TTL para `api_sends` y límites que sobrevivan a un redeploy. **Antes del 13-oct-2027**: mandar MARKETING por la Marketing Messages API según la categoría actual (ver punto 1 arriba).
 
 ---
 

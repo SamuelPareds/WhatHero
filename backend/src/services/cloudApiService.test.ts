@@ -16,8 +16,13 @@ import {
   listMetaTemplates,
   createMetaTemplate,
   deleteMetaTemplate,
+  sendMetaTemplate,
+  isNewerMarketingPreference,
+  isMarketingOptedOut,
+  ApiSendStatusEvent,
   CloudApiTargetFacts,
 } from './cloudApiService';
+import * as admin from 'firebase-admin';
 import { validateTemplateDraft } from './metaTemplates';
 import { clearSessionGone, initSessionSupervisor, markSessionGone } from './sessionSupervisor';
 import { SessionData } from '../types';
@@ -39,6 +44,7 @@ function makeFakeDb(existingChatIds: string[] = []) {
               doc: (chatId: string) => ({
                 id: chatId,
                 exists: existingSet.has(chatId),
+                get: async () => ({ exists: existingSet.has(chatId), get: () => undefined }),
                 collection: (msgCol: string) => ({
                   doc: (msgId: string) => {
                     const path = `${subName}/${nestedName}/${chatId}/${msgCol}/${msgId}`;
@@ -799,6 +805,192 @@ describe('plantillas propias contra Graph', () => {
       await assert.rejects(listMetaTemplates({ accountId: 'acc1', sessionId: '15551234567' }), (err: any) => err.httpStatus === 410);
     } finally {
       clearSessionGone('acc1', '15551234567');
+    }
+  });
+});
+
+// Firestore mínimo con docs de chat y de mensaje que se leen y se actualizan
+// (también dentro de transacciones), para el nombre y el opt-out de marketing.
+function makeChatDb(chats: Record<string, Record<string, any>> = {}) {
+  const docs = new Map<string, Record<string, any>>(Object.entries(chats).map(([id, data]) => [`chats/${id}`, { ...data }]));
+  const deleteSentinel = admin.firestore.FieldValue.delete();
+  const ref = (path: string, id: string): any => ({
+    id,
+    path,
+    get: async () => {
+      const data = docs.get(path);
+      return { id, exists: !!data, get: (field: string) => data?.[field], data: () => data };
+    },
+    update: async (patch: Record<string, any>) => {
+      const current = docs.get(path);
+      if (!current) throw Object.assign(new Error('NOT_FOUND'), { code: 5 });
+      for (const [k, v] of Object.entries(patch)) {
+        if (deleteSentinel.isEqual(v)) delete current[k];
+        else current[k] = v;
+      }
+    },
+    collection: (sub: string) => ({ doc: (childId: string) => ref(`${path}/${sub}/${childId}`, childId) }),
+  });
+  const db: any = {
+    docs,
+    collection: () => ({
+      doc: () => ({
+        collection: () => ({
+          doc: () => ({ collection: () => ({ doc: (chatId: string) => ref(`chats/${chatId}`, chatId) }) }),
+        }),
+      }),
+    }),
+    getAll: async (...refs: any[]) => Promise.all(refs.map((r) => r.get())),
+    runTransaction: async (fn: (tx: any) => Promise<any>) =>
+      fn({ get: (r: any) => r.get(), update: (r: any, patch: Record<string, any>) => r.update(patch) }),
+  };
+  return db;
+}
+
+function cloudWebhook(value: Record<string, any>) {
+  return {
+    object: 'whatsapp_business_account',
+    entry: [{ changes: [{ value: { messaging_product: 'whatsapp', metadata: { phone_number_id: 'phone_id_999' }, ...value } }] }],
+  };
+}
+
+function setupChatDb(chats: Record<string, Record<string, any>>, extra: { onApiSendStatus?: (e: ApiSendStatusEvent) => Promise<void> } = {}) {
+  const db = makeChatDb(chats);
+  const sessions = new Map<string, SessionData>();
+  const session = makeCloudSession('acc1', '15551234567', 'phone_id_999');
+  sessions.set('acc1_15551234567', session);
+  const upserts: any[] = [];
+  initCloudApiService({
+    db,
+    sessions,
+    onUpsertedMessage: async (_k, _a, _s, raw) => {
+      upserts.push(raw);
+    },
+    loadAllSessionConfigs: async () => {},
+    ...extra,
+  });
+  return { db, session, upserts };
+}
+
+describe('nombre del contacto en Cloud API (el del API gana)', () => {
+  it('el nombre de perfil sólo llena un chat sin nombre', async () => {
+    const { session } = setupChatDb({ '5215511111111': { contactName: 'Ana López' } });
+    await handleMetaWebhookPayload(cloudWebhook({
+      contacts: [
+        { wa_id: '5215511111111', profile: { name: 'Anita 🌸' } },
+        { wa_id: '5215522222222', profile: { name: 'Beto' } },
+      ],
+    }));
+    assert.equal(session.contactNames.get('5215511111111'), 'Ana López');
+    assert.equal(session.contactNames.get('5215522222222'), 'Beto');
+  });
+
+  it('lo que ya está en memoria (lo que puso el API) tampoco se pisa', async () => {
+    const { session } = setupChatDb({});
+    session.contactNames.set('5215511111111', 'Ana López');
+    await handleMetaWebhookPayload(cloudWebhook({ contacts: [{ wa_id: '5215511111111', profile: { name: 'Anita 🌸' } }] }));
+    assert.equal(session.contactNames.get('5215511111111'), 'Ana López');
+  });
+});
+
+describe('quien dejó el marketing', () => {
+  const failedStatus = (code: number, timestamp = '1800000000') => cloudWebhook({
+    statuses: [{ id: 'wamid.mk', status: 'failed', recipient_id: '5215511111111', timestamp, errors: [{ code, title: 'x' }] }],
+  });
+  const preference = (value: 'stop' | 'resume', timestamp: number) => cloudWebhook({
+    user_preferences: [{ wa_id: '5215511111111', category: 'marketing_messages', value, timestamp }],
+  });
+
+  it('el #131050 de Meta lo marca en el chat', async () => {
+    const { db } = setupChatDb({ '5215511111111': {} });
+    await handleMetaWebhookPayload(failedStatus(131050));
+    assert.ok(db.docs.get('chats/5215511111111').marketing_opt_out_at);
+    assert.equal(db.docs.get('chats/5215511111111').marketing_opt_out_source, 'meta_131050');
+    assert.equal(await isMarketingOptedOut('acc1', '15551234567', '5215511111111'), true);
+  });
+
+  it('otro error de entrega no lo marca', async () => {
+    const { db } = setupChatDb({ '5215511111111': {} });
+    await handleMetaWebhookPayload(failedStatus(131026));
+    assert.equal(db.docs.get('chats/5215511111111').marketing_opt_out_at, undefined);
+  });
+
+  it('"detener" y "reanudar" de user_preferences, y uno viejo no pisa a uno nuevo', async () => {
+    const { db } = setupChatDb({ '5215511111111': {} });
+    await handleMetaWebhookPayload(preference('stop', 1_800_000_000));
+    assert.ok(db.docs.get('chats/5215511111111').marketing_opt_out_at);
+
+    await handleMetaWebhookPayload(preference('resume', 1_800_000_100));
+    assert.equal(db.docs.get('chats/5215511111111').marketing_opt_out_at, undefined);
+
+    // Meta reintenta el "detener" viejo: el "reanudar" posterior manda.
+    await handleMetaWebhookPayload(preference('stop', 1_800_000_000));
+    assert.equal(db.docs.get('chats/5215511111111').marketing_opt_out_at, undefined);
+  });
+
+  it('sin chat no crea uno fantasma', async () => {
+    const { db } = setupChatDb({});
+    await handleMetaWebhookPayload(preference('stop', 1_800_000_000));
+    assert.equal(db.docs.size, 0);
+  });
+
+  it('isNewerMarketingPreference', () => {
+    assert.equal(isNewerMarketingPreference(undefined, 1), true);
+    assert.equal(isNewerMarketingPreference(admin.firestore.Timestamp.fromMillis(10), 20), true);
+    assert.equal(isNewerMarketingPreference(admin.firestore.Timestamp.fromMillis(20), 10), false);
+  });
+});
+
+describe('acuses de envíos del API (biz_opaque_callback_data)', () => {
+  it('llegan al API antes de tocar el doc del mensaje, con el error de entrega', async () => {
+    const events: ApiSendStatusEvent[] = [];
+    setupChatDb({}, { onApiSendStatus: async (e) => { events.push(e); } });
+    await handleMetaWebhookPayload(cloudWebhook({
+      statuses: [
+        { id: 'wamid.api', status: 'failed', recipient_id: '5215511111111', biz_opaque_callback_data: 'whathero_api:abc', errors: [{ code: 131026, title: 'Undeliverable' }] },
+        { id: 'wamid.app', status: 'read', recipient_id: '5215511111111' },
+      ],
+    }));
+    assert.equal(events.length, 1, 'sólo los que traen nuestra marca');
+    assert.equal(events[0].wamid, 'wamid.api');
+    assert.equal(events[0].callbackData, 'whathero_api:abc');
+    assert.equal(events[0].chatPhone, '5215511111111');
+    assert.match(events[0].deliveryError!, /131026/);
+  });
+});
+
+describe('sendMetaTemplate (envío desde la app) no cambió con el API', () => {
+  const realFetch = globalThis.fetch;
+
+  it('manda a Meta sin marca del API y pinta la burbuja etiquetada con el operador y su tempId', async () => {
+    const { session, upserts } = setupChatDb({});
+    const sent: any[] = [];
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      sent.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ messages: [{ id: 'wamid.app1' }] }));
+    }) as any;
+    try {
+      const result = await sendMetaTemplate({
+        accountId: 'acc1',
+        sessionId: '15551234567',
+        to: '5215511111111',
+        templateName: 'aviso',
+        languageCode: 'es_MX',
+        components: [{ type: 'body', parameters: [{ type: 'text', text: 'Ana\nMaría' }] }],
+        renderedPreviewText: 'Hola Ana María',
+        sender: { type: 'human', name: 'Samuel', uid: 'u1' },
+        clientTempId: 'tmp-1',
+      });
+      assert.deepEqual(result, { wamid: 'wamid.app1', chatPhone: '5215511111111' });
+      assert.equal(sent[0].template.name, 'aviso');
+      assert.equal(sent[0].template.components[0].parameters[0].text, 'Ana María');
+      assert.equal(sent[0].biz_opaque_callback_data, undefined);
+      assert.equal(upserts[0].key.id, 'wamid.app1');
+      assert.equal(upserts[0].message.conversation, 'Hola Ana María');
+      assert.deepEqual(upserts[0].__extraMessageFields, { isTemplate: true, templateName: 'aviso', templateLanguage: 'es_MX' });
+      assert.deepEqual(session.pendingSenders.get('wamid.app1'), { type: 'human', name: 'Samuel', uid: 'u1', tempId: 'tmp-1' });
+    } finally {
+      globalThis.fetch = realFetch;
     }
   });
 });

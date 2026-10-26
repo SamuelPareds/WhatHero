@@ -7,6 +7,7 @@ import { isAiSentMessage, rememberAiSentMessage } from './aiService';
 import { initializeSession, updateMediaIndexEntry } from './firestoreService';
 import { isSessionGone, writeSessionStatus } from './sessionSupervisor';
 import { TemplateDraft, buildCreateTemplatePayload, sanitizeTemplateSendComponents } from './metaTemplates';
+import { META_MARKETING_OPT_OUT } from './publicApiErrors';
 
 const GRAPH_API_VERSION = 'v21.0';
 const GRAPH_BASE_URL = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
@@ -68,6 +69,21 @@ export interface CloudApiDeps {
     accountId: string,
     sessionId: string,
   ) => Promise<void>;
+  // Acuse de un envío del API pública (trae nuestro `biz_opaque_callback_data`).
+  // Ver apiSends.ts.
+  onApiSendStatus?: (event: ApiSendStatusEvent) => Promise<void>;
+}
+
+export interface ApiSendStatusEvent {
+  sessionKey: string;
+  session: SessionData;
+  accountId: string;
+  sessionId: string;
+  chatPhone: string;
+  wamid: string;
+  status: string;
+  callbackData: string;
+  deliveryError?: string;
 }
 
 let deps: CloudApiDeps | null = null;
@@ -271,6 +287,7 @@ async function sendGraphMessageWithRetry(
   accessToken: string,
   toPhone: string,
   buildBody: (recipientPhone: string) => Record<string, any>,
+  signal?: AbortSignal,
 ): Promise<{ wamid: string; recipientUsed: string }> {
   const candidates = waNumberCandidates(normalizePhoneDigits(toPhone));
   const listToTry = candidates.length > 0 ? candidates : [normalizePhoneDigits(toPhone)];
@@ -285,6 +302,7 @@ async function sendGraphMessageWithRetry(
         {
           method: 'POST',
           body: JSON.stringify(buildBody(candidate)),
+          signal,
         },
       );
       const wamid = res?.messages?.[0]?.id || `wamid.${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -1442,39 +1460,33 @@ export async function deleteMetaTemplate(params: {
   });
 }
 
+/** La sesión Cloud API activa en memoria, o `null`. */
+export function getCloudSession(accountId: string, sessionId: string): { sessionKey: string; session: SessionData } | null {
+  const sessionKey = `${accountId}_${sessionId}`;
+  const session = requireDeps().sessions.get(sessionKey);
+  if (!session || session.provider !== 'cloud_api' || !session.cloudApi || !session.sessionId) return null;
+  return { sessionKey, session };
+}
+
 /**
- * Envía una plantilla aprobada de Meta (`type: 'template'`) y persiste la
- * burbuja en Firestore pasando por el flujo estándar (`onUpsertedMessage`).
+ * Manda la plantilla a Meta y nada más: no toca Firestore. `to` ya tiene que
+ * ser el número canónico del chat (`resolveCanonicalChatPhone`).
+ * `bizOpaqueCallbackData` vuelve en cada acuse del webhook (lo usa el API para
+ * reconocer sus envíos aunque el proceso muera antes de anotarlos).
  */
-export async function sendMetaTemplate(params: {
-  accountId: string;
-  sessionId: string;
+export async function postTemplateToMeta(params: {
+  session: SessionData;
   to: string;
   templateName: string;
   languageCode: string;
   components?: any[];
-  renderedPreviewText?: string;
-  sender: SenderInfo;
-  clientTempId?: string | null;
-}): Promise<{ wamid: string; chatPhone: string }> {
-  const { sessions, onUpsertedMessage } = requireDeps();
-  const sessionKey = `${params.accountId}_${params.sessionId}`;
-  const session = sessions.get(sessionKey);
-
-  if (!session || session.provider !== 'cloud_api' || !session.cloudApi) {
-    throw new CloudApiError('La sesión seleccionada no es una sesión activa de Meta Cloud API', {
-      httpStatus: 400,
-    });
+  bizOpaqueCallbackData?: string;
+  signal?: AbortSignal;
+}): Promise<{ wamid: string }> {
+  if (!params.session.cloudApi) {
+    throw new CloudApiError('La sesión seleccionada no es una sesión activa de Meta Cloud API', { httpStatus: 400 });
   }
-
-  const { phoneNumberId, accessToken } = session.cloudApi;
-  const canonicalPhone = await resolveCanonicalChatPhone(
-    params.accountId,
-    params.sessionId,
-    params.to,
-    session,
-  );
-  const canonicalJid = `${canonicalPhone}@s.whatsapp.net`;
+  const { phoneNumberId, accessToken } = params.session.cloudApi;
 
   const templatePayload: Record<string, any> = {
     name: params.templateName,
@@ -1489,44 +1501,114 @@ export async function sendMetaTemplate(params: {
   const { wamid } = await sendGraphMessageWithRetry(
     phoneNumberId,
     accessToken,
-    canonicalPhone,
+    params.to,
     (recipient) => ({
       messaging_product: 'whatsapp',
       recipient_type: 'individual',
       to: recipient,
       type: 'template',
       template: templatePayload,
+      ...(params.bizOpaqueCallbackData && { biz_opaque_callback_data: params.bizOpaqueCallbackData }),
     }),
+    params.signal,
   );
+  return { wamid };
+}
+
+/**
+ * Pinta en el chat una plantilla que ya salió, por el flujo estándar
+ * (`onUpsertedMessage` → saveMessageToFirestore), etiquetada con `sender`.
+ */
+export async function persistOutgoingTemplate(params: {
+  sessionKey: string;
+  session: SessionData;
+  chatPhone: string;
+  wamid: string;
+  displayText: string;
+  templateName: string;
+  languageCode: string;
+  sender: SenderInfo;
+  extraFields?: Record<string, any>;
+}): Promise<void> {
+  const { onUpsertedMessage } = requireDeps();
 
   // Registrar el remitente humano/sistema antes de disparar `onUpsertedMessage`.
-  session.pendingSenders.set(wamid, {
-    ...params.sender,
-    ...(params.clientTempId ? { tempId: params.clientTempId } : {}),
-  });
-
-  const displayBody =
-    params.renderedPreviewText?.trim() ||
-    `📋 Plantilla: ${params.templateName} (${params.languageCode || 'en_US'})`;
+  params.session.pendingSenders.set(params.wamid, params.sender);
 
   const syntheticTemplateMsg: any = {
     key: {
-      remoteJid: canonicalJid,
+      remoteJid: `${params.chatPhone}@s.whatsapp.net`,
       fromMe: true,
-      id: wamid,
+      id: params.wamid,
     },
     messageTimestamp: Math.floor(Date.now() / 1000),
     message: {
-      conversation: displayBody,
+      conversation: params.displayText,
     },
     __extraMessageFields: {
       isTemplate: true,
       templateName: params.templateName,
       templateLanguage: params.languageCode || 'en_US',
+      ...params.extraFields,
     },
   };
 
-  await onUpsertedMessage(sessionKey, params.accountId, session.sock, syntheticTemplateMsg, 'notify');
+  await onUpsertedMessage(params.sessionKey, params.session.accountId, params.session.sock, syntheticTemplateMsg, 'notify');
+}
+
+/**
+ * Envía una plantilla aprobada de Meta (`type: 'template'`) desde la app y
+ * persiste la burbuja en Firestore pasando por el flujo estándar.
+ */
+export async function sendMetaTemplate(params: {
+  accountId: string;
+  sessionId: string;
+  to: string;
+  templateName: string;
+  languageCode: string;
+  components?: any[];
+  renderedPreviewText?: string;
+  sender: SenderInfo;
+  clientTempId?: string | null;
+}): Promise<{ wamid: string; chatPhone: string }> {
+  const found = getCloudSession(params.accountId, params.sessionId);
+  if (!found) {
+    throw new CloudApiError('La sesión seleccionada no es una sesión activa de Meta Cloud API', {
+      httpStatus: 400,
+    });
+  }
+  const { sessionKey, session } = found;
+
+  const canonicalPhone = await resolveCanonicalChatPhone(
+    params.accountId,
+    params.sessionId,
+    params.to,
+    session,
+  );
+
+  const { wamid } = await postTemplateToMeta({
+    session,
+    to: canonicalPhone,
+    templateName: params.templateName,
+    languageCode: params.languageCode,
+    components: params.components,
+  });
+
+  await persistOutgoingTemplate({
+    sessionKey,
+    session,
+    chatPhone: canonicalPhone,
+    wamid,
+    displayText:
+      params.renderedPreviewText?.trim() ||
+      `📋 Plantilla: ${params.templateName} (${params.languageCode || 'en_US'})`,
+    templateName: params.templateName,
+    languageCode: params.languageCode,
+    sender: {
+      ...params.sender,
+      ...(params.clientTempId ? { tempId: params.clientTempId } : {}),
+    },
+  });
 
   return { wamid, chatPhone: canonicalPhone };
 }
@@ -1596,6 +1678,86 @@ export function isDeliveryStatusAdvance(current: unknown, next: string): boolean
   return (DELIVERY_RANK[next] ?? 0) > (DELIVERY_RANK[String(current)] ?? 0);
 }
 
+function chatRef(accountId: string, sessionId: string, chatPhone: string) {
+  return requireDeps()
+    .db.collection(ACCOUNTS_COLLECTION)
+    .doc(accountId)
+    .collection('whatsapp_sessions')
+    .doc(sessionId)
+    .collection('chats')
+    .doc(chatPhone);
+}
+
+/** El `contactName` ya guardado en el chat, o '' (también si no se pudo leer). */
+async function savedContactName(accountId: string, sessionId: string, chatPhone: string): Promise<string> {
+  try {
+    const snap = await chatRef(accountId, sessionId, chatPhone).get();
+    const name = snap.exists ? snap.get('contactName') : null;
+    return typeof name === 'string' ? name.trim() : '';
+  } catch (err) {
+    console.warn(`[CloudAPI] No se pudo leer el nombre guardado de ${chatPhone}:`, err);
+    return '';
+  }
+}
+
+/**
+ * ¿Este aviso de marketing es más nuevo que el último aplicado? Los webhooks
+ * llegan desordenados (y Meta reintenta durante días): un "detener" viejo no
+ * puede pisar un "reanudar" posterior.
+ */
+export function isNewerMarketingPreference(current: unknown, atMs: number): boolean {
+  const currentMs = current instanceof admin.firestore.Timestamp ? current.toMillis() : null;
+  return currentMs === null || atMs >= currentMs;
+}
+
+/**
+ * Marca o limpia "no quiere marketing" en el doc del chat. Sin doc no se crea
+ * nada (un chat fantasma en la lista): si algún día se le escribe, Meta lo
+ * vuelve a avisar con el #131050, sin costo.
+ */
+export async function applyMarketingPreference(
+  accountId: string,
+  sessionId: string,
+  chatPhone: string,
+  pref: { optedOut: boolean; atMs: number; source: string },
+): Promise<void> {
+  const { db } = requireDeps();
+  const ref = chatRef(accountId, sessionId, chatPhone);
+  const at = admin.firestore.Timestamp.fromMillis(pref.atMs);
+  try {
+    const applied = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return false;
+      if (!isNewerMarketingPreference(snap.get('marketing_pref_at'), pref.atMs)) return false;
+      const remove = admin.firestore.FieldValue.delete();
+      tx.update(ref, {
+        marketing_opt_out_at: pref.optedOut ? at : remove,
+        marketing_opt_out_source: pref.optedOut ? pref.source : remove,
+        marketing_pref_at: at,
+      });
+      return true;
+    });
+    if (applied) {
+      console.log(
+        `[CloudAPI] ${chatPhone} ${pref.optedOut ? 'pidió no recibir marketing' : 'volvió a aceptar marketing'} (${pref.source}).`,
+      );
+    }
+  } catch (err) {
+    console.warn(`[CloudAPI] No se pudo anotar la preferencia de marketing de ${chatPhone}:`, err);
+  }
+}
+
+/** ¿El chat dejó el marketing? Falla abierto: si no se puede leer, Meta igual lo frena. */
+export async function isMarketingOptedOut(accountId: string, sessionId: string, chatPhone: string): Promise<boolean> {
+  try {
+    const snap = await chatRef(accountId, sessionId, chatPhone).get();
+    return snap.exists && !!snap.get('marketing_opt_out_at');
+  } catch (err) {
+    console.warn(`[CloudAPI] No se pudo leer la preferencia de marketing de ${chatPhone}:`, err);
+    return false;
+  }
+}
+
 /**
  * Procesa el payload de eventos entrantes del webhook de Meta (`POST /webhook/meta`):
  * - Mensajes entrantes de clientes (texto, botones/interactivos, reacciones, imágenes, videos, audios, documentos, stickers)
@@ -1607,7 +1769,7 @@ export async function handleMetaWebhookPayload(body: any, auth?: MetaWebhookAuth
     return;
   }
 
-  const { db, onUpsertedMessage } = requireDeps();
+  const { db, onUpsertedMessage, onApiSendStatus } = requireDeps();
 
   for (const entry of body.entry) {
     const changes = Array.isArray(entry?.changes) ? entry.changes : [];
@@ -1639,14 +1801,36 @@ export async function handleMetaWebhookPayload(body: any, auth?: MetaWebhookAuth
       if (!sessionId) continue;
 
       // 1. Procesar contactos (`value.contacts`) para cachear el nombre del cliente.
+      // El nombre de perfil de WhatsApp sólo llena un chat SIN nombre: el que
+      // puso el API ("Ana López" desde AgendaCool) no se cambia por "Anita 🌸"
+      // cuando el cliente responde. Igual que con QR, donde sólo cuenta la agenda.
       const contacts = Array.isArray(value.contacts) ? value.contacts : [];
       for (const c of contacts) {
         const waId = c?.wa_id ? normalizePhoneDigits(String(c.wa_id)) : '';
         const profileName = c?.profile?.name ? String(c.profile.name).trim() : '';
         if (waId && profileName) {
           const canonicalPhone = await resolveCanonicalChatPhone(accountId, sessionId, waId, session);
-          session.contactNames.set(canonicalPhone, profileName);
+          if (!session.contactNames.has(canonicalPhone)) {
+            const saved = await savedContactName(accountId, sessionId, canonicalPhone);
+            session.contactNames.set(canonicalPhone, saved || profileName);
+          }
         }
+      }
+
+      // 1b. Preferencias de marketing (`value.user_preferences`): el cliente tocó
+      // "Detener promociones" o "Reanudar" en WhatsApp. Sólo llega si su app de
+      // Meta suscribió ese campo; si no, el #131050 de abajo cubre el "detener".
+      const preferences = Array.isArray(value.user_preferences) ? value.user_preferences : [];
+      for (const pref of preferences) {
+        if (pref?.category !== 'marketing_messages' || (pref.value !== 'stop' && pref.value !== 'resume')) continue;
+        const waId = normalizePhoneDigits(String(pref.wa_id || ''));
+        if (!waId) continue;
+        const chatPhone = await resolveCanonicalChatPhone(accountId, sessionId, waId, session);
+        await applyMarketingPreference(accountId, sessionId, chatPhone, {
+          optedOut: pref.value === 'stop',
+          atMs: Number(pref.timestamp) * 1000 || Date.now(),
+          source: 'user_preferences',
+        });
       }
 
       // 2. Procesar mensajes entrantes (`value.messages`).
@@ -1841,6 +2025,32 @@ export async function handleMetaWebhookPayload(body: any, auth?: MetaWebhookAuth
             recipientId,
             session,
           );
+          const firstErr =
+            statusValue === 'failed' && Array.isArray(st.errors) && st.errors.length > 0 ? st.errors[0] : undefined;
+          const deliveryError = firstErr
+            ? `${firstErr?.code ? `[Meta #${firstErr.code}] ` : ''}${
+              firstErr?.error_data?.details || firstErr?.title || firstErr?.message || 'Envío rechazado'
+            }`
+            : undefined;
+
+          // Envío del API pública: el acuse va a su registro y, si el proceso
+          // murió antes de pintar la burbuja, la pinta. Va ANTES del update de
+          // abajo, que sin el doc del mensaje no hace nada.
+          const callbackData = typeof st.biz_opaque_callback_data === 'string' ? st.biz_opaque_callback_data : '';
+          if (callbackData && onApiSendStatus) {
+            await onApiSendStatus({
+              sessionKey,
+              session,
+              accountId,
+              sessionId,
+              chatPhone: canonicalPhone,
+              wamid,
+              status: statusValue,
+              callbackData,
+              deliveryError,
+            }).catch((err) => console.error(`[CloudAPI Webhook] Error anotando el acuse ${wamid} de un envío del API:`, err));
+          }
+
           const msgRef = db
             .collection(ACCOUNTS_COLLECTION)
             .doc(accountId)
@@ -1854,13 +2064,7 @@ export async function handleMetaWebhookPayload(body: any, auth?: MetaWebhookAuth
           const statusPatch: Record<string, any> = {
             deliveryStatus: statusValue,
           };
-          if (statusValue === 'failed' && Array.isArray(st.errors) && st.errors.length > 0) {
-            const firstErr = st.errors[0];
-            const errCode = firstErr?.code ? `[Meta #${firstErr.code}] ` : '';
-            const errDetail =
-              firstErr?.error_data?.details || firstErr?.title || firstErr?.message || 'Envío rechazado';
-            statusPatch.deliveryError = `${errCode}${errDetail}`;
-          }
+          if (deliveryError) statusPatch.deliveryError = deliveryError;
           // Sin doc no se crea nada: ese mensaje no salió de WhatHero (lo mandó el
           // panel de Meta u otra herramienta) y no hay burbuja que marcar.
           await db.runTransaction(async (tx) => {
@@ -1869,6 +2073,16 @@ export async function handleMetaWebhookPayload(body: any, auth?: MetaWebhookAuth
             if (!isDeliveryStatusAdvance(snap.get('deliveryStatus'), statusValue)) return;
             tx.update(msgRef, statusPatch);
           });
+
+          // Meta dice que dejó el marketing: el API no le vuelve a mandar
+          // marketing. Vale para cualquier plantilla, también las de la app.
+          if (firstErr && META_MARKETING_OPT_OUT.has(Number(firstErr.code))) {
+            await applyMarketingPreference(accountId, sessionId, canonicalPhone, {
+              optedOut: true,
+              atMs: Number(st.timestamp) * 1000 || Date.now(),
+              source: `meta_${firstErr.code}`,
+            });
+          }
         } catch {
           // Ignorar silenciosamente si el documento no existe.
         }

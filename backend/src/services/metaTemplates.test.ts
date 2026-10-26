@@ -1,11 +1,14 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  TemplateDefinition,
   buildCreateTemplatePayload,
+  buildTemplateSend,
   describeTemplateApiError,
   extractDraftVariables,
   sanitizeTemplateParamText,
   sanitizeTemplateSendComponents,
+  templateSendBlock,
   validateTemplateDraft,
 } from './metaTemplates';
 
@@ -188,5 +191,108 @@ describe('describeTemplateApiError', () => {
       /Cuentas de mensajes/,
     );
     assert.equal(describeTemplateApiError({ code: 100, details: 'Ya existe contenido en este idioma' }), 'Ya existe contenido en este idioma');
+  });
+});
+
+function definition(overrides: Partial<TemplateDefinition> = {}): TemplateDefinition {
+  return {
+    name: 'seguimiento_onboarding',
+    status: 'APPROVED',
+    category: 'MARKETING',
+    language: 'es_MX',
+    parameter_format: 'NAMED',
+    components: [
+      { type: 'HEADER', format: 'TEXT', text: 'Hola {{nombre}}' },
+      { type: 'BODY', text: '{{nombre}}, ayer probaste AgendaCool para {{negocio}}. ¿Qué te faltó?' },
+      { type: 'FOOTER', text: 'Responde BAJA para no recibir más' },
+      { type: 'BUTTONS', buttons: [{ type: 'QUICK_REPLY', text: 'Me interesa' }] },
+    ],
+    ...overrides,
+  };
+}
+
+describe('templateSendBlock (qué no se manda por API)', () => {
+  it('sólo pasan las aprobadas; pausada y en revisión se distinguen', () => {
+    assert.equal(templateSendBlock(definition()), null);
+    assert.deepEqual(
+      [templateSendBlock(definition({ status: 'PAUSED' }))?.code, templateSendBlock(definition({ status: 'PAUSED' }))?.templateStatus],
+      ['template_paused', 'PAUSED'],
+    );
+    for (const status of ['PENDING', 'REJECTED', 'IN_APPEAL', 'DISABLED']) {
+      assert.equal(templateSendBlock(definition({ status }))?.code, 'template_not_approved', status);
+    }
+  });
+
+  it('lo que el API todavía no llena se dice antes de enviar', () => {
+    const blocked = (d: Partial<TemplateDefinition>) => templateSendBlock(definition(d))?.code;
+    assert.equal(blocked({ category: 'AUTHENTICATION' }), 'template_unsupported');
+    assert.equal(blocked({ components: [{ type: 'HEADER', format: 'IMAGE' }, { type: 'BODY', text: 'Hola' }] }), 'template_unsupported');
+    assert.equal(blocked({ components: [{ type: 'BODY', text: 'Hola' }, { type: 'CAROUSEL' }] }), 'template_unsupported');
+    assert.equal(
+      blocked({ components: [{ type: 'BODY', text: 'Tu pedido' }, { type: 'BUTTONS', buttons: [{ type: 'URL', text: 'Ver', url: 'https://x.com/p/{{1}}' }] }] }),
+      'template_unsupported',
+    );
+    assert.equal(
+      blocked({ parameter_format: 'POSITIONAL', components: [{ type: 'HEADER', format: 'TEXT', text: 'Hola {{1}}' }, { type: 'BODY', text: 'Tu cita es el {{1}}.' }] }),
+      'template_unsupported',
+    );
+    // Un enlace fijo, un teléfono y las respuestas rápidas sí se mandan.
+    assert.equal(
+      blocked({ components: [{ type: 'BODY', text: 'Hola' }, { type: 'BUTTONS', buttons: [
+        { type: 'URL', text: 'Ver', url: 'https://x.com' }, { type: 'PHONE_NUMBER', text: 'Llamar' }, { type: 'QUICK_REPLY', text: 'Sí' },
+      ] }] }),
+      undefined,
+    );
+  });
+});
+
+describe('buildTemplateSend (quien llama manda valores, WhatHero arma el mensaje)', () => {
+  it('con nombre: una variable llena encabezado y cuerpo, y la burbuja lleva el texto real', () => {
+    const built = buildTemplateSend(definition(), { nombre: 'Ana\nMaría', negocio: 'su estética', sobra: 'se ignora' });
+    assert.ok(built.ok);
+    assert.deepEqual(built.components, [
+      { type: 'header', parameters: [{ type: 'text', parameter_name: 'nombre', text: 'Ana María' }] },
+      { type: 'body', parameters: [
+        { type: 'text', parameter_name: 'nombre', text: 'Ana María' },
+        { type: 'text', parameter_name: 'negocio', text: 'su estética' },
+      ] },
+    ]);
+    assert.equal(
+      built.renderedText,
+      'Hola Ana María\n\nAna María, ayer probaste AgendaCool para su estética. ¿Qué te faltó?\n\nResponde BAJA para no recibir más',
+    );
+  });
+
+  it('numeradas: {{1}}..{{n}} en orden aunque el texto las desordene, sin parameter_name', () => {
+    const built = buildTemplateSend(
+      definition({ parameter_format: undefined, components: [{ type: 'BODY', text: 'El {{2}} te espera {{1}}.' }] }),
+      { 1: 'Ana', '2': 'lunes' },
+    );
+    assert.ok(built.ok);
+    assert.deepEqual(built.components, [
+      { type: 'body', parameters: [{ type: 'text', text: 'Ana' }, { type: 'text', text: 'lunes' }] },
+    ]);
+    assert.equal(built.renderedText, 'El lunes te espera Ana.');
+  });
+
+  it('sin variables no manda components', () => {
+    const built = buildTemplateSend(definition({ components: [{ type: 'BODY', text: 'Gracias por probarnos.' }] }), {});
+    assert.ok(built.ok);
+    assert.deepEqual(built.components, []);
+    assert.equal(built.renderedText, 'Gracias por probarnos.');
+  });
+
+  it('una variable que no vino es error de quien llama; un valor vacío es de ese contacto', () => {
+    const missing = buildTemplateSend(definition(), { nombre: 'Ana' });
+    assert.equal(missing.ok, false);
+    assert.equal(!missing.ok && missing.code, 'missing_variables');
+    assert.deepEqual(!missing.ok && missing.variables, ['negocio']);
+
+    const empty = buildTemplateSend(definition(), { nombre: '   ', negocio: 'x'.repeat(1025) });
+    assert.equal(!empty.ok && empty.code, 'invalid_variable_value');
+    assert.deepEqual(!empty.ok && empty.variables, ['nombre', 'negocio']);
+
+    const wrongType = buildTemplateSend(definition(), { nombre: true, negocio: 'x' });
+    assert.equal(!wrongType.ok && wrongType.code, 'invalid_variable_value');
   });
 });

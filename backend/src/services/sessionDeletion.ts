@@ -38,6 +38,8 @@ import {
 import { cancelAiCyclesForSession } from './aiService';
 import { invalidateMemberAccess } from './memberAccess';
 import { revalidatePresenceAccess } from './presenceService';
+import { removeSessionFromApiKeys } from './apiKeys';
+import { purgeApiSendsForSession } from './apiSends';
 
 // Lo que estaba en vuelo al cortar (una media que reintenta, la última llamada
 // al LLM de un lote de seguimiento) termina en segundos. Dos minutos es
@@ -257,6 +259,10 @@ async function runDeletionJob(accountId: string, sessionId: string, deletingAtMs
   }
 
   await revokeMemberGrants(accountId, sessionId);
+  // Lo del API pública vive fuera del doc de la sesión: los registros de envío
+  // (números y nombres de sus contactos) y las llaves restringidas a ella.
+  await purgeApiSendsForSession(accountId, sessionId);
+  await removeSessionFromApiKeys(accountId, sessionId);
   // Limpiar también el secreto de Cloud API (si existía) guardado fuera de whatsapp_sessions.
   await requireDeps()
     .db.collection(ACCOUNTS_COLLECTION)

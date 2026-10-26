@@ -98,6 +98,9 @@ import {
   CloudApiError,
 } from './src/services/cloudApiService';
 import { validateTemplateDraft, describeTemplateApiError } from './src/services/metaTemplates';
+import { authenticateApiRequest, listApiKeys, createApiKey, revokeApiKey, ApiKeyAdminError } from './src/services/apiKeys';
+import { sendTemplateViaApi, applyApiSendStatus } from './src/services/apiSends';
+import { PublicApiError } from './src/services/publicApiErrors';
 
 // Ensure auth_info directory exists
 const authInfoDir = 'auth_info';
@@ -922,6 +925,14 @@ async function handleSessionUpsertedMessage(
     // processMessageBuffer al terminar.
     let contactPhoneForCancel: string | undefined;
     const isOwnAiChunk = !!message.key.id && isAiSentMessage(message.key.id);
+    // Etiqueta del entry point que envió (se lee antes de guardar, que la consume).
+    const pendingSender = message.key.fromMe && message.key.id
+      ? sessions.get(sessionKey)?.pendingSenders.get(message.key.id)
+      : undefined;
+    // Plantilla mandada por un sistema externo con el API pública: no es un
+    // humano atendiendo. No cede la IA, no resetea pendientes, no marca leído
+    // ni dispara reglas outgoing. Ver CLAUDE.md, "🔑 API pública".
+    const isApiSend = pendingSender?.via === 'api';
     if (message.key.fromMe) {
       const jid = message.key.remoteJid;
       if (jid && !jid.endsWith('@g.us')) {
@@ -940,10 +951,8 @@ async function handleSessionUpsertedMessage(
       // 'human' puesta antes de enviar): repetirlo acá mataría el buffer de un
       // mensaje que el cliente mandó entre el envío y este eco, y ese mensaje
       // quedaría sin respuesta y sin contar.
-      const crmAlreadyYielded =
-        !!message.key.id &&
-        sessions.get(sessionKey)?.pendingSenders.get(message.key.id)?.type === 'human';
-      if (contactPhoneForCancel && !isOwnAiChunk && !crmAlreadyYielded) {
+      const crmAlreadyYielded = pendingSender?.type === 'human';
+      if (contactPhoneForCancel && !isOwnAiChunk && !crmAlreadyYielded && !isApiSend) {
         aiBuffers.yieldToHuman({ accountId, sessionKey, contactPhone: contactPhoneForCancel }, 'respuesta enviada');
       }
     }
@@ -961,6 +970,9 @@ async function handleSessionUpsertedMessage(
 
     // AI auto-response: only for incoming messages (not from self)
     if (message.key.fromMe) {
+      // El API no atiende a nadie: lo pendiente sigue pendiente (y no leído en
+      // el teléfono, para que ambos sigan de acuerdo).
+      if (isApiSend) return;
       // El dueño respondió (CRM web o celular físico): resetear contador,
       // confirmar lectura y reglas outgoing. La IA ya cedió arriba.
       const remoteJidForCancel = message.key.remoteJid;
@@ -2406,6 +2418,90 @@ app.post('/send-template', express.json(), verifyHttpAuth(), async (req, res) =>
   }
 });
 
+// ============================================
+// API PÚBLICA (sistemas externos con llave) — ver CLAUDE.md, "🔑 API pública"
+// ============================================
+
+// IP de quien llama, para frenar a quien prueba llaves. Railway agrega la IP
+// real al final de X-Forwarded-For; lo de antes lo puede escribir el cliente.
+function clientIp(req: express.Request): string {
+  const forwarded = String(req.get('x-forwarded-for') || '').split(',').map((s) => s.trim()).filter(Boolean);
+  return forwarded[forwarded.length - 1] || req.socket.remoteAddress || 'desconocida';
+}
+
+function sendPublicApiError(res: express.Response, error: unknown) {
+  const apiError = error instanceof PublicApiError
+    ? error
+    : new PublicApiError('internal_error', 'Error inesperado en WhatHero. Reintenta más tarde.', { retryAfterSeconds: 60 });
+  if (!(error instanceof PublicApiError)) console.error('[API] Error inesperado:', error);
+  if (apiError.extra.retryAfterSeconds) res.set('Retry-After', String(apiError.extra.retryAfterSeconds));
+  return res.status(apiError.httpStatus).json(apiError.toJSON());
+}
+
+app.post('/api/v1/messages/template', express.json({ limit: '64kb' }), async (req, res) => {
+  try {
+    const key = await authenticateApiRequest(req.get('authorization'), clientIp(req));
+    return res.json(await sendTemplateViaApi(key, req.body));
+  } catch (error) {
+    return sendPublicApiError(res, error);
+  }
+});
+
+// Un JSON mal formado tiene que contestar en el formato del API, no con la
+// página HTML de error de Express.
+app.use('/api/v1', (error: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (error?.type === 'entity.parse.failed' || error?.type === 'entity.too.large') {
+    return sendPublicApiError(res, new PublicApiError('invalid_request', 'El cuerpo no es un JSON válido (o pasa de 64 KB).'));
+  }
+  return next(error);
+});
+
+// Llaves del API: sólo el owner las ve, crea y revoca. Ningún cliente las lee de
+// Firestore (no tienen regla): la app pasa siempre por aquí.
+function apiKeyAdminErrorResponse(res: express.Response, error: unknown, fallback: string) {
+  if (error instanceof ApiKeyAdminError) return res.status(error.httpStatus).json({ error: error.message });
+  console.error(`[api-keys] ${fallback}:`, error);
+  return res.status(500).json({ error: fallback });
+}
+
+app.get('/api-keys', verifyHttpAuth({ requireAccountId: false }), async (req, res) => {
+  try {
+    const accountId = String(req.query.accountId || '').trim();
+    if (!accountId || !(await isAccountOwner(req.auth!.uid, accountId))) {
+      return res.status(403).json({ error: 'Sólo el owner administra las llaves del API' });
+    }
+    return res.json({ success: true, keys: await listApiKeys(accountId) });
+  } catch (error) {
+    return apiKeyAdminErrorResponse(res, error, 'No se pudieron leer las llaves');
+  }
+});
+
+app.post('/api-keys', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const { accountId, name, allSessions, sessionIds } = req.body || {};
+    if (!(await isAccountOwner(req.auth!.uid, accountId))) {
+      return res.status(403).json({ error: 'Sólo el owner administra las llaves del API' });
+    }
+    const created = await createApiKey({ accountId, createdBy: req.auth!.uid, name, allSessions, sessionIds });
+    return res.json({ success: true, key: created.key, apiKey: created.summary });
+  } catch (error) {
+    return apiKeyAdminErrorResponse(res, error, 'No se pudo crear la llave');
+  }
+});
+
+app.post('/api-keys/revoke', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const { accountId, keyId } = req.body || {};
+    if (!(await isAccountOwner(req.auth!.uid, accountId))) {
+      return res.status(403).json({ error: 'Sólo el owner administra las llaves del API' });
+    }
+    await revokeApiKey(accountId, keyId, req.auth!.uid);
+    return res.json({ success: true });
+  } catch (error) {
+    return apiKeyAdminErrorResponse(res, error, 'No se pudo revocar la llave');
+  }
+});
+
 // Reaccionar a un mensaje (emoji nativo de WhatsApp). Soporta mensajes
 // salientes (fromMe=true) y entrantes (fromMe=false). Pasar text='' quita
 // la reacción. El backend NO escribe en Firestore acá: el `messages.upsert`
@@ -3513,6 +3609,7 @@ initCloudApiService({
       );
     }
   },
+  onApiSendStatus: applyApiSendStatus,
 });
 
 const PORT = parseInt(process.env.PORT || '3000', 10);

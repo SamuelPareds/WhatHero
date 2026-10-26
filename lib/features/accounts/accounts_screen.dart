@@ -15,6 +15,7 @@ import 'package:crm_whatsapp/features/accounts/change_number/change_number_flow.
 import 'package:crm_whatsapp/features/accounts/connect_cloud_api_sheet.dart';
 import 'package:crm_whatsapp/features/accounts/link_result.dart';
 import 'package:crm_whatsapp/features/accounts/session_linking.dart';
+import 'package:crm_whatsapp/features/api_keys/api_keys_screen.dart';
 import 'package:crm_whatsapp/features/members/members_screen.dart';
 import 'package:crm_whatsapp/features/settings.dart';
 import 'package:crm_whatsapp/features/chat.dart';
@@ -410,6 +411,20 @@ class _AccountsScreenState extends State<AccountsScreen> {
                 );
               },
               tooltip: 'Miembros del equipo',
+            ),
+          // Llaves del API pública: configuración de la cuenta, sólo el owner.
+          if (AccountContextService().isOwner)
+            IconButton(
+              icon: const Icon(Icons.vpn_key_outlined, color: lightText),
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => ApiKeysScreen(accountId: widget.accountId),
+                  ),
+                );
+              },
+              tooltip: 'Llaves de API',
             ),
           IconButton(
             icon: const Icon(Icons.logout, color: lightText),

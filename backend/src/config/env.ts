@@ -12,3 +12,8 @@
 export const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
 export const ACCOUNTS_COLLECTION = IS_PRODUCTION ? 'accounts' : 'accounts_dev';
+
+// Llaves del API pública (ver services/apiKeys.ts). Raíz propia y separada por
+// entorno como las cuentas: la llave tiene que encontrar su cuenta con una
+// sola lectura por id, y una llave de dev no puede abrir datos de producción.
+export const API_KEYS_COLLECTION = IS_PRODUCTION ? 'api_keys' : 'api_keys_dev';

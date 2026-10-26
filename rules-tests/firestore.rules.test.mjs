@@ -90,6 +90,10 @@ beforeEach(async () => {
         await setDoc(doc(db, ...account, 'whatsapp_sessions', sid, 'chats', 'c1'), { name: 'Cliente' });
       }
       await setDoc(doc(db, ...account, 'cloud_api_secrets', S1), { accessToken: 'EAA-secreto' });
+      await setDoc(doc(db, ...account, 'api_sends', 'r1'), { session_id: S1, to: '5215599999999', status: 'sent' });
+    }
+    for (const keys of ['api_keys', 'api_keys_dev']) {
+      await setDoc(doc(db, keys, 'k1'), { account_id: OWNER, name: 'AgendaCool', secret_hash: 'abc' });
     }
   });
 });
@@ -176,6 +180,32 @@ for (const root of ['accounts', 'accounts_dev']) {
         await assertFails(getDoc(secret));
         await assertFails(getDocs(collection(db, root, OWNER, 'cloud_api_secrets')));
         await assertFails(setDoc(secret, { accessToken: 'robado' }));
+      }
+    });
+  });
+
+  describe(`${root}: API pública (sólo el backend)`, () => {
+    // Las llaves y los registros de envío se administran por el backend. Ni el
+    // owner los lee: la app pide la lista a GET /api-keys, sin el hash.
+    const keysRoot = root === 'accounts' ? 'api_keys' : 'api_keys_dev';
+
+    it('nadie lee, lista ni escribe las llaves desde el cliente', async () => {
+      for (const uid of [OWNER, RESTRICTED, FULL, LEGACY, OUTSIDER]) {
+        const db = dbAs(uid);
+        await assertFails(getDoc(doc(db, keysRoot, 'k1')));
+        await assertFails(getDocs(query(collection(db, keysRoot), where('account_id', '==', OWNER))));
+        await assertFails(setDoc(doc(db, keysRoot, 'k2'), { account_id: OWNER, secret_hash: 'mio' }));
+        await assertFails(updateDoc(doc(db, keysRoot, 'k1'), { revoked_at: null }));
+      }
+    });
+
+    it('nadie lee ni escribe los registros de envío (api_sends)', async () => {
+      for (const uid of [OWNER, RESTRICTED, FULL, LEGACY, OUTSIDER]) {
+        const db = dbAs(uid);
+        await assertFails(getDoc(doc(db, root, OWNER, 'api_sends', 'r1')));
+        await assertFails(getDocs(collection(db, root, OWNER, 'api_sends')));
+        // Borrarlo dejaría reenviar un mensaje que ya salió.
+        await assertFails(deleteDoc(doc(db, root, OWNER, 'api_sends', 'r1')));
       }
     });
   });

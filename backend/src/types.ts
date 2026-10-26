@@ -12,6 +12,10 @@ export interface SenderInfo {
   // Id de la burbuja local de la app (sólo envíos del CRM). Se guarda en el doc
   // como `clientTempId` para reconciliar sin depender del ack.
   tempId?: string;
+  // 'api': lo mandó un sistema externo con una llave del API pública. Su eco
+  // no cuenta como atención: no cede la IA, no resetea pendientes ni marca
+  // leído (ver la rama fromMe de handleSessionUpsertedMessage).
+  via?: 'api';
 }
 
 /** Rol de un socket dentro de su sesión: el que manda o la línea anterior. */
