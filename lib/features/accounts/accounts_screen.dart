@@ -573,27 +573,9 @@ class _AccountsScreenState extends State<AccountsScreen> {
                             Positioned(
                               top: -6,
                               right: -6,
-                              child: StreamBuilder<QuerySnapshot>(
-                                stream: FirebaseFirestore.instance
-                                    .collection(accountsCollection)
-                                    .doc(widget.accountId)
-                                    .collection('whatsapp_sessions')
-                                    .doc(phoneNumber)
-                                    .collection('chats')
-                                    .where('unresponded_count', isGreaterThan: 0)
-                                    .snapshots(),
-                                builder: (context, snap) {
-                                  final count = snap.data?.docs.length ?? 0;
-                                  if (count <= 0) return const SizedBox.shrink();
-                                  // Borde para separar visualmente del avatar
-                                  return Container(
-                                    decoration: BoxDecoration(
-                                      borderRadius: BorderRadius.circular(12),
-                                      border: Border.all(color: darkBg, width: 2),
-                                    ),
-                                    child: UnrespondedBadge(count: count),
-                                  );
-                                },
+                              child: _PendingChatsBadge(
+                                accountId: widget.accountId,
+                                sessionId: phoneNumber,
                               ),
                             ),
                           ],
@@ -809,5 +791,60 @@ class _SessionVisual {
     }
 
     return _SessionVisual(label: 'Desvinculado', color: Colors.red.shade400);
+  }
+}
+
+// Badge de chats pendientes de una sesión (estilo ícono de app de iOS). El
+// stream nace en initState y no en build: la lista de sesiones rebuildea con
+// cada cambio de estado de cualquier sesión, y un `.snapshots()` creado ahí
+// re-suscribía (y en web volvía a leer) los pendientes de todas las tarjetas.
+class _PendingChatsBadge extends StatefulWidget {
+  final String accountId;
+  final String sessionId;
+
+  const _PendingChatsBadge({required this.accountId, required this.sessionId});
+
+  @override
+  State<_PendingChatsBadge> createState() => _PendingChatsBadgeState();
+}
+
+class _PendingChatsBadgeState extends State<_PendingChatsBadge> {
+  late Stream<QuerySnapshot> _pending = _query();
+
+  Stream<QuerySnapshot> _query() => FirebaseFirestore.instance
+      .collection(accountsCollection)
+      .doc(widget.accountId)
+      .collection('whatsapp_sessions')
+      .doc(widget.sessionId)
+      .collection('chats')
+      .where('unresponded_count', isGreaterThan: 0)
+      .snapshots();
+
+  @override
+  void didUpdateWidget(_PendingChatsBadge old) {
+    super.didUpdateWidget(old);
+    // La tarjeta puede reusarse para otra sesión si la lista se reordena.
+    if (old.sessionId != widget.sessionId || old.accountId != widget.accountId) {
+      _pending = _query();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<QuerySnapshot>(
+      stream: _pending,
+      builder: (context, snap) {
+        final count = snap.data?.docs.length ?? 0;
+        if (count <= 0) return const SizedBox.shrink();
+        // Borde para separar visualmente del avatar
+        return Container(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: darkBg, width: 2),
+          ),
+          child: UnrespondedBadge(count: count),
+        );
+      },
+    );
   }
 }

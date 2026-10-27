@@ -319,6 +319,25 @@ El operador copia el número de WhatsApp Web, de un correo o de otro CRM y lo pe
 
 ---
 
+## 📋 La lista de chats sólo se pinta con lo que confirma el servidor
+
+Al pasar de una sesión a otra desde *Mis Cuentas*, la lista aparecía medio segundo con **puros chats pendientes**, todos con su badge naranja, y después se completaba en orden. El operador creía tener una montaña de chats sin contestar.
+
+**Un listener nuevo de Firestore entrega primero lo que haya en el caché local, y ese caché no es "la colección un poco vieja": son los docs que OTROS listeners dejaron ahí.** El badge de cada tarjeta de *Mis Cuentas* escucha `chats where unresponded_count > 0`, y esa pantalla sigue montada debajo de la sesión que abriste. El primer snapshot de `orderBy('lastMessageTimestamp')` traía exactamente los pendientes. En web pasa en cada entrada (caché en memoria: al soltar un listener, sus docs se borran). En móvil el caché persiste y lo que se veía primero era la lista de la última visita, con contadores viejos.
+
+- **`holdCacheUntilServer`** (`lib/core/utils/hold_cache_until_server.dart`, tests en `test/hold_cache_until_server_test.dart`) retiene los snapshots `fromCache` hasta el primero del servidor. Desde ahí pasa todo, también el `fromCache` de una caída de red.
+- **Exige `includeMetadataChanges: true`.** Si el caché ya estaba completo, el servidor sólo confirma metadata, y sin esa opción ese aviso no llega nunca: la lista se quedaría los 2 s en el spinner (la misma trampa que `ReplyCollisionDetector.settle`). Costo aceptado: un rebuild extra de la lista cuando el servidor confirma cada escritura de este dispositivo (Listo, etiqueta, nota, IA) y en cada cambio de conectividad.
+- **Margen de 2 s.** Si el servidor no contestó (sin conexión), se pinta lo guardado; si llega después, actualiza. En móvil, abrir en frío muestra hasta 2 s de spinner en vez de la lista vieja al instante. Es a propósito: la lista vieja con contadores viejos es la que asusta.
+- **Arreglar el badge no bastaba.** Cualquier otro listener sobre `chats`, de hoy o futuro, y el caché persistente de móvil reproducen lo mismo. La defensa va en quien pinta.
+
+### Nunca un `.snapshots()` dentro de `build`
+La lista creaba su stream en `build()`. `StreamBuilder` ve un stream distinto en cada rebuild y se re-suscribe: cada tecla del buscador, cada chat abierto, cada cambio de filtro. En web, soltar el listener borra sus docs del caché, así que cada re-suscripción volvía a empezar del caché parcial y a pedirle al servidor la colección entera.
+- **La lista se escucha una sola vez, en `initState`** (`_listenChats`), y se pinta con un `ValueListenableBuilder` sobre `_chats`. No con un `StreamBuilder` sobre un stream guardado: `_buildChatsList()` se monta en dos ramas (móvil / escritorio) y al cruzar los 600 px se monta de nuevo, y un stream no se puede escuchar dos veces.
+- **El badge de *Mis Cuentas*** (`_PendingChatsBadge`) crea su stream en `initState` por lo mismo. Tiene `didUpdateWidget` porque las tarjetas no llevan key y una puede reusarse para otra sesión.
+- Quedan streams de un solo doc creados en `build` (el doc de la sesión en el AppBar, el del chat abierto). No parpadean porque ese doc ya vive en el caché de otro listener. Una lista nueva va como `_chats`.
+
+---
+
 ## ⇅ Recorrer chats sin volver a la lista (cola congelada)
 
 Revisar la bandeja de ayer costaba dos gestos por chat: back a la lista, encontrar dónde te quedaste, entrar al siguiente. Encontrar dónde te quedaste era el caro, porque **la lista se mueve debajo de los pies**: la ordena `lastMessageTimestamp descending`, así que contestar un chat lo manda al puesto 1, y en *Pendientes* además lo saca del filtro al poner `unresponded_count: 0`. La referencia visual se evapora justo por haber hecho el trabajo.

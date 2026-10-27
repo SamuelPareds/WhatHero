@@ -19,6 +19,7 @@ import 'package:crm_whatsapp/core/services/presence_reporter.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/core/services/storage_service.dart';
 import 'package:crm_whatsapp/core/services/team_presence_service.dart';
+import 'package:crm_whatsapp/core/utils/hold_cache_until_server.dart';
 import 'package:crm_whatsapp/core/utils/phone_input.dart';
 import 'package:crm_whatsapp/core/utils/phone_search.dart';
 import 'package:crm_whatsapp/core/utils/session_deletion.dart';
@@ -90,6 +91,11 @@ class _ChatsScreenState extends State<ChatsScreen> {
   final ValueNotifier<({int unresponded, int notes, int followups})> _filterCounts =
       ValueNotifier((unresponded: 0, notes: 0, followups: 0));
   final TextEditingController searchController = TextEditingController();
+
+  // La lista de chats de la sesión: una sola suscripción por pantalla (ver
+  // _listenChats). null = el servidor todavía no confirmó la bandeja.
+  final ValueNotifier<QuerySnapshot?> _chats = ValueNotifier(null);
+  StreamSubscription? _chatsSubscription;
 
   StreamSubscription? _statusSubscription;
   StreamSubscription? _humanAttentionSubscription;
@@ -164,6 +170,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
       StorageService().saveLastSessionId(widget.sessionId!);
     }
     if (widget.sessionId != null) {
+      _listenChats();
       _subscribeToLabels();
       _loadTeamInbox();
       _watchSessionGone();
@@ -218,6 +225,32 @@ class _ChatsScreenState extends State<ChatsScreen> {
     // re-dispare en rebuilds. El cold-start llega por initialTapReady, donde
     // pendingTap es null, así que el guard `== push` evita limpiar de más.
     if (_pendingTap?.value == push) _pendingTap!.value = null;
+  }
+
+  // La bandeja se pinta sólo con lo que confirma el servidor. El primer
+  // snapshot del caché trae únicamente los chats que otro listener dejó ahí
+  // (el badge de Mis Cuentas cachea los pendientes) y la lista aparecía un
+  // instante con puros pendientes. Vive aquí y no en build: un `.snapshots()`
+  // en build re-suscribe en cada setState (cada tecla del buscador) y en web
+  // vuelve a empezar desde ese caché parcial.
+  void _listenChats() {
+    final query = FirebaseFirestore.instance
+        .collection(accountsCollection)
+        .doc(widget.accountId)
+        .collection('whatsapp_sessions')
+        .doc(widget.sessionId)
+        .collection('chats')
+        .orderBy('lastMessageTimestamp', descending: true);
+    _chatsSubscription = holdCacheUntilServer<QuerySnapshot>(
+      query.snapshots(includeMetadataChanges: true),
+      isFromCache: (s) => s.metadata.isFromCache,
+    ).listen(
+      (snap) {
+        if (mounted) _chats.value = snap;
+      },
+      onError: (Object e) =>
+          debugPrint('[ChatsScreen] No se pudieron leer los chats: $e'),
+    );
   }
 
   void _subscribeToLabels() {
@@ -308,6 +341,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
   @override
   void dispose() {
     searchController.dispose();
+    _chatsSubscription?.cancel();
+    _chats.dispose();
     _statusSubscription?.cancel();
     _humanAttentionSubscription?.cancel();
     _labelsSubscription?.cancel();
@@ -1076,21 +1111,18 @@ class _ChatsScreenState extends State<ChatsScreen> {
               tooltip: 'Nuevo chat',
               child: const Icon(Icons.add_comment_outlined),
             ),
-      body: StreamBuilder<QuerySnapshot>(
-        stream: FirebaseFirestore.instance
-            .collection(accountsCollection)
-            .doc(widget.accountId)
-            .collection('whatsapp_sessions')
-            .doc(widget.sessionId)
-            .collection('chats')
-            .orderBy('lastMessageTimestamp', descending: true)
-            .snapshots(),
-        builder: (context, snapshot) {
-          if (!snapshot.hasData) {
+      // ValueListenableBuilder y no un StreamBuilder sobre un stream guardado:
+      // esta lista se monta en dos ramas (móvil / escritorio) y al cruzar los
+      // 600 px se monta de nuevo. El notifier le da el último valor al
+      // instante; un stream no se puede escuchar dos veces.
+      body: ValueListenableBuilder<QuerySnapshot?>(
+        valueListenable: _chats,
+        builder: (context, chatsSnapshot, _) {
+          if (chatsSnapshot == null) {
             return const Center(child: CircularProgressIndicator());
           }
 
-          final allChats = snapshot.data!.docs;
+          final allChats = chatsSnapshot.docs;
 
           // Publicamos los totales por filtro para que los chips del AppBar
           // muestren su badge. Post-frame para no notificar durante el build.
