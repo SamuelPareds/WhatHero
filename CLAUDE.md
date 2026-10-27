@@ -74,6 +74,46 @@ Cada vez que abrían la app, los miembros del equipo caían en "Bienvenido a Wha
 
 ---
 
+## 🔀 Cambiar de cuenta (el selector del título)
+
+Tocar el nombre de la sesión en la lista de chats ("AC ▾") abre el selector de cuenta. Muestra las sesiones que el usuario puede ver (`visibleSessionsQuery`) en el orden de *Mis Cuentas*, con su estado y sus pendientes. Con una sola sesión el título no lleva flecha ni menú. El ícono de la izquierda sigue llevando a *Mis Cuentas*, que es para administrar: vincular, miembros, llaves y cerrar sesión.
+
+### Sólo el dispatcher cambia de cuenta
+`SessionDispatcher` (`main.dart`) es el único que decide qué sesión se ve. La cambia reemplazando la `ChatsScreen` raíz (`ValueKey(sessionId)`). Los tres caminos pasan por su `_switchTo`: el selector, una tarjeta de *Mis Cuentas* y un push de otra sesión.
+
+**Nunca se apila una `ChatsScreen` encima de otra.** *Mis Cuentas* lo hacía, con tres problemas:
+- La pantalla apilada se quedaba con el `session_key` del momento del toque: tras re-vincular, dejaba de ver los estados de IA.
+- La raíz seguía viva debajo.
+- Tocar la sesión ya abierta la duplicaba.
+
+Ahora tocar una tarjeta cierra *Mis Cuentas* y cambia la raíz. *Atrás* ya no vuelve a *Mis Cuentas*.
+- `ChatsScreen` recibe del dispatcher la lista en vivo (`sessions`) y de ahí saca el nombre, el número y el estado del título, sin un stream propio del doc de sesión. El título usaba `.get('alias')`, que lanza si el doc no tiene alias.
+- Las reglas viven en `pickRootSession` (`lib/features/accounts/session_switch.dart`, tests en `test/session_switch_test.dart`).
+
+### La sesión que se ve no se suelta sola
+El dispatcher sólo mostraba sesiones `connected`, y cada reintento del backend escribe `reconnecting` (`scheduleReconnect` → `syncSessionStatus`). Una caída de segundos sacaba al operador de su cuenta: saltaba a otra, o a la bienvenida, y perdía el chat abierto y el borrador. Con cuentas de distintos negocios, **el operador podía contestarle al cliente de un negocio desde el número de otro sin darse cuenta.**
+
+La regla de `pickRootSession`, en orden:
+1. **Lo pedido** (selector, *Mis Cuentas*, push) se abre con cualquier status: una sesión caída se puede leer.
+2. **La que se ve** se queda mientras siga visible, con cualquier status. Si está caída, el subtítulo dice cómo está (`Reconectando...`, `Sin conexión`…) en vez del número. El composer sigue disponible: un envío falla con "WhatsApp no está conectado" y ofrece Reintentar.
+3. **Sólo si desaparece** (se eliminó o se perdió el acceso) se elige otra sola. Primero las vivas: `connected`, o `reconnecting` para que abrir la app durante un redeploy no deje al operador en otra cuenta. Entre ellas gana la última usada en el dispositivo.
+
+**Nunca se cambia de cuenta en silencio.**
+- Si la sesión desaparece sin que nadie la cambiara, el aviso dice «AC» ya no está disponible. Ahora estás en «Sucursal 2».
+- Si se pide una que no está (un push a una sesión eliminada), dice "La sesión … ya no está disponible".
+- Un error al leer las sesiones conserva la lista que había: no saca a nadie de su cuenta.
+- La bienvenida aparece sólo cuando no hay sesiones visibles. Antes aparecía también si ninguna estaba `connected`, y con el backend caído le pedía al operador que vinculara una cuenta.
+
+### El selector
+- `SessionSwitcher` (`lib/features/chat/widgets/session_switcher.dart`). Sus tests (`test/session_switcher_test.dart`) incluyen el AppBar a 360 dp con un alias largo.
+- **Los pendientes de cada cuenta se ven sólo con el menú abierto**, con el mismo `PendingChatsBadge` de *Mis Cuentas*. Así no hay listeners permanentes sobre las otras cuentas; el aviso de que otra cuenta te necesita ya lo dan los push.
+- El estado y el nombre se derivan igual que en *Mis Cuentas*: `SessionVisual` cruza `status` con `last_sync`, y `sessionDisplayName` usa el alias, si no el nombre verificado de Meta, si no el número.
+- En escritorio, cambiar de cuenta con un chat abierto descarta el borrador, igual que tocar otro chat de la lista.
+
+**Fase 2 (no está hecho):** un punto en el título cuando otra cuenta tiene pendientes (exige un listener permanente por cuenta) y atajos de teclado (⌘1…9).
+
+---
+
 ## 🌉 El Puente: Socket.io con Rooms
 Para garantizar que la data llegue al usuario correcto, implementamos **Rooms**:
 - El socket del cliente se une a la sala de su cuenta, `accountId` (el UID del owner; un miembro del equipo entra a la del owner).
@@ -156,7 +196,7 @@ Transiciones entre modos: `AnimatedSwitcher` 220ms para no saltar.
 ### Quién apaga el indicador
 Cada emisión lleva un `seq` **global**. Un ciclo que termina (bien, con error, derivado o cancelado) apaga el indicador **sólo si la última emisión de ese chat sigue siendo suya** (`releaseAiState`). Si después emitió un buffer nuevo ("esperando…") o un humano ya lo apagó, es de ellos. Antes se decidía con `!cycle.cancelled`, y fallaba en las dos direcciones: el discriminador apagaba el "esperando…" del buffer que sí iba a responder, y un ciclo cancelado por un mensaje que no abría buffer (rancio, regla, media) dejaba "pensando…" pegado 90 s. El `seq` es global a propósito: uno por chat se reinicia al borrarse la entrada y un ciclo viejo podía coincidir con el número del nuevo.
 
-**Pendiente conocido:** los estados se buscan por `sessionKey:contactPhone`, y `AccountsScreen` empuja `ChatsScreen` con el `session_key` leído una sola vez al tocar. Si la sesión se re-vincula con esa pantalla abierta (key nueva), ese chat deja de ver estados de IA hasta volver a entrar. La `ChatsScreen` raíz no tiene el problema: `SessionDispatcher` le pasa el key en vivo.
+Los estados se buscan por `sessionKey:contactPhone`, así que la `ChatsScreen` necesita el key en vivo. Se lo pasa `SessionDispatcher`, que es el único que la crea (ver *🔀 Cambiar de cuenta*). Cuando *Mis Cuentas* apilaba su propia `ChatsScreen` con el key leído al tocar, re-vincular la sesión dejaba ese chat sin estados de IA.
 
 ### Cancelar un ciclo IA desde el cliente
 `SocketService().emit('cancel_ai_buffer', {sessionKey, contactPhone})`. **Nunca** usar `sendMessage(...)` — ese método siempre emite `send_message_socket` (handler de mensajes WhatsApp) y rompe con `Unauthorized accountId`. El backend (`cancel_ai_buffer` → `aiBuffers.yieldToHuman`) corta la espera y el ciclo y emite `ai_state: idle`, así que la UI se apaga sola.
@@ -323,7 +363,7 @@ El operador copia el número de WhatsApp Web, de un correo o de otro CRM y lo pe
 
 Al pasar de una sesión a otra desde *Mis Cuentas*, la lista aparecía medio segundo con **puros chats pendientes**, todos con su badge naranja, y después se completaba en orden. El operador creía tener una montaña de chats sin contestar.
 
-**Un listener nuevo de Firestore entrega primero lo que haya en el caché local, y ese caché no es "la colección un poco vieja": son los docs que OTROS listeners dejaron ahí.** El badge de cada tarjeta de *Mis Cuentas* escucha `chats where unresponded_count > 0`, y esa pantalla sigue montada debajo de la sesión que abriste. El primer snapshot de `orderBy('lastMessageTimestamp')` traía exactamente los pendientes. En web pasa en cada entrada (caché en memoria: al soltar un listener, sus docs se borran). En móvil el caché persiste y lo que se veía primero era la lista de la última visita, con contadores viejos.
+**Un listener nuevo de Firestore entrega primero lo que haya en el caché local, y ese caché no es "la colección un poco vieja": son los docs que OTROS listeners dejaron ahí.** El badge de cada tarjeta de *Mis Cuentas* (y de cada fila del selector de cuenta) escucha `chats where unresponded_count > 0`, y sigue vivo mientras se cierra la animación al cambiar de cuenta. El primer snapshot de `orderBy('lastMessageTimestamp')` traía exactamente los pendientes. En web pasa en cada entrada (caché en memoria: al soltar un listener, sus docs se borran). En móvil el caché persiste y lo que se veía primero era la lista de la última visita, con contadores viejos.
 
 - **`holdCacheUntilServer`** (`lib/core/utils/hold_cache_until_server.dart`, tests en `test/hold_cache_until_server_test.dart`) retiene los snapshots `fromCache` hasta el primero del servidor. Desde ahí pasa todo, también el `fromCache` de una caída de red.
 - **Exige `includeMetadataChanges: true`.** Si el caché ya estaba completo, el servidor sólo confirma metadata, y sin esa opción ese aviso no llega nunca: la lista se quedaría los 2 s en el spinner (la misma trampa que `ReplyCollisionDetector.settle`). Costo aceptado: un rebuild extra de la lista cuando el servidor confirma cada escritura de este dispositivo (Listo, etiqueta, nota, IA) y en cada cambio de conectividad.
@@ -356,7 +396,7 @@ El primer elemento de la fila de filtros es un **desplegable con la vista** (`In
 - **Con texto en el buscador, la vista no acota** (`matchesInboxView(searching:)`). Son estados, no criterios: con Pendientes como vista guardada, buscar a un cliente ya atendido decía que no existía. *Con notas* y las etiquetas sí acotan, como siempre.
 - **La vista se guarda por usuario** en `users/{uid}/prefs/ui.chat_inbox_view` (`'todos' | 'pendientes' | 'listos'`), para todas sus sesiones y dispositivos (`UserPrefs`, `user_prefs_service.dart`). Los chips no se guardan: son consultas del momento, y una etiqueta es de una sesión. Un valor desconocido abre en Todos, y Todos es el default: nadie actualiza la app y ve "desaparecer" sus chats.
   - **No va en `users/{uid}`:** ese doc respalda los custom claims (`memberOfAccounts`) y sólo lo escribe el backend. `prefs/ui` tiene su propia regla (cada quien el suyo) y su test en `rules-tests/`. La raíz `users` es compartida entre dev y prod, así que la vista también: es inocuo.
-  - **Se carga en `AccountContextService.initFor`**, en paralelo con `users/{uid}` y con tope de 2 s: la lista abre directo en la vista guardada, sin pasar un instante por Todos. Es un listener: un cambio en otro dispositivo, o en la otra `ChatsScreen` viva (la raíz queda bajo Mis Cuentas), se sigue solo. `clear()` lo suelta en el logout para que el siguiente usuario no herede la vista.
+  - **Se carga en `AccountContextService.initFor`**, en paralelo con `users/{uid}` y con tope de 2 s: la lista abre directo en la vista guardada, sin pasar un instante por Todos. Es un listener: un cambio en otro dispositivo se sigue solo. `clear()` lo suelta en el logout para que el siguiente usuario no herede la vista.
   - **Reglas antes que la app** (`firebase deploy --only firestore:rules`). Si la app llega primero no se rompe: abre en Todos y loguea `[UserPrefs]`.
 - **"Listo" y "Pendiente" llevan Deshacer** (`showUndoSnackBar`, tests en `test/undo_snack_bar_test.dart`). En Pendientes y Listos el chat se va al instante, y un swipe sin querer no puede ser un viaje sin retorno.
   - **Un SnackBar con acción no se cierra solo:** Flutter lo deja fijo por default (`persist ?? action != null`). Sin `persist: false`, Deshacer quedaba pegado y el teléfono nunca se marcaba leído. El "Reintentar" rojo de la IA (`_showAiError`) tenía el mismo bug.
@@ -465,7 +505,7 @@ La presencia viaja por Socket.io y el backend la guarda en memoria (`presenceReg
 
 - **`composing` = el composer tiene texto**, no "tecleó hace N segundos". Cambia unas dos veces por mensaje, sin throttle ni timers en el server. El borrador del agente de seguimiento cuenta: el operador está a punto de mandarlo.
 - **`clientId` por pestaña, no el socket ni el uid.** Al reconectar llega un socket nuevo antes de que muera el viejo, y el registro retira al "fantasma" de la misma pestaña. En el cliente, `othersIn` excluye **mi `clientId`**, no mi uid: en equipos que comparten login, "tu usuario en otro dispositivo" es otra persona y se muestra así.
-- **Registro por pantalla + `TickerMode`.** Puede haber dos `ChatsScreen` vivas (la raíz queda montada bajo `AccountsScreen`; `SessionDispatcher` monta la sesión nueva antes de desmontar la vieja) y la de abajo sigue rebuildeando. Manda la última registrada que está en pantalla (`TickerMode.valuesOf(context).enabled`: se apaga bajo rutas opacas, sigue encendido bajo diálogos, hojas y visores de fotos). `ActiveChatTracker` tenía el mismo bug; ahora sólo reporta en pantalla y su `dispose` sólo limpia si el rastreador es suyo.
+- **Registro por pantalla + `TickerMode`.** Al cambiar de cuenta hay dos `ChatsScreen` vivas un instante: `SessionDispatcher` monta la sesión nueva antes de desmontar la vieja. Además, bajo *Mis Cuentas* la raíz sigue rebuildeando. Manda la última registrada que está en pantalla (`TickerMode.valuesOf(context).enabled`: se apaga bajo rutas opacas, sigue encendido bajo diálogos, hojas y visores de fotos). `ActiveChatTracker` tenía el mismo bug; ahora sólo reporta en pantalla y su `dispose` sólo limpia si el rastreador es suyo.
 - **Salir de un chat se anuncia al instante.** Hubo una espera de 5 s para que el nombre no parpadeara al volver enseguida, y en uso real hacía lo contrario de lo que buscamos: dos operadores en el mismo chat se quedaban esperándose para ver quién soltaba primero. Sólo atrasaba un dato cierto ("ya salí"); pasar de un chat a otro nunca la tuvo. **No volver a ponerla.** Lo que sí espera es la ausencia: app oculta o en segundo plano, 15 s (cubre el selector de fotos y el alt-tab). `inactive` (blur de la ventana web) **no** es ausencia. Sin tocar la app 3 min = ya no estás en el chat, o un escritorio abandonado bloquearía al equipo. En móvil el teclado en pantalla no genera eventos de tecla: los cambios del composer cuentan como actividad.
 - **Ausente sólo suelta el chat, no la sesión:** sigues viendo la lista y la presencia de los demás.
 - En desktop, la galería de medios tapa el detalle sin ser ruta: mientras está abierta no estás "en" ese chat.
@@ -781,7 +821,7 @@ Si el WhatsApp anterior sigue vivo (perdió la SIM pero no la cuenta), el owner 
 - **La línea "Cambio de número"** (`number_change_divider.dart`, tests en `test/number_change_divider_test.dart`) va **por tiempo**, no por etiqueta: así no hubo que tocar un solo mensaje. Viaja en el mismo `Column` que el separador de día, sin agregar elementos a la lista (los índices de `_resolveJump` no se mueven). Si lo último del chat es del número anterior, abajo aparece "Lo que envíes ahora sale de +…": el cliente todavía no conoce el número nuevo.
 - **Tras el asistente, Ajustes recarga.** El panel lee el doc una sola vez; sin recargar, su próximo "Guardar" volvía a encender los automáticos que el cambio pausó.
 
-**Fase 2 (no está hecho):** juntar dos historiales (`has_history`), volver a vincular el número viejo como línea aparte (`number_replaced`, necesita ids de sesión opacos), promover la línea anterior a principal sin QR, y que `AccountsScreen` empuje `ChatsScreen` con el `session_key` en vivo (pendiente que ya existía; tras un cambio de número se nota más).
+**Fase 2 (no está hecho):** juntar dos historiales (`has_history`), volver a vincular el número viejo como línea aparte (`number_replaced`, necesita ids de sesión opacos) y promover la línea anterior a principal sin QR.
 
 ---
 
@@ -815,7 +855,7 @@ Reglas que no se pueden romper:
 - El subárbol sólo se **escribe** en una sesión viva (`sessionAlive`, +1 lectura por escritura del cliente). Las lecturas no lo exigen: los listeners tienen que poder ver el borrado.
 
 ### En la app
-- La tarjeta muestra "Eliminando…" sin acciones, el dispatcher salta lápidas y una `ChatsScreen` empujada sobre esa sesión se cierra sola (la raíz la cambia el dispatcher).
+- La tarjeta muestra "Eliminando…" sin acciones. El dispatcher salta las lápidas: si la sesión que se ve se elimina, cambia a otra y lo avisa (ver *🔀 Cambiar de cuenta*).
 - `PATCH access` ahora **reemplaza** `access` con `update`. Con `set(merge)` los mapas se mezclaban en profundidad y quitarle una sesión a un miembro **no se la quitaba** (seguía en las reglas y en los pushes; sólo salía de su lista). Además filtra los grants a sesiones vivas: la pantalla de permisos reenvía lo que leyó.
 
 **Lo que queda fuera de nuestro alcance:** pushes ya entregados, logs de Railway, backups/PITR de Firestore, la caché offline de otros dispositivos hasta que sus listeners vean el borrado, y una subida de Storage desde una vista vieja que llegue **después** del job (las reglas de Storage no miran Firestore; cerrarlo exige reglas cruzadas con permiso IAM).

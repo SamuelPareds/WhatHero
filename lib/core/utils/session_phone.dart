@@ -1,3 +1,5 @@
+import 'phone_input.dart';
+
 /// El número que hoy usa una sesión.
 ///
 /// El id del doc de sesión es el número con el que se vinculó POR PRIMERA VEZ.
@@ -7,4 +9,15 @@
 String sessionPhone(Map<String, dynamic>? data, String sessionId) {
   final phone = data?['phone_number'];
   return phone is String && phone.isNotEmpty ? phone : sessionId;
+}
+
+/// Cómo se le nombra una sesión al operador: el alias que le puso, el nombre
+/// verificado de Meta (Cloud API sin alias) o, si no hay ninguno, su número.
+/// Mis Cuentas, el título de la lista y el selector de cuenta la nombran igual.
+String sessionDisplayName(Map<String, dynamic>? data, String sessionId) {
+  for (final field in const ['alias', 'cloud_api_verified_name']) {
+    final value = data?[field];
+    if (value is String && value.trim().isNotEmpty) return value;
+  }
+  return displayPhone(sessionPhone(data, sessionId));
 }

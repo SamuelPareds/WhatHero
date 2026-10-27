@@ -23,10 +23,11 @@ import 'package:crm_whatsapp/core/services/user_prefs_service.dart';
 import 'package:crm_whatsapp/core/utils/hold_cache_until_server.dart';
 import 'package:crm_whatsapp/core/utils/phone_input.dart';
 import 'package:crm_whatsapp/core/utils/phone_search.dart';
-import 'package:crm_whatsapp/core/utils/session_deletion.dart';
 import 'package:crm_whatsapp/core/utils/session_phone.dart';
 import 'package:crm_whatsapp/features/settings.dart';
 import 'package:crm_whatsapp/features/accounts.dart';
+import 'package:crm_whatsapp/features/accounts/session_switch.dart';
+import 'package:crm_whatsapp/features/accounts/widgets/pending_chats_badge.dart';
 import 'chat_filter.dart';
 import 'messages_view.dart';
 import 'number_change_divider.dart';
@@ -36,6 +37,7 @@ import 'widgets/chat_nav_stepper.dart';
 import 'widgets/inbox_view_dropdown.dart';
 import 'widgets/message_search_results.dart';
 import 'widgets/new_chat_sheet.dart';
+import 'widgets/session_switcher.dart';
 import 'widgets/team_inbox_panel.dart';
 import 'widgets/team_presence_banner.dart';
 import 'widgets/undo_snack_bar.dart';
@@ -44,17 +46,28 @@ import 'widgets/label_chip.dart';
 import 'widgets/labels_selector_sheet.dart';
 import 'widgets/note_editor_dialog.dart';
 
+/// La lista de chats de una sesión con su detalle. La crea SÓLO el
+/// SessionDispatcher (main.dart), como pantalla raíz: cambiar de cuenta es
+/// cambiar esta pantalla por la de otra sesión, nunca apilar una encima (ver
+/// CLAUDE.md, "🔀 Cambiar de cuenta").
 class ChatsScreen extends StatefulWidget {
   final String? sessionId;
   final String? sessionKey;
   final String accountId;
-  final String? initialAlias;
+
+  /// Las sesiones que el usuario puede abrir, en vivo desde el dispatcher.
+  /// Alimentan el título (nombre, número, estado) y el selector de cuenta.
+  final List<SessionOption> sessions;
+
+  /// Pide al dispatcher que muestre otra sesión.
+  final ValueChanged<String> onSwitchSession;
 
   const ChatsScreen({
     this.sessionId,
     this.sessionKey,
     required this.accountId,
-    this.initialAlias,
+    this.sessions = const [],
+    required this.onSwitchSession,
     super.key,
   });
 
@@ -64,9 +77,18 @@ class ChatsScreen extends StatefulWidget {
 
 class _ChatsScreenState extends State<ChatsScreen> {
   String? selectedChatPhone;
-  // Número que hoy usa la sesión (`phone_number`), tomado del stream del
-  // AppBar. Tras un cambio de número no es `widget.sessionId`.
-  String? _sessionPhone;
+
+  // Esta sesión, en vivo desde el dispatcher. null sólo en la bienvenida.
+  SessionOption? get _current {
+    for (final s in widget.sessions) {
+      if (s.id == widget.sessionId) return s;
+    }
+    return null;
+  }
+
+  // Número que hoy usa la sesión (`phone_number`). Tras un cambio de número no
+  // es `widget.sessionId`.
+  String? get _sessionPhone => _current?.phone;
   // Para rotular "tu usuario en otro dispositivo" en la presencia del equipo.
   final String? _myUid = FirebaseAuth.instance.currentUser?.uid;
   // Salto a un mensaje concreto al abrir un chat desde el buscador. Lo consume
@@ -104,8 +126,6 @@ class _ChatsScreenState extends State<ChatsScreen> {
   StreamSubscription? _statusSubscription;
   StreamSubscription? _humanAttentionSubscription;
   StreamSubscription? _labelsSubscription;
-  StreamSubscription? _sessionGoneSubscription;
-  bool _leftDeletedSession = false;
   // Intención de deep-link compartida con SessionDispatcher. Esta pantalla solo
   // abre chats de SU sesión; el cambio de sesión lo orquesta el dispatcher.
   ValueNotifier<HumanAttentionPush?>? _pendingTap;
@@ -178,7 +198,6 @@ class _ChatsScreenState extends State<ChatsScreen> {
       _listenChats();
       _subscribeToLabels();
       _loadTeamInbox();
-      _watchSessionGone();
     }
 
     // Cold-start: la app abrió por un tap a una notificación push.
@@ -288,46 +307,6 @@ class _ChatsScreenState extends State<ChatsScreen> {
     });
   }
 
-  // La sesión se está eliminando (o ya no existe). La ChatsScreen raíz la
-  // cambia el SessionDispatcher, que deja de verla entre las conectadas. Ésta
-  // sólo se cierra sola si fue empujada desde la lista de sesiones: nadie más
-  // la cerraría y se quedaría mostrando una sesión vacía.
-  void _watchSessionGone() {
-    _sessionGoneSubscription = FirebaseFirestore.instance
-        .collection(accountsCollection)
-        .doc(widget.accountId)
-        .collection('whatsapp_sessions')
-        .doc(widget.sessionId)
-        .snapshots()
-        .listen(
-      (snap) {
-        // Un "no existe" del cache puede ser sólo que no estaba cacheado.
-        if (!snap.exists && snap.metadata.isFromCache) return;
-        if (snap.exists && !isSessionDeleting(snap.data())) return;
-        _leaveDeletedSession();
-      },
-      // Sin permiso para leerla: el borrado terminó y revocó el acceso.
-      onError: (_) => _leaveDeletedSession(),
-    );
-  }
-
-  void _leaveDeletedSession() {
-    if (_leftDeletedSession || !mounted) return;
-    final route = ModalRoute.of(context);
-    if (route == null || route.isFirst) return;
-    _leftDeletedSession = true;
-    _sessionGoneSubscription?.cancel();
-    final messenger = ScaffoldMessenger.of(context);
-    final navigator = Navigator.of(context);
-    // Primero lo que esté encima (hoja de ajustes, diálogos), luego esta pantalla.
-    navigator.popUntil((r) => r == route);
-    navigator.pop();
-    messenger.showSnackBar(const SnackBar(
-      content: Text('Esta sesión se está eliminando.'),
-      duration: Duration(seconds: 3),
-    ));
-  }
-
   void _setupSocketListeners() {
     if (widget.sessionKey == null) return;
     
@@ -363,7 +342,6 @@ class _ChatsScreenState extends State<ChatsScreen> {
     _statusSubscription?.cancel();
     _humanAttentionSubscription?.cancel();
     _labelsSubscription?.cancel();
-    _sessionGoneSubscription?.cancel();
     _pendingTap?.removeListener(_onPendingTap);
     UserPrefs().chatInboxView.removeListener(_onInboxViewPref);
     _cancelledTimer?.cancel();
@@ -804,11 +782,12 @@ class _ChatsScreenState extends State<ChatsScreen> {
   Widget build(BuildContext context) {
     final isMobile = MediaQuery.of(context).size.width < 600;
 
-    // ¿Esta pantalla es la que se ve? Puede haber dos ChatsScreen vivas (la
-    // raíz queda montada debajo de AccountsScreen) y la de abajo sigue
-    // rebuildeando. TickerMode se apaga bajo una ruta opaca y sigue encendido
-    // bajo diálogos, hojas y visores de fotos. Leerlo aquí crea la dependencia:
-    // al taparse o destaparse, la pantalla se rebuildea y vuelve a reportar.
+    // ¿Esta pantalla es la que se ve? Al cambiar de cuenta, el dispatcher monta
+    // la ChatsScreen nueva antes de desmontar la vieja; y bajo Mis Cuentas esta
+    // sigue rebuildeando. TickerMode se apaga bajo una ruta opaca y sigue
+    // encendido bajo diálogos, hojas y visores de fotos. Leerlo aquí crea la
+    // dependencia: al taparse o destaparse, la pantalla se rebuildea y vuelve
+    // a reportar.
     final onScreen = TickerMode.valuesOf(context).enabled;
 
     // Reportamos al rastreador qué chat está abierto, para que el banner de
@@ -922,12 +901,39 @@ class _ChatsScreenState extends State<ChatsScreen> {
           child: MediaVaultScreen(
             accountId: widget.accountId,
             sessionId: widget.sessionId!,
-            sessionAlias: widget.initialAlias ?? widget.sessionId!,
+            sessionAlias: _current?.name ?? widget.sessionId!,
             onClose: () => setState(() => _showMediaVault = false),
             onJumpToChat: _onMediaJumpToChat,
           ),
         ),
       ],
+    );
+  }
+
+  // Mis Cuentas: vincular números, miembros, llaves de API y cerrar sesión.
+  // Tocar una tarjeta ahí cambia de cuenta por el mismo camino que el selector
+  // del título (el dispatcher cierra Mis Cuentas).
+  void _openAccounts() {
+    Navigator.push(
+      context,
+      PageRouteBuilder(
+        pageBuilder: (context, animation, secondaryAnimation) => AccountsScreen(
+          accountId: widget.accountId,
+          onOpenSession: widget.onSwitchSession,
+        ),
+        transitionsBuilder: (context, animation, secondaryAnimation, child) {
+          return FadeTransition(
+            opacity: animation,
+            child: ScaleTransition(
+              scale: Tween<double>(begin: 0.98, end: 1.0).animate(
+                CurvedAnimation(parent: animation, curve: Curves.easeOutCubic),
+              ),
+              child: child,
+            ),
+          );
+        },
+        transitionDuration: const Duration(milliseconds: 400),
+      ),
     );
   }
 
@@ -969,27 +975,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 ),
                 const SizedBox(height: 32),
                 ElevatedButton.icon(
-                  onPressed: () {
-                    Navigator.push(
-                      context,
-                      PageRouteBuilder(
-                        pageBuilder: (context, animation, secondaryAnimation) => 
-                            AccountsScreen(accountId: widget.accountId),
-                        transitionsBuilder: (context, animation, secondaryAnimation, child) {
-                          return FadeTransition(
-                            opacity: animation,
-                            child: ScaleTransition(
-                              scale: Tween<double>(begin: 0.98, end: 1.0).animate(
-                                CurvedAnimation(parent: animation, curve: Curves.easeOutCubic),
-                              ),
-                              child: child,
-                            ),
-                          );
-                        },
-                        transitionDuration: const Duration(milliseconds: 400),
-                      ),
-                    );
-                  },
+                  onPressed: _openAccounts,
                   icon: const Icon(Icons.manage_accounts_outlined),
                   label: const Text('Gestionar Cuentas'),
                   style: ElevatedButton.styleFrom(
@@ -1020,75 +1006,25 @@ class _ChatsScreenState extends State<ChatsScreen> {
       appBar: AppBar(
         leading: IconButton(
           icon: const Icon(Icons.manage_accounts_outlined, color: primaryAqua),
-          onPressed: () {
-            Navigator.push(
-              context,
-              PageRouteBuilder(
-                pageBuilder: (context, animation, secondaryAnimation) => 
-                    AccountsScreen(accountId: widget.accountId),
-                transitionsBuilder: (context, animation, secondaryAnimation, child) {
-                  return FadeTransition(
-                    opacity: animation,
-                    child: ScaleTransition(
-                      scale: Tween<double>(begin: 0.98, end: 1.0).animate(
-                        CurvedAnimation(parent: animation, curve: Curves.easeOutCubic),
-                      ),
-                      child: child,
-                    ),
-                  );
-                },
-                transitionDuration: const Duration(milliseconds: 400),
-              ),
-            );
-          },
+          onPressed: _openAccounts,
           tooltip: 'Gestionar Cuentas',
         ),
+        // Nombre, número y estado salen de la lista en vivo del dispatcher:
+        // sin un stream propio del doc de sesión.
         title: _searchExpanded
             ? _buildSearchField()
-            : StreamBuilder<DocumentSnapshot>(
-          stream: FirebaseFirestore.instance
-              .collection(accountsCollection)
-              .doc(widget.accountId)
-              .collection('whatsapp_sessions')
-              .doc(widget.sessionId)
-              .snapshots(),
-          builder: (context, snapshot) {
-            String title = widget.initialAlias ?? 'WhatHero';
-            Map<String, dynamic>? sessionData;
-            if (snapshot.hasData && snapshot.data!.exists) {
-              sessionData = snapshot.data!.data() as Map<String, dynamic>?;
-              title = snapshot.data!.get('alias') ?? widget.sessionId ?? title;
-              _sessionPhone = sessionPhone(sessionData, widget.sessionId!);
-            }
-            
-            return Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
-                  style: const TextStyle(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 20,
-                    color: white,
-                  ),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
+            : SessionSwitcher(
+                current: _current ??
+                    SessionOption(id: widget.sessionId!, name: displayPhone(widget.sessionId!), phone: widget.sessionId!),
+                sessions: widget.sessions,
+                onSelected: widget.onSwitchSession,
+                onManage: _openAccounts,
+                pendingBadge: (id) => PendingChatsBadge(
+                  accountId: widget.accountId,
+                  sessionId: id,
+                  borderColor: surfaceDark,
                 ),
-                Text(
-                  // El número que hoy usa la sesión, no su id: tras un
-                  // cambio de número son distintos.
-                  displayPhone(_sessionPhone ?? widget.sessionId!),
-                  style: const TextStyle(
-                    fontSize: 12,
-                    color: lightText,
-                    fontWeight: FontWeight.w400,
-                  ),
-                ),
-              ],
-            );
-          },
-        ),
+              ),
         elevation: 0,
         // Expandido: solo la ✕ para cerrar (máximo ancho al campo). Colapsado:
         // 🔍 junto al nombre + galería y respuestas rápidas.

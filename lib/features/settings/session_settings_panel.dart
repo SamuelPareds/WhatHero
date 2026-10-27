@@ -568,8 +568,8 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
     await StorageService().clearLastSessionIdIf(widget.sessionId);
     if (!mounted) return;
     // Sólo se cierra el panel: lo demás reacciona solo a la lápida (la lista
-    // muestra "Eliminando…", el dispatcher cambia de sesión y una ChatsScreen
-    // abierta sobre esta sesión se cierra).
+    // muestra "Eliminando…" y, si es la sesión que se ve, el dispatcher cambia
+    // a otra y lo avisa).
     Navigator.pop(context);
     messenger.showSnackBar(SnackBar(
       duration: const Duration(seconds: 8),

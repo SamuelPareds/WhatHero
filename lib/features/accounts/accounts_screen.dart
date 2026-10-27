@@ -15,16 +15,23 @@ import 'package:crm_whatsapp/features/accounts/change_number/change_number_flow.
 import 'package:crm_whatsapp/features/accounts/connect_cloud_api_sheet.dart';
 import 'package:crm_whatsapp/features/accounts/link_result.dart';
 import 'package:crm_whatsapp/features/accounts/session_linking.dart';
+import 'package:crm_whatsapp/features/accounts/session_switch.dart';
+import 'package:crm_whatsapp/features/accounts/session_visual.dart';
+import 'package:crm_whatsapp/features/accounts/widgets/pending_chats_badge.dart';
 import 'package:crm_whatsapp/features/api_keys/api_keys_screen.dart';
 import 'package:crm_whatsapp/features/members/members_screen.dart';
 import 'package:crm_whatsapp/features/settings.dart';
-import 'package:crm_whatsapp/features/chat.dart';
-import 'package:crm_whatsapp/features/chat/widgets/unread_badge.dart';
 
 class AccountsScreen extends StatefulWidget {
   final String accountId;
 
-  const AccountsScreen({required this.accountId, super.key});
+  /// Tocar una tarjeta cambia de cuenta: el SessionDispatcher cierra esta
+  /// pantalla y deja esa sesión en la ChatsScreen raíz. Nunca se abre una
+  /// ChatsScreen encima: quedaba con el `session_key` del momento del toque y
+  /// la raíz seguía viva debajo (ver CLAUDE.md, "🔀 Cambiar de cuenta").
+  final ValueChanged<String> onOpenSession;
+
+  const AccountsScreen({required this.accountId, required this.onOpenSession, super.key});
 
   @override
   State<AccountsScreen> createState() => _AccountsScreenState();
@@ -379,14 +386,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
   static Map<String, dynamic> _dataOf(DocumentSnapshot doc) =>
       doc.data() as Map<String, dynamic>? ?? const {};
 
-  static String _aliasOf(DocumentSnapshot doc) {
-    final data = _dataOf(doc);
-    final alias = data['alias'];
-    if (alias is String && alias.trim().isNotEmpty) return alias;
-    final verifiedName = data['cloud_api_verified_name'];
-    if (verifiedName is String && verifiedName.trim().isNotEmpty) return verifiedName;
-    return displayPhone(sessionPhone(data, doc.id));
-  }
+  static String _aliasOf(DocumentSnapshot doc) => sessionDisplayName(_dataOf(doc), doc.id);
 
   @override
   Widget build(BuildContext context) {
@@ -461,21 +461,9 @@ class _AccountsScreenState extends State<AccountsScreen> {
             return const Center(child: CircularProgressIndicator());
           }
 
-          // Ordenamos en memoria por connected_at desc: el branch restringido
-          // (arrayContains) no puede usar orderBy sin un índice compuesto, y
-          // la lista de sesiones es pequeña. Owners y restringidos comparten
-          // el mismo orden visual.
+          // Mismo orden que el selector de cuenta del título.
           final sessions = snapshot.data!.docs.toList()
-            ..sort((a, b) {
-              final ta = (a.data() as Map<String, dynamic>?)?['connected_at'];
-              final tb = (b.data() as Map<String, dynamic>?)?['connected_at'];
-              if (ta is Timestamp && tb is Timestamp) {
-                return tb.compareTo(ta);
-              }
-              if (ta is Timestamp) return -1;
-              if (tb is Timestamp) return 1;
-              return 0;
-            });
+            ..sort((a, b) => compareSessionsByConnectedAt(_dataOf(a), _dataOf(b)));
 
           // Una sesión que se está eliminando no puede recibir el número nuevo.
           _sessions = sessions.where((d) => !isSessionDeleting(_dataOf(d))).toList();
@@ -512,7 +500,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
               final alias = _aliasOf(sessionDoc);
               final previousLines = _livePreviousLines(data);
               final deleting = isSessionDeleting(data);
-              final visual = _SessionVisual.from(
+              final visual = SessionVisual.from(
                 data['status'] as String?,
                 (data['last_sync'] as Timestamp?)?.toDate(),
                 deleting: deleting,
@@ -528,21 +516,8 @@ class _AccountsScreenState extends State<AccountsScreen> {
                 ),
                 child: InkWell(
                   // Eliminándose: no se abre ni se toca. Desaparece sola al terminar.
-                  onTap: deleting ? null : () {
-                    final sessionKey = data['session_key'] as String?;
-                    // Permitimos entrar aunque no haya sessionKey (será modo lectura)
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) => ChatsScreen(
-                          sessionId: phoneNumber,
-                          sessionKey: sessionKey ?? 'disconnected',
-                          accountId: widget.accountId,
-                          initialAlias: alias,
-                        ),
-                      ),
-                    );
-                  },
+                  // Una caída sí se abre, para leerla.
+                  onTap: deleting ? null : () => widget.onOpenSession(phoneNumber),
                   borderRadius: BorderRadius.circular(12),
                   child: Padding(
                     padding: const EdgeInsets.all(16),
@@ -573,7 +548,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
                             Positioned(
                               top: -6,
                               right: -6,
-                              child: _PendingChatsBadge(
+                              child: PendingChatsBadge(
                                 accountId: widget.accountId,
                                 sessionId: phoneNumber,
                               ),
@@ -735,116 +710,4 @@ List<String> _livePreviousLines(Map<String, dynamic> data) {
     for (final entry in lines.entries)
       if (entry.value is Map && (entry.value as Map)['status'] != 'disconnected') entry.key as String,
   ];
-}
-
-/// Cómo se ve una sesión en la lista, derivado de `status` + `last_sync`.
-///
-/// No basta con leer `status`: ese campo lo escribe el backend y, si el backend
-/// se cae o pierde el hilo de una sesión, el doc queda congelado en lo último
-/// que alcanzó a decir. El 03-sep-2026 una sesión pasó 26 horas mostrando
-/// "Reconectando..." con un spinner girando sobre algo que ya no estaba pasando.
-///
-/// Por eso se cruza con `last_sync`: mientras una sesión está reconectando, el
-/// watchdog del backend refresca ese timestamp cada 2 minutos. Si lleva más de
-/// [_staleAfter] sin latir, el que se cayó fue el backend — y el spinner deja de
-/// prometer una reconexión que nadie está intentando.
-class _SessionVisual {
-  final String label;
-  final Color color;
-  final bool showSpinner;
-  final bool isConnected;
-
-  const _SessionVisual({
-    required this.label,
-    required this.color,
-    this.showSpinner = false,
-    this.isConnected = false,
-  });
-
-  /// Holgado respecto al heartbeat de 2 min del backend: tres latidos perdidos
-  /// antes de desconfiar, para no acusar de muerto a un backend que sólo tuvo
-  /// un mal minuto.
-  static const _staleAfter = Duration(minutes: 5);
-
-  factory _SessionVisual.from(String? status, DateTime? lastSync, {bool deleting = false}) {
-    // Gana sobre cualquier status: el owner la mandó eliminar y el backend
-    // está borrando todo lo suyo. La tarjeta desaparece sola al terminar.
-    if (deleting) {
-      return const _SessionVisual(label: 'Eliminando…', color: lightText, showSpinner: true);
-    }
-
-    if (status == 'connected') {
-      return const _SessionVisual(label: 'Conectado', color: accentAqua, isConnected: true);
-    }
-
-    if (status == 'reconnecting') {
-      final beat = lastSync == null || DateTime.now().difference(lastSync) > _staleAfter;
-      return beat
-          ? _SessionVisual(label: 'Sin respuesta', color: Colors.orange.shade400)
-          : _SessionVisual(label: 'Reconectando...', color: Colors.orange.shade400, showSpinner: true);
-    }
-
-    if (status == 'reconnect_failed') {
-      // El backend sigue reintentando de fondo, pero ya lleva rato caída: se
-      // dice tal cual y se ofrece la salida manual.
-      return _SessionVisual(label: 'Sin conexión', color: Colors.red.shade400);
-    }
-
-    return _SessionVisual(label: 'Desvinculado', color: Colors.red.shade400);
-  }
-}
-
-// Badge de chats pendientes de una sesión (estilo ícono de app de iOS). El
-// stream nace en initState y no en build: la lista de sesiones rebuildea con
-// cada cambio de estado de cualquier sesión, y un `.snapshots()` creado ahí
-// re-suscribía (y en web volvía a leer) los pendientes de todas las tarjetas.
-class _PendingChatsBadge extends StatefulWidget {
-  final String accountId;
-  final String sessionId;
-
-  const _PendingChatsBadge({required this.accountId, required this.sessionId});
-
-  @override
-  State<_PendingChatsBadge> createState() => _PendingChatsBadgeState();
-}
-
-class _PendingChatsBadgeState extends State<_PendingChatsBadge> {
-  late Stream<QuerySnapshot> _pending = _query();
-
-  Stream<QuerySnapshot> _query() => FirebaseFirestore.instance
-      .collection(accountsCollection)
-      .doc(widget.accountId)
-      .collection('whatsapp_sessions')
-      .doc(widget.sessionId)
-      .collection('chats')
-      .where('unresponded_count', isGreaterThan: 0)
-      .snapshots();
-
-  @override
-  void didUpdateWidget(_PendingChatsBadge old) {
-    super.didUpdateWidget(old);
-    // La tarjeta puede reusarse para otra sesión si la lista se reordena.
-    if (old.sessionId != widget.sessionId || old.accountId != widget.accountId) {
-      _pending = _query();
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return StreamBuilder<QuerySnapshot>(
-      stream: _pending,
-      builder: (context, snap) {
-        final count = snap.data?.docs.length ?? 0;
-        if (count <= 0) return const SizedBox.shrink();
-        // Borde para separar visualmente del avatar
-        return Container(
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: darkBg, width: 2),
-          ),
-          child: UnrespondedBadge(count: count),
-        );
-      },
-    );
-  }
 }
