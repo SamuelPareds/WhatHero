@@ -19,6 +19,7 @@ import 'package:crm_whatsapp/core/services/presence_reporter.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/core/services/storage_service.dart';
 import 'package:crm_whatsapp/core/services/team_presence_service.dart';
+import 'package:crm_whatsapp/core/services/user_prefs_service.dart';
 import 'package:crm_whatsapp/core/utils/hold_cache_until_server.dart';
 import 'package:crm_whatsapp/core/utils/phone_input.dart';
 import 'package:crm_whatsapp/core/utils/phone_search.dart';
@@ -26,24 +27,22 @@ import 'package:crm_whatsapp/core/utils/session_deletion.dart';
 import 'package:crm_whatsapp/core/utils/session_phone.dart';
 import 'package:crm_whatsapp/features/settings.dart';
 import 'package:crm_whatsapp/features/accounts.dart';
+import 'chat_filter.dart';
 import 'messages_view.dart';
 import 'number_change_divider.dart';
 import 'media_vault_screen.dart';
 import 'widgets/ai_state_indicator.dart';
 import 'widgets/chat_nav_stepper.dart';
+import 'widgets/inbox_view_dropdown.dart';
 import 'widgets/message_search_results.dart';
 import 'widgets/new_chat_sheet.dart';
 import 'widgets/team_inbox_panel.dart';
 import 'widgets/team_presence_banner.dart';
+import 'widgets/undo_snack_bar.dart';
 import 'widgets/unread_badge.dart';
 import 'widgets/label_chip.dart';
 import 'widgets/labels_selector_sheet.dart';
 import 'widgets/note_editor_dialog.dart';
-
-// Filtros rápidos de la lista de chats (estilo chips de WhatsApp).
-// todos / no respondidos / con notas son fijos; `etiqueta` filtra por una
-// etiqueta concreta del catálogo (su id va en `_activeLabelId`).
-enum ChatFilter { todos, seguimiento, noRespondidos, conNotas, etiqueta }
 
 class ChatsScreen extends StatefulWidget {
   final String? sessionId;
@@ -79,11 +78,16 @@ class _ChatsScreenState extends State<ChatsScreen> {
   // Búsqueda expandible: colapsada muestra solo el icono 🔍 junto al nombre de
   // la sesión; al expandir, el campo tapa nombre+número para escribir cómodo.
   bool _searchExpanded = false;
-  // Filtro rápido activo. Se aplica en memoria sobre los chats ya descargados
-  // por el StreamBuilder, antes del filtro de búsqueda — cero lecturas extra.
-  ChatFilter _activeFilter = ChatFilter.todos;
-  // Etiqueta activa cuando `_activeFilter == ChatFilter.etiqueta`. Es el id del
-  // doc en el catálogo; null en cualquier otro filtro.
+  // Vista principal (el desplegable): Todos / Pendientes / Listos. Abre en la
+  // que el usuario dejó elegida, guardada en Firestore para todas sus
+  // sesiones y dispositivos.
+  InboxView _inboxView = inboxViewFromPref(UserPrefs().chatInboxView.value);
+  // Chip activo (Seguimiento, Con notas o una etiqueta), que filtra DENTRO de
+  // la vista; null = ninguno. Vista y chip se aplican en memoria sobre los
+  // chats ya descargados, antes de la búsqueda — cero lecturas extra.
+  ChatFilter? _chipFilter;
+  // Etiqueta activa cuando `_chipFilter == ChatFilter.etiqueta`. Es el id del
+  // doc en el catálogo; null en cualquier otro chip.
   String? _activeLabelId;
   // Contadores por filtro. Los chips viven en el AppBar (fuera del StreamBuilder
   // del body), así que el body los publica aquí y los chips se suscriben sin
@@ -164,6 +168,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
     // Presencia del equipo: esta pantalla cuenta como "dónde estoy" mientras
     // esté en pantalla (ver build).
     PresenceReporter.instance.register(this);
+    UserPrefs().chatInboxView.addListener(_onInboxViewPref);
     if (widget.sessionId != null && widget.sessionKey != null) {
       _setupSocketListeners();
       // Guardar esta sesión como la última activa
@@ -191,6 +196,18 @@ class _ChatsScreenState extends State<ChatsScreen> {
     _pendingTap = NotificationService().pendingTap;
     _pendingTap!.addListener(_onPendingTap);
     if (_pendingTap!.value != null) _handlePushTap(_pendingTap!.value!);
+  }
+
+  // La vista guardada cambió desde otra pantalla (la raíz queda montada bajo
+  // Mis Cuentas) o desde otro dispositivo: la seguimos. El cambio hecho aquí
+  // mismo llega con la vista ya puesta y no hace nada. El chip no se toca.
+  void _onInboxViewPref() {
+    final view = inboxViewFromPref(UserPrefs().chatInboxView.value);
+    if (!mounted || view == _inboxView) return;
+    setState(() {
+      _inboxView = view;
+      _clearNavQueue();
+    });
   }
 
   void _onPendingTap() {
@@ -348,6 +365,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
     _labelsSubscription?.cancel();
     _sessionGoneSubscription?.cancel();
     _pendingTap?.removeListener(_onPendingTap);
+    UserPrefs().chatInboxView.removeListener(_onInboxViewPref);
     _cancelledTimer?.cancel();
     _filterCounts.dispose();
     _internalUnread.dispose();
@@ -754,13 +772,30 @@ class _ChatsScreenState extends State<ChatsScreen> {
     });
   }
 
-  // Cambiar de filtro a mano invalida la cola: la secuencia que recorrías ya
-  // no es la que está en pantalla. Las flechas desaparecen hasta que abras un
-  // chat desde la lista nueva.
-  void _setFilter(ChatFilter filter, {String? labelId}) {
+  // Cambiar de vista o de chip a mano invalida la cola: la secuencia que
+  // recorrías ya no es la que está en pantalla. Las flechas desaparecen hasta
+  // que abras un chat desde la lista nueva.
+
+  // La vista además queda como la que verás al volver a entrar (en cualquier
+  // sesión y dispositivo). Elegir una sale de Seguimiento: ahí la vista no
+  // aplica, y quien la elige quiere verla.
+  void _setInboxView(InboxView view) {
     setState(() {
-      _activeFilter = filter;
-      _activeLabelId = labelId;
+      _inboxView = view;
+      if (_chipFilter == ChatFilter.seguimiento) _chipFilter = null;
+      _clearNavQueue();
+    });
+    UserPrefs().setChatInboxView(inboxViewPref(view));
+  }
+
+  // Tocar el chip activo lo apaga y deja sólo la vista (ya no hay chip
+  // "Todos" al cual volver). Los chips no se recuerdan: son consultas del
+  // momento, y una etiqueta es de una sesión.
+  void _toggleChip(ChatFilter chip, {String? labelId}) {
+    final isActive = _chipFilter == chip && _activeLabelId == labelId;
+    setState(() {
+      _chipFilter = isActive ? null : chip;
+      _activeLabelId = isActive ? null : labelId;
       _clearNavQueue();
     });
   }
@@ -1132,6 +1167,10 @@ class _ChatsScreenState extends State<ChatsScreen> {
           //
           // Una sola pasada para todos los contadores: `d.data()` reconstruye
           // el mapa entero del doc en cada llamada, y antes eran tres pasadas.
+          //
+          // Pendientes (el desplegable) y Seguimiento (la cola del agente, que
+          // ignora la vista) cuentan sobre toda la sesión. Con notas cuenta
+          // dentro de la vista, que es lo que vas a ver al tocarlo.
           var unrespondedTotal = 0;
           var notesTotal = 0;
           // Chats que el agente de seguimiento dejó encolados (con borrador listo).
@@ -1140,10 +1179,11 @@ class _ChatsScreenState extends State<ChatsScreen> {
           final internalUnread = <String, int>{};
           for (final d in allChats) {
             final m = d.data() as Map<String, dynamic>?;
-            final count = (m?['unresponded_count'] as num?)?.toInt() ?? 0;
-            final markedPending = m?['marked_pending'] as bool? ?? false;
-            if (count > 0 || markedPending) unrespondedTotal++;
-            if (((m?['note'] as String?) ?? '').trim().isNotEmpty) notesTotal++;
+            if (isChatPending(m)) unrespondedTotal++;
+            if (matchesChip(ChatFilter.conNotas, m) &&
+                matchesInboxView(_inboxView, m)) {
+              notesTotal++;
+            }
             if ((m?['followup_status'] as String?) == 'queued') followupsTotal++;
             final mine = _internalUnreadIn(m);
             if (mine > 0) internalUnread[d.id] = mine;
@@ -1157,58 +1197,42 @@ class _ChatsScreenState extends State<ChatsScreen> {
               _internalUnread.value = internalUnread;
             }
             // Si vaciaron la cola estando en el filtro "Seguimiento", el chip se
-            // oculta; degradamos a "Todos" para no dejar al usuario mirando vacío.
+            // oculta; lo apagamos (queda la vista) para no dejar al usuario
+            // mirando vacío.
             // Ojo: aquí NO se limpia la cola de navegación. El usuario no
             // cambió de contexto —el agente vació su lista mientras él la
             // recorría— y quitarle las flechas en ese momento sería quitarle
             // justo la forma de volver a lo que acaba de contestar.
             if (mounted &&
                 followupsTotal == 0 &&
-                _activeFilter == ChatFilter.seguimiento) {
-              setState(() => _activeFilter = ChatFilter.todos);
+                _chipFilter == ChatFilter.seguimiento) {
+              setState(() => _chipFilter = null);
             }
           });
 
-          // 1) Filtro rápido (chip activo). 2) Búsqueda. Se encadenan: puedes
-          // buscar dentro de un filtro.
+          // 1) Vista + chip activo. 2) Búsqueda. Se encadenan: puedes buscar
+          // dentro de un filtro.
           //
           // Si lo buscado parece un número, lo reducimos a su cola de dígitos
           // UNA vez por build (no por chat) y comparamos contra eso: así pegar
           // `+52 55 1234 5678` encuentra al `5215512345678` guardado. null =
           // no es un número, se busca como texto.
           final searchTail = phoneSearchTail(searchQuery);
+          final knownLabelIds = _labelsCatalog.keys.toSet();
           final filteredChats = allChats.where((chatDoc) {
             final chatData = chatDoc.data() as Map<String, dynamic>?;
 
-            // Filtro rápido
-            switch (_activeFilter) {
-              case ChatFilter.todos:
-                break;
-              case ChatFilter.seguimiento:
-                if ((chatData?['followup_status'] as String?) != 'queued') {
-                  return false;
-                }
-              case ChatFilter.noRespondidos:
-                final count =
-                    (chatData?['unresponded_count'] as num?)?.toInt() ?? 0;
-                final markedPending =
-                    chatData?['marked_pending'] as bool? ?? false;
-                if (count == 0 && !markedPending) {
-                  return false;
-                }
-              case ChatFilter.conNotas:
-                if (((chatData?['note'] as String?) ?? '').trim().isEmpty) {
-                  return false;
-                }
-              case ChatFilter.etiqueta:
-                // Si la etiqueta activa fue eliminada del catálogo, degradamos
-                // a "todos" (no ocultamos chats por un id huérfano).
-                if (_activeLabelId != null &&
-                    _labelsCatalog.containsKey(_activeLabelId)) {
-                  final ids = ((chatData?['labelIds'] as List?) ?? const [])
-                      .whereType<String>();
-                  if (!ids.contains(_activeLabelId)) return false;
-                }
+            // Vista y chip. Con texto en el buscador la vista no acota, y
+            // Seguimiento la ignora siempre (ver chatIsVisible).
+            if (!chatIsVisible(
+              _inboxView,
+              _chipFilter,
+              chatData,
+              labelId: _activeLabelId,
+              knownLabelIds: knownLabelIds,
+              searching: searchQuery.isNotEmpty,
+            )) {
+              return false;
             }
 
             // Búsqueda (vacía = pasa todo). La nota también es buscable:
@@ -1250,25 +1274,38 @@ class _ChatsScreenState extends State<ChatsScreen> {
             final IconData emptyIcon;
             final String emptyTitle;
             final String emptySubtitle;
-            if (_activeFilter == ChatFilter.seguimiento) {
+            // " pendiente" / " listo": los chips filtran dentro de la vista, y
+            // el texto tiene que decirlo ("Ningún chat pendiente tiene…").
+            final viewQualifier = switch (_inboxView) {
+              InboxView.todos => '',
+              InboxView.pendientes => ' pendiente',
+              InboxView.listos => ' listo',
+            };
+            if (_chipFilter == ChatFilter.seguimiento) {
               emptyIcon = Icons.campaign_outlined;
               emptyTitle = 'Sin seguimientos pendientes';
               emptySubtitle = 'El agente dejará aquí los chats listos para reactivar';
-            } else if (_activeFilter == ChatFilter.noRespondidos) {
-              emptyIcon = Icons.mark_chat_read_outlined;
-              emptyTitle = 'Todo respondido';
-              emptySubtitle = 'No tienes mensajes pendientes por responder';
-            } else if (_activeFilter == ChatFilter.conNotas) {
+            } else if (_chipFilter == ChatFilter.conNotas) {
               emptyIcon = Icons.sticky_note_2_outlined;
               emptyTitle = 'Sin notas';
-              emptySubtitle = 'Ningún chat tiene una nota todavía';
-            } else if (_activeFilter == ChatFilter.etiqueta) {
+              emptySubtitle = _inboxView == InboxView.todos
+                  ? 'Ningún chat tiene una nota todavía'
+                  : 'Ningún chat$viewQualifier tiene nota';
+            } else if (_chipFilter == ChatFilter.etiqueta) {
               final labelName = _labelsCatalog[_activeLabelId]?.name ?? '';
               emptyIcon = Icons.label_off_outlined;
               emptyTitle = 'Sin chats con esta etiqueta';
               emptySubtitle = labelName.isEmpty
-                  ? 'Ningún chat tiene esta etiqueta'
-                  : 'Ningún chat tiene la etiqueta "$labelName"';
+                  ? 'Ningún chat$viewQualifier tiene esta etiqueta'
+                  : 'Ningún chat$viewQualifier tiene la etiqueta "$labelName"';
+            } else if (_inboxView == InboxView.pendientes) {
+              emptyIcon = Icons.mark_chat_read_outlined;
+              emptyTitle = 'Bandeja limpia';
+              emptySubtitle = 'No hay conversaciones esperando respuesta';
+            } else if (_inboxView == InboxView.listos) {
+              emptyIcon = Icons.task_alt;
+              emptyTitle = 'Nada en Listos todavía';
+              emptySubtitle = 'Aquí quedan los chats que ya no esperan respuesta';
             } else {
               emptyIcon = Icons.chat_bubble_outline;
               emptyTitle = 'Sin chats';
@@ -1277,7 +1314,14 @@ class _ChatsScreenState extends State<ChatsScreen> {
             }
             // El botón "Ir a Mis Cuentas" solo tiene sentido en la bandeja
             // realmente vacía, no cuando un filtro no arroja nada.
-            final showAccountsCta = _activeFilter == ChatFilter.todos;
+            final showAccountsCta =
+                _chipFilter == null && _inboxView == InboxView.todos;
+            // Pendientes y Listos son vistas que se recuerdan: quien entra y ve
+            // la pantalla vacía tiene que poder salir sin buscar el
+            // desplegable, o creería que no tiene chats. Con un chip, "Ver
+            // todos" lo conserva: sin VIP pendientes, muestra todos los VIP.
+            final showAllCta = _inboxView != InboxView.todos &&
+                _chipFilter != ChatFilter.seguimiento;
             return _withMediaShortcut(Center(
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
@@ -1305,6 +1349,18 @@ class _ChatsScreenState extends State<ChatsScreen> {
                       color: lightText,
                     ),
                   ),
+                  if (showAllCta) ...[
+                    const SizedBox(height: 24),
+                    OutlinedButton(
+                      onPressed: () => _setInboxView(InboxView.todos),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: primaryAqua,
+                        side: const BorderSide(color: primaryAqua),
+                        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                      ),
+                      child: const Text('Ver todos'),
+                    ),
+                  ],
                   if (showAccountsCta) ...[
                     const SizedBox(height: 24),
                     ElevatedButton.icon(
@@ -1365,7 +1421,16 @@ class _ChatsScreenState extends State<ChatsScreen> {
     final markedPending = chatData?['marked_pending'] as bool? ?? false;
     // Un chat está "pendiente" por la señal automática o por la marca
     // manual de seguimiento. Ambas pintan naranja y abren el swipe.
-    final isPending = unrespondedCount > 0 || markedPending;
+    final isPending = isChatPending(chatData);
+    final displayName = contactName.isNotEmpty ? contactName : phoneNumber;
+    // Pendiente → "Listo"; si no → "Pendiente". Con lo que tenía antes, para
+    // que Deshacer lo deje exactamente como estaba.
+    void togglePending() => isPending
+        ? _markAsResponded(phoneNumber,
+            displayName: displayName,
+            prevCount: unrespondedCount,
+            prevMarked: markedPending)
+        : _markAsPending(phoneNumber, displayName: displayName);
     final labelIds = ((chatData?['labelIds'] as List?) ?? const [])
         .whereType<String>()
         .toList();
@@ -1382,6 +1447,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
       isSelected: selectedChatPhone == phoneNumber,
       unrespondedCount: unrespondedCount,
       markedPending: markedPending,
+      isPending: isPending,
       internalUnread: internalUnread,
       sessionKey: widget.sessionKey,
       sessionPhone: widget.sessionId,
@@ -1390,8 +1456,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
       labelsCatalog: _labelsCatalog,
       note: note,
       onTap: () => _openChatFromList(phoneNumber, navOrder),
-      onLongPress: () => _showChatOptions(
-          phoneNumber, contactName, labelIds, note, isPending),
+      onLongPress: () => _showChatOptions(phoneNumber, contactName, labelIds,
+          note, isPending, togglePending),
     );
 
     // Swipe simétrico estilo WhatsApp: si el chat está pendiente,
@@ -1406,7 +1472,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
         children: [
           if (isPending)
             SlidableAction(
-              onPressed: (_) => _markAsResponded(phoneNumber),
+              onPressed: (_) => togglePending(),
               backgroundColor: const Color(0xFFF97316),
               foregroundColor: Colors.white,
               icon: Icons.mark_chat_read,
@@ -1414,7 +1480,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
             )
           else
             SlidableAction(
-              onPressed: (_) => _markAsPending(phoneNumber),
+              onPressed: (_) => togglePending(),
               backgroundColor: const Color(0xFFF97316),
               foregroundColor: Colors.white,
               icon: Icons.mark_chat_unread,
@@ -1576,9 +1642,11 @@ class _ChatsScreenState extends State<ChatsScreen> {
     );
   }
 
-  // Fila horizontal de chips de filtro rápido (estilo WhatsApp). Vive en el
-  // AppBar, así que lee los contadores vía ValueListenableBuilder para que su
-  // badge se actualice sin rebuildar toda la pantalla.
+  // Fila horizontal de filtros (estilo WhatsApp): primero el desplegable de la
+  // vista (Todos / Pendientes / Listos) y después los chips, que filtran
+  // dentro de ella. Vive en el AppBar, así que lee los contadores vía
+  // ValueListenableBuilder para que su badge se actualice sin rebuildar toda
+  // la pantalla.
   Widget _buildFilterChips() {
     // Etiquetas del catálogo ordenadas, para pintar un chip por cada una.
     final labels = _labelsCatalog.values.toList()
@@ -1593,35 +1661,37 @@ class _ChatsScreenState extends State<ChatsScreen> {
             scrollDirection: Axis.horizontal,
             padding: const EdgeInsets.symmetric(horizontal: 16),
             children: [
-              _FilterChip(
-                label: 'Todos',
-                selected: _activeFilter == ChatFilter.todos,
-                onTap: () => _setFilter(ChatFilter.todos),
+              InboxViewDropdown(
+                view: _inboxView,
+                pendingCount: counts.unresponded,
+                dimmed: _chipFilter == ChatFilter.seguimiento,
+                onSelected: _setInboxView,
+              ),
+              // Separa la vista de los chips que filtran dentro de ella.
+              Center(
+                child: Container(
+                  width: 1,
+                  height: 20,
+                  margin: const EdgeInsets.symmetric(horizontal: 10),
+                  color: white.withValues(alpha: 0.12),
+                ),
               ),
               // Chip del agente de seguimiento: solo aparece cuando hay chats
-              // encolados, justo después de "Todos" para máxima visibilidad.
+              // encolados, primero para máxima visibilidad.
               if (counts.followups > 0) ...[
-                const SizedBox(width: 8),
                 _FilterChip(
                   label: 'Seguimiento',
                   count: counts.followups,
-                  selected: _activeFilter == ChatFilter.seguimiento,
-                  onTap: () => _setFilter(ChatFilter.seguimiento),
+                  selected: _chipFilter == ChatFilter.seguimiento,
+                  onTap: () => _toggleChip(ChatFilter.seguimiento),
                 ),
+                const SizedBox(width: 8),
               ],
-              const SizedBox(width: 8),
-              _FilterChip(
-                label: 'Pendientes',
-                count: counts.unresponded,
-                selected: _activeFilter == ChatFilter.noRespondidos,
-                onTap: () => _setFilter(ChatFilter.noRespondidos),
-              ),
-              const SizedBox(width: 8),
               _FilterChip(
                 label: 'Con notas',
                 count: counts.notes,
-                selected: _activeFilter == ChatFilter.conNotas,
-                onTap: () => _setFilter(ChatFilter.conNotas),
+                selected: _chipFilter == ChatFilter.conNotas,
+                onTap: () => _toggleChip(ChatFilter.conNotas),
               ),
               // Un chip por etiqueta del catálogo, con su propio color. Tocar
               // filtra los chats que la tengan asignada.
@@ -1629,10 +1699,10 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 const SizedBox(width: 8),
                 _LabelFilterChip(
                   label: label,
-                  selected: _activeFilter == ChatFilter.etiqueta &&
+                  selected: _chipFilter == ChatFilter.etiqueta &&
                       _activeLabelId == label.id,
                   onTap: () =>
-                      _setFilter(ChatFilter.etiqueta, labelId: label.id),
+                      _toggleChip(ChatFilter.etiqueta, labelId: label.id),
                 ),
               ],
             ],
@@ -2068,6 +2138,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
     List<String> labelIds,
     String note,
     bool isPending,
+    VoidCallback togglePending,
   ) {
     HapticFeedback.mediumImpact();
     // Si el chat ya tiene etiquetas asignadas la acción es "administrar";
@@ -2163,16 +2234,12 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 color: const Color(0xFFF97316),
               ),
               title: Text(
-                isPending ? 'Quitar pendiente' : 'Marcar como pendiente',
+                isPending ? 'Marcar como listo' : 'Marcar como pendiente',
                 style: const TextStyle(color: white),
               ),
               onTap: () {
                 Navigator.pop(sheetCtx);
-                if (isPending) {
-                  _markAsResponded(phoneNumber);
-                } else {
-                  _markAsPending(phoneNumber);
-                }
+                togglePending();
               },
             ),
             ListTile(
@@ -2298,49 +2365,85 @@ class _ChatsScreenState extends State<ChatsScreen> {
     }
   }
 
-  // "Listo": cierra el pendiente por completo. Limpia el contador automático
-  // y también la marca manual de seguimiento, para que el chat salga del filtro
-  // "Pendientes" y vuelva a su estado neutro.
-  Future<void> _markAsResponded(String contactPhone) async {
-    HapticFeedback.lightImpact();
-    try {
-      await FirebaseFirestore.instance
+  DocumentReference<Map<String, dynamic>> _chatDoc(String contactPhone) =>
+      FirebaseFirestore.instance
           .collection(accountsCollection)
           .doc(widget.accountId)
           .collection('whatsapp_sessions')
           .doc(widget.sessionId)
           .collection('chats')
-          .doc(contactPhone)
-          .set(
-            {'unresponded_count': 0, 'marked_pending': false},
-            SetOptions(merge: true),
-          );
+          .doc(contactPhone);
 
-      // El teléfono también tiene que enterarse. Si no, el chat se queda en
-      // negrita allá para siempre y ensucia justo la bandeja que usamos para
-      // pescar los mensajes que WhatsApp nunca le entregó a WhatHero.
-      unawaited(_markChatReadOnWhatsApp(contactPhone));
-    } catch (e) {
-      debugPrint('Error marking chat as responded: $e');
-      if (mounted) {
-        _showEtherealToast(false, 'Error al marcar', isActivating: false);
-      }
+  void _onMarkError(Object e) {
+    debugPrint('Error al marcar el chat: $e');
+    if (mounted) {
+      _showEtherealToast(false, 'Error al marcar', isActivating: false);
     }
   }
 
-  // Confirma lectura en el WhatsApp del teléfono, sin enviar nada. Best-effort
-  // a propósito: el pendiente ya quedó cerrado en Firestore (que es lo que ve
-  // el operador), así que un fallo de red acá no merece molestarlo con un
-  // error. El backend respeta el switch `mark_read_on_reply` de la sesión.
-  Future<void> _markChatReadOnWhatsApp(String contactPhone) async {
+  // "Listo": cierra el pendiente por completo. Limpia el contador automático
+  // y también la marca manual de seguimiento, para que el chat salga del filtro
+  // "Pendientes" y pase a "Listos".
+  //
+  // No se espera a la escritura: Firestore la aplica local al instante (el
+  // chat ya se fue de la lista) y su Future sólo completa con el servidor.
+  void _markAsResponded(
+    String contactPhone, {
+    required String displayName,
+    required int prevCount,
+    required bool prevMarked,
+  }) {
+    HapticFeedback.lightImpact();
+    final chat = _chatDoc(contactPhone);
+    // Capturados: el aviso puede cerrarse con esta pantalla ya desmontada.
+    final sessionKey = widget.sessionKey;
+    final accountId = widget.accountId;
+    var failed = false;
+    chat.set(
+      {'unresponded_count': 0, 'marked_pending': false},
+      SetOptions(merge: true),
+    ).catchError((Object e) {
+      failed = true;
+      _onMarkError(e);
+    });
+    showUndoSnackBar(
+      ScaffoldMessenger.of(context),
+      'Marcado como listo: $displayName',
+      // `increment` y no el valor previo: si el cliente escribió en estos
+      // segundos, su mensaje se suma en vez de pisarse.
+      onUndo: () => chat.set({
+        if (prevCount > 0) 'unresponded_count': FieldValue.increment(prevCount),
+        if (prevMarked) 'marked_pending': true,
+      }, SetOptions(merge: true)).catchError(_onMarkError),
+      // El teléfono se entera recién al confirmarse: si se deshace, el chat
+      // sigue pendiente y tiene que seguir en negrita allá.
+      onCommit: () {
+        if (failed) return;
+        unawaited(_markChatReadOnWhatsApp(contactPhone,
+            sessionKey: sessionKey, accountId: accountId));
+      },
+    );
+  }
+
+  // Confirma lectura en el WhatsApp del teléfono, sin enviar nada. Así el chat
+  // no se queda en negrita allá para siempre ensuciando justo la bandeja que
+  // usamos para pescar los mensajes que WhatsApp nunca le entregó a WhatHero.
+  // Best-effort a propósito: el pendiente ya quedó cerrado en Firestore (que
+  // es lo que ve el operador), así que un fallo de red acá no merece
+  // molestarlo con un error. El backend respeta el switch `mark_read_on_reply`.
+  Future<void> _markChatReadOnWhatsApp(
+    String contactPhone, {
+    required String? sessionKey,
+    required String accountId,
+  }) async {
     try {
       await http.post(
         Uri.parse('$backendUrl/mark-chat-read'),
         headers: await authHeaders(),
         body: jsonEncode({
           'phoneNumber': contactPhone,
-          'sessionKey': widget.sessionKey,
-          'accountId': widget.accountId,
+          'sessionKey': sessionKey,
+          'accountId': accountId,
         }),
       ).timeout(const Duration(seconds: 10));
     } catch (e) {
@@ -2352,23 +2455,19 @@ class _ChatsScreenState extends State<ChatsScreen> {
   // Escribe directo a Firestore: el backend nunca toca este campo, así que la
   // marca sobrevive hasta que respondas (el backend la limpia en
   // resetUnrespondedCount) o la quites con "Listo".
-  Future<void> _markAsPending(String contactPhone) async {
+  void _markAsPending(String contactPhone, {required String displayName}) {
     HapticFeedback.lightImpact();
-    try {
-      await FirebaseFirestore.instance
-          .collection(accountsCollection)
-          .doc(widget.accountId)
-          .collection('whatsapp_sessions')
-          .doc(widget.sessionId)
-          .collection('chats')
-          .doc(contactPhone)
-          .set({'marked_pending': true}, SetOptions(merge: true));
-    } catch (e) {
-      debugPrint('Error marking chat as pending: $e');
-      if (mounted) {
-        _showEtherealToast(false, 'Error al marcar', isActivating: false);
-      }
-    }
+    final chat = _chatDoc(contactPhone);
+    chat
+        .set({'marked_pending': true}, SetOptions(merge: true))
+        .catchError(_onMarkError);
+    showUndoSnackBar(
+      ScaffoldMessenger.of(context),
+      'Marcado como pendiente: $displayName',
+      onUndo: () => chat
+          .set({'marked_pending': false}, SetOptions(merge: true))
+          .catchError(_onMarkError),
+    );
   }
 
   // Etiqueta corta del ciclo IA — se muestra en el subtítulo del AppBar
@@ -2719,6 +2818,9 @@ class _ChatTile extends StatelessWidget {
   // Marca manual de seguimiento (sin número). Pinta un punto naranja en el
   // avatar cuando no hay contador automático visible.
   final bool markedPending;
+  // Pendiente = señal automática o marca manual (`isChatPending`). Llega
+  // calculado para que la definición viva en un solo lugar.
+  final bool isPending;
   // Mensajes internos del equipo para mí, sin ver. Pastilla violeta bajo la
   // hora: el número es de ESOS mensajes, no del cliente.
   final int internalUnread;
@@ -2745,6 +2847,7 @@ class _ChatTile extends StatelessWidget {
     required this.isSelected,
     required this.unrespondedCount,
     required this.markedPending,
+    required this.isPending,
     required this.internalUnread,
     required this.sessionKey,
     required this.sessionPhone,
@@ -2791,8 +2894,6 @@ class _ChatTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final displayName = contactName.isNotEmpty ? contactName : phoneNumber;
     final avatarLetter = displayName.substring(0, 1).toUpperCase();
-    // Pendiente = señal automática (con número) o marca manual (sin número).
-    final isPending = unrespondedCount > 0 || markedPending;
 
     return GestureDetector(
       onTap: onTap,

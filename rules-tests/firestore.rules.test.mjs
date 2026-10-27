@@ -232,6 +232,23 @@ describe('users/{uid}', () => {
     await assertFails(updateDoc(doc(dbAs(OUTSIDER), 'users', OUTSIDER), { memberOfAccounts: [OWNER] }));
   });
 
+  it('cada quien lee y escribe sus preferencias, no las de otro', async () => {
+    for (const uid of [OWNER, RESTRICTED]) {
+      const prefs = doc(dbAs(uid), 'users', uid, 'prefs', 'ui');
+      await assertSucceeds(setDoc(prefs, { chat_inbox_view: 'pendientes' }, { merge: true }));
+      await assertSucceeds(getDoc(prefs));
+    }
+    const ajenas = doc(dbAs(RESTRICTED), 'users', OWNER, 'prefs', 'ui');
+    await assertFails(getDoc(ajenas));
+    await assertFails(setDoc(ajenas, { chat_inbox_view: 'todos' }));
+  });
+
+  it('las preferencias no abren nada más del usuario', async () => {
+    const db = dbAs(RESTRICTED);
+    await assertFails(setDoc(doc(db, 'users', RESTRICTED, 'prefs', 'otra'), { x: 1 }));
+    await assertFails(updateDoc(doc(db, 'users', RESTRICTED), { chat_inbox_view: 'listos' }));
+  });
+
   it('el auto-bootstrap crea un owner de su propia cuenta y nada más', async () => {
     const owner = (uid) => ({
       role: 'owner', ownedAccountId: uid, memberOfAccounts: [uid], mustChangePassword: false,

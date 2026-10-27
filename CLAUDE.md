@@ -338,6 +338,39 @@ La lista creaba su stream en `build()`. `StreamBuilder` ve un stream distinto en
 
 ---
 
+## 📥 Pendientes / Listos (la bandeja como lista de trabajo)
+
+"Listo" siempre sacó el chat de *Pendientes*, pero la lista volvía a *Todos* en cada montaje: nadie trabajaba ahí y "Listo" sólo apagaba el badge. Ahora la vista elegida se recuerda y existe *Listos*, para que un operador vacíe *Pendientes* como bandeja de trabajo (inbox zero).
+
+### La vista y los chips se combinan
+El primer elemento de la fila de filtros es un **desplegable con la vista** (`InboxViewDropdown`: Todos / Pendientes / Listos, tests en `test/inbox_view_dropdown_test.dart`), siempre resaltado. Los chips de al lado (*Con notas*, etiquetas) filtran **dentro** de ella: *Pendientes* + VIP = los pendientes con VIP. Es lo que cualquiera espera al ver un desplegable junto a chips; con el chip reemplazando a la vista, "Pendientes ▾ · VIP" habría mostrado VIPs ya atendidos.
+- **Seguimiento es la excepción: ignora la vista** (`chatIsVisible`). El agente encola chats cuyo último mensaje fue ayer sin importar quién habló al final, así que la cola mezcla pendientes y listos: combinada con Pendientes perdería parte, y su chip (que cuenta la cola entera) prometería chats que no se ven. Mientras está activo, el desplegable se ve atenuado; elegir una vista sale de Seguimiento.
+- **Los contadores dicen lo que vas a ver:** *Con notas* cuenta dentro de la vista; Pendientes (en la píldora sólo con esa vista: al lado de "Todos" se leería como el total) y Seguimiento cuentan toda la sesión.
+- **Tocar el chip activo lo apaga** (`_toggleChip`): ya no hay chip "Todos" al cual volver.
+- **Los textos vacíos nombran la vista** ("Ningún chat pendiente tiene la etiqueta VIP") y "Ver todos" conserva el chip: sin VIP pendientes, muestra todos los VIP.
+
+### Pendiente o Listo
+
+**Listos es la otra mitad de Todos, no un estado propio.** Un chat es Pendiente (`unresponded_count > 0 || marked_pending`) o Listo; no hay punto medio. Pasa a Listos si responde un humano o la IA, o con "Listo". Vuelve a Pendientes cuando el cliente escribe y nadie le contesta. Sin campo nuevo, sin backend y sin backfill. **`isChatPending` (`lib/features/chat/chat_filter.dart`) es la única definición de pendiente**: estaba copiada en cuatro lugares, y si una se separa un chat queda en los dos filtros o en ninguno. Reglas en `test/chat_filter_test.dart`.
+
+- **Con texto en el buscador, la vista no acota** (`matchesInboxView(searching:)`). Son estados, no criterios: con Pendientes como vista guardada, buscar a un cliente ya atendido decía que no existía. *Con notas* y las etiquetas sí acotan, como siempre.
+- **La vista se guarda por usuario** en `users/{uid}/prefs/ui.chat_inbox_view` (`'todos' | 'pendientes' | 'listos'`), para todas sus sesiones y dispositivos (`UserPrefs`, `user_prefs_service.dart`). Los chips no se guardan: son consultas del momento, y una etiqueta es de una sesión. Un valor desconocido abre en Todos, y Todos es el default: nadie actualiza la app y ve "desaparecer" sus chats.
+  - **No va en `users/{uid}`:** ese doc respalda los custom claims (`memberOfAccounts`) y sólo lo escribe el backend. `prefs/ui` tiene su propia regla (cada quien el suyo) y su test en `rules-tests/`. La raíz `users` es compartida entre dev y prod, así que la vista también: es inocuo.
+  - **Se carga en `AccountContextService.initFor`**, en paralelo con `users/{uid}` y con tope de 2 s: la lista abre directo en la vista guardada, sin pasar un instante por Todos. Es un listener: un cambio en otro dispositivo, o en la otra `ChatsScreen` viva (la raíz queda bajo Mis Cuentas), se sigue solo. `clear()` lo suelta en el logout para que el siguiente usuario no herede la vista.
+  - **Reglas antes que la app** (`firebase deploy --only firestore:rules`). Si la app llega primero no se rompe: abre en Todos y loguea `[UserPrefs]`.
+- **"Listo" y "Pendiente" llevan Deshacer** (`showUndoSnackBar`, tests en `test/undo_snack_bar_test.dart`). En Pendientes y Listos el chat se va al instante, y un swipe sin querer no puede ser un viaje sin retorno.
+  - **Un SnackBar con acción no se cierra solo:** Flutter lo deja fijo por default (`persist ?? action != null`). Sin `persist: false`, Deshacer quedaba pegado y el teléfono nunca se marcaba leído. El "Reintentar" rojo de la IA (`_showAiError`) tenía el mismo bug.
+  - **El teléfono se marca leído al cerrarse el aviso sin Deshacer**, no antes: si se deshace, el chat sigue pendiente y tiene que seguir en negrita allá. Cerrar la pestaña en esos 4 s lo deja en negrita hasta la próxima respuesta. Aceptado.
+  - **Deshacer restaura con `increment(prevCount)`**, no con el valor previo: un mensaje que entró en esos segundos se suma en vez de pisarse.
+  - **Un aviso nuevo reemplaza al anterior** (`hideCurrentSnackBar`), que se confirma: cinco "Listo" seguidos no son 20 s de avisos en fila.
+- **Pendientes vacío dice "Bandeja limpia" y ofrece "Ver todos"**, igual que Listos vacío: con la vista guardada, quien entra y ve la pantalla vacía tiene que poder salir sin buscar el desplegable.
+
+**Pendiente conocido:** el badge de *Mis Cuentas* cuenta sólo `unresponded_count > 0` (ignora `marked_pending`), así que puede diferir del contador de Pendientes.
+
+**Fase 2 (no está hecho):** "Listo" dentro del chat abierto, para cerrar un "gracias 👍" sin volver a la lista (ver *Recorrer chats*).
+
+---
+
 ## ⇅ Recorrer chats sin volver a la lista (cola congelada)
 
 Revisar la bandeja de ayer costaba dos gestos por chat: back a la lista, encontrar dónde te quedaste, entrar al siguiente. Encontrar dónde te quedaste era el caro, porque **la lista se mueve debajo de los pies**: la ordena `lastMessageTimestamp descending`, así que contestar un chat lo manda al puesto 1, y en *Pendientes* además lo saca del filtro al poner `unresponded_count: 0`. La referencia visual se evapora justo por haber hecho el trabajo.
@@ -345,9 +378,9 @@ Revisar la bandeja de ayer costaba dos gestos por chat: back a la lista, encontr
 Por eso el stepper del AppBar (`ChatNavStepper`, ↑ 4/12 ↓) **no camina la lista viva**. Camina `_navQueue`: una **foto** del orden filtrado, copiada en `_openChatFromList` en el momento de entrar desde la lista.
 
 - **Congelada es la característica, no un atajo.** Contestar reordena y filtra la lista real; la cola no se entera y tu posición sobrevive. ↑ te devuelve al chat que acabas de contestar **aunque ya no figure en el filtro**, porque la cola conserva a los que salieron.
-- **Sale del mismo `filteredChats`** que pinta la lista ([`chats_screen.dart`](lib/features/chat/chats_screen.dart)), o sea con filtro rápido + búsqueda ya aplicados: funciona igual en *Todos*, *Pendientes*, *Seguimiento*, *Con notas* y cualquier etiqueta, sin código por filtro.
+- **Sale del mismo `filteredChats`** que pinta la lista ([`chats_screen.dart`](lib/features/chat/chats_screen.dart)), o sea con vista + chip + búsqueda ya aplicados: funciona igual en *Todos*, *Pendientes*, *Listos*, *Seguimiento*, *Con notas* y cualquier etiqueta, sin código por filtro.
 - **Sin cola no hay flechas.** Abrir por push, desde la galería de medios, desde un hit de la sección "Mensajes" o con "Nuevo chat" limpia la cola: ninguna de esas aperturas es una posición dentro de una secuencia, y un `4/12` ahí sería mentira. El guard `_hasNavQueue` exige además que el cursor apunte al chat abierto.
-- **Cambiar de filtro a mano** (`_setFilter`) la limpia — la secuencia que recorrías ya no es la que se ve. La degradación **automática** de *Seguimiento* → *Todos* (cuando el agente vacía la cola) **no** la limpia a propósito: el usuario no cambió de contexto, y es justo el momento en que perder las flechas dolería.
+- **Cambiar de vista o de chip a mano** (`_setInboxView`, `_toggleChip`) la limpia — la secuencia que recorrías ya no es la que se ve. Que *Seguimiento* se apague solo (cuando el agente vacía la cola) **no** la limpia a propósito: el usuario no cambió de contexto, y es justo el momento en que perder las flechas dolería.
 - **La geometría manda sobre la semántica:** la lista es reciente↑ / antiguo↓, así que ↓ avanza hacia lo más viejo. Chevrones verticales, no flechas ←→.
 - **El contador es la mitad del valor y no cuesta nada.** Responde el "¿dónde me quedé?" que era el dolor original y comunica sin palabras que recorres una secuencia congelada. `_navQueue.length` cuenta una lista en RAM que salió del `snapshot` que la lista **ya** tenía suscrito: cero lecturas extra a Firestore.
 - **La cola guarda sólo `d.id`, nunca un campo del documento.** Se arma en cada build de la lista —que rebuildea con cada mensaje entrante— y recorre *todos* los chats, no los ~10 que el `ListView` construye perezosamente. Leer un campo obligaría a `d.data()`, que reconstruye el mapa completo del doc en cada llamada: en "Todos" con miles de conversaciones son miles de deserializaciones por mensaje recibido. La primera versión pagaba eso **dos veces por chat** para precargar el nombre del contacto en el tooltip de la flecha; el tooltip se quitó, no valía su precio. El id del doc **es** el número (el backend siempre escribe en `.doc(phoneNumber)`), así que abrir por id abre el mismo chat.

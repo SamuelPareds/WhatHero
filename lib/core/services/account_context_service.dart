@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import '../config.dart';
+import 'user_prefs_service.dart';
 
 /// Resuelve el "accountId activo" para el usuario logueado.
 ///
@@ -93,7 +94,14 @@ class AccountContextService extends ChangeNotifier {
     try {
       final docRef =
           FirebaseFirestore.instance.collection('users').doc(user.uid);
-      final snap = await docRef.get();
+      // Las preferencias (vista de la lista de chats) se cargan en paralelo:
+      // así la lista abre en la vista guardada sin pasar por Todos, y sin
+      // sumar latencia. `load` nunca lanza.
+      final results = await Future.wait([
+        docRef.get(),
+        UserPrefs().load(user.uid),
+      ]);
+      final snap = results.first as DocumentSnapshot<Map<String, dynamic>>;
 
       if (!snap.exists) {
         // Migración transparente: usuario existente sin doc users/{uid}.
@@ -219,6 +227,7 @@ class AccountContextService extends ChangeNotifier {
   /// para que cualquier listener que reaccione al signOut ya vea contexto limpio.
   Future<void> clear() async {
     debugPrint('[AccountContext] Limpiando contexto');
+    UserPrefs().clear();
     _currentUid = null;
     _activeAccountId = null;
     _role = 'owner';

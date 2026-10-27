@@ -104,6 +104,14 @@ service cloud.firestore {
       allow update, delete: if false;
     }
 
+    // Preferencias de la app de cada usuario (la vista con la que abre la
+    // lista de chats). Sólo UI: no dan acceso a nada, por eso las escribe el
+    // propio usuario. Aparte de users/{uid} a propósito: ese doc respalda los
+    // custom claims y abrirle escrituras al cliente es un error caro.
+    match /users/{uid}/prefs/ui {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+    }
+
     // -------------------------------------------------------------------
     // Reglas de accounts/ (prod) y accounts_dev/ (dev).
     // No usamos un catch-all `{document=**}` porque Firestore EVALÚA TODAS

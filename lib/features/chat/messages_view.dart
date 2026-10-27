@@ -1609,12 +1609,15 @@ class _MessagesViewState extends State<MessagesView> {
   // SnackBar de error rojo con acción "Reintentar" que reusa la misma instrucción
   // del operador. Solo aplica al modo manual (botón auto_awesome) — el
   // auto-responder no pasa por aquí.
+  // `persist: false`: con acción, Flutter lo deja fijo por default y el aviso
+  // rojo se quedaba en pantalla hasta tocarlo.
   void _showAiError(String message, {String? operatorInstruction}) {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(message),
         backgroundColor: Colors.red.shade600,
         duration: const Duration(seconds: 6),
+        persist: false,
         action: SnackBarAction(
           label: 'Reintentar',
           textColor: Colors.white,
