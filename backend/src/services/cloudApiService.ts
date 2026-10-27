@@ -772,7 +772,17 @@ export function createCloudApiSocket(
         if (mediaKind === 'image') {
           innerMessage.imageMessage = { caption, mimetype: mimeType, ...(contextInfo && { contextInfo }) };
         } else if (mediaKind === 'video') {
-          innerMessage.videoMessage = { caption, mimetype: mimeType, ...(contextInfo && { contextInfo }) };
+          // Lo que midió `probeVideo` en `performSendMessage` viaja en el eco,
+          // igual que en Baileys: de ahí `extractMediaInfo` saca
+          // mediaWidth/Height/Duration. Sin esto la burbuja quedaba en 16:9 y 0:00.
+          innerMessage.videoMessage = {
+            caption,
+            mimetype: mimeType,
+            width: content.width,
+            height: content.height,
+            seconds: content.seconds,
+            ...(contextInfo && { contextInfo }),
+          };
         } else if (mediaKind === 'document') {
           innerMessage.documentMessage = {
             caption,

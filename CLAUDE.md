@@ -589,6 +589,9 @@ quedaba en 16:9 y `0:00`.
   la rama `videoUrl` de `performSendMessage`, el único punto por donde sale video (composer y
   respuestas rápidas). **Todo camino nuevo que mande video tiene que pasar por ahí.** El binario viene
   en el mismo `apk add ffmpeg` que usa Baileys para la miniatura.
+- **En Cloud API el eco es sintético:** lo arma el adaptador (`cloudApiService.ts`), que copia esas
+  medidas al `videoMessage` igual que Baileys. Hasta el 27-oct-2026 no las copiaba y la burbuja
+  saliente de Cloud API quedaba en 16:9 y `0:00`.
 - **Manda cómo se VE el video, no cómo está guardado.** ffprobe da los píxeles guardados y dos marcas
   del archivo los corrigen: la rotación (un vertical de la cámara del iPhone viene como 1920×1080 más
   −90°; sin intercambiar ancho y alto llegaría horizontal) y la proporción de píxel (ver abajo).
@@ -614,6 +617,23 @@ WhatsApp en iPhone no**: dibuja los píxeles guardados. Por eso sólo falla en i
   `Encoded Pixels` ≠ `Presentation Dimensions`, es esto.
 - **Recodificar en el backend lo resolvería para todos**, pero cuesta CPU y segundos en cada envío. Se
   descartó mientras sea un caso raro; si empieza a repetirse, ése es el camino.
+
+### "Por Cloud API el video falla con #131053" → es HEVC, no el MIME
+
+Pasó el 27-oct-2026 con el mismo tutorial, ya reexportado sin anamórfico pero con el codificador
+**H.265** de HandBrake. Meta acepta la subida y segundos después el webhook lo marca fallido:
+`Video file uploaded with mimetype as video/mp4, however on processing it is of type video/mp4,
+videoCodec=hevc, audioCodec=aac`. Engaña: el MIME está bien, lo que Meta rechaza es el códec.
+
+- **Cloud API sólo acepta video H.264 + audio AAC** (una pista de audio o ninguna), ≤16 MB. Por QR el
+  mismo archivo sale porque Baileys no valida nada: por eso nunca había fallado.
+- **Arreglo: reexportar en H.264** (HandBrake: *Video → H.264 (x264)*, perfil Main o Baseline, *Web
+  Optimized*). Con `avmediainfo`, la pista de video tiene que decir `H.264 'avc1'`, no `HEVC 'hvc1'`.
+- **La burbuja corta el error en una línea.** El texto completo vive en `deliveryError`, en el doc del
+  mensaje.
+- `probeVideo` ya corre ffprobe antes de enviar: con su `codec_name` se podría frenar un HEVC en
+  sesiones Cloud API con un aviso al instante, o recodificarlo. No se hizo, con el mismo criterio que el
+  anamórfico.
 
 ---
 
