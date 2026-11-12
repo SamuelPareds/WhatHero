@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:crm_whatsapp/core.dart';
+import 'package:crm_whatsapp/core/services/account_context_service.dart';
 import 'package:crm_whatsapp/features/auth/login_screen.dart';
 
 class RegisterScreen extends StatefulWidget {
@@ -55,73 +55,61 @@ class _RegisterScreenState extends State<RegisterScreen> {
       return;
     }
 
+    final email = emailController.text.trim();
     setState(() => isLoading = true);
+    // Esta pantalla NO escribe en Firestore. Al crear el usuario, AuthWrapper
+    // (debajo de esta ruta) arranca AccountContextService.initFor, que crea
+    // users/{uid}; aquí sólo le pasamos el nombre. Cuando las dos creaban el
+    // doc, la segunda escritura era rechazada y el botón quedaba cargando.
+    AccountContextService().prepareSignup(email: email, displayName: fullName);
+    final UserCredential credential;
     try {
-      await FirebaseAuth.instance.createUserWithEmailAndPassword(
-        email: emailController.text.trim(),
+      credential = await FirebaseAuth.instance.createUserWithEmailAndPassword(
+        email: email,
         password: passwordController.text.trim(),
       );
-
-      // Crear documento de cuenta en Firestore inmediatamente
-      final user = FirebaseAuth.instance.currentUser;
-      if (user != null) {
-        // Sincronizar el displayName en el perfil de Firebase Auth para que
-        // todo el ecosistema (incluyendo el helper resolveHumanSender en el
-        // backend) tenga acceso al nombre desde el primer login.
-        await user.updateDisplayName(fullName);
-
-        await FirebaseFirestore.instance
-          .collection(accountsCollection)
-          .doc(user.uid)
-          .set({
-            'email': user.email,
-            'createdAt': Timestamp.now(),
-            'accountId': user.uid,
-          }, SetOptions(merge: true));
-
-        // Crear doc users/{uid} como owner de su propia cuenta. Este doc
-        // es la fuente de verdad para AccountContextService y para las
-        // Firestore Rules (campo memberOfAccounts). Vive fuera del switch
-        // de entorno (accounts vs accounts_dev) porque la membresía es
-        // global al usuario Firebase, no dependiente del entorno.
-        await FirebaseFirestore.instance
-          .collection('users')
-          .doc(user.uid)
-          .set({
-            'email': user.email,
-            'displayName': fullName,
-            'ownedAccountId': user.uid,
-            'memberOfAccounts': [user.uid],
-            'role': 'owner',
-            'mustChangePassword': false,
-            'createdAt': FieldValue.serverTimestamp(),
-          });
-      }
-
-      // Pequeño delay para asegurar que Firebase haya actualizado el estado
-      if (!mounted) return;
-      await Future.delayed(const Duration(milliseconds: 500));
-      // Pop esta pantalla - AuthWrapper mostrará AccountsScreen automáticamente
-      if (mounted) Navigator.of(context).pop();
-    } on FirebaseAuthException catch (e) {
+    } catch (e) {
+      AccountContextService().cancelSignup();
+      debugPrint('[Register] No se pudo crear la cuenta: $e');
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(_authErrorMessage(e.code))),
+        SnackBar(content: Text(_signupErrorMessage(e))),
       );
       setState(() => isLoading = false);
+      return;
     }
+
+    // La cuenta ya existe: de aquí en adelante nada puede dejar al usuario
+    // en esta pantalla. El nombre también va al perfil de Auth, que es de
+    // donde lo toma initFor si el primer intento de crear users/{uid} falla
+    // (sin red) y el doc se crea en el siguiente login.
+    try {
+      await credential.user?.updateDisplayName(fullName);
+    } catch (e) {
+      debugPrint('[Register] No se pudo guardar el nombre en Auth: $e');
+    }
+
+    // Pequeño delay para que AuthWrapper ya muestre la app debajo al cerrar.
+    if (!mounted) return;
+    await Future.delayed(const Duration(milliseconds: 500));
+    if (mounted) Navigator.of(context).pop();
   }
 
-  String _authErrorMessage(String code) {
-    switch (code) {
+  String _signupErrorMessage(Object error) {
+    if (error is! FirebaseAuthException) return 'Error al registrarse. Intenta de nuevo.';
+    switch (error.code) {
       case 'weak-password':
         return 'Contraseña muy débil';
       case 'email-already-in-use':
         return 'Este email ya está registrado';
       case 'invalid-email':
         return 'Email inválido';
+      case 'network-request-failed':
+        return 'Sin conexión. Revisa tu internet e intenta de nuevo.';
+      case 'too-many-requests':
+        return 'Demasiados intentos. Espera unos minutos.';
       default:
-        return 'Error al registrarse';
+        return 'Error al registrarse (${error.code})';
     }
   }
 

@@ -20,6 +20,7 @@ import {
   getDoc,
   getDocs,
   query,
+  runTransaction,
   setDoc,
   setLogLevel,
   updateDoc,
@@ -289,5 +290,46 @@ describe('users/{uid}', () => {
     await assertFails(setDoc(doc(dbAs('intruso'), 'users', 'intruso'), {
       ...owner('intruso'), memberOfAccounts: [OWNER],
     }));
+  });
+
+  // Ver CLAUDE.md, "🆕 Registro". Firebase avisa del usuario nuevo en cuanto lo
+  // crea, y la pantalla de registro y AccountContextService creaban el doc a la
+  // vez: el segundo `set` era un update rechazado y el botón quedaba cargando.
+  describe('registro: el doc nace una sola vez', () => {
+    const nuevo = {
+      role: 'owner', ownedAccountId: 'nuevo', memberOfAccounts: ['nuevo'], mustChangePassword: false,
+    };
+    // Lo que hace AccountContextService._createOwnerDoc.
+    const createIfAbsent = (db, onRead = async () => {}) => runTransaction(db, async (tx) => {
+      const ref = doc(db, 'users', 'nuevo');
+      const snap = await tx.get(ref);
+      await onRead();
+      if (!snap.exists()) tx.set(ref, nuevo);
+    });
+
+    it('un segundo `set` es un update y se rechaza', async () => {
+      const ref = doc(dbAs('nuevo'), 'users', 'nuevo');
+      await assertSucceeds(setDoc(ref, nuevo));
+      await assertFails(setDoc(ref, nuevo));
+    });
+
+    it('la cuenta no se escribe antes de que exista el doc', async () => {
+      // La pantalla de registro lo intentaba primero, y fallaba si ganaba la carrera.
+      await assertFails(setDoc(doc(dbAs('nuevo'), 'accounts', 'nuevo'), { email: 'x' }, { merge: true }));
+    });
+
+    it('crear-si-falta en transacción: crea, y si ya existe no escribe', async () => {
+      await assertSucceeds(createIfAbsent(dbAs('nuevo')));
+      await assertSucceeds(createIfAbsent(dbAs('nuevo')));
+    });
+
+    it('si otro lo crea entre la lectura y la escritura, la transacción se repite y no falla', async () => {
+      let attempts = 0;
+      await assertSucceeds(createIfAbsent(dbAs('nuevo'), async () => {
+        if (++attempts > 1) return;
+        await env.withSecurityRulesDisabled((ctx) => setDoc(doc(ctx.firestore(), 'users', 'nuevo'), nuevo));
+      }));
+      assert.equal(attempts, 2);
+    });
   });
 });

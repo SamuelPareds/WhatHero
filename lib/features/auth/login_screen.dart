@@ -42,17 +42,21 @@ class _LoginScreenState extends State<LoginScreen> {
       await Future.delayed(const Duration(milliseconds: 500));
       // Pop esta pantalla - AuthWrapper mostrará AccountsScreen automáticamente
       if (mounted) Navigator.of(context).pop();
-    } on FirebaseAuthException catch (e) {
+    } catch (e) {
+      // Cualquier error, no sólo los de Auth: si uno se escapa, el botón
+      // queda cargando para siempre (pasó en el registro).
+      debugPrint('[Login] No se pudo iniciar sesión: $e');
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(_authErrorMessage(e.code))),
+        SnackBar(content: Text(_authErrorMessage(e))),
       );
       setState(() => isLoading = false);
     }
   }
 
-  String _authErrorMessage(String code) {
-    switch (code) {
+  String _authErrorMessage(Object error) {
+    if (error is! FirebaseAuthException) return 'Error al iniciar sesión. Intenta de nuevo.';
+    switch (error.code) {
       case 'user-not-found':
       case 'wrong-password':
       case 'invalid-credential':
@@ -61,6 +65,8 @@ class _LoginScreenState extends State<LoginScreen> {
         return 'Email inválido';
       case 'too-many-requests':
         return 'Demasiados intentos. Intenta más tarde';
+      case 'network-request-failed':
+        return 'Sin conexión. Revisa tu internet e intenta de nuevo.';
       default:
         return 'Error al iniciar sesión';
     }

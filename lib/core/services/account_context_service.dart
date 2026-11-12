@@ -18,7 +18,9 @@ import 'user_prefs_service.dart';
 /// Migración transparente: si `users/{uid}` no existe (cuenta creada antes
 /// de esta feature), el servicio lo crea on-demand con
 /// `ownedAccountId = uid`. Esto preserva el comportamiento actual sin que
-/// el usuario note nada.
+/// el usuario note nada. Es también como nace el doc de un usuario recién
+/// registrado: **éste es el único lugar de la app que crea users/{uid}**
+/// (ver [prepareSignup]).
 ///
 /// Singleton + ChangeNotifier: el AuthWrapper escucha cambios para
 /// re-renderizar si el contexto cambia (ej. tras login/logout).
@@ -39,6 +41,10 @@ class AccountContextService extends ChangeNotifier {
   // miembros sin campo `access`.
   bool _allSessionsAccess = true;
   Set<String> _grantedSessions = {};
+
+  // Lo que el usuario escribió al registrarse, para el doc users/{uid}. Ver
+  // [prepareSignup].
+  PendingSignup? _pendingSignup;
 
   String? get currentUid => _currentUid;
   String? get activeAccountId => _activeAccountId;
@@ -78,6 +84,23 @@ class AccountContextService extends ChangeNotifier {
     return sessions.where('allowedUids', arrayContains: uid);
   }
 
+  /// Llamar ANTES de `createUserWithEmailAndPassword`, con el nombre que
+  /// escribió el usuario.
+  ///
+  /// Firebase avisa del usuario nuevo (authStateChanges → [initFor]) en el
+  /// mismo instante en que lo crea, y [initFor] crea users/{uid} antes de que
+  /// la pantalla de registro alcance a guardar nada. Por eso el doc lo crea
+  /// SÓLO [initFor] y el nombre le llega por aquí. La pantalla de registro
+  /// también lo creaba, y como las reglas sólo dejan crear ese doc (nunca
+  /// editarlo), el segundo `set` era un update rechazado. Del 04-may al
+  /// 12-nov-2026 eso dejó el botón "Registrarse" cargando para siempre.
+  void prepareSignup({required String email, required String displayName}) {
+    _pendingSignup = PendingSignup(email: email, displayName: displayName);
+  }
+
+  /// El registro falló: el nombre no puede quedar esperando a otro usuario.
+  void cancelSignup() => _pendingSignup = null;
+
   /// Resuelve el contexto para un usuario Firebase recién logueado.
   /// Idempotente: si ya estamos resueltos para este uid, no hace nada.
   /// Retorna `true` si la resolución fue exitosa, `false` si falló (y la UI
@@ -102,37 +125,17 @@ class AccountContextService extends ChangeNotifier {
         UserPrefs().load(user.uid),
       ]);
       final snap = results.first as DocumentSnapshot<Map<String, dynamic>>;
+      // Usuario recién registrado (o de antes de multi-usuario): no tiene
+      // doc todavía y lo creamos como owner de su propia cuenta.
+      final data = snap.data() ?? await _createOwnerDoc(docRef, user);
 
-      if (!snap.exists) {
-        // Migración transparente: usuario existente sin doc users/{uid}.
-        // Lo creamos como owner de su propia cuenta (== comportamiento previo).
-        debugPrint(
-          '[AccountContext] users/${user.uid} no existe, bootstrap como owner',
-        );
-        await docRef.set({
-          'email': user.email,
-          'displayName': user.displayName,
-          'ownedAccountId': user.uid,
-          'memberOfAccounts': [user.uid],
-          'role': 'owner',
-          'mustChangePassword': false,
-          'createdAt': FieldValue.serverTimestamp(),
-        });
-        _activeAccountId = user.uid;
-        _role = 'owner';
-        _mustChangePassword = false;
-      } else {
-        final data = snap.data()!;
-        // ownedAccountId es la fuente de verdad: para owners == uid;
-        // para sub-users == uid del owner. Si el doc tiene memberOfAccounts
-        // con varias cuentas (futuro), por ahora tomamos la primera o la
-        // ownedAccountId. En Fase futura: selector de cuenta activa.
-        _activeAccountId =
-            data['ownedAccountId'] as String? ?? user.uid;
-        _role = (data['role'] as String?) ?? 'owner';
-        _mustChangePassword =
-            (data['mustChangePassword'] as bool?) ?? false;
-      }
+      // ownedAccountId es la fuente de verdad: para owners == uid;
+      // para sub-users == uid del owner. Si el doc tiene memberOfAccounts
+      // con varias cuentas (futuro), por ahora tomamos la primera o la
+      // ownedAccountId. En Fase futura: selector de cuenta activa.
+      _activeAccountId = data['ownedAccountId'] as String? ?? user.uid;
+      _role = (data['role'] as String?) ?? 'owner';
+      _mustChangePassword = (data['mustChangePassword'] as bool?) ?? false;
 
       // Permisos por sesión. El owner siempre tiene acceso total; para
       // sub-users leemos su doc de miembro. Default (sin campo access o si
@@ -161,6 +164,39 @@ class AccountContextService extends ChangeNotifier {
       _isReady = false;
       return false;
     }
+  }
+
+  /// Crea users/{uid} como owner de su propia cuenta y devuelve lo que quedó
+  /// guardado.
+  ///
+  /// Es una transacción porque las reglas sólo dejan CREAR este doc: un `set`
+  /// sobre uno que ya existe es un update y se rechaza. Si otro lo crea entre
+  /// la lectura y la escritura (un segundo [initFor], otro dispositivo), la
+  /// transacción se repite, ve el doc y lo usa en vez de fallar.
+  Future<Map<String, dynamic>> _createOwnerDoc(
+    DocumentReference<Map<String, dynamic>> docRef,
+    User user,
+  ) async {
+    debugPrint('[AccountContext] users/${user.uid} no existe, se crea como owner');
+    final displayName =
+        signupDisplayNameFor(_pendingSignup, user.email) ?? user.displayName;
+    final data = await FirebaseFirestore.instance.runTransaction((tx) async {
+      final snap = await tx.get(docRef);
+      if (snap.exists) return snap.data()!;
+      final fresh = <String, dynamic>{
+        'email': user.email,
+        'displayName': displayName,
+        'ownedAccountId': user.uid,
+        'memberOfAccounts': [user.uid],
+        'role': 'owner',
+        'mustChangePassword': false,
+        'createdAt': FieldValue.serverTimestamp(),
+      };
+      tx.set(docRef, fresh);
+      return fresh;
+    });
+    _pendingSignup = null;
+    return data;
   }
 
   /// Lee accounts/{accountId}/members/{uid}.access para resolver los permisos
@@ -228,6 +264,7 @@ class AccountContextService extends ChangeNotifier {
   Future<void> clear() async {
     debugPrint('[AccountContext] Limpiando contexto');
     UserPrefs().clear();
+    _pendingSignup = null;
     _currentUid = null;
     _activeAccountId = null;
     _role = 'owner';
@@ -237,4 +274,28 @@ class AccountContextService extends ChangeNotifier {
     _grantedSessions = {};
     notifyListeners();
   }
+}
+
+/// Nombre y correo que el usuario escribió en la pantalla de registro.
+@immutable
+class PendingSignup {
+  final String email;
+  final String displayName;
+  const PendingSignup({required this.email, required this.displayName});
+}
+
+/// El nombre para el doc users/{uid} de un usuario recién creado, si viene de
+/// la pantalla de registro.
+///
+/// Se compara el correo para que el nombre no le quede a otro usuario: un
+/// registro que falla con "ya registrado", seguido de un login con una cuenta
+/// vieja sin doc. Firebase guarda el correo en minúsculas, así que la
+/// comparación ignora mayúsculas y espacios.
+@visibleForTesting
+String? signupDisplayNameFor(PendingSignup? pending, String? userEmail) {
+  if (pending == null || userEmail == null) return null;
+  final sameEmail = pending.email.trim().toLowerCase() ==
+      userEmail.trim().toLowerCase();
+  final name = pending.displayName.trim();
+  return sameEmail && name.isNotEmpty ? name : null;
 }

@@ -74,6 +74,19 @@ Cada vez que abrían la app, los miembros del equipo caían en "Bienvenido a Wha
 
 ---
 
+## 🆕 Registro: `users/{uid}` tiene un solo creador
+
+Del 04-may al 12-nov-2026 el botón "Registrarse" se quedaba cargando para siempre. Firebase avisa del usuario nuevo (`authStateChanges`) en el instante en que lo crea, y debajo de la pantalla de registro `AuthWrapper` arranca `AccountContextService.initFor`, que crea `users/{uid}` si falta. La pantalla de registro también lo creaba, y las reglas sólo dejan **crear** ese doc, nunca editarlo: el segundo `set` era un update rechazado. Su `catch` sólo atrapaba `FirebaseAuthException`, así que el `PERMISSION_DENIED` se escapaba sin apagar el spinner. **Fallaba siempre, no a veces:** antes escribía `accounts/{uid}`, que exige que `users/{uid}` ya exista, así que con cualquier orden una de las dos escrituras se rechazaba. La cuenta sí quedaba creada: al reabrir la app, el usuario entraba.
+
+- **`AccountContextService._createOwnerDoc` es el único lugar de la app que crea `users/{uid}`**, con una transacción de crear-si-falta: si otro lo crea entre la lectura y la escritura, la transacción se repite y usa el doc que encontró. La pantalla de registro no escribe nada en Firestore.
+- **El nombre llega por `prepareSignup`**, llamado *antes* de `createUserWithEmailAndPassword`, que es lo único que ocurre antes del aviso de Firebase. Va atado al correo (`signupDisplayNameFor`, tests en `test/signup_display_name_test.dart`) para que un registro fallido no le deje su nombre a otro usuario. También se guarda en el perfil de Auth: si la primera creación falla (sin red), el doc se crea en el siguiente login con ese nombre.
+- **Ya no se escribe `accounts/{uid}`** (`email`, `createdAt`, `accountId`): nadie lo leía, y el backend recorre la raíz con `listDocuments()`, que no lo necesita.
+- **Las pantallas de auth atrapan cualquier error**, no sólo los de Auth. Uno que se escapa deja el botón cargando sin dejar rastro.
+- **Los owners registrados en ese periodo quedaron sin `displayName`**: "Sin nombre" en Miembros y "Usuario" como remitente. `cd backend && npx tsx scripts/backfill-owner-names.ts` los lista sin escribir; con `--apply` copia el nombre del perfil de Auth.
+- Las reglas de este flujo viven en `rules-tests/` (*registro: el doc nace una sola vez*).
+
+---
+
 ## 🔀 Cambiar de cuenta (el selector del título)
 
 Tocar el nombre de la sesión en la lista de chats ("AC ▾") abre el selector de cuenta. Muestra las sesiones que el usuario puede ver (`visibleSessionsQuery`) en el orden de *Mis Cuentas*, con su estado y sus pendientes, y al final **"Gestionar cuentas"**, que abre *Mis Cuentas*: vincular, miembros, llaves y cerrar sesión.
