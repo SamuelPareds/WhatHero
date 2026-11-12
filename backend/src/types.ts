@@ -15,7 +15,9 @@ export interface SenderInfo {
   // 'api': lo mandó un sistema externo con una llave del API pública. Su eco
   // no cuenta como atención: no cede la IA, no resetea pendientes ni marca
   // leído (ver la rama fromMe de handleSessionUpsertedMessage).
-  via?: 'api';
+  // 'followup': lo mandó el goteo de una campaña de seguimiento. Su eco no
+  // cierra la propuesta que lo originó (ver followupCampaignService.ts).
+  via?: 'api' | 'followup';
 }
 
 /** Rol de un socket dentro de su sesión: el que manda o la línea anterior. */

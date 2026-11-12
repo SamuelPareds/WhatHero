@@ -170,6 +170,38 @@ for (const root of ['accounts', 'accounts_dev']) {
     });
   });
 
+  describe(`${root}: seguimiento (sólo el backend escribe)`, () => {
+    const backendOnly = ['followup_queue', 'followup_campaigns', 'followup_outbox'];
+    const ref = (db, sid, col) => doc(db, root, OWNER, 'whatsapp_sessions', sid, col, 'x1');
+
+    it('nadie escribe la cola, las campañas ni el goteo desde el cliente, ni el owner', async () => {
+      for (const uid of [OWNER, FULL, LEGACY, RESTRICTED]) {
+        const db = dbAs(uid);
+        for (const col of backendOnly) {
+          await assertFails(setDoc(ref(db, S1, col), { status: 'approved' }));
+        }
+      }
+    });
+
+    it('quien tiene acceso a la sesión los lee; quien no, no', async () => {
+      await env.withSecurityRulesDisabled(async (ctx) => {
+        for (const col of backendOnly) {
+          for (const sid of [S1, S2]) await setDoc(ref(ctx.firestore(), sid, col), { status: 'pending' });
+        }
+      });
+      for (const col of backendOnly) {
+        await assertSucceeds(getDoc(ref(dbAs(RESTRICTED), S1, col)));
+        await assertFails(getDoc(ref(dbAs(RESTRICTED), S2, col)));
+        await assertSucceeds(getDoc(ref(dbAs(OWNER), S2, col)));
+        await assertFails(getDoc(ref(dbAs(OUTSIDER), S1, col)));
+      }
+    });
+
+    it('el resto del subárbol sigue escribiéndose como siempre', async () => {
+      await assertSucceeds(setDoc(doc(dbAs(RESTRICTED), root, OWNER, 'whatsapp_sessions', S1, 'labels', 'l1'), { name: 'VIP' }));
+    });
+  });
+
   describe(`${root}: secretos de Cloud API (sólo el backend)`, () => {
     // El access token de Meta manda mensajes en nombre de la empresa: ningún
     // cliente lo lee, ni el owner. La app sólo ve `cloud_api_token_hint`.

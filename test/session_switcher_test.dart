@@ -5,7 +5,7 @@ import 'package:crm_whatsapp/features/chat/widgets/session_switcher.dart';
 
 // El selector de cuenta vive en el título de la lista de chats, donde el ancho
 // es un recurso peleado: comparte fila con Mis Cuentas, la bandeja del equipo,
-// el buscador y las respuestas rápidas.
+// las campañas de seguimiento, el buscador y las respuestas rápidas.
 void main() {
   const ac = SessionOption(id: '5215514252103', name: 'AC', phone: '5215514252103', status: 'connected');
   const sucursal = SessionOption(id: '5215561642726', name: 'Sucursal Norte', phone: '5215561642726', status: 'connected');
@@ -27,8 +27,9 @@ void main() {
       data: MediaQueryData(size: size),
       child: MaterialApp(
         home: Scaffold(
-          // AppBar realista: Mis Cuentas + selector + las tres acciones que
-          // puede tener en móvil. Si el título engorda, revienta con overflow.
+          // AppBar realista: Mis Cuentas + selector + las cuatro acciones que
+          // puede tener en móvil (bandeja del equipo, campañas, buscador y
+          // respuestas rápidas). Si el título engorda, revienta con overflow.
           appBar: AppBar(
             leading: IconButton(icon: const Icon(Icons.manage_accounts_outlined), onPressed: () {}),
             title: SessionSwitcher(
@@ -39,7 +40,11 @@ void main() {
               pendingBadge: (id) => Text('badge-$id'),
             ),
             actions: [
-              IconButton(icon: const Icon(Icons.lock_outline, size: 20), onPressed: () {}),
+              IconButton(icon: const Icon(Icons.forum_outlined, size: 20), onPressed: () {}),
+              IconButton(
+                icon: const Badge(label: Text('23'), child: Icon(Icons.campaign_outlined, size: 20)),
+                onPressed: () {},
+              ),
               IconButton(icon: const Icon(Icons.search, size: 20), onPressed: () {}),
               IconButton(icon: const Icon(Icons.flash_on, size: 20), onPressed: () {}),
             ],

@@ -984,6 +984,57 @@ Las reglas viven en `apiKeys.test.ts`, `apiSends.test.ts`, `metaTemplates.test.t
 ---
 
 
+## 📣 Campañas de seguimiento (darle instrucciones al asistente)
+
+El barrido diario sólo miraba los chats cuyo último mensaje fue **ayer**. Ahora el owner escribe una instrucción ("de los últimos 7 días, a los que preguntaron por microblading y no compraron, mándales: *Faltan x días para el fin de la promo…*") desde el megáfono 📣 de la lista de chats. La IA la convierte en un plan, el owner lo confirma en la tarjeta **"Esto entendí"**, el backend revisa las conversaciones del periodo y cada cliente que coincide queda **por revisar** con su mensaje. Nada sale sin que alguien lo apruebe. Lo aprobado sale solo, espaciado.
+
+Piezas: `followupCampaigns.ts` (puro, con tests), `followupOutbox.ts` (el ritmo, con tests), `followupCampaignService.ts` (Firestore, IA y WhatsApp). En la app: `lib/features/followups/`.
+
+### La IA interpreta, el backend calcula, el humano confirma
+- **La IA no hace aritmética de fechas.** Devuelve `{kind:'last_days', days:7}` o `last_month`, y `resolvePeriod` calcula los límites en la zona de la sesión. "Últimos 7 días" va de las 00:00 de hace 7 días hasta ahora. Tope de 90 días.
+- **El plan no escribe nada** (`POST /followup-campaigns/plan`). La tarjeta muestra las fechas exactas, cuántas conversaciones se revisan, el mensaje como lo verá "Ana" hoy y lo que falta (`missing`). Lo que no dijo (periodo, mensaje, fecha límite) se pide, no se inventa.
+- **El mensaje es el del owner, palabra por palabra.** El plan sólo corrige faltas evidentes y cambia "faltan x días" por `{faltan_dias}`. Variables: `{nombre}` (primer nombre usable o se quita sin dejar huecos), `{faltan_dias}` ("Faltan 3 días" / "Falta 1 día" / "Hoy es el último día") y `{fecha_limite}`. Cualquier otra `{…}` se rechaza: saldría literal al cliente.
+- **Las variables de fecha se llenan al ENVIAR**, no al analizar: lo aprobado hoy que sale mañana dice los días de mañana. La app tiene una copia de esa regla para la vista previa (`followup_message.dart`); los tests de los dos lados fijan las mismas frases.
+- **"Adaptar el saludo"** (opcional): la IA agrega una frase sobre lo que preguntó el cliente. Si su versión pierde una variable o una cifra (`$200`), se usa el texto exacto (`adaptedKeepsOffer`).
+
+### Quién entra
+1. **Sin gastar IA** (`structuralSkip`): grupos, `followup_opt_out`, `marketing_opt_out_at`, **chats pendientes** (esperan una respuesta, no la promo), actividad en las últimas 12 h, seguimiento recibido en los últimos 7 días, propuesta ya aprobada o de otra campaña abierta.
+2. **La IA lee hasta 80 mensajes** y responde `{match, reason, quote}`. Recibe el periodo, a quién sí, a quién no y las reglas "A quién NO" de Ajustes. Ante la duda, no entra; una respuesta ilegible tampoco (`parseCandidateJson`).
+3. **La cita se verifica** (`verifyEvidence`): tiene que existir en un mensaje del CLIENTE. Si la IA la inventó, se descarta la cita, no el candidato.
+- Tope de 600 chats por campaña (los más recientes), concurrencia 3, progreso al doc cada página. 8 errores de IA seguidos fallan la campaña con "revisa la llave". Si el proceso muere, se retoma desde `cursor` al reconectar la sesión.
+
+### Una propuesta por chat (`followup_queue/{chatId}`)
+- **El doc se llama como el chat a propósito:** dos campañas no le escriben dos veces al mismo cliente. `writeProposal` (transacción) no pisa una propuesta aprobada, en envío o `in_doubt`, ni una pendiente de otra campaña, ni lo que el owner ya decidió en la misma campaña retomada. El barrido diario escribe por la misma función (`source: 'daily'`) y salta los chats con propuesta abierta.
+- **Se guarda el `lastMessageId` del chat al analizar.** Si cambió antes de escribir, la IA decidió sobre una conversación vieja y no se encola.
+- **Se cierra sola cuando el chat se mueve** (`closeOnActivity`, llamado desde `handleSessionUpsertedMessage`): si escribe el cliente → `stale`; si contesta alguien del equipo (CRM o celular) → `handled`, que cuenta como el seguimiento de la semana. Por eso mandar el borrador precargado en el composer ya no escribe nada desde la app. El conjunto de chats con propuesta abierta vive en memoria: un `has` por mensaje, no una lectura.
+- **`/delete-chat` la borra y la consolidación LID la mueve**, como a los internos.
+- Estados: `pending → approved → sending → sent`, o `rejected`, `stale`, `handled`, `expired`, `cancelled`, `failed` (se puede reintentar) e `in_doubt`. El chat doc refleja cada uno en `followup_status` (`chatFollowupStatus`): `queued` sigue alimentando el chip "Seguimiento".
+- Vence al terminar el día de la fecha límite, o a los 7 días sin ella.
+
+### El goteo (`followupOutbox.ts`)
+Mandar decenas de mensajes en minutos a gente que no te tiene guardado es lo que WhatsApp castiga con un bloqueo, y en QR el número es del cliente.
+- **Uno cada 60–150 s al azar, de 9:00 a 20:00 en la zona de la sesión, tope de 80 al día.** Fuera de horario o con la sesión caída espera, no falla. `FOLLOWUP_GAP_MS` acorta el ritmo **sólo fuera de producción**.
+- **3 fallos seguidos pausan el goteo** (puede ser un bloqueo; insistir lo empeora). Lo reanuda una persona. El cambio de número también lo pausa.
+- **Cada envío se reclama en una transacción** con el chat recién leído (`checkSendable`): si la conversación se movió desde el análisis, el cliente quedó pendiente o pidió no recibir mensajes, no sale. Mismo patrón que `apiSends.ts`: un envío sin respuesta en 30 s queda `in_doubt` y **no se reintenta nunca**. Al reiniciar, un `sending` cuyo `messageId` está en el chat pasa a `sent`; si no, a `in_doubt`.
+- El eco lleva `{type:'bot', name:'Seguimiento', via:'followup'}` (puesto ANTES de enviar, como en `sendAsHuman`), así no cierra su propia propuesta. Como todo saliente, resetea pendientes y marca leído.
+- El estado del goteo para la franja de la app vive en `followup_outbox/state`. Sólo se escribe cuando cambia: una sesión caída re-mira cada minuto y serían 1 440 escrituras al día.
+
+### Permisos y reglas
+- **Lanzar y cancelar: sólo el owner** (`isAccountOwner`): gasta la llave de IA del cliente y termina en mensajes a muchos clientes. **Revisar, aprobar, rechazar, editar y pausar: cualquiera con acceso a la sesión** (`canAccessSession`). Pausar nunca es lo peligroso.
+- **`followup_queue`, `followup_campaigns` y `followup_outbox` sólo los escribe el backend** (`backendOnlySessionCollection` en `firestore.rules`). Si la app pudiera, un `status: 'approved'` puesto a mano saltaría la revisión, y un `sent` borrado haría reenviar. Las apps viejas que todavía escriben la cola al descartar fallan en silencio (ya iba en `try/catch`).
+- **Ninguna consulta nueva necesita índice compuesto:** la cola se lee por una sola igualdad (`campaignId`, `source` o `status`) y se ordena en memoria.
+- **Despliegue: backend → reglas → app.** La app nueva llama endpoints que el backend viejo no tiene.
+
+### De paso se cerraron
+- `/send-reminders` y `/run-followups` no tenían auth: con un `accountId` y un `sessionKey` cualquiera podía mandarle recordatorios a todos los clientes de una cuenta ajena o gastarle la IA. Ahora exigen token y owner. El cron interno llama a los servicios directo.
+- **El comando "enviar recordatorios" por WhatsApp ya no existe.** Se leía en los mensajes ENTRANTES: cualquier cliente que lo escribiera disparaba el lote de recordatorios a todos los demás, y su mensaje desaparecía sin quedar pendiente. Lo reemplaza el botón **"Enviar ahora"** del owner en Ajustes › Conexión (`POST /send-reminders`, en segundo plano). **No volver a leer comandos del operador en mensajes entrantes:** desde un dispositivo vinculado no se distingue al operador de un cliente.
+- **Los recordatorios salen una vez por día** (`remindersRanToday`, tests en `reminderService.test.ts`). No tienen dedupe por cita, así que un segundo lote el mismo día le mandaba a cada cliente su recordatorio dos veces. Cada corrida deja `reminder_last_run` en el doc de la sesión, marcado `running` **antes** del primer envío: el cron se salta el día si ya salió algo o si una corrida quedó a medias (el proceso murió), y "Enviar ahora" pide confirmación (`force`). Una corrida de hoy que no mandó nada (todo falló) sí deja reintentar. Tampoco corren dos lotes a la vez en el proceso.
+- El barrido diario escribía el chat con `set(merge)`: un chat borrado mientras la IA pensaba renacía como fantasma. Ahora `update`.
+
+**Fase 2 (no está hecho):** campañas con plantilla aprobada en Cloud API (hoy un chat con la ventana de 24 h cerrada no se deja aprobar), lista chat por chat de por qué no entró, push al terminar el análisis, adjuntar una imagen al mensaje, campañas recurrentes y métricas de respuesta por campaña.
+
+---
+
 ## 📦 Dependencias iOS: sólo Swift Package Manager
 
 **iOS no tiene CocoaPods.** No hay `ios/Podfile`, ni `Podfile.lock`, ni `Pods/`. Los 14 plugins con código nativo iOS —Firebase completo, `just_audio`, `file_picker`, `image_picker_ios`, `video_player_avfoundation`…— se resuelven por SPM a través de `ios/Flutter/ephemeral/Packages/FlutterGeneratedPluginSwiftPackage`, y hasta el propio engine llega por ahí (`FLUTTER_FRAMEWORK_SWIFT_PACKAGE_PATH`).

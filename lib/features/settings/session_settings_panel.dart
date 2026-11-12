@@ -15,6 +15,7 @@ import 'package:crm_whatsapp/core/utils/session_phone.dart';
 import '../accounts/change_number/change_number_flow.dart';
 import '../accounts/connect_cloud_api_sheet.dart';
 import '../templates/templates_screen.dart';
+import '../followups/followup_message.dart' show formatDayMonth, todayString;
 import '../accounts/link_result.dart';
 import '../chat/number_change_divider.dart';
 import '../chat/widgets/label_editor_dialog.dart';
@@ -89,6 +90,9 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
 
   // AgendaCool
   bool _reminderEnabled = false;
+  // `reminder_last_run` del doc: lo escribe el backend en cada lote.
+  Map<String, dynamic>? _reminderLastRun;
+  bool _sendingReminders = false;
   TimeOfDay _reminderScheduledTime = const TimeOfDay(hour: 9, minute: 0);
 
   // Agente de Seguimiento de Ventas (Re-engagement)
@@ -195,6 +199,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
               : 15;
 
           _reminderEnabled = data['reminder_enabled'] ?? false;
+          _reminderLastRun = data['reminder_last_run'] as Map<String, dynamic>?;
           _reminderApiUrlController.text = data['reminder_api_url'] ?? '';
           _reminderTemplateController.text = data['reminder_template'] ?? '¡Hola {name}! 🌸\n\nTe recordamos tu cita para mañana a las {time}.';
           
@@ -819,6 +824,20 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
                   'Cada día revisa las conversaciones que quedaron frías sin cerrar y deja un mensaje de seguimiento en una cola para que lo apruebes antes de enviar.',
                   style: TextStyle(color: lightText.withValues(alpha: 0.7), fontSize: 12),
                 ),
+                const SizedBox(height: 8),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Icon(Icons.campaign_outlined, size: 16, color: primaryAqua),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        'Para revisar más días o mandar un mensaje tuyo (una promo, por ejemplo), usa Campañas: el ícono del megáfono en la lista de chats. Las reglas de "A quién NO" de aquí también se aplican ahí.',
+                        style: TextStyle(color: primaryAqua.withValues(alpha: 0.85), fontSize: 12),
+                      ),
+                    ),
+                  ],
+                ),
                 const SizedBox(height: 16),
                 _timeTile('Hora del Barrido Diario', _followupScheduledTime, (t) => setState(() => _followupScheduledTime = t)),
                 const SizedBox(height: 16),
@@ -1123,6 +1142,78 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
     }
   }
 
+  // "Enviar ahora": antes era un comando que cualquiera podía escribir por
+  // WhatsApp ("enviar recordatorios"), y lo escribía también un cliente. Usa
+  // la configuración GUARDADA. Si hoy ya salieron, pregunta antes de repetir:
+  // cada cliente recibiría su recordatorio dos veces.
+  Future<void> _sendRemindersNow({bool force = false}) async {
+    setState(() => _sendingReminders = true);
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final response = await http
+          .post(
+            Uri.parse('$backendUrl/send-reminders'),
+            headers: await authHeaders(),
+            body: jsonEncode({'accountId': widget.accountId, 'sessionId': widget.sessionId, 'force': force}),
+          )
+          .timeout(const Duration(seconds: 30));
+      if (!mounted) return;
+      Map<String, dynamic> body = const {};
+      try {
+        body = jsonDecode(response.body) as Map<String, dynamic>;
+      } catch (_) {}
+      if (response.statusCode == 202) {
+        setState(() => _reminderLastRun = {'day': todayString(), 'status': 'running'});
+        messenger.showSnackBar(const SnackBar(content: Text('Enviando recordatorios: sale uno cada 7 segundos.')));
+        return;
+      }
+      if (body['code'] == 'already_sent_today') {
+        final last = body['lastRun'] as Map<String, dynamic>?;
+        final sent = (last?['sent'] as num?)?.toInt() ?? 0;
+        final running = last?['status'] == 'running';
+        final again = await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            backgroundColor: surfaceDark,
+            title: const Text('Hoy ya se enviaron', style: TextStyle(color: white)),
+            content: Text(
+              running
+                  ? 'Un envío de hoy quedó a medias (el servidor se reinició mientras enviaba). Si los mandas otra vez, quienes ya lo recibieron lo recibirán dos veces.'
+                  : 'Hoy ya salieron $sent ${sent == 1 ? 'recordatorio' : 'recordatorios'}. Si los mandas otra vez, cada cliente recibirá el suyo dos veces.',
+              style: const TextStyle(color: lightText, height: 1.4),
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('No enviar')),
+              TextButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Enviar otra vez', style: TextStyle(color: Color(0xFFF87171))),
+              ),
+            ],
+          ),
+        );
+        if (again == true && mounted) await _sendRemindersNow(force: true);
+        return;
+      }
+      messenger.showSnackBar(SnackBar(content: Text((body['error'] as String?) ?? 'No se pudieron enviar (HTTP ${response.statusCode}).')));
+    } catch (_) {
+      messenger.showSnackBar(const SnackBar(content: Text('Sin conexión con el servidor.')));
+    } finally {
+      if (mounted) setState(() => _sendingReminders = false);
+    }
+  }
+
+  String _reminderLastRunLabel() {
+    final last = _reminderLastRun;
+    final day = last?['day'] as String?;
+    if (last == null || day == null) return 'Todavía no se ha enviado ninguno.';
+    final isToday = day == todayString();
+    final when = isToday ? 'Hoy' : 'El ${formatDayMonth(day)}';
+    if (last['status'] == 'running') return '$when: enviando…';
+    final sent = (last['sent'] as num?)?.toInt() ?? 0;
+    final failed = (last['failed'] as num?)?.toInt() ?? 0;
+    return '$when: $sent ${sent == 1 ? 'enviado' : 'enviados'}${failed > 0 ? ', $failed no salieron' : ''}.';
+  }
+
   Widget _buildIntegrationsTab() {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24),
@@ -1163,6 +1254,29 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
                     canExpand: true,
                     focusNode: _reminderTemplateFocus,
                   ),
+                  if (AccountContextService().isOwner) ...[
+                    const SizedBox(height: 16),
+                    Wrap(
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      spacing: 12,
+                      runSpacing: 8,
+                      children: [
+                        Text(_reminderLastRunLabel(), style: const TextStyle(color: lightText, fontSize: 12)),
+                        OutlinedButton.icon(
+                          onPressed: _sendingReminders ? null : () => _sendRemindersNow(),
+                          icon: _sendingReminders
+                              ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+                              : const Icon(Icons.send_outlined, size: 16),
+                          label: const Text('Enviar ahora'),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Usa la configuración guardada. Antes se podía disparar escribiendo "enviar recordatorios" por WhatsApp; ya no: cualquier cliente podía hacerlo.',
+                      style: TextStyle(color: lightText.withValues(alpha: 0.55), fontSize: 11),
+                    ),
+                  ],
                 ],
               ],
             ),

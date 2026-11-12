@@ -10,6 +10,7 @@ import 'package:flutter_slidable/flutter_slidable.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:crm_whatsapp/core.dart';
+import 'package:crm_whatsapp/core/services/account_context_service.dart';
 import 'package:crm_whatsapp/core/services/active_chat_tracker.dart';
 import 'package:crm_whatsapp/core/services/ai_state_service.dart';
 import 'package:crm_whatsapp/core/services/api_client.dart';
@@ -28,6 +29,7 @@ import 'package:crm_whatsapp/features/settings.dart';
 import 'package:crm_whatsapp/features/accounts.dart';
 import 'package:crm_whatsapp/features/accounts/session_switch.dart';
 import 'package:crm_whatsapp/features/accounts/widgets/pending_chats_badge.dart';
+import 'package:crm_whatsapp/features/followups/followup_campaigns_screen.dart';
 import 'chat_filter.dart';
 import 'messages_view.dart';
 import 'number_change_divider.dart';
@@ -721,6 +723,53 @@ class _ChatsScreenState extends State<ChatsScreen> {
     );
   }
 
+  // Campañas de seguimiento. El owner las lanza; cualquiera con acceso a la
+  // sesión revisa. El contador es el mismo del chip "Seguimiento" (chats con
+  // una propuesta por revisar), que la lista ya cuenta: cero lecturas extra.
+  // Para un miembro sólo aparece cuando hay algo que revisar.
+  Widget _campaignsButton() {
+    return ValueListenableBuilder<({int unresponded, int notes, int followups})>(
+      valueListenable: _filterCounts,
+      builder: (context, counts, _) {
+        final owner = AccountContextService().isOwner;
+        if (!owner && counts.followups == 0) return const SizedBox.shrink();
+        return IconButton(
+          tooltip: 'Campañas de seguimiento',
+          onPressed: _openCampaigns,
+          icon: Badge(
+            isLabelVisible: counts.followups > 0,
+            backgroundColor: primaryAqua,
+            textColor: darkBg,
+            label: Text('${counts.followups}'),
+            child: Icon(
+              Icons.campaign_outlined,
+              size: 20,
+              color: counts.followups > 0 ? primaryAqua : null,
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  void _openCampaigns() {
+    final listRoute = ModalRoute.of(context);
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => FollowupCampaignsScreen(
+        accountId: widget.accountId,
+        sessionId: widget.sessionId!,
+        sessionName: _current?.name ?? displayPhone(widget.sessionId!),
+        isOwner: AccountContextService().isOwner,
+        // Ver conversación: se vuelve a la lista y se abre ahí, sin flechas
+        // (no es una posición dentro de la lista), igual que desde la bandeja.
+        onOpenChat: (chatId) {
+          Navigator.of(context).popUntil((route) => route == listRoute || route.isFirst);
+          _openChatFromInbox(chatId);
+        },
+      ),
+    ));
+  }
+
   // Abre un chat desde la lista y congela el orden visible como cola. `order`
   // ya viene con filtro rápido + búsqueda aplicados, así que la secuencia es
   // exactamente la que el operador tenía en pantalla.
@@ -1038,6 +1087,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
               ]
             : [
                 if (isMobile && _hasTeam) _teamInboxButton(),
+                _campaignsButton(),
                 IconButton(
                   icon: const Icon(Icons.search, size: 20),
                   tooltip: 'Buscar contacto o mensaje',

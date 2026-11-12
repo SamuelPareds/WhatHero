@@ -76,6 +76,14 @@ service cloud.firestore {
     // sobre chats de una sesión ya borrada y dejaba huérfanos que reaparecían
     // si el número se volvía a vincular (el id del doc es el número). Las
     // lecturas no lo exigen: los listeners tienen que poder ver el borrado.
+    // Subcolecciones de la sesión que sólo escribe el backend. La cola de
+    // seguimiento decide qué mensajes salen a clientes: si la app pudiera
+    // escribirla, un `status: 'approved'` puesto a mano saltaría la revisión,
+    // y un `sent` borrado haría reenviar algo que ya salió.
+    function backendOnlySessionCollection(collection) {
+      return collection in ['followup_queue', 'followup_campaigns', 'followup_outbox'];
+    }
+
     function sessionAlive(root, accountId, sessionId) {
       let path = /databases/$(database)/documents/$(root)/$(accountId)/whatsapp_sessions/$(sessionId);
       return exists(path) && get(path).data.get('deleting_at', null) == null;
@@ -155,7 +163,8 @@ service cloud.firestore {
         match /{collection}/{document=**} {
           allow read: if canAccessSession('accounts', accountId, sessionId);
           allow write: if canAccessSession('accounts', accountId, sessionId)
-            && sessionAlive('accounts', accountId, sessionId);
+            && sessionAlive('accounts', accountId, sessionId)
+            && !backendOnlySessionCollection(collection);
         }
       }
 
@@ -191,7 +200,8 @@ service cloud.firestore {
         match /{collection}/{document=**} {
           allow read: if canAccessSession('accounts_dev', accountId, sessionId);
           allow write: if canAccessSession('accounts_dev', accountId, sessionId)
-            && sessionAlive('accounts_dev', accountId, sessionId);
+            && sessionAlive('accounts_dev', accountId, sessionId)
+            && !backendOnlySessionCollection(collection);
         }
       }
 

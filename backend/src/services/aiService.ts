@@ -696,7 +696,7 @@ export function normalizeHistory(
 // discriminador lo lea como contexto. Etiquetas en español; agrupamos los
 // últimos turns user contiguos como "intención más reciente" implícita
 // (el LLM la identifica sola a partir del orden).
-function buildTranscript(
+export function buildTranscript(
   history: { role: 'user' | 'model'; parts: { text: string }[] }[]
 ): string {
   if (!history || history.length === 0) return '(historial vacío)';
@@ -1099,6 +1099,79 @@ REGLAS DE REDACCIÓN:
     return null;
   }
   return result.text;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Una consulta suelta al LLM (sistema + usuario → texto). La usan las campañas
+// de seguimiento para convertir la instrucción del owner en un plan y para
+// decidir quién entra. Pasa por `outputParams()` como toda llamada a
+// `chat.completions.create`, y tiene timeout: un lote de 600 chats no puede
+// quedarse esperando a un proveedor colgado. Lanza AiError: quien llama decide
+// qué significa un fallo (el clasificador lo cuenta como "no entra").
+// ─────────────────────────────────────────────────────────────────────────
+
+export interface AiCredentials {
+  apiKey: string;
+  provider?: AiProvider;
+  model?: string;
+  openaiApiKey?: string;
+  deepseekApiKey?: string;
+}
+
+export function hasAiCredentials(c: AiCredentials): boolean {
+  return !!(c.apiKey || c.openaiApiKey || c.deepseekApiKey);
+}
+
+export async function completeText(
+  creds: AiCredentials,
+  system: string,
+  user: string,
+  opts: { maxTokens?: number; temperature?: number; timeoutMs?: number } = {},
+): Promise<string> {
+  const provider = creds.provider || 'gemini';
+  const modelName = creds.model || 'gemini-2.5-flash';
+  const maxTokens = opts.maxTokens ?? 1000;
+  const temperature = opts.temperature ?? 0.1;
+
+  const run = async (): Promise<string> => {
+    if (provider === 'openai' || provider === 'deepseek') {
+      const isDeepSeek = provider === 'deepseek';
+      const client = new OpenAI({
+        apiKey: (isDeepSeek ? creds.deepseekApiKey : creds.openaiApiKey) || creds.apiKey,
+        ...(isDeepSeek && { baseURL: DEEPSEEK_BASE_URL }),
+        maxRetries: 1,
+      });
+      const response = await client.chat.completions.create({
+        model: modelName,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: user },
+        ],
+        // El pensamiento sale del mismo presupuesto: 8× para los que razonan.
+        ...outputParams(modelName, { plain: maxTokens, reasoning: Math.max(maxTokens * 8, 4000), temperature }),
+      });
+      return response.choices[0]?.message.content || '';
+    }
+    // Gemini (sin systemInstruction en v0.3.x): todo en un turno user. En los
+    // 2.5 el pensamiento también descuenta de maxOutputTokens.
+    const genAI = new GoogleGenerativeAI(creds.apiKey);
+    const model = genAI.getGenerativeModel({ model: modelName });
+    const result = await model.generateContent({
+      contents: [{ role: 'user', parts: [{ text: `${system}\n\n${user}` }] }],
+      generationConfig: { temperature, maxOutputTokens: Math.max(maxTokens * 4, 2048) },
+    });
+    return result.response.text();
+  };
+
+  try {
+    const timeoutMs = opts.timeoutMs ?? 60_000;
+    let text = await withTimeout(run(), timeoutMs);
+    // DeepSeek (y a veces OpenAI) devuelve vacío de forma intermitente.
+    if (!text.trim()) text = await withTimeout(run(), timeoutMs);
+    return text;
+  } catch (error) {
+    throw classifyAiError(error);
+  }
 }
 
 // Divide la respuesta en grupos de párrafos (alternando 2 y 3) para simular escritura humana.

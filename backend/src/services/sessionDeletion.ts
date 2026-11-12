@@ -28,6 +28,7 @@ import admin from 'firebase-admin';
 import { existsSync, readdirSync, rmSync } from 'fs';
 import type { Server } from 'socket.io';
 import type { SessionData } from '../types';
+import { forgetFollowupSession } from './followupCampaignService';
 import { ACCOUNTS_COLLECTION } from '../config/env';
 import {
   forgetKey,
@@ -169,6 +170,9 @@ export async function stopSessionActivity(accountId: string, sessionId: string):
   // La IA primero: un ciclo que se queda sin socket falla al enviar y escala a
   // humano, o sea, escribe el chat y manda un push. Uno cancelado no escala.
   for (const [key] of ours) cancelAiCyclesForSession(key);
+  // El goteo de seguimientos y su memoria. Lo que esté en vuelo lo frena
+  // isSessionGone (ya marcada arriba).
+  forgetFollowupSession(accountId, sessionId);
 
   const results = await Promise.all(
     ours.map(async ([key, s]) => {

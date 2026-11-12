@@ -15,7 +15,7 @@ import admin from 'firebase-admin';
 import { rmSync, existsSync, readdirSync, writeFileSync, readFileSync, mkdirSync } from 'fs';
 import { randomUUID } from 'crypto';
 import cron from 'node-cron';
-import { SessionData, SessionRole } from './src/types';
+import { SessionData, SessionRole, SenderInfo } from './src/types';
 import { extractPhoneNumber, storeLIDMapping, resolveLIDViaSock, isConversationalJid, waNumberCandidates } from './src/utils/phone';
 import { unwrapMessageContent } from './src/utils/message';
 import { initializeSession, saveMessageToFirestore, getAIConfig, cacheContactName, applyContactUpdate, reconcileContactNames, consolidateLIDChat, incrementUnrespondedCount, resetUnrespondedCount, writeMediaIndexEntry, isIndexableMedia, writeMessageIndexEntry } from './src/services/firestoreService';
@@ -75,6 +75,23 @@ const AI_ERROR_HTTP: Record<string, number> = {
 import { extractMediaInfo, classifyIncomingMedia } from './src/services/mediaService';
 import { ReminderService } from './src/services/reminderService';
 import { FollowupService } from './src/services/followupService';
+import {
+  initFollowupCampaigns,
+  tickFollowupCampaigns,
+  closeOnActivity,
+  repointProposal,
+  deleteProposalForChat,
+  planCampaign,
+  createCampaign,
+  cancelCampaign,
+  decideProposal,
+  approveAll,
+  setOutboxPaused,
+  pauseOutboxForNumberChange,
+  findPrimarySession,
+  CampaignError,
+  DecideAction,
+} from './src/services/followupCampaignService';
 import { sendHumanAttentionNotification } from './src/services/notificationService';
 import { ACCOUNTS_COLLECTION, IS_PRODUCTION } from './src/config/env';
 import { resolveWaVersion } from './src/config/waVersion';
@@ -442,6 +459,9 @@ async function changeSessionNumber(
   // La transacción va primero: si falla, no se tocó nada.
   const { pausedAutomations, changedAtMs } = await applyNumberChange(accountId, sessionId, fromPhone, linked, keep);
   session.numberChangedAt = changedAtMs;
+  // Los seguimientos ya aprobados saldrían desde un número que el cliente no
+  // conoce: el goteo se pausa igual que los automáticos.
+  pauseOutboxForNumberChange(accountId, sessionId);
   console.log(
     `[CambioNúmero] ${sessionId}: ${fromPhone} → ${linked}. Línea anterior: ` +
     `${oldLines.length === 0 ? 'no estaba conectada' : keep ? 'sigue recibiendo' : 'se desconecta'}. ` +
@@ -627,6 +647,8 @@ async function startSession(sessionKey: string, accountId: string, linkIntent?: 
     const session = sessions.get(sessionKey);
     if (session?.sessionId) {
       await consolidateLIDChat(accountId, session.sessionId, lidNum, pnNum);
+      await repointProposal(accountId, session.sessionId, lidNum, pnNum)
+        .catch((error) => console.warn('[Seguimiento] No se pudo mover la propuesta del LID:', error));
     }
   });
 
@@ -827,6 +849,7 @@ async function handlePreviousLineMessage(
   }
 
   await incrementUnrespondedCount(accountId, sessionId, contactPhone, 1);
+  if (upsertType !== 'prepend') closeOnActivity(accountId, sessionId, contactPhone, 'incoming');
 
   // El backlog que llega al reconectar queda pendiente sin push: avisar de
   // mensajes de hace horas como si fueran nuevos sería ruido.
@@ -970,6 +993,13 @@ async function handleSessionUpsertedMessage(
 
     // AI auto-response: only for incoming messages (not from self)
     if (message.key.fromMe) {
+      // Alguien le escribió a este cliente: una propuesta de seguimiento viva
+      // ya no responde a la conversación y se cierra. El eco del propio
+      // seguimiento no cuenta (su propuesta ya está `sending`).
+      const liveForFollowup = sessions.get(sessionKey);
+      if (contactPhoneForCancel && liveForFollowup?.sessionId && upsertType !== 'prepend' && pendingSender?.via !== 'followup') {
+        closeOnActivity(accountId, liveForFollowup.sessionId, contactPhoneForCancel, 'outgoing');
+      }
       // El API no atiende a nadie: lo pendiente sigue pendiente (y no leído en
       // el teléfono, para que ambos sigan de acuerdo).
       if (isApiSend) return;
@@ -1071,6 +1101,11 @@ async function handleSessionUpsertedMessage(
       }
     }
 
+    // El cliente escribió: el borrador de seguimiento que tuviera ya no
+    // contesta a lo último que dijo. Un mensaje rancio también cuenta (llegó
+    // tarde, pero la conversación ya no es la que la IA analizó).
+    if (upsertType !== 'prepend') closeOnActivity(accountId, session.sessionId, contactPhone, 'incoming');
+
     // Queda pendiente de confirmar como leído ante WhatsApp. Se registra acá,
     // antes de cualquier corte por rancio o por IA no elegible: TODO entrante
     // cuenta, y el recibo sale recién cuando le respondamos a este chat.
@@ -1119,20 +1154,11 @@ async function handleSessionUpsertedMessage(
       return;
     }
 
-    // --- KEYWORD TRIGGER FOR REMINDERS (sólo texto exacto, comando del operador) ---
-    const lowerMsg = messageText.toLowerCase();
-    if (lowerMsg === 'enviar_recordatorios' || lowerMsg === 'enviar recordatorios') {
-      console.log(`[Reminders] Manual trigger detected from ${message.key.remoteJid}`);
-      // Run in background
-      ReminderService.processReminders(accountId, session.sessionId, sessionKey, sessions)
-        .then(result => {
-          console.log(`[Reminders] Manual trigger completed for ${session.sessionId}`, result);
-        })
-        .catch(err => {
-          console.error(`[Reminders] Manual trigger failed for ${session.sessionId}`, err);
-        });
-      return; // Comando interno, no cuenta como pendiente
-    }
+    // Aquí vivía el comando "enviar recordatorios". Se leía en los mensajes
+    // ENTRANTES: cualquier cliente que lo escribiera le disparaba el lote de
+    // recordatorios a todos los demás, y el mensaje desaparecía sin quedar
+    // pendiente. El disparo manual ahora es un botón del owner en Ajustes
+    // (POST /send-reminders), con candado de una vez por día.
 
     const aiConfig = await getAIConfig(session, accountId);
     const mediaClass = classifyIncomingMedia(mediaInfo, aiConfig.mediaAllowlist);
@@ -1431,31 +1457,51 @@ async function performSendMessage(
   }
 }
 
-// El envío en sí: arma el contenido y lo manda etiquetado como humano.
-async function sendAsHuman(
-  session: SessionData,
-  senderUid: string,
-  { to, text, imageUrl, documentUrl, documentName, videoUrl, audioUrl, mimetype, isPtt, cleanupAfterSend, accountId, quotedMessageId, quotedText, quotedFromMe, tempId }: any,
-) {
-  // Try to get the stored remoteJid from the chat document
+// El JID por el que se le escribe a un chat: el `remoteJid` guardado en su
+// doc (puede ser un LID o la variante 521/52 que WhatsApp considera buena), y
+// si no hay, el número tal cual.
+async function resolveChatJid(session: SessionData, accountId: string, to: string): Promise<string> {
   let jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
-
   try {
-    const chatDocRef = db
+    const chatDoc = await db
       .collection(ACCOUNTS_COLLECTION)
       .doc(accountId)
       .collection('whatsapp_sessions')
       .doc(session.sessionId!)
       .collection('chats')
-      .doc(to);
-
-    const chatDoc = await chatDocRef.get();
+      .doc(to)
+      .get();
     if (chatDoc.exists && chatDoc.data()?.remoteJid) {
       jid = chatDoc.data()!.remoteJid;
     }
   } catch (error) {
     console.warn(`[performSendMessage] Error retrieving chat document:`, error);
   }
+  return jid;
+}
+
+// Texto de un remitente automático (el goteo de seguimientos). Mismo contrato
+// que sendAsHuman: la etiqueta va ANTES de enviar, con el id que generó quien
+// llama, para que el eco se guarde con ella y quien llama pueda reconocerlo.
+async function sendTextAs(session: SessionData, to: string, text: string, sender: SenderInfo, messageId: string) {
+  if (!session.isReady || !session.sock || session.role !== 'primary') throw new Error('WhatsApp no está conectado');
+  const jid = await resolveChatJid(session, session.accountId, to);
+  session.pendingSenders.set(messageId, sender);
+  try {
+    await session.sock.sendMessage(jid, { text }, { messageId });
+  } catch (error) {
+    session.pendingSenders.delete(messageId);
+    throw error;
+  }
+}
+
+// El envío en sí: arma el contenido y lo manda etiquetado como humano.
+async function sendAsHuman(
+  session: SessionData,
+  senderUid: string,
+  { to, text, imageUrl, documentUrl, documentName, videoUrl, audioUrl, mimetype, isPtt, cleanupAfterSend, accountId, quotedMessageId, quotedText, quotedFromMe, tempId }: any,
+) {
+  const jid = await resolveChatJid(session, accountId, to);
 
   // Reply: si el frontend mandó un quotedMessageId, construimos el stub
   // mínimo que Baileys necesita para que WhatsApp renderice la cita.
@@ -2743,6 +2789,8 @@ app.post('/delete-chat', express.json(), verifyHttpAuth(), async (req, res) => {
     await deleteInBatches(
       sessionRef.collection('internal_messages').where('chatId', '==', phoneNumber),
     );
+    // La propuesta de seguimiento, por lo mismo: renacería con el chat.
+    await deleteProposalForChat(accountId, sessionId, phoneNumber);
 
     // Paso 3: Chat doc.
     await chatRef.delete();
@@ -3383,38 +3431,63 @@ app.post('/backfill-message-index', express.json(), verifyHttpAuth(), async (req
   }
 });
 
-// REST API endpoint to send reminders manually
-// NOTA: Este endpoint NO usa verifyHttpAuth porque es invocado por cron
-// interno (sin Firebase user). Si en el futuro se expone al cliente, debe
-// pasar por el middleware de auth para validar membresía.
-app.post('/send-reminders', express.json(), async (req, res) => {
+// "Enviar ahora" de Ajustes › Conexión (sólo el owner). El cron interno llama
+// al servicio directo. Antes no tenía auth: con un accountId y un sessionKey
+// cualquiera podía mandarle recordatorios a todos los clientes de una cuenta
+// ajena. No repite un día que ya salió sin `force` (cada cliente recibiría su
+// recordatorio dos veces) y corre en segundo plano: el resultado queda en
+// `reminder_last_run` del doc de la sesión.
+app.post('/send-reminders', express.json(), verifyHttpAuth(), async (req, res) => {
   try {
-    const { sessionKey, accountId, sessionId } = req.body;
-
-    if (!sessionKey || !accountId || !sessionId) {
-      return res.status(400).json({ error: 'Missing sessionKey, accountId, or sessionId' });
+    const { accountId, sessionId, force } = req.body;
+    if (typeof sessionId !== 'string' || !sessionId) {
+      return res.status(400).json({ error: 'Missing sessionId' });
+    }
+    if (!(await isAccountOwner(req.auth!.uid, accountId))) {
+      return res.status(403).json({ error: 'Sólo el dueño de la cuenta puede enviar recordatorios', code: 'owner_only' });
+    }
+    const live = findPrimarySession(accountId, sessionId);
+    if (!live) {
+      return res.status(409).json({ error: 'WhatsApp no está conectado.', code: 'not_ready' });
     }
 
-    const result = await ReminderService.processReminders(accountId, sessionId, sessionKey, sessions);
-    res.json(result);
+    const result = await ReminderService.startManualRun(accountId, sessionId, live.key, sessions, force === true);
+    switch (result.status) {
+      case 'started':
+        return res.status(202).json({ status: 'started' });
+      case 'already_sent_today':
+        return res.status(409).json({
+          error: 'Hoy ya se enviaron los recordatorios.',
+          code: 'already_sent_today',
+          lastRun: result.lastRun,
+        });
+      case 'running':
+        return res.status(409).json({ error: 'Los recordatorios se están enviando ahora mismo.', code: 'running' });
+      case 'not_configured':
+        return res.status(409).json({ error: 'Activa los recordatorios y guarda la URL de AgendaCool primero.', code: 'not_configured' });
+      case 'not_ready':
+        return res.status(409).json({ error: 'WhatsApp no está conectado.', code: 'not_ready' });
+    }
   } catch (error) {
     console.error('Error sending reminders (HTTP):', error);
-    res.status(500).json({
-      error: 'Failed to send reminders',
-      details: (error as any).message,
-    });
+    res.status(500).json({ error: 'No se pudieron enviar los recordatorios.', code: 'internal' });
   }
 });
 
-// Disparo manual del agente de seguimiento (Fase 1: arma la cola, NO envía).
-// Mismo patrón que /send-reminders: sin verifyHttpAuth porque lo invoca el cron
-// interno. Útil para probar el clasificador y los borradores a demanda.
-app.post('/run-followups', express.json(), async (req, res) => {
+// Disparo manual del barrido diario de seguimiento (arma la cola, NO envía).
+// Gasta créditos de IA del cliente: sólo el owner, con auth.
+app.post('/run-followups', express.json(), verifyHttpAuth(), async (req, res) => {
   try {
     const { sessionKey, accountId, sessionId } = req.body;
-
     if (!sessionKey || !accountId || !sessionId) {
       return res.status(400).json({ error: 'Missing sessionKey, accountId, or sessionId' });
+    }
+    if (!(await isAccountOwner(req.auth!.uid, accountId))) {
+      return res.status(403).json({ error: 'Sólo el dueño de la cuenta puede correr el seguimiento' });
+    }
+    const session = sessions.get(sessionKey);
+    if (!session || session.accountId !== accountId || session.sessionId !== sessionId) {
+      return res.status(403).json({ error: 'Unauthorized session' });
     }
 
     const result = await FollowupService.buildFollowupQueue(accountId, sessionId, sessionKey, sessions);
@@ -3425,6 +3498,123 @@ app.post('/run-followups', express.json(), async (req, res) => {
       error: 'Failed to run followups',
       details: (error as any).message,
     });
+  }
+});
+
+// ============================================
+// 📣 Campañas de seguimiento (ver src/services/followupCampaignService.ts).
+// Lanzar es del owner (gasta IA y termina en mensajes a muchos clientes);
+// revisar, aprobar y rechazar, de cualquiera con acceso a la sesión.
+// ============================================
+
+function sendCampaignError(res: express.Response, error: unknown, label: string) {
+  if (error instanceof CampaignError) {
+    return res.status(error.http).json({ error: error.message, code: error.code });
+  }
+  console.error(`[${label}] Error:`, error);
+  return res.status(500).json({ error: 'Algo falló de nuestro lado. Intenta de nuevo.', code: 'internal' });
+}
+
+async function requireOwnerOfSession(req: express.Request, res: express.Response): Promise<string | null> {
+  const { accountId, sessionId } = req.body;
+  if (typeof sessionId !== 'string' || !sessionId) {
+    res.status(400).json({ error: 'Missing sessionId' });
+    return null;
+  }
+  if (!(await isAccountOwner(req.auth!.uid, accountId))) {
+    res.status(403).json({ error: 'Sólo el dueño de la cuenta puede lanzar campañas', code: 'owner_only' });
+    return null;
+  }
+  return sessionId;
+}
+
+async function requireSessionAccess(req: express.Request, res: express.Response): Promise<string | null> {
+  const { accountId, sessionId } = req.body;
+  if (typeof sessionId !== 'string' || !sessionId) {
+    res.status(400).json({ error: 'Missing sessionId' });
+    return null;
+  }
+  if (!(await canAccessSession(accountId, req.auth!.uid, sessionId))) {
+    res.status(403).json({ error: 'Sin acceso a esta sesión', code: 'no_access' });
+    return null;
+  }
+  return sessionId;
+}
+
+// La instrucción → un plan para la tarjeta "Esto entendí". No escribe nada.
+app.post('/followup-campaigns/plan', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const sessionId = await requireOwnerOfSession(req, res);
+    if (!sessionId) return;
+    res.json(await planCampaign(req.body.accountId, sessionId, { instruction: req.body.instruction, plan: req.body.plan }));
+  } catch (error) {
+    sendCampaignError(res, error, '/followup-campaigns/plan');
+  }
+});
+
+app.post('/followup-campaigns', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const sessionId = await requireOwnerOfSession(req, res);
+    if (!sessionId) return;
+    const result = await createCampaign(req.body.accountId, sessionId, req.auth!.uid, {
+      instruction: req.body.instruction,
+      plan: req.body.plan,
+    });
+    res.json(result);
+  } catch (error) {
+    sendCampaignError(res, error, '/followup-campaigns');
+  }
+});
+
+app.post('/followup-campaigns/cancel', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const sessionId = await requireOwnerOfSession(req, res);
+    if (!sessionId) return;
+    if (typeof req.body.campaignId !== 'string') return res.status(400).json({ error: 'Missing campaignId' });
+    res.json(await cancelCampaign(req.body.accountId, sessionId, req.body.campaignId));
+  } catch (error) {
+    sendCampaignError(res, error, '/followup-campaigns/cancel');
+  }
+});
+
+const DECIDE_ACTIONS: DecideAction[] = ['approve', 'reject', 'edit', 'unapprove'];
+
+app.post('/followup-queue/decide', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const sessionId = await requireSessionAccess(req, res);
+    if (!sessionId) return;
+    const { chatId, action, text } = req.body;
+    if (typeof chatId !== 'string' || !chatId || !DECIDE_ACTIONS.includes(action)) {
+      return res.status(400).json({ error: 'Missing chatId or action' });
+    }
+    res.json(await decideProposal(req.body.accountId, sessionId, chatId, action, req.auth!.uid, typeof text === 'string' ? text : undefined));
+  } catch (error) {
+    sendCampaignError(res, error, '/followup-queue/decide');
+  }
+});
+
+app.post('/followup-queue/approve-all', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const sessionId = await requireSessionAccess(req, res);
+    if (!sessionId) return;
+    if (typeof req.body.campaignId !== 'string') return res.status(400).json({ error: 'Missing campaignId' });
+    res.json(await approveAll(req.body.accountId, sessionId, req.body.campaignId, req.auth!.uid));
+  } catch (error) {
+    sendCampaignError(res, error, '/followup-queue/approve-all');
+  }
+});
+
+// Pausar / reanudar el goteo de la sesión. Lo puede hacer cualquiera con
+// acceso: frenar envíos nunca es lo peligroso.
+app.post('/followup-outbox/pause', express.json(), verifyHttpAuth(), async (req, res) => {
+  try {
+    const sessionId = await requireSessionAccess(req, res);
+    if (!sessionId) return;
+    const paused = req.body.paused === true;
+    await setOutboxPaused(req.body.accountId, sessionId, paused, paused ? 'manual' : null);
+    res.json({ paused });
+  } catch (error) {
+    sendCampaignError(res, error, '/followup-outbox/pause');
   }
 });
 
@@ -3619,6 +3809,10 @@ httpServer.listen(PORT, async () => {
   console.log(`[Env] ${envLabel} | NODE_ENV=${process.env.NODE_ENV ?? 'undefined'} | Firestore collection: "${ACCOUNTS_COLLECTION}"`);
 
   initSessionSupervisor({ sessions, db, io, startSession });
+  initFollowupCampaigns({
+    sessions,
+    sendText: (session, chatId, text, sender, messageId) => sendTextAs(session, chatId, text, sender, messageId),
+  });
   initSessionDeletion({
     sessions,
     db,
@@ -3666,5 +3860,8 @@ httpServer.listen(PORT, async () => {
     ReminderService.checkAndRunScheduledReminders(sessions);
     // Agente de seguimiento: mismo tick. Cada uno arma su cola a su hora configurada.
     FollowupService.checkAndRunScheduledFollowups(sessions);
+    // Campañas: arranca cada sesión que se conecta (propuestas abiertas,
+    // envíos a medias, análisis que un reinicio cortó y el goteo).
+    tickFollowupCampaigns(sessions);
   });
 });

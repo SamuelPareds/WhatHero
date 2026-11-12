@@ -19,6 +19,9 @@ import 'package:crm_whatsapp/core/services/presence_reporter.dart';
 import 'package:crm_whatsapp/core/services/socket_service.dart';
 import 'package:crm_whatsapp/core/services/team_presence_service.dart';
 import 'package:crm_whatsapp/features/settings.dart';
+import 'package:crm_whatsapp/features/followups/followup_api.dart';
+import 'package:crm_whatsapp/features/followups/followup_models.dart';
+import 'package:crm_whatsapp/features/followups/followup_message.dart';
 import 'internal_timeline.dart';
 import 'jump_to_message.dart';
 import 'number_change_divider.dart';
@@ -177,6 +180,9 @@ class _MessagesViewState extends State<MessagesView> {
   // mientras el borrador sigue "vivo" (no enviado ni descartado). ValueNotifier
   // para rebuildar solo el cintillo, no todo el composer.
   final ValueNotifier<bool> _isFollowupChat = ValueNotifier(false);
+  // La propuesta de este chat ya está aprobada y saldrá sola (goteo). El
+  // composer no se precarga: mandarla a mano además la duplicaría.
+  final ValueNotifier<bool> _followupScheduled = ValueNotifier(false);
   // Guard para pre-llenar el borrador una sola vez por apertura del chat.
   bool _followupChecked = false;
 
@@ -375,6 +381,7 @@ class _MessagesViewState extends State<MessagesView> {
     _qrScroll.dispose();
     _replyDraft.dispose();
     _isFollowupChat.dispose();
+    _followupScheduled.dispose();
     _hasRecentCustomerMessage.dispose();
     _inputFocusNode.dispose();
     super.dispose();
@@ -667,6 +674,10 @@ class _MessagesViewState extends State<MessagesView> {
   // Al abrir el chat: si el agente dejó un borrador encolado, lo pre-cargamos
   // en el composer (editable) y encendemos el cintillo. Una sola vez por
   // apertura. No pisa lo que el usuario ya haya escrito.
+  //
+  // La cola la escribe sólo el backend (firestore.rules). Mandar el borrador
+  // desde aquí la cierra sola: el backend ve la respuesta del equipo y marca
+  // la propuesta como atendida. Ver CLAUDE.md, "📣 Campañas de seguimiento".
   Future<void> _loadFollowupDraft() async {
     if (_followupChecked) return;
     _followupChecked = true;
@@ -674,49 +685,56 @@ class _MessagesViewState extends State<MessagesView> {
     if (widget.jumpToMessageId != null) return;
     try {
       final snap = await _followupQueueRef.get();
-      final data = snap.data();
-      if (!mounted || data == null) return;
-      if ((data['status'] as String?) != 'pending') return;
-      final draft = (data['draftMessage'] as String?)?.trim() ?? '';
+      if (!mounted || !snap.exists) return;
+      final proposal = FollowupProposal.fromDoc(snap);
+      final today = todayString();
+      if (proposal.isExpired(today)) return;
+      if (proposal.status == 'approved') {
+        _followupScheduled.value = true;
+        return;
+      }
+      if (proposal.status != 'pending') return;
+      // Los días que faltan, contados hoy (el borrador guardado es del día
+      // en que se analizó).
+      final draft = proposal.previewFor(today)?.trim() ?? '';
       if (draft.isEmpty) return;
       if (_messageController.text.trim().isNotEmpty) return; // respeta lo ya escrito
       _messageController.text = draft;
       _isFollowupChat.value = true;
     } catch (e) {
       // Silencioso: el seguimiento es una ayuda, su fallo no debe romper el chat.
-      print('[Followup] No se pudo cargar el borrador: $e');
+      debugPrint('[Followup] No se pudo cargar el borrador: $e');
     }
   }
 
-  // El operador envió el seguimiento: lo marcamos como enviado para que salga
-  // del filtro "Seguimiento" y no se vuelva a elegir mañana.
-  Future<void> _markFollowupSent() async {
+  FollowupApi get _followupApi => FollowupApi(accountId: widget.accountId, sessionId: widget.sessionId);
+
+  // El operador envió el seguimiento. No se escribe nada: el eco de su
+  // mensaje le dice al backend que el chat ya se atendió.
+  void _markFollowupSent() {
     _isFollowupChat.value = false;
-    try {
-      await _chatDocRef.set({
-        'followup_status': 'sent',
-        'followup_count': FieldValue.increment(1),
-        'followup_last_at': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true));
-      await _followupQueueRef.set({'status': 'sent'}, SetOptions(merge: true));
-    } catch (e) {
-      print('[Followup] No se pudo marcar como enviado: $e');
-    }
   }
 
-  // El operador descarta el borrador sin enviarlo: limpia el composer y saca el
-  // chat del filtro (lo dejamos en paz, como un "no dar seguimiento" puntual).
+  // El operador descarta el borrador sin enviarlo: limpia el composer y saca
+  // el chat del filtro (lo dejamos en paz, como un "no dar seguimiento" puntual).
   Future<void> _dismissFollowupDraft() async {
     _isFollowupChat.value = false;
     _messageController.clear();
     try {
-      await _chatDocRef.set({
-        'followup_status': 'dismissed',
-        'followup_last_reason': 'Descartado por el operador',
-      }, SetOptions(merge: true));
-      await _followupQueueRef.set({'status': 'cancelled'}, SetOptions(merge: true));
+      await _followupApi.decide(widget.phoneNumber, 'reject');
     } catch (e) {
-      print('[Followup] No se pudo descartar: $e');
+      debugPrint('[Followup] No se pudo descartar: $e');
+    }
+  }
+
+  // "No enviar" sobre una propuesta ya aprobada: vuelve a quedar por revisar.
+  Future<void> _unscheduleFollowup() async {
+    _followupScheduled.value = false;
+    try {
+      await _followupApi.decide(widget.phoneNumber, 'unapprove');
+    } on FollowupApiException catch (e) {
+      _followupScheduled.value = true;
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
     }
   }
 
@@ -2622,6 +2640,43 @@ class _MessagesViewState extends State<MessagesView> {
                     // Cintillo del agente de seguimiento: aparece cuando el chat
                     // trae un borrador encolado. Comunica que el texto del
                     // composer es una propuesta editable, y ofrece descartarla.
+                    ValueListenableBuilder<bool>(
+                      valueListenable: _followupScheduled,
+                      builder: (context, scheduled, _) {
+                        if (!scheduled) return const SizedBox.shrink();
+                        return Container(
+                          margin: const EdgeInsets.only(bottom: 8),
+                          padding: const EdgeInsets.fromLTRB(10, 8, 4, 8),
+                          decoration: BoxDecoration(
+                            color: primaryAqua.withValues(alpha: 0.1),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border(left: BorderSide(color: primaryAqua, width: 3)),
+                          ),
+                          child: Row(
+                            children: [
+                              const Icon(Icons.schedule_send_outlined, size: 16, color: primaryAqua),
+                              const SizedBox(width: 8),
+                              const Expanded(
+                                child: Text(
+                                  'Seguimiento aprobado · sale solo en la fila de envío',
+                                  style: TextStyle(color: primaryAqua, fontSize: 12, fontWeight: FontWeight.w600),
+                                ),
+                              ),
+                              TextButton(
+                                onPressed: _unscheduleFollowup,
+                                style: TextButton.styleFrom(
+                                  foregroundColor: lightText,
+                                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                                  minimumSize: const Size(0, 32),
+                                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                ),
+                                child: const Text('No enviar', style: TextStyle(fontSize: 12)),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
                     ValueListenableBuilder<bool>(
                       valueListenable: _isFollowupChat,
                       builder: (context, isFollowup, _) {

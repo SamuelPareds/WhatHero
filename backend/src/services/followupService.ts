@@ -3,6 +3,8 @@ import { SessionData } from '../types';
 import { ACCOUNTS_COLLECTION } from '../config/env';
 import { getAIConfig } from './firestoreService';
 import { isSessionGone } from './sessionSupervisor';
+import { writeProposal } from './followupCampaignService';
+import { OPEN_PROPOSAL_STATUSES, localDate, proposalLastDay } from './followupCampaigns';
 import {
   normalizeHistory,
   classifyFollowupCandidate,
@@ -18,8 +20,10 @@ import {
 // que quedaron frías "ayer", decide con IA cuáles son leads recuperables y deja
 // un borrador en la cola `followup_queue` para que el operador revise y apruebe.
 //
-// FASE 1 (este archivo): construir la cola. NO envía ningún mensaje.
-// FASE 2 (futuro): drainFollowupQueue() enviará los aprobados con pacing.
+// Construye la cola. NO envía ningún mensaje: lo que el operador aprueba sale
+// por el goteo de followupOutbox.ts, igual que lo de las campañas (la cola es
+// una sola, ver followupCampaignService.ts). Un chat con una propuesta viva de
+// una campaña no se toca.
 
 // Tope de candidatos analizados por corrida para acotar el costo de IA.
 const MAX_CANDIDATES_PER_RUN = 50;
@@ -213,8 +217,27 @@ export class FollowupService {
     let queued = 0;
     let skipped = 0;
     const results: { chatId: string; decision: string; reason: string; draftPreview?: string }[] = [];
+    const today = localDate(new Date(), config.timezone);
+
+    // Un chat con una propuesta viva (de una campaña, o de ayer sin revisar)
+    // no se re-clasifica: un SKIP pisaría su `followup_status` y lo sacaría
+    // del filtro "Seguimiento" con la propuesta todavía abierta.
+    const queueRefs = candidates.map(({ chatId }) => this.db
+      .collection(ACCOUNTS_COLLECTION).doc(accountId)
+      .collection('whatsapp_sessions').doc(sessionId)
+      .collection('followup_queue').doc(chatId));
+    const existing = queueRefs.length ? await this.db.getAll(...queueRefs) : [];
+    const busy = new Set(
+      existing
+        .filter(d => [...OPEN_PROPOSAL_STATUSES, 'sending', 'in_doubt'].includes(d.get('status')))
+        .map(d => d.id)
+    );
 
     for (const { chatId, data } of candidates) {
+      if (busy.has(chatId)) {
+        results.push({ chatId, decision: 'SKIP', reason: '(ya tiene una propuesta abierta)' });
+        continue;
+      }
       // Si la sesión se está eliminando, se corta. Cada vuelta tarda segundos
       // (hasta dos llamadas al LLM), así que se re-chequea también antes de
       // escribir: si no, el lote seguiría recreando chats que ya se borraron.
@@ -245,10 +268,9 @@ export class FollowupService {
 
       if (decision === 'SKIP') {
         skipped++;
-        await chatRef.set(
-          { followup_status: 'skipped', followup_last_reason: reason },
-          { merge: true }
-        );
+        // `update`, no `set(merge)`: si el chat se borró mientras la IA
+        // pensaba, no lo resucitamos como doc fantasma.
+        await chatRef.update({ followup_status: 'skipped', followup_last_reason: reason }).catch(() => undefined);
         results.push({ chatId, decision, reason });
         continue;
       }
@@ -271,31 +293,29 @@ export class FollowupService {
         // La IA no produjo texto: no encolamos basura. Lo marcamos como skip
         // con razón clara para auditar.
         skipped++;
-        await chatRef.set(
-          { followup_status: 'skipped', followup_last_reason: '(IA no generó borrador)' },
-          { merge: true }
-        );
+        await chatRef.update({ followup_status: 'skipped', followup_last_reason: '(IA no generó borrador)' }).catch(() => undefined);
         results.push({ chatId, decision: 'SKIP', reason: '(IA no generó borrador)' });
         continue;
       }
 
-      await this.db
-        .collection(ACCOUNTS_COLLECTION).doc(accountId)
-        .collection('whatsapp_sessions').doc(sessionId)
-        .collection('followup_queue').doc(chatId)
-        .set({
-          chatId,
-          contactName: data.contactName ?? null,
-          draftMessage: draft.trim(),
-          status: 'pending',
-          reason,
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        }, { merge: true });
-
-      await chatRef.set(
-        { followup_status: 'queued', followup_last_reason: reason },
-        { merge: true }
-      );
+      const written = await writeProposal(accountId, sessionId, {
+        chatId,
+        contactName: data.contactName ?? null,
+        source: 'daily',
+        campaignId: null,
+        messageTemplate: draft.trim(),
+        deadline: null,
+        lastDay: proposalLastDay(null, today),
+        reason,
+        evidence: null,
+        expectedLastMessageId: data.lastMessageId ?? null,
+        today,
+      });
+      if (written !== 'written') {
+        skipped++;
+        results.push({ chatId, decision: 'SKIP', reason: `(no se encoló: ${written})` });
+        continue;
+      }
 
       queued++;
       results.push({ chatId, decision, reason, draftPreview: draft.trim().substring(0, 120) });

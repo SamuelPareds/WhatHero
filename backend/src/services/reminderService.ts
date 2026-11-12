@@ -16,6 +16,49 @@ interface Appointment {
   notes: string;
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Una vez por día, y nunca dos lotes a la vez.
+// ─────────────────────────────────────────────────────────────────────────
+// Los recordatorios no tienen dedupe por cita: correr el lote dos veces el
+// mismo día le manda a cada cliente su recordatorio dos veces. Cada corrida
+// deja `reminder_last_run` en el doc de la sesión (marcado como `running`
+// ANTES de enviar el primero) y la siguiente lo consulta:
+//   - el cron se salta el día si ya salió algo hoy, o si una corrida quedó a
+//     medias (el proceso murió: reenviar duplicaría lo que sí salió);
+//   - el botón "Enviar ahora" pide confirmación (`force`) en esos casos.
+
+export interface ReminderRun {
+  day: string;          // 'YYYY-MM-DD' en la zona de los recordatorios
+  status: 'running' | 'done';
+  via: 'cron' | 'manual';
+  sent: number;
+  failed: number;
+  total: number;
+  startedAtMs: number;
+}
+
+/** ¿Hoy ya salieron recordatorios (o hay una corrida a medias)? */
+export function remindersRanToday(last: Partial<ReminderRun> | null | undefined, today: string): boolean {
+  if (!last || last.day !== today) return false;
+  return last.status === 'running' || Number(last.sent ?? 0) > 0;
+}
+
+function localDay(now: Date, timezone: string): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(now);
+}
+
+export type ManualRunResult =
+  | { status: 'started' }
+  | { status: 'running' }
+  | { status: 'already_sent_today'; lastRun: Partial<ReminderRun> }
+  | { status: 'not_configured' }
+  | { status: 'not_ready' };
+
+// Corridas en vuelo en este proceso, por doc de sesión.
+const runningReminders = new Set<string>();
+
 interface ReminderConfig {
   enabled: boolean;
   apiUrl: string;
@@ -23,6 +66,7 @@ interface ReminderConfig {
   timezone: string;
   template: string;
   loadedAt: number;
+  lastRun: Partial<ReminderRun> | null;
 }
 
 export class ReminderService {
@@ -77,6 +121,7 @@ export class ReminderService {
       if (!data) return null;
 
       return {
+        lastRun: (data.reminder_last_run as Partial<ReminderRun> | undefined) ?? null,
         enabled: data.reminder_enabled ?? false,
         apiUrl: data.reminder_api_url ?? '',
         scheduledTime: data.reminder_scheduled_time ?? '09:00',
@@ -149,7 +194,63 @@ export class ReminderService {
     accountId: string,
     sessionId: string,
     sessionKey: string,
-    sessions: Map<string, SessionData>
+    sessions: Map<string, SessionData>,
+    via: 'cron' | 'manual' = 'cron',
+  ) {
+    const runKey = `${accountId}/${sessionId}`;
+    if (runningReminders.has(runKey)) {
+      console.warn(`[ReminderService] Ya hay un lote en curso para ${sessionId}; no se inicia otro`);
+      return { success: false, error: 'Already running' };
+    }
+    runningReminders.add(runKey);
+    try {
+      return await this.runReminders(accountId, sessionId, sessionKey, sessions, via);
+    } finally {
+      runningReminders.delete(runKey);
+    }
+  }
+
+  private static async writeRun(accountId: string, sessionId: string, run: ReminderRun): Promise<void> {
+    // `update`: el status de una sesión eliminada no puede resucitar su doc.
+    await this.db
+      .collection(ACCOUNTS_COLLECTION).doc(accountId)
+      .collection('whatsapp_sessions').doc(sessionId)
+      .update({ reminder_last_run: run });
+  }
+
+  /**
+   * "Enviar ahora" desde Ajustes. Sin `force`, no repite un día que ya salió:
+   * devuelve `already_sent_today` para que la app pregunte. Corre en segundo
+   * plano (sale uno cada 7 s): el resultado queda en `reminder_last_run`.
+   */
+  static async startManualRun(
+    accountId: string,
+    sessionId: string,
+    sessionKey: string,
+    sessions: Map<string, SessionData>,
+    force: boolean,
+  ): Promise<ManualRunResult> {
+    const session = sessions.get(sessionKey);
+    if (!session || !session.isReady || !session.sock || session.role !== 'primary') return { status: 'not_ready' };
+    if (runningReminders.has(`${accountId}/${sessionId}`)) return { status: 'running' };
+    const config = await this.getReminderConfig(accountId, sessionId);
+    if (!config || !config.enabled || !config.apiUrl) return { status: 'not_configured' };
+    const today = localDay(new Date(), config.timezone);
+    if (!force && remindersRanToday(config.lastRun, today)) {
+      return { status: 'already_sent_today', lastRun: config.lastRun! };
+    }
+    this.processReminders(accountId, sessionId, sessionKey, sessions, 'manual')
+      .then((result) => console.log(`[ReminderService] Envío manual de ${sessionId}:`, result))
+      .catch((err) => console.error(`[ReminderService] Envío manual de ${sessionId} falló:`, err));
+    return { status: 'started' };
+  }
+
+  private static async runReminders(
+    accountId: string,
+    sessionId: string,
+    sessionKey: string,
+    sessions: Map<string, SessionData>,
+    via: 'cron' | 'manual',
   ) {
     const session = sessions.get(sessionKey);
     // `role`: una línea anterior (tras un cambio de número) nunca envía.
@@ -185,6 +286,19 @@ export class ReminderService {
       let errorCount = 0;
       const failedNumbers: string[] = [];
 
+      // La marca va ANTES del primer envío: si el proceso muere a mitad, la
+      // corrida queda `running` y el cron de hoy no la repite.
+      const run: ReminderRun = {
+        day: localDay(new Date(), config.timezone),
+        status: 'running',
+        via,
+        sent: 0,
+        failed: 0,
+        total: sortedAppointments.length,
+        startedAtMs: Date.now(),
+      };
+      await this.writeRun(accountId, sessionId, run);
+
       for (const appointment of sortedAppointments) {
         // La sesión se retiró a mitad del lote (eliminada, o cerrada desde el
         // teléfono): ya no hay socket por el cual mandar el resto.
@@ -209,6 +323,8 @@ export class ReminderService {
       }
 
       console.log(`[ReminderService] Completed: ${successCount} sent, ${errorCount} failed`);
+      await this.writeRun(accountId, sessionId, { ...run, status: 'done', sent: successCount, failed: errorCount })
+        .catch((error) => console.error('[ReminderService] No se pudo guardar el resultado del lote:', error));
 
       return {
         success: true,
@@ -251,6 +367,10 @@ export class ReminderService {
       if (!config || !config.enabled) continue;
 
       if (config.scheduledTime === currentTime) {
+        if (remindersRanToday(config.lastRun, localDay(now, config.timezone))) {
+          console.log(`[ReminderService] ${session.sessionId}: hoy ya salieron recordatorios (${config.lastRun?.via}); el cron no los repite`);
+          continue;
+        }
         console.log(`[ReminderService] Running scheduled reminders for ${session.sessionId} at ${currentTime}`);
         this.processReminders(session.accountId, session.sessionId, sessionKey, sessions)
           .then(result => {
