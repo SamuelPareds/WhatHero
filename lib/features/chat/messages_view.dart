@@ -1516,22 +1516,11 @@ class _MessagesViewState extends State<MessagesView> {
     );
   }
 
-  // Abre el panel de configuración de sesión como bottom sheet. Se usa cuando
-  // el asistente IA aún no está habilitado: en lugar de bloquear al usuario,
-  // lo llevamos directo al lugar donde puede activarlo.
+  // Abre los Ajustes de la sesión. Se usa cuando el asistente IA aún no está
+  // habilitado: en lugar de bloquear al usuario, lo llevamos directo al lugar
+  // donde puede activarlo.
   void _openSessionSettings() {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: surfaceDark,
-      isScrollControlled: true,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-      ),
-      builder: (_) => SessionSettingsPanel(
-        sessionId: widget.sessionId,
-        accountId: widget.accountId,
-      ),
-    );
+    openSessionSettings(context, accountId: widget.accountId, sessionId: widget.sessionId);
   }
 
   // Genera una sugerencia de IA y la vuelca al composer. Si `operatorInstruction`

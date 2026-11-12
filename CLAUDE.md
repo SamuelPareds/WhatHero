@@ -819,7 +819,7 @@ Si el WhatsApp anterior sigue vivo (perdió la SIM pero no la cuenta), el owner 
 
 - **Puntos de entrada (sólo el owner):** re-vincular una tarjeta pregunta "¿el mismo o uno nuevo?"; el FAB pregunta "¿Este número reemplaza a otro?" **antes** del QR (es el momento natural de quien perdió su línea, y evita llegar a `has_history`); Ajustes › Perfil › "Cambiar a un número nuevo". Todo pasa por `linkWhatsApp()` (`session_linking.dart`) y el asistente `change_number_flow.dart`, que explica todo **antes** del QR porque el cambio ocurre solo al conectar.
 - **La línea "Cambio de número"** (`number_change_divider.dart`, tests en `test/number_change_divider_test.dart`) va **por tiempo**, no por etiqueta: así no hubo que tocar un solo mensaje. Viaja en el mismo `Column` que el separador de día, sin agregar elementos a la lista (los índices de `_resolveJump` no se mueven). Si lo último del chat es del número anterior, abajo aparece "Lo que envíes ahora sale de +…": el cliente todavía no conoce el número nuevo.
-- **Tras el asistente, Ajustes recarga.** El panel lee el doc una sola vez; sin recargar, su próximo "Guardar" volvía a encender los automáticos que el cambio pausó.
+- **Ajustes ve la pausa en vivo.** El panel escucha el doc y guarda campo por campo (ver *⚙️ Ajustes de sesión*). Antes leía el doc una sola vez, y su "Guardar todo" volvía a encender los automáticos que el cambio había pausado.
 
 **Fase 2 (no está hecho):** juntar dos historiales (`has_history`), volver a vincular el número viejo como línea aparte (`number_replaced`, necesita ids de sesión opacos) y promover la línea anterior a principal sin QR.
 
@@ -1032,6 +1032,22 @@ Mandar decenas de mensajes en minutos a gente que no te tiene guardado es lo que
 - El barrido diario escribía el chat con `set(merge)`: un chat borrado mientras la IA pensaba renacía como fantasma. Ahora `update`.
 
 **Fase 2 (no está hecho):** campañas con plantilla aprobada en Cloud API (hoy un chat con la ventana de 24 h cerrada no se deja aprobar), lista chat por chat de por qué no entró, push al terminar el análisis, adjuntar una imagen al mensaje, campañas recurrentes y métricas de respuesta por campaña.
+
+---
+
+## ⚙️ Ajustes de sesión: cada cambio se guarda donde se hace
+
+`SessionSettingsPanel` tenía un botón fijo "Guardar Todos los Cambios" que hacía **un solo `update` con unos 25 campos copiados de la memoria del panel**. Etiquetas y Respuestas ya se guardaban solas, así que el botón confundía. Además, cada guardado reescribía lo que no habías tocado: lo que otro operador cambió con el panel abierto, o la pausa de los automáticos que hace el backend al cambiar de número.
+
+- **Controles (switches, selectores, horas, slider): al instante, y sólo su campo.** Todo pasa por `_saveFields`, el único que escribe el doc desde el panel. El proveedor guarda `ai_provider` y `ai_model` juntos, el slider guarda al soltar (`onChangeEnd`) y `ai_active_hours` se escribe como mapa completo. Debajo del título, *Guardando… / ✓ Guardado* confirma cada cambio. Un error sale en un SnackBar.
+- **Texto: botón propio.** `DraftTextController` y `DraftSaveBar` (`session_settings_fields.dart`) muestran *Sin guardar · Descartar · Guardar* sólo cuando el campo cambió. **No es autoguardado, y es a propósito:** el backend cachea `getAIConfig` 60 s, y unas instrucciones a medio escribir le estarían contestando a clientes reales. Todo se guarda recortado, también las API keys (una llave pegada con un salto de línea no autentica).
+- **Es una pantalla completa, y se abre sólo con `openSessionSettings()`** (lista de chats, chat abierto y *Mis Cuentas*). Antes era una hoja al 85 %, y con cinco pestañas, prompts largos y hojas encima se quedaba corta. Además, un arrastre sin querer la cerraba. En escritorio el contenido se limita a 760 px. El AppBar dice de qué sesión son los ajustes: si llega un push de otra cuenta, el dispatcher cambia la lista de abajo y esta pantalla sigue arriba. Como es una ruta opaca, mientras estás en Ajustes no cuentas como "en el chat" para la presencia del equipo (igual que en *Mis Cuentas*).
+- **Salir guarda lo escrito** (`PopScope.onPopInvokedWithResult` → `_flushDrafts`) y lo avisa. No se pregunta "¿descartar cambios?": hacerlo exige `canPop: false`, que en iOS apaga el gesto de volver mientras haya cambios. Para tirar un borrador está *Descartar*.
+- **El panel escucha el doc en vivo** (`snapshots()` en `initState`). Lo que cambie el backend u otro operador aparece solo, y si el servidor rechaza una escritura, el snapshot del rollback devuelve el control a su valor sin código para revertir. **`applyServer` no pisa un borrador:** sólo toca el texto si el valor guardado cambió de verdad y el campo no tiene cambios ni se está guardando. Si un guardado falla, el texto se queda y vuelve a *Sin guardar*, llegue el rollback antes o después del error. Las reglas viven en `test/session_settings_fields_test.dart`.
+- **Lo que se ve es lo que se guarda** (`sessionSettingsDisplayGaps`). Sin `ai_response_delay_ms`, el backend espera 1 500 ms, mientras el slider dice 15 s. El botón global lo tapaba porque escribía la pantalla entera. Guardando campo por campo, activar la IA en una sesión nueva la dejaba respondiendo a los 1,5 s. Ahora, lo que el panel muestra y el doc no tiene (la espera, también un valor fuera de 8 a 30 s; proveedor, modelo, instrucciones y mensaje de recordatorio por defecto) viaja en la primera escritura. **Un default nuevo que el panel muestre y el backend no comparta va ahí.**
+- **Si la lectura falla, se muestra el error con Reintentar, nunca un formulario.** El panel viejo caía a los defaults, y su "Guardar" los escribía encima de la configuración real. Con la sesión en lápida, el panel lo dice y no deja editar. No se cierra solo: al eliminar desde el propio panel, la lápida llega con el diálogo de confirmación todavía abierto.
+- **"Enviar ahora" guarda primero** la URL y el mensaje del recordatorio. El backend lee lo guardado, y antes salía el mensaje viejo.
+- `ai_media_allowlist` no se escribe: es de sólo lectura hasta que la IA lea media.
 
 ---
 

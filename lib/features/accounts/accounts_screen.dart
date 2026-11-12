@@ -673,20 +673,11 @@ class _AccountsScreenState extends State<AccountsScreen> {
                         if (!deleting)
                           IconButton(
                             icon: const Icon(Icons.settings_outlined, color: lightText, size: 20),
-                            onPressed: () {
-                              showModalBottomSheet(
-                                context: context,
-                                backgroundColor: surfaceDark,
-                                isScrollControlled: true,
-                                shape: const RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-                                ),
-                                builder: (_) => SessionSettingsPanel(
-                                  sessionId: phoneNumber,
-                                  accountId: widget.accountId,
-                                ),
-                              );
-                            },
+                            onPressed: () => openSessionSettings(
+                              context,
+                              accountId: widget.accountId,
+                              sessionId: phoneNumber,
+                            ),
                           ),
                       ],
                     ),

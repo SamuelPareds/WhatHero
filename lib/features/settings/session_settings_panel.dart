@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
@@ -20,7 +21,27 @@ import '../accounts/link_result.dart';
 import '../chat/number_change_divider.dart';
 import '../chat/widgets/label_editor_dialog.dart';
 import 'delete_session_dialog.dart';
+import 'session_settings_fields.dart';
 
+/// Abre los Ajustes de la sesión a pantalla completa. Es la única forma de
+/// abrirlos: la lista de chats, el chat abierto y Mis Cuentas pasan por aquí.
+Future<void> openSessionSettings(
+  BuildContext context, {
+  required String accountId,
+  required String sessionId,
+}) {
+  return Navigator.of(context).push(MaterialPageRoute<void>(
+    builder: (_) => SessionSettingsPanel(accountId: accountId, sessionId: sessionId),
+  ));
+}
+
+// Ajustes de la sesión, a pantalla completa (era una hoja al 85 %: con cinco
+// pestañas, prompts largos y hojas encima, se quedaba corta y un arrastre la
+// cerraba sin querer). Cada cambio se guarda donde se hace: los controles
+// (switches, selectores, horas, slider) al instante y sólo su campo; el texto
+// con su propio Guardar, o al salir de la pantalla. No hay "guardar todo": eso
+// reescribía la pantalla entera y pisaba lo que otro (o el backend) había
+// cambiado. Ver CLAUDE.md, "⚙️ Ajustes de sesión".
 class SessionSettingsPanel extends StatefulWidget {
   final String sessionId;
   final String accountId;
@@ -35,24 +56,36 @@ class SessionSettingsPanel extends StatefulWidget {
   State<SessionSettingsPanel> createState() => _SessionSettingsPanelState();
 }
 
-class _SessionSettingsPanelState extends State<SessionSettingsPanel> with SingleTickerProviderStateMixin {
-  static const _minResponseDelaySeconds = 8;
-  static const _maxResponseDelaySeconds = 30;
-  static const _recommendedResponseDelaySeconds = 20;
+enum _SaveStatus { idle, saving, saved }
 
+class _SessionSettingsPanelState extends State<SessionSettingsPanel> with SingleTickerProviderStateMixin {
   late TabController _tabController;
-  
-  // Controllers
-  late TextEditingController _aliasController;
-  late TextEditingController _apiKeyController;
-  late TextEditingController _openaiApiKeyController;
-  late TextEditingController _deepseekApiKeyController;
-  late TextEditingController _systemPromptController;
-  late TextEditingController _discriminatorPromptController;
-  late TextEditingController _reminderApiUrlController;
-  late TextEditingController _reminderTemplateController;
-  late TextEditingController _followupExclusionController;
-  late TextEditingController _followupMessageController;
+
+  // Campos de texto: cada uno sabe qué hay guardado y se guarda con su botón
+  // (DraftSaveBar) o al cerrar el panel (_flushDrafts).
+  final _aliasController = DraftTextController(field: 'alias', label: 'Alias');
+  final _apiKeyController = DraftTextController(field: 'ai_api_key', label: 'API Key de Gemini');
+  final _openaiApiKeyController = DraftTextController(field: 'ai_openai_api_key', label: 'API Key de OpenAI');
+  final _deepseekApiKeyController = DraftTextController(field: 'ai_deepseek_api_key', label: 'API Key de DeepSeek');
+  final _systemPromptController = DraftTextController(field: 'ai_system_prompt', label: 'Instrucciones del Sistema');
+  final _discriminatorPromptController = DraftTextController(field: 'ai_discriminator_prompt', label: 'Reglas de Intervención Humana');
+  final _reminderApiUrlController = DraftTextController(field: 'reminder_api_url', label: 'API URL de Sincronización');
+  final _reminderTemplateController = DraftTextController(field: 'reminder_template', label: 'Mensaje de Recordatorio');
+  final _followupExclusionController = DraftTextController(field: 'followup_exclusion_prompt', label: 'A quién NO dar seguimiento');
+  final _followupMessageController = DraftTextController(field: 'followup_message_prompt', label: 'Tono del mensaje de seguimiento');
+
+  List<DraftTextController> get _drafts => [
+        _aliasController,
+        _apiKeyController,
+        _openaiApiKeyController,
+        _deepseekApiKeyController,
+        _systemPromptController,
+        _discriminatorPromptController,
+        _reminderApiUrlController,
+        _reminderTemplateController,
+        _followupExclusionController,
+        _followupMessageController,
+      ];
 
   // FocusNodes for focus management
   late FocusNode _systemPromptFocus;
@@ -80,9 +113,9 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
 
   // Allowlist de tipos de media que la IA puede leer. Por defecto todo en
   // false: la IA es solo-texto. En Fase 1 los toggles son read-only
-  // ("próximamente") — el estado se carga y persiste para que el backend
-  // tenga el campo disponible y para evitar reescribir cuando se abra
-  // la edición en Fase 2.
+  // ("próximamente"): el estado sólo se lee y el panel no lo escribe (el
+  // backend trata la falta del campo como todo apagado). Cuando se abra la
+  // edición en Fase 2, cada toggle se guarda con `_change`.
   bool _mediaAllowImage = false;
   bool _mediaAllowAudio = false;
   bool _mediaAllowVideo = false;
@@ -114,234 +147,318 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
   String? _cloudApiVerifiedName;
   String? _cloudApiTokenHint;
 
-  bool _isSaving = false;
   bool _isLoading = true;
+  // Nombre de la sesión para el AppBar (alias, nombre verificado o número).
+  String? _sessionName;
+  // La lectura falló: se muestra el error con Reintentar, NUNCA un formulario
+  // con valores por defecto (guardar ahí pisaba la configuración real).
+  String? _loadError;
+  // La sesión se está eliminando (lápida) o ya no existe.
+  bool _sessionGone = false;
+
+  // El panel escucha el doc en vivo: refleja lo que cambie el backend (pausa
+  // por cambio de número, recordatorios en curso, línea anterior) u otro
+  // operador, y si el servidor rechaza una escritura, el snapshot del
+  // rollback devuelve el control a su valor sin lógica de revertir.
+  StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _sub;
+
+  // Lo que se ve y el doc todavía no tiene. Va en la primera escritura.
+  Map<String, Object> _displayGaps = const {};
+
+  // Estado del indicador del header (Guardando… / ✓ Guardado).
+  final _saveStatus = ValueNotifier<_SaveStatus>(_SaveStatus.idle);
+  int _writesInFlight = 0;
+  bool _batchFailed = false;
+  Timer? _savedTimer;
+
+  DocumentReference<Map<String, dynamic>> get _sessionRef => FirebaseFirestore.instance
+      .collection(accountsCollection)
+      .doc(widget.accountId)
+      .collection('whatsapp_sessions')
+      .doc(widget.sessionId);
 
   Future<void> _openCloudApiConfig() async {
-    final result = await showConnectCloudApiSheet(
+    // Lo que escriba la hoja llega solo por el listener.
+    await showConnectCloudApiSheet(
       context,
       accountId: widget.accountId,
       intoSessionId: widget.sessionId,
       initialPhoneNumberId: _cloudApiPhoneNumberId,
       initialWabaId: _cloudApiWabaId,
-      initialAlias: _aliasController.text.trim(),
+      initialAlias: _aliasController.trimmed,
       tokenHint: _cloudApiTokenHint,
     );
-    if (result != null && mounted) {
-      await _loadSettings();
-    }
   }
 
   @override
   void initState() {
     super.initState();
     _tabController = TabController(length: 5, vsync: this);
-    _aliasController = TextEditingController();
-    _apiKeyController = TextEditingController();
-    _openaiApiKeyController = TextEditingController();
-    _deepseekApiKeyController = TextEditingController();
-    _systemPromptController = TextEditingController();
-    _discriminatorPromptController = TextEditingController();
-    _reminderApiUrlController = TextEditingController();
-    _reminderTemplateController = TextEditingController();
-    _followupExclusionController = TextEditingController();
-    _followupMessageController = TextEditingController();
     _systemPromptFocus = FocusNode();
     _discriminatorFocus = FocusNode();
     _reminderTemplateFocus = FocusNode();
     _followupExclusionFocus = FocusNode();
     _followupMessageFocus = FocusNode();
-    _loadSettings();
+    _listen();
   }
 
-  Future<void> _loadSettings() async {
-    try {
-      final doc = await FirebaseFirestore.instance
-          .collection(accountsCollection)
-          .doc(widget.accountId)
-          .collection('whatsapp_sessions')
-          .doc(widget.sessionId)
-          .get();
-
-      if (doc.exists) {
-        final data = doc.data() ?? {};
-        setState(() {
-          _linkedPhone = sessionPhone(data, widget.sessionId);
-          _isCloudApi = data['provider'] == 'cloud_api';
-          _cloudApiPhoneNumberId = data['cloud_api_phone_number_id'] as String?;
-          _cloudApiWabaId = data['cloud_api_waba_id'] as String?;
-          _cloudApiVerifiedName = data['cloud_api_verified_name'] as String?;
-          _cloudApiTokenHint = data['cloud_api_token_hint'] as String?;
-          _numberHistory = parseNumberHistory(data['number_history']);
-          _previousLines = data['previous_lines'] is Map
-              ? Map<String, dynamic>.from(data['previous_lines'] as Map)
-              : const {};
-          final change = data['number_change'];
-          _pausedAutomations = change is Map && change['pausedAutomations'] is List
-              ? (change['pausedAutomations'] as List).whereType<String>().toList()
-              : const [];
-          _aliasController.text = data['alias'] ??
-              _cloudApiVerifiedName ??
-              'Sucursal - ${_linkedPhone ?? widget.sessionId}';
-          _aiEnabled = data['ai_enabled'] ?? false;
-          _selectedProvider = data['ai_provider'] ?? 'gemini';
-          _apiKeyController.text = data['ai_api_key'] ?? '';
-          _openaiApiKeyController.text = data['ai_openai_api_key'] ?? '';
-          _deepseekApiKeyController.text = data['ai_deepseek_api_key'] ?? '';
-          _systemPromptController.text = data['ai_system_prompt'] ?? 'Eres un asistente útil.';
-          _selectedModel = data['ai_model'] ?? _defaultModelFor(_selectedProvider);
-          // Firestore conserva milisegundos; la UI trabaja en segundos enteros.
-          // Normalizar valores antiguos evita decimales y un Slider fuera de rango.
-          final delayMs = data['ai_response_delay_ms'];
-          _responseDelaySeconds = delayMs is num && delayMs.isFinite
-              ? (delayMs / Duration.millisecondsPerSecond).round().clamp(
-                  _minResponseDelaySeconds, _maxResponseDelaySeconds)
-              : 15;
-
-          _reminderEnabled = data['reminder_enabled'] ?? false;
-          _reminderLastRun = data['reminder_last_run'] as Map<String, dynamic>?;
-          _reminderApiUrlController.text = data['reminder_api_url'] ?? '';
-          _reminderTemplateController.text = data['reminder_template'] ?? '¡Hola {name}! 🌸\n\nTe recordamos tu cita para mañana a las {time}.';
-          
-          if (data['reminder_scheduled_time'] is String) {
-            final parts = (data['reminder_scheduled_time'] as String).split(':');
-            _reminderScheduledTime = TimeOfDay(hour: int.tryParse(parts[0]) ?? 9, minute: int.tryParse(parts[1]) ?? 0);
-          }
-
-          _followupEnabled = data['followup_enabled'] ?? false;
-          _followupExclusionController.text = data['followup_exclusion_prompt'] ?? '';
-          _followupMessageController.text = data['followup_message_prompt'] ?? '';
-          if (data['followup_scheduled_time'] is String) {
-            final parts = (data['followup_scheduled_time'] as String).split(':');
-            _followupScheduledTime = TimeOfDay(hour: int.tryParse(parts[0]) ?? 9, minute: int.tryParse(parts[1]) ?? 0);
-          }
-
-          if (data['ai_active_hours'] is Map) {
-            final hours = data['ai_active_hours'] as Map;
-            _activeHoursEnabled = hours['enabled'] ?? false;
-            _activeHoursTimezone = hours['timezone'] ?? 'America/Mexico_City';
-            if (hours['start'] is String) {
-              final parts = (hours['start'] as String).split(':');
-              _activeHoursStart = TimeOfDay(hour: int.tryParse(parts[0]) ?? 9, minute: int.tryParse(parts[1]) ?? 0);
-            }
-            if (hours['end'] is String) {
-              final parts = (hours['end'] as String).split(':');
-              _activeHoursEnd = TimeOfDay(hour: int.tryParse(parts[0]) ?? 18, minute: int.tryParse(parts[1]) ?? 0);
-            }
-          }
-
-          // Back-compat: leer del nuevo nombre (`bot_keyword_rules`) primero
-          // y caer al viejo (`ai_keyword_rules`) si todavía no se migró.
-          // Reglas sin campo `trigger` se asumen como 'incoming' para preservar
-          // su comportamiento histórico hasta que el usuario las edite.
-          final rawRules = data['bot_keyword_rules'] ?? data['ai_keyword_rules'];
-          if (rawRules is List) {
-            _botKeywordRules = List<Map<String, dynamic>>.from(rawRules.map((rule) => {
-              // `ruleId` ancla el archivo en Storage (path determinista).
-              // Reglas legacy no lo tienen → se genera al editarlas en el sheet.
-              'ruleId': rule['ruleId'] as String? ?? '',
-              'keyword': rule['keyword'] as String? ?? '',
-              'response': rule['response'] as String? ?? '',
-              'imageUrl': rule['imageUrl'] as String? ?? '',
-              // Adjunto documento (PDF). Una regla lleva imagen O documento.
-              'documentUrl': rule['documentUrl'] as String? ?? '',
-              'documentName': rule['documentName'] as String? ?? '',
-              'trigger': (rule['trigger'] as String?) ?? 'incoming',
-            }));
-          }
-
-          _markReadOnReply = data['mark_read_on_reply'] ?? true;
-          _discriminatorEnabled = data['ai_discriminator_enabled'] ?? false;
-          _discriminatorPromptController.text = data['ai_discriminator_prompt'] ?? '';
-
-          if (data['ai_media_allowlist'] is Map) {
-            final allow = data['ai_media_allowlist'] as Map;
-            _mediaAllowImage = allow['image'] == true;
-            _mediaAllowAudio = allow['audio'] == true;
-            _mediaAllowVideo = allow['video'] == true;
-            _mediaAllowDocument = allow['document'] == true;
-          }
-
-          _isLoading = false;
-        });
-      } else {
-        setState(() => _isLoading = false);
-      }
-    } catch (e) {
-      setState(() => _isLoading = false);
-    }
-  }
-
-  Future<void> _save() async {
-    setState(() => _isSaving = true);
-    try {
-      await FirebaseFirestore.instance
-          .collection(accountsCollection)
-          .doc(widget.accountId)
-          .collection('whatsapp_sessions')
-          .doc(widget.sessionId)
-          .update({
-        'alias': _aliasController.text.trim(),
-        'ai_enabled': _aiEnabled,
-        'ai_provider': _selectedProvider,
-        'ai_api_key': _apiKeyController.text,
-        'ai_openai_api_key': _openaiApiKeyController.text,
-        'ai_deepseek_api_key': _deepseekApiKeyController.text,
-        'ai_system_prompt': _systemPromptController.text,
-        'ai_model': _selectedModel,
-        'ai_response_delay_ms': _responseDelaySeconds * Duration.millisecondsPerSecond,
-        'ai_active_hours': {
-          'enabled': _activeHoursEnabled,
-          'timezone': _activeHoursTimezone,
-          'start': '${_activeHoursStart.hour.toString().padLeft(2, '0')}:${_activeHoursStart.minute.toString().padLeft(2, '0')}',
-          'end': '${_activeHoursEnd.hour.toString().padLeft(2, '0')}:${_activeHoursEnd.minute.toString().padLeft(2, '0')}',
-        },
-        // `bot_keyword_rules` NO se escribe aquí: las respuestas automáticas se
-        // persisten al instante desde su editor (ver _persistRules), igual que
-        // las etiquetas. Así no dependen del footer ni chocan con otras pestañas.
-        'mark_read_on_reply': _markReadOnReply,
-        'ai_discriminator_enabled': _discriminatorEnabled,
-        'ai_discriminator_prompt': _discriminatorPromptController.text.trim(),
-        'ai_media_allowlist': {
-          'image': _mediaAllowImage,
-          'audio': _mediaAllowAudio,
-          'video': _mediaAllowVideo,
-          'document': _mediaAllowDocument,
-        },
-        'reminder_enabled': _reminderEnabled,
-        'reminder_api_url': _reminderApiUrlController.text.trim(),
-        'reminder_template': _reminderTemplateController.text.trim(),
-        'reminder_scheduled_time': '${_reminderScheduledTime.hour.toString().padLeft(2, '0')}:${_reminderScheduledTime.minute.toString().padLeft(2, '0')}',
-        'followup_enabled': _followupEnabled,
-        'followup_scheduled_time': '${_followupScheduledTime.hour.toString().padLeft(2, '0')}:${_followupScheduledTime.minute.toString().padLeft(2, '0')}',
-        'followup_exclusion_prompt': _followupExclusionController.text.trim(),
-        'followup_message_prompt': _followupMessageController.text.trim(),
+  void _listen() {
+    _sub?.cancel();
+    _sub = _sessionRef.snapshots().listen(_applySnapshot, onError: (Object e) {
+      debugPrint('[SessionSettings] No se pudo leer la sesión ${widget.sessionId}: $e');
+      if (!mounted) return;
+      setState(() {
+        _isLoading = false;
+        _loadError = _errorReason(e);
       });
+    });
+  }
 
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Configuración guardada exitosamente')));
-        Navigator.pop(context);
-      }
-    } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
-    } finally {
-      if (mounted) setState(() => _isSaving = false);
+  void _retry() {
+    setState(() {
+      _isLoading = true;
+      _loadError = null;
+    });
+    _listen();
+  }
+
+  void _applySnapshot(DocumentSnapshot<Map<String, dynamic>> doc) {
+    if (!mounted) return;
+    final data = doc.data();
+    // Un "no existe" del caché no es la respuesta: sin el doc cacheado, el
+    // primer snapshot puede llegar vacío antes que el del servidor.
+    if (data == null && doc.metadata.isFromCache) return;
+    if (data == null || data['deleting_at'] != null) {
+      // No se cierra el panel desde aquí: al eliminar desde este mismo panel,
+      // la lápida llega con el diálogo de confirmación todavía abierto.
+      setState(() {
+        _isLoading = false;
+        _sessionGone = true;
+      });
+      return;
     }
+
+    String str(String field, [String fallback = '']) {
+      final value = data[field];
+      return value is String ? value : fallback;
+    }
+
+    setState(() {
+      _isLoading = false;
+      _loadError = null;
+      _sessionGone = false;
+      _displayGaps = sessionSettingsDisplayGaps(data);
+      _sessionName = sessionDisplayName(data, widget.sessionId);
+      _linkedPhone = sessionPhone(data, widget.sessionId);
+      _isCloudApi = data['provider'] == 'cloud_api';
+      _cloudApiPhoneNumberId = data['cloud_api_phone_number_id'] as String?;
+      _cloudApiWabaId = data['cloud_api_waba_id'] as String?;
+      _cloudApiVerifiedName = data['cloud_api_verified_name'] as String?;
+      _cloudApiTokenHint = data['cloud_api_token_hint'] as String?;
+      _numberHistory = parseNumberHistory(data['number_history']);
+      _previousLines = data['previous_lines'] is Map
+          ? Map<String, dynamic>.from(data['previous_lines'] as Map)
+          : const {};
+      final change = data['number_change'];
+      _pausedAutomations = change is Map && change['pausedAutomations'] is List
+          ? (change['pausedAutomations'] as List).whereType<String>().toList()
+          : const [];
+
+      // Texto: `applyServer` no pisa lo que el operador está escribiendo.
+      // Sin alias el campo queda vacío: el resto de la app muestra el nombre
+      // verificado o el número, y un "Sucursal - …" de relleno parecería
+      // guardado sin estarlo.
+      _aliasController.applyServer(str('alias', _cloudApiVerifiedName ?? ''));
+      _apiKeyController.applyServer(str('ai_api_key'));
+      _openaiApiKeyController.applyServer(str('ai_openai_api_key'));
+      _deepseekApiKeyController.applyServer(str('ai_deepseek_api_key'));
+      _systemPromptController.applyServer(str('ai_system_prompt', defaultSystemPrompt));
+      _discriminatorPromptController.applyServer(str('ai_discriminator_prompt'));
+      _reminderApiUrlController.applyServer(str('reminder_api_url'));
+      _reminderTemplateController.applyServer(str('reminder_template', defaultReminderTemplate));
+      _followupExclusionController.applyServer(str('followup_exclusion_prompt'));
+      _followupMessageController.applyServer(str('followup_message_prompt'));
+
+      _aiEnabled = data['ai_enabled'] ?? false;
+      _selectedProvider = str('ai_provider', defaultAiProvider);
+      _selectedModel = str('ai_model', defaultModelFor(_selectedProvider));
+      _responseDelaySeconds = responseDelaySecondsFrom(data['ai_response_delay_ms']);
+
+      _reminderEnabled = data['reminder_enabled'] ?? false;
+      _reminderLastRun = data['reminder_last_run'] as Map<String, dynamic>?;
+      if (data['reminder_scheduled_time'] is String) {
+        _reminderScheduledTime = _parseTime(data['reminder_scheduled_time'] as String, 9);
+      }
+
+      _followupEnabled = data['followup_enabled'] ?? false;
+      if (data['followup_scheduled_time'] is String) {
+        _followupScheduledTime = _parseTime(data['followup_scheduled_time'] as String, 9);
+      }
+
+      if (data['ai_active_hours'] is Map) {
+        final hours = data['ai_active_hours'] as Map;
+        _activeHoursEnabled = hours['enabled'] ?? false;
+        _activeHoursTimezone = hours['timezone'] ?? 'America/Mexico_City';
+        if (hours['start'] is String) _activeHoursStart = _parseTime(hours['start'] as String, 9);
+        if (hours['end'] is String) _activeHoursEnd = _parseTime(hours['end'] as String, 18);
+      }
+
+      // Back-compat: leer del nuevo nombre (`bot_keyword_rules`) primero
+      // y caer al viejo (`ai_keyword_rules`) si todavía no se migró.
+      // Reglas sin campo `trigger` se asumen como 'incoming' para preservar
+      // su comportamiento histórico hasta que el usuario las edite.
+      final rawRules = data['bot_keyword_rules'] ?? data['ai_keyword_rules'];
+      if (rawRules is List) {
+        _botKeywordRules = List<Map<String, dynamic>>.from(rawRules.map((rule) => {
+          // `ruleId` ancla el archivo en Storage (path determinista).
+          // Reglas legacy no lo tienen → se genera al editarlas en el sheet.
+          'ruleId': rule['ruleId'] as String? ?? '',
+          'keyword': rule['keyword'] as String? ?? '',
+          'response': rule['response'] as String? ?? '',
+          'imageUrl': rule['imageUrl'] as String? ?? '',
+          // Adjunto documento (PDF). Una regla lleva imagen O documento.
+          'documentUrl': rule['documentUrl'] as String? ?? '',
+          'documentName': rule['documentName'] as String? ?? '',
+          'trigger': (rule['trigger'] as String?) ?? 'incoming',
+        }));
+      }
+
+      _markReadOnReply = data['mark_read_on_reply'] ?? true;
+      _discriminatorEnabled = data['ai_discriminator_enabled'] ?? false;
+
+      if (data['ai_media_allowlist'] is Map) {
+        final allow = data['ai_media_allowlist'] as Map;
+        _mediaAllowImage = allow['image'] == true;
+        _mediaAllowAudio = allow['audio'] == true;
+        _mediaAllowVideo = allow['video'] == true;
+        _mediaAllowDocument = allow['document'] == true;
+      }
+    });
+  }
+
+  static TimeOfDay _parseTime(String hhmm, int fallbackHour) {
+    final parts = hhmm.split(':');
+    return TimeOfDay(
+      hour: int.tryParse(parts[0]) ?? fallbackHour,
+      minute: parts.length > 1 ? int.tryParse(parts[1]) ?? 0 : 0,
+    );
+  }
+
+  static String _hhmm(TimeOfDay t) =>
+      '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+
+  Map<String, Object> get _activeHoursMap => {
+        'enabled': _activeHoursEnabled,
+        'timezone': _activeHoursTimezone,
+        'start': _hhmm(_activeHoursStart),
+        'end': _hhmm(_activeHoursEnd),
+      };
+
+  static String _errorReason(Object e) {
+    if (e is FirebaseException) {
+      switch (e.code) {
+        case 'permission-denied':
+          return 'no tienes permiso para cambiar esta sesión';
+        case 'unavailable':
+          return 'sin conexión';
+        case 'not-found':
+          return 'la sesión ya no existe';
+      }
+      return e.message ?? e.code;
+    }
+    return '$e';
+  }
+
+  // El único que escribe en el doc de la sesión desde el panel. Escribe SÓLO
+  // los campos que cambiaron (más lo que se ve y el doc no tiene, ver
+  // `sessionSettingsDisplayGaps`). Si el servidor lo rechaza, avisa; el
+  // control vuelve a su valor solo, con el snapshot del rollback.
+  Future<bool> _saveFields(Map<String, Object?> fields, {required String what}) async {
+    if (_sessionGone || !mounted) return false;
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    final payload = {..._displayGaps, ...fields};
+    _displayGaps = const {};
+    if (_writesInFlight++ == 0) _batchFailed = false;
+    _savedTimer?.cancel();
+    _saveStatus.value = _SaveStatus.saving;
+    try {
+      await _sessionRef.update(payload);
+      return true;
+    } catch (e) {
+      _batchFailed = true;
+      debugPrint('[SessionSettings] No se pudo guardar $what: $e');
+      messenger?.showSnackBar(SnackBar(content: Text('No se pudo guardar $what: ${_errorReason(e)}')));
+      return false;
+    } finally {
+      if (--_writesInFlight == 0 && mounted) {
+        if (_batchFailed) {
+          _saveStatus.value = _SaveStatus.idle;
+        } else {
+          _saveStatus.value = _SaveStatus.saved;
+          _savedTimer = Timer(const Duration(seconds: 2), () {
+            if (mounted) _saveStatus.value = _SaveStatus.idle;
+          });
+        }
+      }
+    }
+  }
+
+  // Controles discretos: se ven al instante y se guardan al instante.
+  void _change(VoidCallback apply, Map<String, Object?> fields, String what) {
+    setState(apply);
+    _saveFields(fields, what: what);
+  }
+
+  // El horario se guarda como mapa completo, cambie la pieza que cambie.
+  void _changeActiveHours(VoidCallback apply) {
+    setState(apply);
+    _saveFields({'ai_active_hours': _activeHoursMap}, what: 'Horario de Atención');
+  }
+
+  Future<bool> _saveDraft(DraftTextController draft) async {
+    try {
+      await draft.save((value) async {
+        if (!await _saveFields({draft.field: value}, what: draft.label)) {
+          throw StateError('No se guardó ${draft.field}');
+        }
+      });
+      return true;
+    } catch (_) {
+      return false; // el aviso ya salió desde _saveFields
+    }
+  }
+
+  // Al salir de la pantalla (flecha, atrás de Android, gesto de iOS), lo
+  // escrito y no guardado se guarda solo y se avisa. Se guarda en vez de
+  // preguntar "¿descartar cambios?": preguntar exige `canPop: false`, que en
+  // iOS apaga el gesto de volver mientras haya cambios, y perder un prompt
+  // largo es mucho peor que guardar algo que se podía descartar con su botón.
+  void _flushDrafts() {
+    if (_sessionGone) return;
+    final pending = _drafts.where((d) => d.isDirty && !d.isSaving).toList();
+    if (pending.isEmpty) return;
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    final names = pending.map((d) => '«${d.label}»').join(', ');
+    _sessionRef.update({
+      ..._displayGaps,
+      for (final d in pending) d.field: d.trimmed,
+    }).then((_) {
+      messenger?.showSnackBar(SnackBar(content: Text('Se guardó lo que escribiste en $names.')));
+    }, onError: (Object e) {
+      debugPrint('[SessionSettings] No se pudo guardar al cerrar: $e');
+      messenger?.showSnackBar(SnackBar(content: Text('No se pudo guardar lo que escribiste en $names: ${_errorReason(e)}')));
+    });
   }
 
   @override
   void dispose() {
+    _sub?.cancel();
+    _savedTimer?.cancel();
+    _saveStatus.dispose();
     _tabController.dispose();
-    _aliasController.dispose();
-    _apiKeyController.dispose();
-    _openaiApiKeyController.dispose();
-    _deepseekApiKeyController.dispose();
-    _systemPromptController.dispose();
-    _discriminatorPromptController.dispose();
-    _reminderApiUrlController.dispose();
-    _reminderTemplateController.dispose();
-    _followupExclusionController.dispose();
-    _followupMessageController.dispose();
+    for (final draft in _drafts) {
+      draft.dispose();
+    }
     _systemPromptFocus.dispose();
     _discriminatorFocus.dispose();
     _reminderTemplateFocus.dispose();
@@ -352,66 +469,156 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
 
   @override
   Widget build(BuildContext context) {
-    if (_isLoading) {
-      return const SizedBox(height: 500, child: Center(child: CircularProgressIndicator(color: primaryAqua)));
-    }
-
-    return Container(
-      height: MediaQuery.of(context).size.height * 0.85,
-      decoration: const BoxDecoration(
-        color: surfaceDark,
-        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
-      ),
-      child: Column(
-        children: [
-          // Header & Handle
-          _buildHeader(),
-          
-          // TabBar
-          _buildTabBar(),
-          
-          // Content
-          Expanded(
-            child: TabBarView(
-              controller: _tabController,
-              children: [
-                _buildGeneralTab(),
-                _buildAITab(),
-                _buildRulesTab(),
-                _buildLabelsTab(),
-                _buildIntegrationsTab(),
-              ],
-            ),
-          ),
-          
-          // Footer with Save Button
-          _buildFooter(),
-        ],
+    return PopScope(
+      // Se salga como se salga (flecha, atrás de Android, gesto de iOS), lo
+      // escrito no se pierde.
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) _flushDrafts();
+      },
+      child: Scaffold(
+        // surfaceDark y no darkBg: las tarjetas del panel son darkBg
+        // translúcido y sobre darkBg desaparecerían.
+        backgroundColor: surfaceDark,
+        appBar: _buildAppBar(),
+        body: SafeArea(top: false, child: _buildBody()),
       ),
     );
   }
 
-  Widget _buildHeader() {
-    return Column(
-      children: [
-        const SizedBox(height: 12),
-        Container(
-          width: 40,
-          height: 4,
-          decoration: BoxDecoration(color: lightText.withValues(alpha: 0.2), borderRadius: BorderRadius.circular(2)),
+  Widget _buildBody() {
+    if (_isLoading) {
+      return const Center(child: CircularProgressIndicator(color: primaryAqua));
+    }
+    if (_loadError != null) {
+      return _buildBlocked(
+        icon: Icons.cloud_off_outlined,
+        title: 'No se pudo leer la configuración',
+        detail: _loadError!,
+        onRetry: _retry,
+      );
+    }
+    if (_sessionGone) {
+      return _buildBlocked(
+        icon: Icons.delete_outline,
+        title: 'Esta sesión se está eliminando',
+        detail: 'Ya no se puede cambiar su configuración.',
+      );
+    }
+    // En escritorio el contenido no se estira a todo el ancho: un campo de
+    // 1 800 px es ilegible y los switches quedarían lejísimos de su texto.
+    return Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 760),
+        child: Column(
+          children: [
+            _buildTabBar(),
+            Expanded(
+              child: TabBarView(
+                controller: _tabController,
+                children: [
+                  _buildGeneralTab(),
+                  _buildAITab(),
+                  _buildRulesTab(),
+                  _buildLabelsTab(),
+                  _buildIntegrationsTab(),
+                ],
+              ),
+            ),
+          ],
         ),
-        const SizedBox(height: 16),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 24),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              const Text('Ajustes de Sesión', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: white)),
-              IconButton(onPressed: () => Navigator.pop(context), icon: const Icon(Icons.close, color: lightText)),
+      ),
+    );
+  }
+
+  // Lectura fallida o sesión eliminada: un aviso, nunca un formulario.
+  Widget _buildBlocked({required IconData icon, required String title, required String detail, VoidCallback? onRetry}) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 40, color: lightText.withValues(alpha: 0.6)),
+            const SizedBox(height: 16),
+            Text(title, textAlign: TextAlign.center, style: const TextStyle(color: white, fontSize: 17, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            Text(detail, textAlign: TextAlign.center, style: const TextStyle(color: lightText, fontSize: 13)),
+            if (onRetry != null) ...[
+              const SizedBox(height: 24),
+              FilledButton(
+                onPressed: onRetry,
+                style: FilledButton.styleFrom(backgroundColor: primaryAqua, foregroundColor: darkBg),
+                child: const Text('Reintentar'),
+              ),
             ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  // Título + de qué sesión son estos ajustes. Con varias cuentas abiertas el
+  // nombre importa: el dispatcher puede cambiar la sesión de la lista (un push
+  // de otra cuenta) mientras esta pantalla sigue arriba.
+  PreferredSizeWidget _buildAppBar() {
+    return AppBar(
+      backgroundColor: surfaceDark,
+      titleSpacing: 0,
+      title: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Text(
+            'Ajustes de Sesión',
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontSize: 19, fontWeight: FontWeight.bold, color: white),
           ),
+          if (_sessionName != null)
+            Text(
+              _sessionName!,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 12.5, color: lightText),
+            ),
+        ],
+      ),
+      actions: [
+        Padding(
+          padding: const EdgeInsets.only(right: 16, left: 8),
+          child: Center(child: _buildSaveStatus()),
         ),
       ],
+    );
+  }
+
+  // "Guardando…" / "✓ Guardado" a la derecha del título. Es la confirmación
+  // de los cambios al instante; los errores van en SnackBar.
+  Widget _buildSaveStatus() {
+    return ValueListenableBuilder<_SaveStatus>(
+      valueListenable: _saveStatus,
+      builder: (context, status, _) => AnimatedSwitcher(
+        duration: const Duration(milliseconds: 200),
+        child: switch (status) {
+          _SaveStatus.idle => const SizedBox.shrink(key: ValueKey('idle')),
+          _SaveStatus.saving => const Row(
+              key: ValueKey('saving'),
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(width: 10, height: 10, child: CircularProgressIndicator(strokeWidth: 1.5, color: lightText)),
+                SizedBox(width: 6),
+                Text('Guardando…', style: TextStyle(color: lightText, fontSize: 12)),
+              ],
+            ),
+          _SaveStatus.saved => const Row(
+              key: ValueKey('saved'),
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.check_circle, size: 14, color: primaryAqua),
+                SizedBox(width: 5),
+                Text('Guardado', style: TextStyle(color: primaryAqua, fontSize: 12, fontWeight: FontWeight.w600)),
+              ],
+            ),
+        },
+      ),
     );
   }
 
@@ -521,7 +728,11 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
             style: TextStyle(color: lightText, fontSize: 13),
           ),
           const SizedBox(height: 20),
-          _switchTile('Marcar como leído al responder', _markReadOnReply, (v) => setState(() => _markReadOnReply = v)),
+          _switchTile(
+            'Marcar como leído al responder',
+            _markReadOnReply,
+            (v) => _change(() => _markReadOnReply = v, {'mark_read_on_reply': v}, 'Marcar como leído'),
+          ),
           if (AccountContextService().isOwner) ..._buildDangerZone(),
         ],
       ),
@@ -650,11 +861,10 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
   }
 
   Future<void> _openChangeNumber() async {
+    // El cambio reescribe el número, el alias por defecto y pausa los
+    // automáticos: llega solo por el listener. Como el panel guarda campo por
+    // campo, ya no hay un "Guardar" que pueda volver a encenderlos.
     await showChangeNumberFlow(context, accountId: widget.accountId, sessionId: widget.sessionId);
-    // El cambio reescribe el número, el alias por defecto y los automáticos
-    // que pausa. Sin recargar, el próximo "Guardar" de este panel los volvería
-    // a encender con lo que tenía en memoria.
-    if (mounted) await _loadSettings();
   }
 
   Future<void> _disconnectPreviousLine(String phone) async {
@@ -691,7 +901,6 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
           .timeout(const Duration(seconds: 20));
       if (response.statusCode != 200) throw Exception('HTTP ${response.statusCode}');
       messenger.showSnackBar(SnackBar(content: Text('${displayPhone(phone)} desconectado')));
-      if (mounted) await _loadSettings();
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('No se pudo desconectar: $e')));
     } finally {
@@ -732,15 +941,18 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
       padding: const EdgeInsets.all(24),
       child: Column(
         children: [
-          _switchTile('Activar Asistente IA', _aiEnabled, (v) => setState(() => _aiEnabled = v)),
+          _switchTile('Activar Asistente IA', _aiEnabled, (v) => _change(() => _aiEnabled = v, {'ai_enabled': v}, 'Asistente IA')),
           const SizedBox(height: 24),
           _sectionTitle('Cerebro del Asistente'),
           const SizedBox(height: 16),
           _dropdownTile('Proveedor', _selectedProvider, ['gemini', 'openai', 'deepseek'], (v) {
-            setState(() {
+            // Proveedor y modelo van juntos: un modelo de otro proveedor
+            // guardado a medias rompería la siguiente respuesta.
+            final model = defaultModelFor(v);
+            _change(() {
               _selectedProvider = v!;
-              _selectedModel = _defaultModelFor(v);
-            });
+              _selectedModel = model;
+            }, {'ai_provider': v, 'ai_model': model}, 'Proveedor');
           }),
           const SizedBox(height: 16),
           _modelDropdownTile(),
@@ -771,15 +983,15 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
             'Horario de Atención',
             Icons.access_time,
             _activeHoursEnabled,
-            (v) => setState(() => _activeHoursEnabled = v),
+            (v) => _changeActiveHours(() => _activeHoursEnabled = v),
             Column(
               children: [
-                _dropdownTile('Zona Horaria', _activeHoursTimezone, ['America/Mexico_City', 'America/New_York', 'Europe/Madrid'], (v) => setState(() => _activeHoursTimezone = v!)),
+                _dropdownTile('Zona Horaria', _activeHoursTimezone, ['America/Mexico_City', 'America/New_York', 'Europe/Madrid'], (v) => _changeActiveHours(() => _activeHoursTimezone = v!)),
                 Row(
                   children: [
-                    Expanded(child: _timeTile('Apertura', _activeHoursStart, (t) => setState(() => _activeHoursStart = t))),
+                    Expanded(child: _timeTile('Apertura', _activeHoursStart, (t) => _changeActiveHours(() => _activeHoursStart = t))),
                     const SizedBox(width: 12),
-                    Expanded(child: _timeTile('Cierre', _activeHoursEnd, (t) => setState(() => _activeHoursEnd = t))),
+                    Expanded(child: _timeTile('Cierre', _activeHoursEnd, (t) => _changeActiveHours(() => _activeHoursEnd = t))),
                   ],
                 ),
               ],
@@ -790,7 +1002,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
             'Discriminador IA',
             Icons.psychology,
             _discriminatorEnabled,
-            (v) => setState(() => _discriminatorEnabled = v),
+            (v) => _change(() => _discriminatorEnabled = v, {'ai_discriminator_enabled': v}, 'Discriminador IA'),
             Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -816,7 +1028,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
             'Seguimiento de Ventas',
             Icons.campaign_outlined,
             _followupEnabled,
-            (v) => setState(() => _followupEnabled = v),
+            (v) => _change(() => _followupEnabled = v, {'followup_enabled': v}, 'Seguimiento de Ventas'),
             Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -839,7 +1051,11 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
                   ],
                 ),
                 const SizedBox(height: 16),
-                _timeTile('Hora del Barrido Diario', _followupScheduledTime, (t) => setState(() => _followupScheduledTime = t)),
+                _timeTile(
+                  'Hora del Barrido Diario',
+                  _followupScheduledTime,
+                  (t) => _change(() => _followupScheduledTime = t, {'followup_scheduled_time': _hhmm(t)}, 'Hora del Barrido Diario'),
+                ),
                 const SizedBox(height: 16),
                 _textField(
                   controller: _followupExclusionController,
@@ -1057,8 +1273,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
 
   // Abre el editor de regla en bottom sheet. Sin argumentos → crear; con
   // index → editar esa regla. Cada acción (crear/editar/eliminar) se persiste
-  // de inmediato en Firestore, igual que las etiquetas → no depende del
-  // "Guardar Todos los Cambios" del footer.
+  // de inmediato en Firestore, igual que las etiquetas.
   Future<void> _showRuleEditor([int? index]) async {
     final existing = index != null ? _botKeywordRules[index] : null;
     final result = await showModalBottomSheet<Map<String, dynamic>>(
@@ -1117,9 +1332,8 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
     }
   }
 
-  // Persiste solo el campo de reglas de inmediato (independiente del footer),
-  // siguiendo el patrón de las etiquetas. Así el usuario no tiene que recordar
-  // guardar y se elimina el conflicto con el guardado de otras pestañas.
+  // Persiste solo el campo de reglas de inmediato, siguiendo el patrón de las
+  // etiquetas.
   Future<void> _persistRules({bool deleted = false}) async {
     try {
       await FirebaseFirestore.instance
@@ -1143,13 +1357,19 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
   }
 
   // "Enviar ahora": antes era un comando que cualquiera podía escribir por
-  // WhatsApp ("enviar recordatorios"), y lo escribía también un cliente. Usa
-  // la configuración GUARDADA. Si hoy ya salieron, pregunta antes de repetir:
-  // cada cliente recibiría su recordatorio dos veces.
+  // WhatsApp ("enviar recordatorios"), y lo escribía también un cliente. El
+  // backend lee la configuración GUARDADA, así que primero se guarda lo que
+  // el operador dejó escrito en la URL y el mensaje: si no, salía el mensaje
+  // viejo. Si hoy ya salieron, pregunta antes de repetir: cada cliente
+  // recibiría su recordatorio dos veces.
   Future<void> _sendRemindersNow({bool force = false}) async {
     setState(() => _sendingReminders = true);
     final messenger = ScaffoldMessenger.of(context);
     try {
+      for (final draft in [_reminderApiUrlController, _reminderTemplateController]) {
+        if ((draft.isDirty || draft.isSaving) && !await _saveDraft(draft)) return;
+      }
+      if (!mounted) return;
       final response = await http
           .post(
             Uri.parse('$backendUrl/send-reminders'),
@@ -1237,14 +1457,22 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
                       Text('AgendaCool', style: TextStyle(color: white, fontSize: 18, fontWeight: FontWeight.bold)),
                       Text('Recordatorios de Citas', style: TextStyle(color: lightText, fontSize: 12)),
                     ])),
-                    Switch(value: _reminderEnabled, activeThumbColor: primaryAqua, onChanged: (v) => setState(() => _reminderEnabled = v)),
+                    Switch(
+                      value: _reminderEnabled,
+                      activeThumbColor: primaryAqua,
+                      onChanged: (v) => _change(() => _reminderEnabled = v, {'reminder_enabled': v}, 'Recordatorios'),
+                    ),
                   ],
                 ),
                 if (_reminderEnabled) ...[
                   const SizedBox(height: 24),
                   _textField(controller: _reminderApiUrlController, label: 'API URL de Sincronización', hint: 'https://...'),
                   const SizedBox(height: 16),
-                  _timeTile('Hora de Envío Diario', _reminderScheduledTime, (t) => setState(() => _reminderScheduledTime = t)),
+                  _timeTile(
+                    'Hora de Envío Diario',
+                    _reminderScheduledTime,
+                    (t) => _change(() => _reminderScheduledTime = t, {'reminder_scheduled_time': _hhmm(t)}, 'Hora de Envío Diario'),
+                  ),
                   const SizedBox(height: 16),
                   _textField(
                     controller: _reminderTemplateController, 
@@ -1273,7 +1501,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      'Usa la configuración guardada. Antes se podía disparar escribiendo "enviar recordatorios" por WhatsApp; ya no: cualquier cliente podía hacerlo.',
+                      'Sale con lo que ves aquí: si cambiaste el mensaje, se guarda antes de enviar. Antes se podía disparar escribiendo "enviar recordatorios" por WhatsApp; ya no: cualquier cliente podía hacerlo.',
                       style: TextStyle(color: lightText.withValues(alpha: 0.55), fontSize: 11),
                     ),
                   ],
@@ -1286,82 +1514,75 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
     );
   }
 
-  // Pestaña 5: gestión de etiquetas. CRUD live sobre la subcolección `labels`
-  // de la sesión. No usa _save() del footer porque cada etiqueta se persiste
-  // al instante (modelo idéntico a quick_responses).
+  // Pestaña de etiquetas. CRUD live sobre la subcolección `labels` de la
+  // sesión: cada etiqueta se persiste al instante (modelo idéntico a
+  // quick_responses).
   Widget _buildLabelsTab() {
     return _LabelsTabBody(accountId: widget.accountId, sessionId: widget.sessionId);
   }
 
-  Widget _buildFooter() {
-    return Container(
-      padding: EdgeInsets.fromLTRB(24, 16, 24, 16 + MediaQuery.of(context).padding.bottom),
-      decoration: BoxDecoration(
-        color: surfaceDark,
-        border: Border(top: BorderSide(color: white.withValues(alpha: 0.05))),
-      ),
-      child: ElevatedButton(
-        onPressed: _isSaving ? null : _save,
-        style: ElevatedButton.styleFrom(
-          backgroundColor: primaryAqua,
-          minimumSize: const Size(double.infinity, 56),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-          elevation: 0,
-        ),
-        child: _isSaving 
-          ? const CircularProgressIndicator(color: darkBg) 
-          : const Text('Guardar Todos los Cambios', style: TextStyle(color: darkBg, fontSize: 16, fontWeight: FontWeight.bold)),
-      ),
-    );
-  }
-
-  void _showExpandedEditor(String title, TextEditingController controller, FocusNode? focusNode) {
+  // Editor a pantalla completa para los textos largos. Con cambios, la acción
+  // es GUARDAR (guarda y cierra); sin cambios, LISTO. La ✕ cierra y el
+  // borrador se queda en el campo, con su "Sin guardar".
+  void _showExpandedEditor(String title, DraftTextController controller, FocusNode? focusNode) {
     showDialog(
       context: context,
-      builder: (context) => Dialog.fullscreen(
-        backgroundColor: surfaceDark,
-        child: Scaffold(
+      builder: (dialogContext) {
+        void close() {
+          Navigator.pop(dialogContext);
+          focusNode?.requestFocus();
+        }
+
+        return Dialog.fullscreen(
           backgroundColor: surfaceDark,
-          appBar: AppBar(
+          child: Scaffold(
             backgroundColor: surfaceDark,
-            elevation: 0,
-            title: Text(title, style: const TextStyle(color: white, fontSize: 18, fontWeight: FontWeight.bold)),
-            leading: IconButton(
-              icon: const Icon(Icons.close, color: white),
-              onPressed: () {
-                Navigator.pop(context);
-                focusNode?.requestFocus();
-              },
+            appBar: AppBar(
+              backgroundColor: surfaceDark,
+              elevation: 0,
+              title: Text(title, style: const TextStyle(color: white, fontSize: 18, fontWeight: FontWeight.bold)),
+              leading: IconButton(icon: const Icon(Icons.close, color: white), onPressed: close),
+              actions: [
+                ListenableBuilder(
+                  listenable: controller,
+                  builder: (_, _) {
+                    final dirty = controller.isDirty;
+                    return TextButton(
+                      onPressed: controller.isSaving
+                          ? null
+                          : () async {
+                              if (dirty && !await _saveDraft(controller)) return;
+                              if (dialogContext.mounted) close();
+                            },
+                      child: Text(
+                        dirty ? 'GUARDAR' : 'LISTO',
+                        style: const TextStyle(color: primaryAqua, fontWeight: FontWeight.bold),
+                      ),
+                    );
+                  },
+                ),
+                const SizedBox(width: 8),
+              ],
             ),
-            actions: [
-              TextButton(
-                onPressed: () {
-                  Navigator.pop(context);
-                  focusNode?.requestFocus();
-                },
-                child: const Text('LISTO', style: TextStyle(color: primaryAqua, fontWeight: FontWeight.bold)),
-              ),
-              const SizedBox(width: 8),
-            ],
-          ),
-          body: Padding(
-            padding: const EdgeInsets.all(24.0),
-            child: TextField(
-              controller: controller,
-              maxLines: null,
-              expands: true,
-              textAlignVertical: TextAlignVertical.top,
-              autofocus: true,
-              style: const TextStyle(color: white, fontSize: 16, height: 1.6),
-              decoration: InputDecoration(
-                border: InputBorder.none,
-                hintText: 'Escribe tus instrucciones detalladas aquí...',
-                hintStyle: TextStyle(color: white.withValues(alpha: 0.1)),
+            body: Padding(
+              padding: const EdgeInsets.all(24.0),
+              child: TextField(
+                controller: controller,
+                maxLines: null,
+                expands: true,
+                textAlignVertical: TextAlignVertical.top,
+                autofocus: true,
+                style: const TextStyle(color: white, fontSize: 16, height: 1.6),
+                decoration: InputDecoration(
+                  border: InputBorder.none,
+                  hintText: 'Escribe tus instrucciones detalladas aquí...',
+                  hintStyle: TextStyle(color: white.withValues(alpha: 0.1)),
+                ),
               ),
             ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 
@@ -1371,8 +1592,10 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
     return Text(title.toUpperCase(), style: const TextStyle(color: primaryAqua, fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1.2));
   }
 
+  // Campo de texto de Ajustes: se guarda con su propio botón (DraftSaveBar),
+  // que sólo aparece cuando hay cambios.
   Widget _textField({
-    required TextEditingController controller, 
+    required DraftTextController controller,
     required String label, 
     String? hint, 
     int maxLines = 1, 
@@ -1421,6 +1644,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
             contentPadding: const EdgeInsets.all(16),
           ),
         ),
+        DraftSaveBar(controller: controller, onSave: () => _saveDraft(controller)),
       ],
     );
   }
@@ -1443,7 +1667,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
 
   // Controller de la API key del proveedor activo. Cada proveedor guarda su
   // llave en un campo Firestore aparte; aquí solo elegimos cuál editar.
-  TextEditingController get _activeApiKeyController {
+  DraftTextController get _activeApiKeyController {
     switch (_selectedProvider) {
       case 'openai':
         return _openaiApiKeyController;
@@ -1451,18 +1675,6 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
         return _deepseekApiKeyController;
       default:
         return _apiKeyController;
-    }
-  }
-
-  // Modelo por defecto al cambiar de proveedor (el "Recomendado" de cada uno).
-  String _defaultModelFor(String? provider) {
-    switch (provider) {
-      case 'openai':
-        return 'gpt-4.1-mini';
-      case 'deepseek':
-        return 'deepseek-v4-flash';
-      default:
-        return 'gemini-2.5-flash';
     }
   }
 
@@ -1525,7 +1737,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
                 ],
               )
             )).toList(),
-            onChanged: (v) => setState(() => _selectedModel = v!),
+            onChanged: (v) => _change(() => _selectedModel = v!, {'ai_model': v}, 'Modelo de IA'),
           ),
         ),
       ],
@@ -1705,7 +1917,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
   }
 
   Widget _responseDelayTile() {
-    final belowRecommended = _responseDelaySeconds < _recommendedResponseDelaySeconds;
+    final belowRecommended = _responseDelaySeconds < recommendedResponseDelaySeconds;
     final hintColor = belowRecommended ? const Color(0xFFF59E0B) : primaryAqua;
 
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -1724,14 +1936,19 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
       const SizedBox(height: 8),
       Slider(
         value: _responseDelaySeconds.toDouble(),
-        min: _minResponseDelaySeconds.toDouble(),
-        max: _maxResponseDelaySeconds.toDouble(),
-        divisions: _maxResponseDelaySeconds - _minResponseDelaySeconds,
+        min: minResponseDelaySeconds.toDouble(),
+        max: maxResponseDelaySeconds.toDouble(),
+        divisions: maxResponseDelaySeconds - minResponseDelaySeconds,
         label: '$_responseDelaySeconds s',
         semanticFormatterCallback: (value) => '${value.round()} segundos',
         activeColor: hintColor,
         inactiveColor: darkBg,
         onChanged: (value) => setState(() => _responseDelaySeconds = value.round()),
+        // Se guarda al soltar, no en cada paso del arrastre.
+        onChangeEnd: (value) => _saveFields(
+          {'ai_response_delay_ms': value.round() * Duration.millisecondsPerSecond},
+          what: 'Espera para responder',
+        ),
       ),
       const SizedBox(height: 8),
       Container(
@@ -1750,7 +1967,7 @@ class _SessionSettingsPanelState extends State<SessionSettingsPanel> with Single
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    'Recomendado por WhatHero: $_recommendedResponseDelaySeconds s o más',
+                    'Recomendado por WhatHero: $recommendedResponseDelaySeconds s o más',
                     style: TextStyle(color: hintColor, fontSize: 12, fontWeight: FontWeight.w600),
                   ),
                   const SizedBox(height: 4),
@@ -1789,6 +2006,18 @@ class _LabelsTabBodyState extends State<_LabelsTabBody> {
       .collection('whatsapp_sessions')
       .doc(widget.sessionId)
       .collection('labels');
+
+  // Se escucha una sola vez: creado en `build`, cada rebuild del panel (y con
+  // los guardados al instante son muchos) volvía a suscribirse y la lista
+  // parpadeaba al spinner. Ver CLAUDE.md, "Nunca un .snapshots() dentro de
+  // build".
+  late final Stream<QuerySnapshot> _labels;
+
+  @override
+  void initState() {
+    super.initState();
+    _labels = _ref.orderBy('order').snapshots();
+  }
 
   Future<void> _openEditor({ChatLabel? existing, int nextOrder = 0}) async {
     // Editor compartido con el selector de etiquetas del chat
@@ -1838,7 +2067,7 @@ class _LabelsTabBodyState extends State<_LabelsTabBody> {
   @override
   Widget build(BuildContext context) {
     return StreamBuilder<QuerySnapshot>(
-      stream: _ref.orderBy('order').snapshots(),
+      stream: _labels,
       builder: (context, snap) {
         if (!snap.hasData) {
           return const Center(child: CircularProgressIndicator(color: primaryAqua));

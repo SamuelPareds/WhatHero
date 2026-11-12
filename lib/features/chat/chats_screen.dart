@@ -1698,23 +1698,12 @@ class _ChatsScreenState extends State<ChatsScreen> {
     );
   }
 
-  // Abre el panel de configuración de la sesión como bottom sheet. Lo usamos
-  // cuando los iconos de IA están en estado "no configurado": en lugar de
-  // mostrar un botón muerto, llevamos al usuario directo a activar el asistente.
+  // Abre los Ajustes de la sesión. Lo usamos cuando los iconos de IA están en
+  // estado "no configurado": en lugar de mostrar un botón muerto, llevamos al
+  // usuario directo a activar el asistente.
   void _openSessionSettings() {
     if (widget.sessionId == null) return;
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: surfaceDark,
-      isScrollControlled: true,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-      ),
-      builder: (_) => SessionSettingsPanel(
-        sessionId: widget.sessionId!,
-        accountId: widget.accountId,
-      ),
-    );
+    openSessionSettings(context, accountId: widget.accountId, sessionId: widget.sessionId!);
   }
 
   Future<void> _toggleAiAutoResponse(bool currentValue) async {
