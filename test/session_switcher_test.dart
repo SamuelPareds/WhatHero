@@ -4,8 +4,9 @@ import 'package:crm_whatsapp/features/accounts/session_switch.dart';
 import 'package:crm_whatsapp/features/chat/widgets/session_switcher.dart';
 
 // El selector de cuenta vive en el título de la lista de chats, donde el ancho
-// es un recurso peleado: comparte fila con Mis Cuentas, la bandeja del equipo,
-// las campañas de seguimiento, el buscador y las respuestas rápidas.
+// es un recurso peleado: comparte fila con la bandeja del equipo, las campañas
+// de seguimiento, el buscador y las respuestas rápidas. Es también la única
+// entrada a Mis Cuentas desde la lista: ya no hay ícono a la izquierda.
 void main() {
   const ac = SessionOption(id: '5215514252103', name: 'AC', phone: '5215514252103', status: 'connected');
   const sucursal = SessionOption(id: '5215561642726', name: 'Sucursal Norte', phone: '5215561642726', status: 'connected');
@@ -27,11 +28,10 @@ void main() {
       data: MediaQueryData(size: size),
       child: MaterialApp(
         home: Scaffold(
-          // AppBar realista: Mis Cuentas + selector + las cuatro acciones que
-          // puede tener en móvil (bandeja del equipo, campañas, buscador y
-          // respuestas rápidas). Si el título engorda, revienta con overflow.
+          // AppBar realista: selector + las cuatro acciones que puede tener en
+          // móvil (bandeja del equipo, campañas, buscador y respuestas
+          // rápidas). Si el título engorda, revienta con overflow.
           appBar: AppBar(
-            leading: IconButton(icon: const Icon(Icons.manage_accounts_outlined), onPressed: () {}),
             title: SessionSwitcher(
               current: current,
               sessions: sessions,
@@ -55,12 +55,19 @@ void main() {
     return (selected: selected, managed: managed);
   }
 
-  testWidgets('con una sola sesión es el título de siempre: sin flecha ni menú', (tester) async {
-    await pump(tester, sessions: const [ac]);
+  testWidgets('con una sola sesión el menú sigue ahí: es la salida a Mis Cuentas', (tester) async {
+    final calls = await pump(tester, sessions: const [ac]);
     expect(find.text('AC'), findsOneWidget);
     expect(find.text('+52 55 1425 2103'), findsOneWidget);
-    expect(find.byIcon(Icons.expand_more), findsNothing);
-    expect(find.byType(PopupMenuButton<String>), findsNothing);
+    expect(find.byIcon(Icons.expand_more), findsOneWidget);
+
+    await tester.tap(find.text('AC'));
+    await tester.pumpAndSettle();
+    expect(find.byIcon(Icons.check), findsOneWidget);
+    await tester.tap(find.text('Gestionar cuentas'));
+    await tester.pumpAndSettle();
+    expect(calls.managed, ['manage']);
+    expect(calls.selected, isEmpty);
   });
 
   testWidgets('con varias, el menú lista cada cuenta con su número y marca la actual', (tester) async {

@@ -4,9 +4,12 @@ import 'package:crm_whatsapp/core.dart';
 import 'package:crm_whatsapp/core/utils/phone_input.dart';
 import 'package:crm_whatsapp/features/accounts/session_switch.dart';
 
-/// El título de la lista de chats: la sesión que se ve y, si el usuario ve más
-/// de una, el desplegable para cambiar de cuenta en dos toques. Con una sola
-/// es el título de siempre, sin flecha.
+/// El título de la lista de chats: la sesión que se ve y el desplegable para
+/// cambiar de cuenta en dos toques o ir a "Gestionar cuentas".
+///
+/// El menú existe también con una sola sesión: es la única entrada a Mis
+/// Cuentas desde la lista (vincular otro número, miembros, llaves de API y
+/// cerrar sesión). Sin él, quien tiene una sola cuenta no tendría salida.
 ///
 /// El cambio no lo hace este widget: lo pide con [onSelected] y lo aplica el
 /// SessionDispatcher, el único que decide qué sesión se ve (ver CLAUDE.md,
@@ -38,15 +41,10 @@ class SessionSwitcher extends StatelessWidget {
   // Los ids de sesión son dígitos: no puede chocar con uno.
   static const _manageValue = '__manage__';
 
-  bool get _canSwitch => sessions.length > 1;
-
   @override
   Widget build(BuildContext context) {
-    final title = _title();
-    if (!_canSwitch) return title;
-
     return PopupMenuButton<String>(
-      tooltip: 'Cambiar de cuenta',
+      tooltip: sessions.length > 1 ? 'Cambiar de cuenta' : 'Cuentas',
       position: PopupMenuPosition.under,
       color: surfaceDark,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
@@ -82,7 +80,7 @@ class SessionSwitcher extends StatelessWidget {
           ),
         ),
       ],
-      child: title,
+      child: _title(),
     );
   }
 
@@ -103,7 +101,8 @@ class SessionSwitcher extends StatelessWidget {
                 style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 20, color: white),
               ),
             ),
-            if (_canSwitch) const Icon(Icons.expand_more, size: 20, color: lightText),
+            // Siempre: es lo que dice que el título se toca.
+            const Icon(Icons.expand_more, size: 20, color: lightText),
           ],
         ),
         // Conectada: el número que usa hoy (no el id: tras un cambio de número

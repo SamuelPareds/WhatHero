@@ -76,7 +76,9 @@ Cada vez que abrían la app, los miembros del equipo caían en "Bienvenido a Wha
 
 ## 🔀 Cambiar de cuenta (el selector del título)
 
-Tocar el nombre de la sesión en la lista de chats ("AC ▾") abre el selector de cuenta. Muestra las sesiones que el usuario puede ver (`visibleSessionsQuery`) en el orden de *Mis Cuentas*, con su estado y sus pendientes. Con una sola sesión el título no lleva flecha ni menú. El ícono de la izquierda sigue llevando a *Mis Cuentas*, que es para administrar: vincular, miembros, llaves y cerrar sesión.
+Tocar el nombre de la sesión en la lista de chats ("AC ▾") abre el selector de cuenta. Muestra las sesiones que el usuario puede ver (`visibleSessionsQuery`) en el orden de *Mis Cuentas*, con su estado y sus pendientes, y al final **"Gestionar cuentas"**, que abre *Mis Cuentas*: vincular, miembros, llaves y cerrar sesión.
+
+**Es la única entrada a *Mis Cuentas* desde la lista.** El ícono de la izquierda (`manage_accounts`) se quitó porque repetía "Gestionar cuentas". Por eso **el menú existe aunque haya una sola sesión**, con su flecha: antes, con una, el título no abría nada, y sin el ícono ese usuario (el típico cliente nuevo) no tendría cómo agregar un número, invitar al equipo ni cerrar sesión. **No volver a esconder el menú con una sola sesión.**
 
 ### Sólo el dispatcher cambia de cuenta
 `SessionDispatcher` (`main.dart`) es el único que decide qué sesión se ve. La cambia reemplazando la `ChatsScreen` raíz (`ValueKey(sessionId)`). Los tres caminos pasan por su `_switchTo`: el selector, una tarjeta de *Mis Cuentas* y un push de otra sesión.

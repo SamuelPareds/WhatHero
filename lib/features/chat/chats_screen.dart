@@ -1053,11 +1053,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
       // al deslizamiento "Listo / Pendiente" de cada chat.
       endDrawerEnableOpenDragGesture: false,
       appBar: AppBar(
-        leading: IconButton(
-          icon: const Icon(Icons.manage_accounts_outlined, color: primaryAqua),
-          onPressed: _openAccounts,
-          tooltip: 'Gestionar Cuentas',
-        ),
+        // Sin ícono de Mis Cuentas a la izquierda: se llega desde el menú del
+        // título ("Gestionar cuentas"), que existe aunque haya una sola sesión.
         // Nombre, número y estado salen de la lista en vivo del dispatcher:
         // sin un stream propio del doc de sesión.
         title: _searchExpanded
@@ -1350,7 +1347,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
                   if (showAccountsCta) ...[
                     const SizedBox(height: 24),
                     ElevatedButton.icon(
-                      onPressed: () => Navigator.pop(context),
+                      // Abrir, no `pop`: esta lista es la raíz y ya no vive
+                      // encima de Mis Cuentas (ver CLAUDE.md, "Cambiar de cuenta").
+                      onPressed: _openAccounts,
                       icon: const Icon(Icons.manage_accounts_outlined),
                       label: const Text('Ir a Mis Cuentas'),
                       style: ElevatedButton.styleFrom(
